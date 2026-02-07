@@ -17,5 +17,5 @@ gen/
 *.out
 *.zip
 # 敏感配置和数据库文件
-
+config
 
