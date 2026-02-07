@@ -1,6 +1,32 @@
 ![logo-blue](https://user-images.githubusercontent.com/51039935/197520391-f35db354-6071-4c12-86ea-fc450f04bc85.png)
 # NAS媒体库资源归集、整理自动化工具
 
+## 本分支修改内容
+
+### 动漫名称识别算法优化
+
+优化了动漫文件名的季数识别，支持非标准命名格式：
+
+**修改文件：**
+- `app/media/meta/metainfo.py` - 修改 `is_anime()` 函数
+- `app/media/meta/metaanime.py` - 添加非标准季数识别逻辑
+
+**解决的问题：**
+
+对于类似 `[LoliHouse] Mato Seihei no Slave 2 - 05` 这种非标准命名格式：
+
+| 项目 | 修改前 | 修改后 |
+|------|--------|--------|
+| 名称 | Mato Seihei No Slave 2 | Mato Seihei No Slave |
+| 季数 | 未识别 | S02 |
+| 集数 | E05 | E05 |
+
+**技术细节：**
+1. `is_anime()` 函数增加对字符串结尾集数格式的支持（如 `标题 2 - 05` 不带后缀）
+2. `MetaAnime` 类在 anitopy 无法识别季数时，从标题末尾提取数字作为季数
+
+---
+
 [![GitHub stars](https://img.shields.io/github/stars/jxxghp/nas-tools?style=plastic)](https://github.com/jxxghp/nas-tools/stargazers)
 [![GitHub forks](https://img.shields.io/github/forks/jxxghp/nas-tools?style=plastic)](https://github.com/jxxghp/nas-tools/network/members)
 [![GitHub issues](https://img.shields.io/github/issues/jxxghp/nas-tools?style=plastic)](https://github.com/jxxghp/nas-tools/issues)
