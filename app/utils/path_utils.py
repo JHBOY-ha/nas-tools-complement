@@ -59,7 +59,11 @@ class PathUtils:
         for file in os.listdir(in_path):
             path = os.path.join(in_path, file)
             if os.path.isfile(path):
-                if not exts or os.path.splitext(file)[-1].lower() in exts:
+                file_ext = os.path.splitext(file)[-1].lower()
+                # 跳过没有扩展名的文件（如 .DS_Store）
+                if exts and not file_ext:
+                    continue
+                if not exts or file_ext in exts:
                     ret_list.append(path)
         return ret_list
 

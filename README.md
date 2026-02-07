@@ -3,7 +3,7 @@
 
 ## 本分支修改内容
 
-### 动漫名称识别算法优化
+### 1. 动漫名称识别算法优化
 
 优化了动漫文件名的季数识别，支持非标准命名格式：
 
@@ -24,6 +24,23 @@
 **技术细节：**
 1. `is_anime()` 函数增加对字符串结尾集数格式的支持（如 `标题 2 - 05` 不带后缀）
 2. `MetaAnime` 类在 anitopy 无法识别季数时，从标题末尾提取数字作为季数
+
+### 2. 修复 .DS_Store 导致数据库初始化失败
+
+**修改文件：**
+- `app/utils/path_utils.py` - 修改 `get_dir_level1_files()` 函数
+
+**解决的问题：**
+
+macOS 系统会在目录中自动创建 `.DS_Store` 文件，当 config 目录中存在该文件时，数据库初始化会尝试将其作为 SQL 文件读取，导致 UTF-8 解码错误：
+
+```
+UnicodeDecodeError: 'utf-8' codec can't decode byte 0x80 in position 3131: invalid start byte
+```
+
+**技术细节：**
+
+原代码中 `"" in ".sql"` 返回 `True`（Python 空字符串包含检查特性），导致无扩展名的 `.DS_Store` 文件被错误地包含在 SQL 文件列表中。修复后增加了对空扩展名文件的过滤
 
 ---
 

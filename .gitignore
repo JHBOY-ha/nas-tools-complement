@@ -19,3 +19,5 @@ gen/
 # 敏感配置和数据库文件
 config
 
+config/user.db
+config/config.yaml
