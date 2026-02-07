@@ -1,0 +1,21 @@
+__pycache__
+*.sock
+*.log
+*.pid
+test.py
+
+### IntelliJ IDEA ###
+.idea
+*.iws
+*.iml
+*.ipr
+out/
+gen/
+.claude
+.venv
+.DS_Store
+*.out
+*.zip
+# 敏感配置和数据库文件
+
+
