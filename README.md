@@ -1,74 +1,96 @@
-![logo-blue](https://user-images.githubusercontent.com/51039935/197520391-f35db354-6071-4c12-86ea-fc450f04bc85.png)
-# NAS媒体库资源归集、整理自动化工具
+<p align="center">
+  <img src="https://user-images.githubusercontent.com/51039935/197520391-f35db354-6071-4c12-86ea-fc450f04bc85.png" alt="NAS-Tools Logo" width="200">
+</p>
+
+<h1 align="center">NAS-Tools</h1>
+<p align="center">NAS 媒体库资源归集、整理自动化工具</p>
+
+<p align="center">
+  <a href="#部署方式">部署方式</a> •
+  <a href="#功能">功能</a> •
+  <a href="#安装">安装</a> •
+  <a href="#配置">配置</a>
+</p>
+
+---
 
 ## 本分支修改内容
 
-> **测试环境说明**：本分支的修改在群晖 Container Manager（Docker）和 macOS 环境中测试通过，其他环境仅供参考。
+> **测试环境**：群晖 Container Manager（Docker）和 macOS，其他环境仅供参考。
 
-### 1. 动漫名称识别算法优化
+<details>
+<summary><b>1. 动漫名称识别算法优化</b></summary>
 
-优化了动漫文件名的季数识别，支持非标准命名格式：
+优化了动漫文件名的季数识别，支持非标准命名格式。
 
 **修改文件：**
-- `app/media/meta/metainfo.py` - 修改 `is_anime()` 函数
-- `app/media/meta/metaanime.py` - 添加非标准季数识别逻辑
+- `app/media/meta/metainfo.py` - `is_anime()` 函数
+- `app/media/meta/metaanime.py` - 非标准季数识别逻辑
 
-**解决的问题：**
+**效果对比：**
 
-对于类似 `[LoliHouse] Mato Seihei no Slave 2 - 05` 这种非标准命名格式：
+以 `[LoliHouse] Mato Seihei no Slave 2 - 05` 为例：
 
 | 项目 | 修改前 | 修改后 |
-|------|--------|--------|
+|:----:|:------:|:------:|
 | 名称 | Mato Seihei No Slave 2 | Mato Seihei No Slave |
 | 季数 | 未识别 | S02 |
 | 集数 | E05 | E05 |
 
 **技术细节：**
-1. `is_anime()` 函数增加对字符串结尾集数格式的支持（如 `标题 2 - 05` 不带后缀）
-2. `MetaAnime` 类在 anitopy 无法识别季数时，从标题末尾提取数字作为季数
+1. `is_anime()` 增加对 `标题 2 - 05` 格式的支持
+2. `MetaAnime` 在 anitopy 无法识别季数时，从标题末尾提取数字作为季数
 
-### 2. 修复 .DS_Store 导致数据库初始化失败
+</details>
+
+<details>
+<summary><b>2. 修复 .DS_Store 导致数据库初始化失败</b></summary>
 
 **修改文件：**
-- `app/utils/path_utils.py` - 修改 `get_dir_level1_files()` 函数
+- `app/utils/path_utils.py` - `get_dir_level1_files()` 函数
 
-**解决的问题：**
+**问题描述：**
 
-macOS 系统会在目录中自动创建 `.DS_Store` 文件，当 config 目录中存在该文件时，数据库初始化会尝试将其作为 SQL 文件读取，导致 UTF-8 解码错误：
+macOS 自动创建的 `.DS_Store` 文件会导致数据库初始化时 UTF-8 解码错误：
 
 ```
-UnicodeDecodeError: 'utf-8' codec can't decode byte 0x80 in position 3131: invalid start byte
+UnicodeDecodeError: 'utf-8' codec can't decode byte 0x80 in position 3131
 ```
 
-**技术细节：**
+**原因分析：**
 
-原代码中 `"" in ".sql"` 返回 `True`（Python 空字符串包含检查特性），导致无扩展名的 `.DS_Store` 文件被错误地包含在 SQL 文件列表中。修复后增加了对空扩展名文件的过滤
+Python 中 `"" in ".sql"` 返回 `True`，导致无扩展名文件被错误包含。修复后增加了空扩展名过滤。
+
+</details>
+
+---
 
 ## 部署方式
 
-### Docker 部署（群晖 Container Manager）
+### Docker 部署
 
-如果你已有 NAS-Tools 容器，可以通过修改环境变量来使用本仓库的代码：
-
-**方式一：修改现有容器**
+<details>
+<summary><b>方式一：修改现有容器</b></summary>
 
 1. 停止容器
-2. 编辑容器设置 → 环境变量
-3. 修改以下变量：
+2. 编辑容器设置 → 环境变量，修改以下变量：
 
 | 变量 | 值 |
-|------|-----|
+|:-----|:---|
 | `REPO_URL` | `https://github.com/JHBOY-ha/nas-tools-complement.git` |
 | `NASTOOL_VERSION` | `master` |
 | `NASTOOL_AUTO_UPDATE` | `true` |
 
-4. 保存并重新启动容器
+3. 保存并重新启动容器
 
-**方式二：新建容器**
+</details>
 
-使用任意 NAS-Tools 镜像（如 `jxxghp/nas-tools:latest` 或 `19970688/nastools-bt:latest`），在创建时设置以下环境变量：
+<details>
+<summary><b>方式二：新建容器</b></summary>
 
-```
+使用 `jxxghp/nas-tools:latest` 或 `19970688/nastools-bt:latest` 镜像，设置以下环境变量：
+
+```env
 PUID=0
 PGID=0
 TZ=Asia/Shanghai
@@ -80,44 +102,20 @@ NASTOOL_VERSION=master
 REPO_URL=https://github.com/JHBOY-ha/nas-tools-complement.git
 ```
 
-容器启动时会自动从本仓库拉取代码。
+</details>
 
 ### 网络代理配置
 
-NAS-Tools 需要访问 TMDB、豆瓣、GitHub 等外部服务，建议部署代理服务以确保网络连通性：
+NAS-Tools 需要访问 TMDB、豆瓣、GitHub 等外部服务，建议配置代理：
 
-**1. 群晖系统代理（用于容器更新拉取 GitHub 代码）**
+| 代理类型 | 配置位置 | 用途 |
+|:---------|:---------|:-----|
+| 群晖系统代理 | 控制面板 → 网络 → 代理服务器 | 容器更新拉取 GitHub 代码 |
+| NAS-Tools 代理 | 设置 → 基础设置 → 系统 → 代理服务器 | TMDB、豆瓣等服务访问 |
 
-群晖控制面板 → 网络 → 代理服务器，填写代理地址和端口（HTTP）
-
-**2. NAS-Tools 代理（用于 TMDB、豆瓣等服务访问）**
-
-NAS-Tools 设置 → 基础设置 → 系统 → 代理服务器，配置 HTTP 代理，格式：`代理IP:端口`
-
-**3. 代理服务部署**
-
-建议使用 [v2rayA](https://github.com/v2rayA/v2rayA) 等项目在 NAS 上部署代理服务
-
-配置完成后可在 NAS-Tools 设置 → 网络连通性 中测试各服务的连接状态
+> 推荐使用 [v2rayA](https://github.com/v2rayA/v2rayA) 在 NAS 上部署代理服务。
 
 ---
-
-[![GitHub stars](https://img.shields.io/github/stars/jxxghp/nas-tools?style=plastic)](https://github.com/jxxghp/nas-tools/stargazers)
-[![GitHub forks](https://img.shields.io/github/forks/jxxghp/nas-tools?style=plastic)](https://github.com/jxxghp/nas-tools/network/members)
-[![GitHub issues](https://img.shields.io/github/issues/jxxghp/nas-tools?style=plastic)](https://github.com/jxxghp/nas-tools/issues)
-[![GitHub license](https://img.shields.io/github/license/jxxghp/nas-tools?style=plastic)](https://github.com/jxxghp/nas-tools/blob/master/LICENSE.md)
-[![Docker pulls](https://img.shields.io/docker/pulls/jxxghp/nas-tools?style=plastic)](https://hub.docker.com/r/jxxghp/nas-tools)
-[![Platform](https://img.shields.io/badge/platform-amd64/arm64-pink?style=plastic)](https://hub.docker.com/r/jxxghp/nas-tools)
-
-
-Docker：https://hub.docker.com/repository/docker/jxxghp/nas-tools
-
-TG频道：https://t.me/nastool
-
-WIKI：https://github.com/jxxghp/nas-tools/wiki
-
-API: http://localhost:3000/api/v1/
-
 
 ## 功能：
 
