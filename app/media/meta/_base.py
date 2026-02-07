@@ -586,7 +586,10 @@ class MetaBase(object):
         if not info.get('media_type'):
             return self.type
         if info.get('media_type') == MediaType.TV:
+            # 优先从 genre_ids 获取（搜索结果），否则从 genres 获取（详细信息）
             genre_ids = info.get("genre_ids")
+            if not genre_ids and info.get("genres"):
+                genre_ids = [g.get("id") for g in info.get("genres") if g.get("id")]
             if not genre_ids:
                 return MediaType.TV
             if isinstance(genre_ids, list):
@@ -598,6 +601,9 @@ class MetaBase(object):
             else:
                 return MediaType.TV
         else:
+            # 如果原始识别已有集数信息，说明是剧集，不应被TMDB的电影结果覆盖
+            if self.begin_episode is not None and self.type in [MediaType.TV, MediaType.ANIME]:
+                return self.type
             return info.get('media_type')
 
     def init_subtitle(self, title_text):

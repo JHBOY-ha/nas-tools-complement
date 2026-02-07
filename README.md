@@ -19,7 +19,41 @@
 > **测试环境**：群晖 Container Manager（Docker）和 macOS，其他环境仅供参考。
 
 <details>
-<summary><b>1. 动漫名称识别算法优化</b></summary>
+<summary><b>1. 媒体识别优化：模糊匹配与动漫类型修复</b></summary>
+
+**修改文件：**
+- `app/media/media.py` - TMDB搜索和缓存逻辑
+- `app/media/meta/_base.py` - 类型判断逻辑
+
+**功能改进：**
+
+1. **TMDB模糊搜索**
+   - 当精确搜索无结果时，自动尝试用部分关键词重新搜索
+   - 解决字幕组拼写错误（如 "Srange" vs "Strange"）导致无法匹配TMDB的问题
+
+2. **名称相似度匹配**
+   - 使用difflib计算相似度，阈值0.8以上认为匹配成功
+   - 解决因拼写差异导致的匹配失败问题
+
+3. **动漫类型识别修复**
+   - 支持从genres字段获取类型信息（TMDB详细信息查询）
+   - 修复缓存保存时动漫类型丢失的问题（第一次识别正确，第二次变成电视剧）
+   - 保护已识别出集数的剧集不被TMDB电影结果覆盖
+
+**效果对比：**
+
+以 `[绿茶字幕组] 命运-奇异赝品 / Fate Srange Fake [05][WebRip][1080p]` 为例：
+
+| 项目 | 修改前 | 修改后 |
+|:----:|:------:|:------:|
+| 类型 | 电影 | 动漫 |
+| TMDB匹配 | 未匹配 | 229858 |
+| 缓存一致性 | 第二次变电视剧 | 始终为动漫 |
+
+</details>
+
+<details>
+<summary><b>2. 动漫名称识别算法优化</b></summary>
 
 优化了动漫文件名的季数识别，支持非标准命名格式。
 
@@ -44,7 +78,7 @@
 </details>
 
 <details>
-<summary><b>2. 修复 .DS_Store 导致数据库初始化失败</b></summary>
+<summary><b>3. 修复 .DS_Store 导致数据库初始化失败</b></summary>
 
 **修改文件：**
 - `app/utils/path_utils.py` - `get_dir_level1_files()` 函数

@@ -16,7 +16,7 @@ from app.utils import PathUtils, EpisodeFormat, RequestUtils, NumberUtils, Strin
 from app.utils.types import MediaType, MatchMode
 from config import Config, KEYWORD_BLACKLIST, KEYWORD_SEARCH_WEIGHT_3, KEYWORD_SEARCH_WEIGHT_2, KEYWORD_SEARCH_WEIGHT_1, \
     KEYWORD_STR_SIMILARITY_THRESHOLD, KEYWORD_DIFF_SCORE_THRESHOLD, TMDB_IMAGE_ORIGINAL_URL, DEFAULT_TMDB_PROXY, \
-    TMDB_IMAGE_FACE_URL, TMDB_PEOPLE_PROFILE_URL, TMDB_IMAGE_W500_URL
+    TMDB_IMAGE_FACE_URL, TMDB_PEOPLE_PROFILE_URL, TMDB_IMAGE_W500_URL, ANIME_GENREIDS
 
 
 class Media:
@@ -79,11 +79,12 @@ class Media:
             self._search_tmdbweb = laboratory.get("search_tmdbweb")
 
     @staticmethod
-    def __compare_tmdb_names(file_name, tmdb_names):
+    def __compare_tmdb_names(file_name, tmdb_names, fuzzy=True):
         """
         比较文件名是否匹配，忽略大小写和特殊字符
         :param file_name: 识别的文件名或者种子名
         :param tmdb_names: TMDB返回的译名
+        :param fuzzy: 是否启用模糊匹配，默认True
         :return: True or False
         """
         if not file_name or not tmdb_names:
@@ -93,8 +94,16 @@ class Media:
         file_name = StringUtils.handler_special_chars(file_name).upper()
         for tmdb_name in tmdb_names:
             tmdb_name = StringUtils.handler_special_chars(tmdb_name).strip().upper()
+            # 精确匹配
             if file_name == tmdb_name:
                 return True
+            # 模糊匹配：使用相似度比较，阈值0.8以上认为匹配
+            if fuzzy and file_name and tmdb_name:
+                # 使用 difflib 计算相似度
+                ratio = difflib.SequenceMatcher(None, file_name, tmdb_name).ratio()
+                if ratio >= 0.8:
+                    log.debug(f"【Meta】模糊匹配成功：{file_name} vs {tmdb_name}，相似度：{ratio:.2f}")
+                    return True
         return False
 
     def __search_tmdb_allnames(self, mtype: MediaType, tmdb_id):
@@ -224,6 +233,10 @@ class Media:
             log.error(f"【Meta】连接TMDB出错：{str(e)}")
             return None
         log.debug(f"【Meta】API返回：{str(self.search.total_results)}")
+        # 如果没有结果，尝试模糊搜索
+        if len(movies) == 0:
+            log.debug(f"【Meta】{file_media_name} 未找到相关电影信息，尝试模糊搜索...")
+            movies = self.__fuzzy_search_movie(file_media_name, first_media_year)
         if len(movies) == 0:
             log.debug(f"【Meta】{file_media_name} 未找到相关电影信息!")
             return {}
@@ -264,6 +277,48 @@ class Media:
                         break
         return {}
 
+    def __fuzzy_search_movie(self, file_media_name, first_media_year):
+        """
+        模糊搜索电影：当精确搜索无结果时，尝试用部分关键词搜索
+        :param file_media_name: 识别的文件名或种子名
+        :param first_media_year: 电影上映日期
+        :return: 搜索结果列表
+        """
+        if not file_media_name:
+            return []
+        # 分割名称为单词
+        words = file_media_name.split()
+        if len(words) <= 1:
+            return []
+        # 尝试不同的搜索策略
+        search_queries = []
+        # 策略1：去掉最后一个单词（可能是拼错的）
+        if len(words) >= 2:
+            search_queries.append(' '.join(words[:-1]))
+        # 策略2：去掉第一个单词后的第一个单词
+        if len(words) >= 3:
+            search_queries.append(words[0] + ' ' + ' '.join(words[2:]))
+        # 策略3：只用第一个单词（通常是系列名）
+        if len(words) >= 2:
+            search_queries.append(words[0])
+
+        for query in search_queries:
+            if not query or len(query) < 2:
+                continue
+            try:
+                log.debug(f"【Meta】模糊搜索尝试：{query}")
+                if first_media_year:
+                    movies = self.search.movies({"query": query, "year": first_media_year})
+                else:
+                    movies = self.search.movies({"query": query})
+                if movies and len(movies) > 0:
+                    log.info(f"【Meta】模糊搜索 {query} 找到 {len(movies)} 个结果")
+                    return movies
+            except Exception as e:
+                log.debug(f"【Meta】模糊搜索出错：{str(e)}")
+                continue
+        return []
+
     def __search_tv_by_name(self, file_media_name, first_media_year):
         """
         根据名称查询电视剧TMDB匹配
@@ -283,6 +338,10 @@ class Media:
             log.error(f"【Meta】连接TMDB出错：{str(e)}")
             return None
         log.debug(f"【Meta】API返回：{str(self.search.total_results)}")
+        # 如果没有结果，尝试模糊搜索（去掉可能拼错的单词，只用主要关键词搜索）
+        if len(tvs) == 0:
+            log.debug(f"【Meta】{file_media_name} 未找到相关剧集信息，尝试模糊搜索...")
+            tvs = self.__fuzzy_search_tv(file_media_name, first_media_year)
         if len(tvs) == 0:
             log.debug(f"【Meta】{file_media_name} 未找到相关剧集信息!")
             return {}
@@ -322,6 +381,48 @@ class Media:
                     if index > 5:
                         break
         return {}
+
+    def __fuzzy_search_tv(self, file_media_name, first_media_year):
+        """
+        模糊搜索电视剧：当精确搜索无结果时，尝试用部分关键词搜索
+        :param file_media_name: 识别的文件名或者种子名
+        :param first_media_year: 电视剧的首播年份
+        :return: 搜索结果列表
+        """
+        if not file_media_name:
+            return []
+        # 分割名称为单词
+        words = file_media_name.split()
+        if len(words) <= 1:
+            return []
+        # 尝试不同的搜索策略
+        search_queries = []
+        # 策略1：去掉最后一个单词（可能是拼错的）
+        if len(words) >= 2:
+            search_queries.append(' '.join(words[:-1]))
+        # 策略2：去掉第一个单词后的第一个单词
+        if len(words) >= 3:
+            search_queries.append(words[0] + ' ' + ' '.join(words[2:]))
+        # 策略3：只用第一个单词（通常是系列名）
+        if len(words) >= 2:
+            search_queries.append(words[0])
+
+        for query in search_queries:
+            if not query or len(query) < 2:
+                continue
+            try:
+                log.debug(f"【Meta】模糊搜索尝试：{query}")
+                if first_media_year:
+                    tvs = self.search.tv_shows({"query": query, "first_air_date_year": first_media_year})
+                else:
+                    tvs = self.search.tv_shows({"query": query})
+                if tvs and len(tvs) > 0:
+                    log.info(f"【Meta】模糊搜索 {query} 找到 {len(tvs)} 个结果")
+                    return tvs
+            except Exception as e:
+                log.debug(f"【Meta】模糊搜索出错：{str(e)}")
+                continue
+        return []
 
     def __search_tv_by_season(self, file_media_name, media_year, season_number):
         """
@@ -736,10 +837,24 @@ class Media:
                 "media_type") == MediaType.MOVIE else file_media_info.get('first_air_date')
             if cache_year:
                 cache_year = cache_year[:4]
+            # 缓存类型：需要判断是否为动漫
+            cache_type = file_media_info.get("media_type")
+            if cache_type == MediaType.TV:
+                # 检查是否为动漫（genre_ids 包含 16）
+                genre_ids = file_media_info.get("genre_ids")
+                if not genre_ids and file_media_info.get("genres"):
+                    genre_ids = [g.get("id") for g in file_media_info.get("genres") if g.get("id")]
+                if genre_ids:
+                    if isinstance(genre_ids, list):
+                        genre_ids = [str(val).upper() for val in genre_ids]
+                    else:
+                        genre_ids = [str(genre_ids).upper()]
+                    if set(genre_ids).intersection(set(ANIME_GENREIDS)):
+                        cache_type = MediaType.ANIME
             self.meta.update_meta_data({
                 media_key: {
                     "id": file_media_info.get("id"),
-                    "type": file_media_info.get("media_type"),
+                    "type": cache_type,
                     "year": cache_year,
                     "title": cache_title,
                     "poster_path": file_media_info.get("poster_path"),
