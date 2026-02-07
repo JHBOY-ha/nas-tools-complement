@@ -3,6 +3,8 @@
 
 ## 本分支修改内容
 
+> **测试环境说明**：本分支的修改在群晖 Container Manager（Docker）和 macOS 环境中测试通过，其他环境仅供参考。
+
 ### 1. 动漫名称识别算法优化
 
 优化了动漫文件名的季数识别，支持非标准命名格式：
@@ -79,6 +81,24 @@ REPO_URL=https://github.com/JHBOY-ha/nas-tools-complement.git
 ```
 
 容器启动时会自动从本仓库拉取代码。
+
+### 网络代理配置
+
+NAS-Tools 需要访问 TMDB、豆瓣、GitHub 等外部服务，建议部署代理服务以确保网络连通性：
+
+**1. 群晖系统代理（用于容器更新拉取 GitHub 代码）**
+
+群晖控制面板 → 网络 → 代理服务器，填写代理地址和端口（HTTP）
+
+**2. NAS-Tools 代理（用于 TMDB、豆瓣等服务访问）**
+
+NAS-Tools 设置 → 基础设置 → 系统 → 代理服务器，配置 HTTP 代理，格式：`代理IP:端口`
+
+**3. 代理服务部署**
+
+建议使用 [v2rayA](https://github.com/v2rayA/v2rayA) 等项目在 NAS 上部署代理服务
+
+配置完成后可在 NAS-Tools 设置 → 网络连通性 中测试各服务的连接状态
 
 ---
 
