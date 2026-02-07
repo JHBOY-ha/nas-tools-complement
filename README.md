@@ -42,6 +42,44 @@ UnicodeDecodeError: 'utf-8' codec can't decode byte 0x80 in position 3131: inval
 
 原代码中 `"" in ".sql"` 返回 `True`（Python 空字符串包含检查特性），导致无扩展名的 `.DS_Store` 文件被错误地包含在 SQL 文件列表中。修复后增加了对空扩展名文件的过滤
 
+## 部署方式
+
+### Docker 部署（群晖 Container Manager）
+
+如果你已有 NAS-Tools 容器，可以通过修改环境变量来使用本仓库的代码：
+
+**方式一：修改现有容器**
+
+1. 停止容器
+2. 编辑容器设置 → 环境变量
+3. 修改以下变量：
+
+| 变量 | 值 |
+|------|-----|
+| `REPO_URL` | `https://github.com/JHBOY-ha/nas-tools-complement.git` |
+| `NASTOOL_VERSION` | `master` |
+| `NASTOOL_AUTO_UPDATE` | `true` |
+
+4. 保存并重新启动容器
+
+**方式二：新建容器**
+
+使用任意 NAS-Tools 镜像（如 `jxxghp/nas-tools:latest` 或 `19970688/nastools-bt:latest`），在创建时设置以下环境变量：
+
+```
+PUID=0
+PGID=0
+TZ=Asia/Shanghai
+UMASK=022
+NASTOOL_CONFIG=/config/config.yaml
+NASTOOL_AUTO_UPDATE=true
+NASTOOL_CN_UPDATE=true
+NASTOOL_VERSION=master
+REPO_URL=https://github.com/JHBOY-ha/nas-tools-complement.git
+```
+
+容器启动时会自动从本仓库拉取代码。
+
 ---
 
 [![GitHub stars](https://img.shields.io/github/stars/jxxghp/nas-tools?style=plastic)](https://github.com/jxxghp/nas-tools/stargazers)
