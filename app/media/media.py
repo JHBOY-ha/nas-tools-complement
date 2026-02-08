@@ -106,6 +106,30 @@ class Media:
                     return True
         return False
 
+    @staticmethod
+    def __match_tmdb_name_score(file_name, tmdb_names):
+        """
+        比较名称并返回匹配分数，精确匹配返回 1.1，模糊匹配返回最高相似度（>=0.8）
+        """
+        if not file_name or not tmdb_names:
+            return 0
+        if not isinstance(tmdb_names, list):
+            tmdb_names = [tmdb_names]
+        file_name = StringUtils.handler_special_chars(file_name).upper()
+        max_ratio = 0
+        for tmdb_name in tmdb_names:
+            if not tmdb_name:
+                continue
+            tmdb_name = StringUtils.handler_special_chars(tmdb_name).strip().upper()
+            if not tmdb_name:
+                continue
+            if file_name == tmdb_name:
+                return 1.1
+            ratio = difflib.SequenceMatcher(None, file_name, tmdb_name).ratio()
+            if ratio > max_ratio:
+                max_ratio = ratio
+        return max_ratio if max_ratio >= 0.8 else 0
+
     def __search_tmdb_allnames(self, mtype: MediaType, tmdb_id):
         """
         检索tmdb中所有的标题和译名，用于名称匹配
@@ -495,28 +519,63 @@ class Media:
             return {}
         else:
             info = {}
+            best_movie = None
+            best_tv = None
+
+            def __pick_best():
+                """
+                在电影和电视剧候选中选最优，分数接近时优先电影，避免被后续 TV 结果覆盖
+                """
+                if best_movie and best_tv:
+                    if best_movie[0] + 0.02 >= best_tv[0]:
+                        return best_movie[1]
+                    return best_tv[1]
+                if best_movie:
+                    return best_movie[1]
+                if best_tv:
+                    return best_tv[1]
+                return {}
+
             for multi in multis:
                 if multi.get("media_type") == "movie":
-                    if self.__compare_tmdb_names(file_media_name, multi.get('title')) \
-                            or self.__compare_tmdb_names(file_media_name, multi.get('original_title')):
-                        info = multi
+                    score = max(
+                        self.__match_tmdb_name_score(file_media_name, multi.get('title')),
+                        self.__match_tmdb_name_score(file_media_name, multi.get('original_title'))
+                    )
+                    if score > 0 and (not best_movie or score > best_movie[0]):
+                        best_movie = (score, multi)
                 elif multi.get("media_type") == "tv":
-                    if self.__compare_tmdb_names(file_media_name, multi.get('name')) \
-                            or self.__compare_tmdb_names(file_media_name, multi.get('original_name')):
-                        info = multi
+                    score = max(
+                        self.__match_tmdb_name_score(file_media_name, multi.get('name')),
+                        self.__match_tmdb_name_score(file_media_name, multi.get('original_name'))
+                    )
+                    if score > 0 and (not best_tv or score > best_tv[0]):
+                        best_tv = (score, multi)
+
+            info = __pick_best()
             if not info:
+                best_movie = None
+                best_tv = None
                 for multi in multis[:5]:
                     if multi.get("media_type") == "movie":
                         movie_info, names = self.__search_tmdb_allnames(MediaType.MOVIE, multi.get("id"))
-                        if self.__compare_tmdb_names(file_media_name, names):
-                            info = movie_info
+                        score = self.__match_tmdb_name_score(file_media_name, names)
+                        if score > 0 and (not best_movie or score > best_movie[0]):
+                            best_movie = (score, movie_info)
                     elif multi.get("media_type") == "tv":
                         tv_info, names = self.__search_tmdb_allnames(MediaType.TV, multi.get("id"))
-                        if self.__compare_tmdb_names(file_media_name, names):
-                            info = tv_info
+                        score = self.__match_tmdb_name_score(file_media_name, names)
+                        if score > 0 and (not best_tv or score > best_tv[0]):
+                            best_tv = (score, tv_info)
+                info = __pick_best()
         # 返回
         if info:
-            info['media_type'] = MediaType.MOVIE if info.get('media_type') == 'movie' else MediaType.TV
+            if info.get('media_type') in ['movie', MediaType.MOVIE]:
+                info['media_type'] = MediaType.MOVIE
+            elif info.get('media_type') in ['tv', MediaType.TV]:
+                info['media_type'] = MediaType.TV
+            else:
+                info['media_type'] = MediaType.MOVIE if info.get('title') else MediaType.TV
             return info
         else:
             log.info("【Meta】%s 在TMDB中未找到媒体信息!" % file_media_name)
