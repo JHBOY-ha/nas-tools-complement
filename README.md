@@ -97,6 +97,25 @@ Python 中 `"" in ".sql"` 返回 `True`，导致无扩展名文件被错误包�
 
 </details>
 
+<details>
+<summary><b>4. 新增服务项：网络连通性测试-anime</b></summary>
+
+在“服务”页面新增 `网络连通性测试-anime`，用于一键检测动漫相关站点连通性。
+
+**修改文件：**
+- `app/conf/moduleconf.py` - 新增动漫网络测试目标列表
+- `web/main.py` - 服务页新增 `nettest_anime` 服务项
+- `web/templates/service.html` - 新增动漫网络测试弹窗与前端测试逻辑
+- `web/action.py` - `net_test` 兼容完整 URL 输入
+
+**测试目标：**
+- `bgm.tv`
+- `api.bgm.tv`
+- `www.comicat.org`
+- `mikanani.me`
+
+</details>
+
 ---
 
 ## 部署方式

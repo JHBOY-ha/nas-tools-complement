@@ -845,9 +845,15 @@ def service():
     </svg>
     '''
     targets = ModuleConf.NETTEST_TARGETS
+    anime_targets = ModuleConf.NETTEST_ANIME_TARGETS
     scheduler_cfg_list.append(
         {'name': '网络连通性测试', 'time': '', 'state': 'OFF', 'id': 'nettest', 'svg': svg, 'color': 'cyan',
          "targets": targets})
+
+    # 动漫网络连通性测试
+    scheduler_cfg_list.append(
+        {'name': '网络连通性测试-anime', 'time': '', 'state': 'OFF', 'id': 'nettest_anime', 'svg': svg, 'color': 'azure',
+         "targets": anime_targets})
 
     # 备份
     svg = '''
@@ -862,7 +868,9 @@ def service():
     return render_template("service.html",
                            Count=len(scheduler_cfg_list),
                            RuleGroups=RuleGroups,
-                           SchedulerTasks=scheduler_cfg_list)
+                           SchedulerTasks=scheduler_cfg_list,
+                           NetTestTargets=targets,
+                           NetTestAnimeTargets=anime_targets)
 
 
 # 历史记录页面
