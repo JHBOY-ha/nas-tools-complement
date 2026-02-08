@@ -2117,6 +2117,8 @@
 <script type="text/javascript">
   //当前页面地址
   let CURRENT_PAGE_URI = "";
+  // SPA 导航深度，用于控制返回按钮只在应用内跳转
+  window._spa_nav_index = 0;
 
   function window_history_refresh() {
     if (window.history.state?.page) {
@@ -2134,12 +2136,15 @@
       extra: extra,                            // 额外的保存数据
     };
     if (newflag) {
+      window._spa_nav_index++;
+      state._nav_index = window._spa_nav_index;
       window.history.pushState(state, "");
     } else {
       // 当未传递extra时的页面缓存刷新, 应当重新保留extra数据
       if (!extra && window.history.state?.extra) {
         state.extra = window.history.state.extra;
       }
+      state._nav_index = window._spa_nav_index;
       window.history.replaceState(state, "");
     }
   }
@@ -2352,21 +2357,30 @@
     $(window).unbind('scroll');
     page = page.replaceAll(" ", "%20");
     NProgress.start();
-    $("#page_content").load(page, {}, function (response, status, xhr) {
-      NProgress.done();
-      if ($("#page_content").find("title").first().text() === "登录 - NAStool") {
-        window.location.reload();
-      } else {
-        fresh_tooltip();
-        init_filetree_element();
-      }
-      if (page !== CURRENT_PAGE_URI) {
-        $(window).scrollTop(0);
-        CURRENT_PAGE_URI = page;
-      }
-      // 并记录当前历史记录
-      window_history(!newflag);
-    });
+
+    // 淡出当前内容
+    var $content = $("#page_content");
+    $content.addClass("content-fade-out");
+
+    setTimeout(function() {
+      $content.load(page, {}, function (response, status, xhr) {
+        NProgress.done();
+        if ($content.find("title").first().text() === "登录 - NAStool") {
+          window.location.reload();
+        } else {
+          fresh_tooltip();
+          init_filetree_element();
+        }
+        if (page !== CURRENT_PAGE_URI) {
+          $(window).scrollTop(0);
+          CURRENT_PAGE_URI = page;
+        }
+        // 并记录当前历史记录
+        window_history(!newflag);
+        // 淡入新内容
+        $content.removeClass("content-fade-out");
+      });
+    }, 150);
   }
 
 </script>
@@ -2381,6 +2395,8 @@
   $(document).ready(function () {
     window.addEventListener('popstate', function(e) {
         if (e.state) {
+          // 还原 SPA 导航深度
+          window._spa_nav_index = e.state._nav_index ?? 0;
           // 开始还原页面
           if (e.state.CurrentPage) {
             sessionStorage.CurrentPage = e.state.CurrentPage;
@@ -2389,9 +2405,15 @@
           document.querySelector("#navbar-menu").update_active();
           $(window).unbind('scroll');
           document.title = e.state.title;
-          $('#page_content').html(e.state.html).ready(function() {
-            $(window).scrollTop(e.state.scroll);
-          })
+
+          var $content = $('#page_content');
+          $content.addClass("content-fade-out");
+          setTimeout(function() {
+            $content.html(e.state.html).ready(function() {
+              $(window).scrollTop(e.state.scroll);
+            });
+            $content.removeClass("content-fade-out");
+          }, 150);
         }
     });
 

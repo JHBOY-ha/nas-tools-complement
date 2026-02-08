@@ -100,6 +100,19 @@ export class LayoutSearchbar extends CustomElement {
         <div class="d-flex flex-row flex-grow-1 align-items-center py-1">
           <!-- 导航展开按钮 -->
           <layout-navbar-button></layout-navbar-button>
+          <!-- 返回上一页按钮 -->
+          <a href="javascript:void(0)" class="btn btn-icon btn-ghost-secondary ms-1"
+             title="返回上一页"
+             @click=${() => { if (window._spa_nav_index > 0) window.history.back(); }}>
+            <svg xmlns="http://www.w3.org/2000/svg" class="icon icon-tabler icon-tabler-arrow-left"
+                 width="24" height="24" viewBox="0 0 24 24" stroke-width="2"
+                 stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round">
+              <path stroke="none" d="M0 0h24v24H0z" fill="none"></path>
+              <line x1="5" y1="12" x2="19" y2="12"></line>
+              <line x1="5" y1="12" x2="11" y2="18"></line>
+              <line x1="5" y1="12" x2="11" y2="6"></line>
+            </svg>
+          </a>
           <!-- 搜索栏 -->
           <div class="input-group input-group-flat mx-2">
             <span class="input-group-text form-control-rounded">

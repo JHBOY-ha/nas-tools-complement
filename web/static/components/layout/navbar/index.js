@@ -585,7 +585,7 @@ export class LayoutNavbar extends CustomElement {
 
   update_active(page) {
     this._active_name = page ?? window.history.state?.page;
-    this.show_collapse(this._active_name);
+    this.updateComplete.then(() => this.show_collapse(this._active_name));
   }
 
   show_collapse(page) {
@@ -594,6 +594,7 @@ export class LayoutNavbar extends CustomElement {
         if (page === a.getAttribute("data-lit-page")) {
           item.classList.add("show");
           this.querySelectorAll(`button[data-bs-target='#${item.id}']`)[0].classList.remove("collapsed");
+          a.scrollIntoView({ block: "center", behavior: "smooth" });
           return;
         }
       }
@@ -694,6 +695,7 @@ export class LayoutNavbar extends CustomElement {
 
         .lit-navbar-accordion-item, .lit-navbar-accordion-item-active {
           border-radius:0.75rem;
+          transition: background-color 0.2s ease;
         }
 
         .theme-dark .lit-navbar-accordion-item:hover {

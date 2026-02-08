@@ -158,3 +158,11 @@ body, .page {
 .select_logger h5{
     padding-right:5px
 }
+
+#page_content {
+    transition: opacity 0.15s ease-in-out;
+}
+
+#page_content.content-fade-out {
+    opacity: 0;
+}
