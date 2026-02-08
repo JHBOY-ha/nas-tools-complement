@@ -97,6 +97,27 @@ Python 中 `"" in ".sql"` 返回 `True`，导致无扩展名文件被错误包�
 
 </details>
 
+<details>
+<summary><b>4. 页面切换动画和导航栏高亮过渡</b></summary>
+
+为页面内容切换和导航栏高亮增加平滑过渡效果，消除突然闪变的视觉体验。
+
+**修改文件：**
+- `web/static/css/style.css` - 添加 `#page_content` 的 opacity 过渡和 `.content-fade-out` class
+- `web/templates/navigation.html` - `navmenu()` 和 `popstate` 处理器中加入淡出/淡入逻辑
+- `web/static/components/layout/navbar/index.js` - 导航菜单项添加 `background-color` 过渡
+
+**功能改进：**
+
+1. **页面内容淡入淡出**
+   - 点击导航切换页面时，当前内容先淡出（150ms），新内容加载完成后淡入
+   - 浏览器前进/后退恢复页面时同样有淡出→淡入过渡
+
+2. **导航栏高亮平滑过渡**
+   - 左侧导航栏的活跃项背景色切换增加 200ms 过渡动画，不再突变
+
+</details>
+
 ---
 
 ## 部署方式
