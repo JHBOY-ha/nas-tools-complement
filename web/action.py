@@ -2161,12 +2161,18 @@ class WebAction:
 
     @staticmethod
     def __net_test(data):
-        target = data
-        if target == "image.tmdb.org":
-            target = target + "/t/p/w500/wwemzKWzjKYJFfCeiB57q3r4Bcm.png"
-        if target == "qyapi.weixin.qq.com":
-            target = target + "/cgi-bin/message/send"
-        target = "https://" + target
+        target = str(data or "").strip()
+        if not target:
+            return {"res": False, "time": "0 毫秒"}
+
+        # 兼容只传域名的历史逻辑
+        if not target.startswith("http://") and not target.startswith("https://"):
+            if target == "image.tmdb.org":
+                target = target + "/t/p/w500/wwemzKWzjKYJFfCeiB57q3r4Bcm.png"
+            if target == "qyapi.weixin.qq.com":
+                target = target + "/cgi-bin/message/send"
+            target = "https://" + target
+
         start_time = datetime.datetime.now()
         if target.find("themoviedb") != -1 \
                 or target.find("telegram") != -1 \

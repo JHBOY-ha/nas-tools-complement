@@ -518,6 +518,14 @@ class ModuleConf(object):
         "www.opensubtitles.org"
     ]
 
+    # 动漫相关网络测试对象
+    NETTEST_ANIME_TARGETS = [
+        "bgm.tv",
+        "api.bgm.tv",
+        "www.comicat.org",
+        "mikanani.me"
+    ]
+
     # 下载器
     DOWNLOADER_CONF = {
         "qbittorrent": {
