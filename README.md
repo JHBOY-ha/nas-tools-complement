@@ -116,6 +116,48 @@ Python 中 `"" in ".sql"` 返回 `True`，导致无扩展名文件被错误包�
 
 </details>
 
+<details>
+<summary><b>5. 页面切换动画和导航栏高亮过渡</b></summary>
+
+为页面内容切换和导航栏高亮增加平滑过渡效果，消除突然闪变的视觉体验。
+
+**修改文件：**
+- `web/static/css/style.css` - 添加 `#page_content` 的 opacity 过渡和 `.content-fade-out` class
+- `web/templates/navigation.html` - `navmenu()` 和 `popstate` 处理器中加入淡出/淡入逻辑
+- `web/static/components/layout/navbar/index.js` - 导航菜单项添加 `background-color` 过渡
+
+**功能改进：**
+
+1. **页面内容淡入淡出**
+   - 点击导航切换页面时，当前内容先淡出（150ms），新内容加载完成后淡入
+   - 浏览器前进/后退恢复页面时同样有淡出→淡入过渡
+
+2. **导航栏高亮平滑过渡**
+   - 左侧导航栏的活跃项背景色切换增加 200ms 过渡动画，不再突变
+
+</details>
+
+<details>
+<summary><b>6. 导航栏菜单搜索过滤</b></summary>
+
+在左侧导航栏 logo 下方新增搜索框，输入关键词可实时过滤导航菜单项，快速定位功能页面。
+
+**修改文件：**
+- `web/static/components/layout/navbar/index.js` - 搜索框 UI 及过滤逻辑
+
+**功能说明：**
+
+1. **实时过滤**
+   - 输入关键词后，导航栏仅显示名称匹配的菜单项，不区分大小写
+   - 有子菜单的分组会自动展开并只显示匹配的子项；分组名称本身匹配时显示全部子项
+
+2. **自动恢复**
+   - 点击搜索结果中的菜单项后，搜索框自动清空，导航栏恢复完整显示
+   - 选中的菜单项所在分组自动展开并滚动居中
+   - 点击输入框右侧 X 按钮可手动清空搜索
+
+</details>
+
 ---
 
 ## 部署方式

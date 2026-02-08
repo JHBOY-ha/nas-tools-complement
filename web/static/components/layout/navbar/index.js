@@ -517,6 +517,7 @@ export class LayoutNavbar extends CustomElement {
     _update_appversion: { state: true },
     _update_url: { state: true },
     _is_update: { state: true },
+    _filter_keyword: { state: true },
   };
 
   constructor() {
@@ -528,6 +529,7 @@ export class LayoutNavbar extends CustomElement {
     this._update_appversion = "";
     this._update_url = "https://github.com/jxxghp/nas-tools";
     this._is_update = false;
+    this._filter_keyword = "";
     this.classList.add("navbar","navbar-vertical","navbar-expand-lg","lit-navbar-fixed","lit-navbar","lit-navbar-hide-scrollbar");
   }
 
@@ -585,7 +587,7 @@ export class LayoutNavbar extends CustomElement {
 
   update_active(page) {
     this._active_name = page ?? window.history.state?.page;
-    this.show_collapse(this._active_name);
+    this.updateComplete.then(() => this.show_collapse(this._active_name));
   }
 
   show_collapse(page) {
@@ -594,6 +596,7 @@ export class LayoutNavbar extends CustomElement {
         if (page === a.getAttribute("data-lit-page")) {
           item.classList.add("show");
           this.querySelectorAll(`button[data-bs-target='#${item.id}']`)[0].classList.remove("collapsed");
+          a.scrollIntoView({ block: "center", behavior: "smooth" });
           return;
         }
       }
@@ -672,6 +675,19 @@ export class LayoutNavbar extends CustomElement {
           filter: invert(1) grayscale(100%) brightness(200%);
         }
 
+        .lit-navbar-search .input-group-flat {
+          border: 1px solid #232323;
+          border-radius: 0.75rem;
+        }
+        .lit-navbar-search .input-group-text {
+          border: 0;
+          background: transparent;
+        }
+        .lit-navbar-search .form-control {
+          border-radius: 0.75rem;
+          border: 0;
+        }
+
         /* 屏蔽lg以下顶栏 */
         @media (max-width: 992px) {
           .lit-navbar {
@@ -694,6 +710,7 @@ export class LayoutNavbar extends CustomElement {
 
         .lit-navbar-accordion-item, .lit-navbar-accordion-item-active {
           border-radius:0.75rem;
+          transition: background-color 0.2s ease;
         }
 
         .theme-dark .lit-navbar-accordion-item:hover {
@@ -719,22 +736,48 @@ export class LayoutNavbar extends CustomElement {
               <h1 class="mt-3" style="text-align:center;">
                 <img src="../static/img/logo-blue.png" alt="NAStool" class="lit-navbar-logo">
               </h1>
+              <div class="px-3 pt-2 lit-navbar-search">
+                <div class="input-group input-group-flat">
+                  <input type="text" class="form-control" placeholder="搜索菜单..."
+                    .value=${this._filter_keyword}
+                    @input=${(e) => { this._filter_keyword = e.target.value; }}>
+                  ${this._filter_keyword ? html`
+                    <span class="input-group-text" style="cursor:pointer"
+                      @click=${() => { this._filter_keyword = ""; }}>
+                      <svg xmlns="http://www.w3.org/2000/svg" class="icon icon-tabler icon-tabler-x" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"></path><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                    </span>` : nothing}
+                </div>
+              </div>
               <div class="accordion px-2 py-2 flex-grow-1">
-                ${navbar_list.map((item, index) => ( html`
-                  ${this.layout_userpris.includes(item.name)
-                  ? html`
-                    ${item.list?.length > 0
-                    ? html`
-                      <button class="accordion-button lit-navbar-accordion-button collapsed ps-2 pe-1 py-2" style="font-size:1.1rem;" data-bs-toggle="collapse" data-bs-target="#lit-navbar-collapse-${index}" aria-expanded="false">
+                ${navbar_list.map((item, index) => {
+                  if (!this.layout_userpris.includes(item.name)) return nothing;
+                  const kw = this._filter_keyword.toLowerCase();
+                  if (item.list?.length > 0) {
+                    const filteredList = kw
+                      ? item.list.filter((sub) => {
+                          const n = (sub.also ?? sub.name).toLowerCase();
+                          return n.includes(kw) || (sub.also && sub.also.toLowerCase().includes(kw));
+                        })
+                      : item.list;
+                    const groupNameMatch = kw && ((item.also ?? item.name).toLowerCase().includes(kw) || (item.also && item.also.toLowerCase().includes(kw)));
+                    const renderList = groupNameMatch ? item.list : filteredList;
+                    if (kw && renderList.length === 0) return nothing;
+                    return html`
+                      <button class="accordion-button lit-navbar-accordion-button ${kw ? '' : 'collapsed'} ps-2 pe-1 py-2" style="font-size:1.1rem;" data-bs-toggle="collapse" data-bs-target="#lit-navbar-collapse-${index}" aria-expanded="${kw ? 'true' : 'false'}">
                         ${item.also??item.name}
                       </button>
-                      <div class="accordion-collapse collapse" id="lit-navbar-collapse-${index}">
-                        ${item.list.map((drop) => (this._render_page_item(drop, true)))}
-                      </div>`
-                    : this._render_page_item(item, false)
-                    } `
-                  : nothing }
-                `))}
+                      <div class="accordion-collapse collapse ${kw ? 'show' : ''}" id="lit-navbar-collapse-${index}">
+                        ${renderList.map((drop) => (this._render_page_item(drop, true)))}
+                      </div>`;
+                  } else {
+                    if (kw) {
+                      const n = (item.also ?? item.name).toLowerCase();
+                      const match = n.includes(kw) || (item.also && item.also.toLowerCase().includes(kw));
+                      if (!match) return nothing;
+                    }
+                    return this._render_page_item(item, false);
+                  }
+                })}
               </div>
               <div class="d-flex align-items-end">
                 <span class="d-flex flex-grow-1 justify-content-center border rounded-3 m-3 p-2 ${this._is_update ? "bg-yellow" : ""}">
@@ -779,7 +822,13 @@ export class LayoutNavbar extends CustomElement {
       href="javascript:void(0)" data-bs-dismiss="offcanvas" aria-label="Close"
       style="${child ? "font-size:1rem" : "font-size:1.1rem;"}"
       data-lit-page=${item.page}
-      @click=${ () => { navmenu(item.page) }}>
+      @click=${ () => {
+        navmenu(item.page);
+        if (this._filter_keyword) {
+          this._filter_keyword = "";
+          this.updateComplete.then(() => this.show_collapse(item.page));
+        }
+      }}>
       <span class="nav-link-icon" ?hidden=${!child} style="color:var(--tblr-body-color);">
         ${item.icon ?? nothing}
       </span>
