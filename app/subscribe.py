@@ -232,11 +232,12 @@ class Subscribe:
         else:
             return code, "添加订阅失败", media_info
 
-    def finish_rss_subscribe(self, rssid, media):
+    def finish_rss_subscribe(self, rssid, media, completion_reason=None):
         """
         完成订阅
         :param rssid: 订阅ID
         :param media: 识别的媒体信息，发送消息使用
+        :param completion_reason: 完结原因说明
         """
         if not rssid or not media:
             return
@@ -281,10 +282,12 @@ class Subscribe:
             self.dbhelper.delete_rss_tv(rssid=rssid)
 
         # 发送订阅完成的消息
-        log.info("【Rss】%s %s %s 订阅完成，删除订阅..." % (
+        completion_info = f" - {completion_reason}" if completion_reason else ""
+        log.info("【Rss】%s %s %s 订阅完成，删除订阅%s..." % (
             media.type.value,
             media.get_title_string(),
-            media.get_season_string()
+            media.get_season_string(),
+            completion_info
         ))
         self.message.send_rss_finished_message(media_info=media)
 
@@ -676,6 +679,38 @@ class Subscribe:
             if not media_info or not media_info.tmdb_info:
                 self.dbhelper.update_rss_tv_state(rssid=rssid, state='R')
                 continue
+
+            # 检查TMDB完结状态（新增）
+            try:
+                from app.media.completion_checker import CompletionChecker, CompletionStatus
+                completion_checker = CompletionChecker()
+                completion_status, completion_reason = completion_checker.check_completion_status(
+                    media_info=media_info.__dict__,
+                    tmdb_info=media_info.tmdb_info
+                )
+
+                # 如果TMDB明确标记为已完结，直接完成订阅
+                if completion_status in [CompletionStatus.COMPLETED_BY_TMDB, CompletionStatus.SUSPICIOUS_COMPLETED]:
+                    log.info(f"【Subscribe】{media_info.get_title_string()} 根据TMDB判断已完结: {completion_reason}")
+                    # 更新数据库中的完结状态
+                    self.dbhelper.update_rss_tv_completion_status(
+                        rssid=rssid,
+                        completion_status=completion_status.value,
+                        tmdb_status=media_info.tmdb_info.get('status'),
+                        completion_reason=completion_reason
+                    )
+                    # 完成订阅
+                    self.finish_rss_subscribe(rssid=rss_info.get("id"),
+                                            media=media_info,
+                                            completion_reason=completion_reason)
+                    continue
+                else:
+                    # 记录检查结果但继续订阅流程
+                    log.info(f"【Subscribe】{media_info.get_title_string()} 完结状态检查: {completion_reason}")
+
+            except Exception as e:
+                log.warning(f"【Subscribe】完结状态检查出错: {e}")
+                # 出错时继续原有流程，不影响订阅功能
             # 取下载设置
             media_info.set_download_info(download_setting=rss_info.get("download_setting"),
                                          save_path=rss_info.get("save_path"))
@@ -727,7 +762,8 @@ class Subscribe:
                             media_info.get_title_string()))
                         # 完成订阅
                         self.finish_rss_subscribe(rssid=rss_info.get("id"),
-                                                  media=media_info)
+                                                  media=media_info,
+                                                  completion_reason="本地媒体库已包含全部集数")
                     continue
                 # 取交集做为缺失集
                 rss_no_exists = Torrent.get_intersection_episodes(target=rss_no_exists,

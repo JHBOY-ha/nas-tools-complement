@@ -1083,6 +1083,36 @@ class DbHelper:
                     "STATE": state
                 })
 
+    @DbPersist(_db)
+    def update_rss_tv_completion_status(self, rssid=None, title=None, year=None, season=None,
+                                      completion_status=None, tmdb_status=None,
+                                      completion_reason=None):
+        """
+        更新电视剧订阅完结状态
+        """
+        from datetime import datetime
+
+        if not rssid and not title:
+            return
+
+        update_data = {}
+        if completion_status is not None:
+            update_data["COMPLETION_STATUS"] = completion_status
+        if tmdb_status is not None:
+            update_data["TMDB_STATUS"] = tmdb_status
+        if completion_reason is not None:
+            update_data["COMPLETION_REASON"] = completion_reason
+
+        # Always update the last check time
+        update_data["LAST_COMPLETION_CHECK"] = datetime.now()
+
+        if rssid:
+            self._db.query(RSSTVS).filter(RSSTVS.ID == int(rssid)).update(update_data)
+        else:
+            self._db.query(RSSTVS).filter(RSSTVS.NAME == title,
+                                          RSSTVS.YEAR == str(year),
+                                          RSSTVS.SEASON == season).update(update_data)
+
     def is_sync_in_history(self, path, dest):
         """
         查询是否存在同步历史记录

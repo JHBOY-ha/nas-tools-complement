@@ -15,6 +15,18 @@ def init_db():
     log.console('开始初始化数据库...')
     MediaDb().init_db()
     MainDb().init_db()
+
+    # 执行数据库迁移
+    try:
+        from .migrations.add_completion_fields import execute_migration
+        main_db = MainDb()
+        if execute_migration(main_db.get_db()):
+            log.console('完结状态字段迁移成功')
+        else:
+            log.console('完结状态字段迁移失败')
+    except Exception as e:
+        log.console(f'执行数据库迁移时出错: {e}')
+
     log.console('数据库初始化完成')
 
 

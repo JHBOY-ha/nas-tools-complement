@@ -1448,7 +1448,23 @@ class Media:
         try:
             log.info("【Meta】正在查询TMDB电视剧：%s ..." % tmdbid)
             tmdbinfo = self.tv.details(tmdbid, append_to_response)
-            return tmdbinfo or {}
+            if tmdbinfo:
+                # 验证完结判断所需的关键字段
+                required_fields = ['status', 'in_production', 'next_episode_to_air', 'last_air_date']
+                missing_fields = []
+                for field in required_fields:
+                    if field not in tmdbinfo:
+                        missing_fields.append(field)
+
+                if missing_fields:
+                    log.warning(f"【Meta】TMDB数据缺少关键字段: {missing_fields}")
+
+                # 检查总集数是否异常
+                if tmdbinfo.get('number_of_episodes') == 0:
+                    log.warning(f"【Meta】TMDB显示总集数为0，可能数据不准确 (ID: {tmdbid})")
+
+                return tmdbinfo
+            return {}
         except Exception as e:
             print(str(e))
             return None
@@ -2307,3 +2323,45 @@ class Media:
             result.append({"制作公司": production_company})
 
         return result
+
+    def get_next_episode_date(self, tmdb_info):
+        """
+        获取下一集播出时间
+
+        Args:
+            tmdb_info: TMDB信息字典
+
+        Returns:
+            datetime: 下一集播出时间，如果没有则返回None
+        """
+        from datetime import datetime
+
+        next_ep = tmdb_info.get('next_episode_to_air')
+        if next_ep and next_ep.get('air_date'):
+            try:
+                return datetime.fromisoformat(next_ep['air_date'])
+            except ValueError:
+                log.warning(f"无法解析下一集播出日期: {next_ep['air_date']}")
+        return None
+
+    def is_long_time_no_update(self, tmdb_info, days=7):
+        """
+        检查是否超过指定天数未更新
+
+        Args:
+            tmdb_info: TMDB信息字典
+            days: 天数阈值
+
+        Returns:
+            bool: 是否超过指定天数
+        """
+        from datetime import datetime
+
+        last_date = tmdb_info.get('last_air_date')
+        if last_date:
+            try:
+                last = datetime.fromisoformat(last_date)
+                return (datetime.now() - last).days > days
+            except ValueError:
+                log.warning(f"无法解析最后播出日期: {last_date}")
+        return False

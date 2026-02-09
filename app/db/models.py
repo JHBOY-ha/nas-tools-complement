@@ -1,5 +1,5 @@
 # coding: utf-8
-from sqlalchemy import Column, Float, Index, Integer, Text, text, Sequence
+from sqlalchemy import Column, Float, Index, Integer, Text, text, Sequence, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 
 Base = declarative_base()
@@ -295,6 +295,10 @@ class RSSTVS(Base):
     STATE = Column(Text)
     DESC = Column(Text)
     NOTE = Column(Text)
+    COMPLETION_STATUS = Column(Text)    # 完结状态（来自CompletionStatus枚举）
+    TMDB_STATUS = Column(Text)          # TMDB 原始状态值
+    LAST_COMPLETION_CHECK = Column(DateTime)  # 最后完结状态检查时间
+    COMPLETION_REASON = Column(Text)    # 完结原因说明
 
     def as_dict(self):
         return {c.name: getattr(self, c.name) for c in self.__table__.columns}
