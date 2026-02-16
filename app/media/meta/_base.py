@@ -159,6 +159,38 @@ class MetaBase(object):
             return self.cn_name
         return ""
 
+    @staticmethod
+    def normalize_release_version_suffix(name):
+        """
+        去除标题尾部发布修订号，如: v2/V10/ver2/ver.2。
+        仅处理尾部且要求前有分隔符，不影响 01v2/03v2 这类集号写法。
+        """
+        if not name:
+            return name
+
+        cleaned = str(name).strip()
+        if not cleaned:
+            return cleaned
+
+        # 仅匹配尾部版本号，且前面必须有分隔符
+        suffix_re = re.compile(
+            r"(?i)(?:[\s._\-~]+)(?:v(?:er)?\.?\s*\d{1,2})[\s._\-~]*$"
+        )
+
+        while True:
+            updated = suffix_re.sub("", cleaned).strip()
+            updated = re.sub(r"\s+", " ", updated)
+            updated = re.sub(r"[\s._\-~]+$", "", updated).strip()
+
+            if updated == cleaned:
+                break
+            if not updated:
+                # 兜底：避免误删后得到空标题
+                return str(name).strip()
+            cleaned = updated
+
+        return cleaned
+
     def get_title_string(self):
         if self.title:
             return "%s (%s)" % (self.title, self.year) if self.year else self.title
