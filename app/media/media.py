@@ -779,6 +779,174 @@ class Media:
             return {}
         return self.meta.get_meta_data_by_key(self.__make_cache_key(meta_info))
 
+    @staticmethod
+    def __is_same_search_name(name1, name2):
+        """
+        比较两个检索名称是否相同（忽略大小写和特殊字符）
+        """
+        if not name1 or not name2:
+            return False
+        return StringUtils.handler_special_chars(name1).upper() == StringUtils.handler_special_chars(name2).upper()
+
+    @staticmethod
+    def __extract_cn_fallback_name(meta_info):
+        """
+        提取中文兜底检索名
+        """
+        def _clean_candidate(text):
+            if not text:
+                return ""
+            text = str(text).strip()
+            text = text.replace("／", "/")
+            text = re.sub(r"^\s*[\[\]【】()（）「」]+|[\[\]【】()（）「」]+\s*$", "", text)
+            # 去掉末尾集号标记（例如 - 06、第06集）
+            text = re.sub(r"(?i)\s*[-_~]?\s*(?:第?\s*\d{1,4}\s*[集话話期]?)\s*$", "", text)
+            text = re.sub(r"(?i)\s*[-_~]?\s*\d{1,4}(?:[vV]\d{1,2})?\s*$", "", text)
+            text = re.sub(r"\s+", " ", text).strip()
+            text = re.sub(r"[\s._\-~:：]+$", "", text).strip()
+            return text
+
+        def _is_valid_cn_candidate(text):
+            if not text:
+                return False
+            if not StringUtils.is_chinese(text):
+                return False
+
+            # 含明显元信息分隔符时，通常不是纯标题
+            if re.search(r"[\[\]【】{}<>|_]", text):
+                return False
+
+            pure = re.sub(r"\s+", "", text)
+            if len(pure) < 4 or len(pure) > 40:
+                return False
+
+            zh_count = len(re.findall(r"[\u4e00-\u9fff]", text))
+            if zh_count < 4:
+                return False
+
+            # 中文占比过低的混合串通常是发布信息而非片名
+            if zh_count / max(len(pure), 1) < 0.35:
+                return False
+
+            # 英文字符过多时容易是“中英混合+标签”串
+            if len(re.findall(r"[A-Za-z]", text)) >= 8:
+                return False
+
+            # 排除技术标签和字幕说明
+            if re.search(r"(?i)\b(?:HEVC|AVC|X26[45]|AAC|EAC3|FLAC|WEB[- ]?RIP|WEB[- ]?DL|BDRIP|BLURAY|REMUX|MKV|MP4|1080P|2160P|720P|10BIT|8BIT)\b", text):
+                return False
+            if re.search(r"字幕|内封|外挂|简繁|简体|繁体|中字|双语|中日|招募", text):
+                return False
+            return True
+
+        def _score_candidate(text):
+            zh_count = len(re.findall(r"[\u4e00-\u9fff]", text))
+            pure_len = len(re.sub(r"\s+", "", text))
+            # 中文字符越多越优先，长度越短略优先
+            return zh_count * 10 - pure_len
+
+        if not meta_info:
+            return None
+
+        candidates = []
+
+        # 优先使用已识别中文名（经清洗后再校验）
+        cn_name = _clean_candidate(meta_info.cn_name or "")
+        if _is_valid_cn_candidate(cn_name):
+            candidates.append(cn_name)
+
+        org_string = (meta_info.org_string or "").strip()
+        if not org_string:
+            return candidates[0] if candidates else None
+
+        # 去掉开头发布组 [xxx]
+        org_string = re.sub(r"^\s*\[[^\]]*]\s*", "", org_string).strip()
+
+        # 1) 先从分隔段（/）中提取
+        split_parts = re.split(r"\s*[／/]\s*", org_string)
+        for part in split_parts:
+            part = (part or "").strip()
+            if not part:
+                continue
+            # 段内 []/【】内容作为候选
+            for b1, b2 in re.findall(r"\[([^\]]+)\]|【([^】]+)】", part):
+                block = _clean_candidate(b1 or b2)
+                if _is_valid_cn_candidate(block):
+                    candidates.append(block)
+            # 去掉括号段后作为候选
+            plain = _clean_candidate(re.sub(r"\[[^\]]*]\s*|【[^】]*】\s*", " ", part))
+            if _is_valid_cn_candidate(plain):
+                candidates.append(plain)
+
+        # 2) 再从整串 []/【】内容兜底提取
+        for b1, b2 in re.findall(r"\[([^\]]+)\]|【([^】]+)】", org_string):
+            block = _clean_candidate(b1 or b2)
+            if _is_valid_cn_candidate(block):
+                candidates.append(block)
+
+        if not candidates:
+            return None
+
+        # 去重后按分数选最优
+        uniq_candidates = []
+        seen = set()
+        for item in candidates:
+            key = StringUtils.handler_special_chars(item).upper()
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq_candidates.append(item)
+
+        uniq_candidates.sort(key=lambda x: _score_candidate(x), reverse=True)
+        return uniq_candidates[0]
+
+    def __search_media_with_name(self, meta_info, query_name, strict=None):
+        """
+        根据指定检索词执行媒体检索（含 tmdbweb/关键词辅助）
+        """
+        if not meta_info or not query_name:
+            return {}
+
+        if meta_info.type != MediaType.TV and not meta_info.year:
+            file_media_info = self.__search_multi_tmdb(file_media_name=query_name)
+        else:
+            if meta_info.type == MediaType.TV:
+                file_media_info = self.__search_tmdb(file_media_name=query_name,
+                                                     first_media_year=meta_info.year,
+                                                     search_type=meta_info.type,
+                                                     media_year=meta_info.year,
+                                                     season_number=meta_info.begin_season)
+                if not file_media_info and meta_info.year and self._rmt_match_mode == MatchMode.NORMAL and not strict:
+                    file_media_info = self.__search_tmdb(file_media_name=query_name,
+                                                         search_type=meta_info.type)
+            else:
+                file_media_info = self.__search_tmdb(file_media_name=query_name,
+                                                     first_media_year=meta_info.year,
+                                                     search_type=MediaType.MOVIE)
+                if not file_media_info:
+                    file_media_info = self.__search_tmdb(file_media_name=query_name,
+                                                         first_media_year=meta_info.year,
+                                                         search_type=MediaType.TV)
+                if not file_media_info and self._rmt_match_mode == MatchMode.NORMAL and not strict:
+                    file_media_info = self.__search_multi_tmdb(file_media_name=query_name)
+
+        if not file_media_info and self._search_tmdbweb:
+            file_media_info = self.__search_tmdb_web(file_media_name=query_name, mtype=meta_info.type)
+
+        if not file_media_info and self._search_keyword:
+            cache_name = cacheman["tmdb_supply"].get(query_name)
+            is_movie = False
+            if not cache_name:
+                cache_name, is_movie = self.__search_engine(query_name)
+                cacheman["tmdb_supply"].set(query_name, cache_name)
+            if cache_name:
+                log.info("【Meta】开始辅助查询：%s ..." % cache_name)
+                if is_movie:
+                    file_media_info = self.__search_tmdb(file_media_name=cache_name, search_type=MediaType.MOVIE)
+                else:
+                    file_media_info = self.__search_multi_tmdb(file_media_name=cache_name)
+        return file_media_info
+
     def get_media_info(self, title,
                        subtitle=None,
                        mtype=None,
@@ -811,53 +979,25 @@ class Media:
             meta_info.type = mtype
         media_key = self.__make_cache_key(meta_info)
         if not cache or not self.meta.get_meta_data_by_key(media_key):
-            # 缓存没有或者强制不使用缓存
-            if meta_info.type != MediaType.TV and not meta_info.year:
-                file_media_info = self.__search_multi_tmdb(file_media_name=meta_info.get_name())
-            else:
-                if meta_info.type == MediaType.TV:
-                    # 确定是电视
-                    file_media_info = self.__search_tmdb(file_media_name=meta_info.get_name(),
-                                                         first_media_year=meta_info.year,
-                                                         search_type=meta_info.type,
-                                                         media_year=meta_info.year,
-                                                         season_number=meta_info.begin_season
-                                                         )
-                    if not file_media_info and meta_info.year and self._rmt_match_mode == MatchMode.NORMAL and not strict:
-                        # 非严格模式下去掉年份再查一次
-                        file_media_info = self.__search_tmdb(file_media_name=meta_info.get_name(),
-                                                             search_type=meta_info.type
-                                                             )
-                else:
-                    # 有年份先按电影查
-                    file_media_info = self.__search_tmdb(file_media_name=meta_info.get_name(),
-                                                         first_media_year=meta_info.year,
-                                                         search_type=MediaType.MOVIE
-                                                         )
-                    # 没有再按电视剧查
-                    if not file_media_info:
-                        file_media_info = self.__search_tmdb(file_media_name=meta_info.get_name(),
-                                                             first_media_year=meta_info.year,
-                                                             search_type=MediaType.TV
-                                                             )
-                    if not file_media_info and self._rmt_match_mode == MatchMode.NORMAL and not strict:
-                        # 非严格模式下去掉年份和类型再查一次
-                        file_media_info = self.__search_multi_tmdb(file_media_name=meta_info.get_name())
-            if not file_media_info and self._search_tmdbweb:
-                file_media_info = self.__search_tmdb_web(file_media_name=meta_info.get_name(),
-                                                         mtype=meta_info.type)
-            if not file_media_info and self._search_keyword:
-                cache_name = cacheman["tmdb_supply"].get(meta_info.get_name())
-                is_movie = False
-                if not cache_name:
-                    cache_name, is_movie = self.__search_engine(meta_info.get_name())
-                    cacheman["tmdb_supply"].set(meta_info.get_name(), cache_name)
-                if cache_name:
-                    log.info("【Meta】开始辅助查询：%s ..." % cache_name)
-                    if is_movie:
-                        file_media_info = self.__search_tmdb(file_media_name=cache_name, search_type=MediaType.MOVIE)
-                    else:
-                        file_media_info = self.__search_multi_tmdb(file_media_name=cache_name)
+            main_query_name = meta_info.get_name()
+            file_media_info = self.__search_media_with_name(meta_info=meta_info,
+                                                            query_name=main_query_name,
+                                                            strict=strict)
+            # 主检索失败时，尝试使用中文名兜底检索
+            cn_fallback_name = None
+            if not file_media_info:
+                cn_fallback_name = self.__extract_cn_fallback_name(meta_info)
+                if cn_fallback_name and not self.__is_same_search_name(main_query_name, cn_fallback_name):
+                    log.info("【Meta】%s 使用中文兜底识别：%s" % (main_query_name, cn_fallback_name))
+                    file_media_info = self.__search_media_with_name(meta_info=meta_info,
+                                                                    query_name=cn_fallback_name,
+                                                                    strict=strict)
+                    if file_media_info:
+                        meta_info.cn_name = cn_fallback_name
+                # 双重失败时默认展示中文名
+                if not file_media_info and cn_fallback_name:
+                    meta_info.cn_name = cn_fallback_name
+                    meta_info.en_name = None
             # 补充全量信息
             if file_media_info and not file_media_info.get("genres"):
                 file_media_info = self.get_tmdb_info(mtype=file_media_info.get("media_type"),
@@ -878,6 +1018,10 @@ class Media:
                                                      append_to_response=append_to_response)
             else:
                 file_media_info = None
+                cn_fallback_name = self.__extract_cn_fallback_name(meta_info)
+                if cn_fallback_name:
+                    meta_info.cn_name = cn_fallback_name
+                    meta_info.en_name = None
         # 赋值TMDB信息并返回
         meta_info.set_tmdb_info(file_media_info)
         return meta_info
@@ -997,33 +1141,23 @@ class Media:
                     media_key = self.__make_cache_key(meta_info)
                     if not self.meta.get_meta_data_by_key(media_key):
                         # 没有缓存数据
-                        file_media_info = self.__search_tmdb(file_media_name=meta_info.get_name(),
-                                                             first_media_year=meta_info.year,
-                                                             search_type=meta_info.type,
-                                                             media_year=meta_info.year,
-                                                             season_number=meta_info.begin_season)
+                        main_query_name = meta_info.get_name()
+                        file_media_info = self.__search_media_with_name(meta_info=meta_info,
+                                                                        query_name=main_query_name,
+                                                                        strict=None)
+                        cn_fallback_name = None
                         if not file_media_info:
-                            if self._rmt_match_mode == MatchMode.NORMAL:
-                                # 去掉年份再查一次，有可能是年份错误
-                                file_media_info = self.__search_tmdb(file_media_name=meta_info.get_name(),
-                                                                     search_type=meta_info.type)
-                        if not file_media_info and self._search_tmdbweb:
-                            # 从网站查询
-                            file_media_info = self.__search_tmdb_web(file_media_name=meta_info.get_name(),
-                                                                     mtype=meta_info.type)
-                        if not file_media_info and self._search_keyword:
-                            cache_name = cacheman["tmdb_supply"].get(meta_info.get_name())
-                            is_movie = False
-                            if not cache_name:
-                                cache_name, is_movie = self.__search_engine(meta_info.get_name())
-                                cacheman["tmdb_supply"].set(meta_info.get_name(), cache_name)
-                            if cache_name:
-                                log.info("【Meta】开始辅助查询：%s ..." % cache_name)
-                                if is_movie:
-                                    file_media_info = self.__search_tmdb(file_media_name=cache_name,
-                                                                         search_type=MediaType.MOVIE)
-                                else:
-                                    file_media_info = self.__search_multi_tmdb(file_media_name=cache_name)
+                            cn_fallback_name = self.__extract_cn_fallback_name(meta_info)
+                            if cn_fallback_name and not self.__is_same_search_name(main_query_name, cn_fallback_name):
+                                log.info("【Meta】%s 使用中文兜底识别：%s" % (main_query_name, cn_fallback_name))
+                                file_media_info = self.__search_media_with_name(meta_info=meta_info,
+                                                                                query_name=cn_fallback_name,
+                                                                                strict=None)
+                                if file_media_info:
+                                    meta_info.cn_name = cn_fallback_name
+                            if not file_media_info and cn_fallback_name:
+                                meta_info.cn_name = cn_fallback_name
+                                meta_info.en_name = None
                         # 补全TMDB信息
                         if file_media_info and not file_media_info.get("genres"):
                             file_media_info = self.get_tmdb_info(mtype=file_media_info.get("media_type"),
@@ -1043,6 +1177,10 @@ class Media:
                         else:
                             # 缓存为未识别
                             file_media_info = None
+                            cn_fallback_name = self.__extract_cn_fallback_name(meta_info)
+                            if cn_fallback_name:
+                                meta_info.cn_name = cn_fallback_name
+                                meta_info.en_name = None
                     # 赋值TMDB信息
                     meta_info.set_tmdb_info(file_media_info)
                 # 自带TMDB信息
