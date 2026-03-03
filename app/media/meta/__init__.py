@@ -3,4 +3,3 @@ from .metaanime import MetaAnime
 from ._base import MetaBase
 from .metavideo import MetaVideo
 from .release_groups import ReleaseGroupsMatcher
-from .llm_parser import LLMMetaParser

@@ -345,26 +345,3 @@ laboratory:
   search_en_title: true
   # 【使用TMDB代理】
   tmdb_proxy: false
-
-# 【LLM识别增强】
-llm:
-  # 【启用LLM识别】
-  enable: false
-  # 【识别模式】：rule_first（规则优先）、llm_first（LLM优先）、hybrid（混合）
-  mode: rule_first
-  # 【API地址】：OpenAI兼容接口地址
-  base_url: ''
-  # 【API密钥】
-  api_key: ''
-  # 【模型名称】
-  model: ''
-  # 【请求超时（秒）】
-  timeout: 20
-  # 【混合模式置信度阈值】
-  confidence_threshold: 0.75
-  # 【启用检索增强】：先检索TMDB/Bangumi候选，再作为上下文交给LLM（可辅助回填年份）
-  search_context_enable: false
-  # 【检索候选数量】
-  search_max_results: 3
-  # 【检索超时（秒）】
-  search_timeout: 8

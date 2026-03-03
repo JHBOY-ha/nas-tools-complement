@@ -3,7 +3,6 @@ import regex as re
 
 import log
 from app.helper import WordsHelper
-from app.media.meta.llm_parser import LLMMetaParser
 from app.media.meta.metaanime import MetaAnime
 from app.media.meta.metavideo import MetaVideo
 from app.utils.types import MediaType
@@ -42,16 +41,6 @@ def MetaInfo(title, subtitle=None, mtype=None):
     meta_info.ignored_words = used_info.get("ignored")
     meta_info.replaced_words = used_info.get("replaced")
     meta_info.offset_words = used_info.get("offset")
-
-    # LLM增强识别（配置关闭或调用失败时会自动回落规则识别结果）
-    meta_info = LLMMetaParser().merge_into(meta_info=meta_info,
-                                           title=title,
-                                           subtitle=subtitle,
-                                           mtype_hint=mtype)
-
-    # 外部强制指定类型优先
-    if mtype:
-        meta_info.type = mtype
 
     return meta_info
 

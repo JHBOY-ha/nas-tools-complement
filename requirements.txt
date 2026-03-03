@@ -44,7 +44,6 @@ MarkupSafe==2.1.1
 matplotlib-inline==0.1.6
 msgpack==1.0.4
 outcome==1.2.0
-openai==1.30.5
 parse==1.19.0
 parsel==1.6.0
 parso==0.8.3
