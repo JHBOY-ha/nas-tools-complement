@@ -692,6 +692,33 @@
               </div>
             </div>
             <div class="row">
+              <div class="col-12 col-xl-3">
+                <div class="mb-3">
+                  <label class="form-check form-switch">
+                    <input class="form-check-input" type="checkbox" id="llm.search_context_enable"
+                      {% if Config.llm and Config.llm.search_context_enable %}checked{% endif %}>
+                    <span class="form-check-label">启用检索增强 <span class="form-help"
+                      title="先检索TMDB/Bangumi/IMDb候选，再作为参考上下文交给LLM解析"
+                      data-bs-toggle="tooltip">?</span></span>
+                  </label>
+                </div>
+              </div>
+              <div class="col-12 col-xl-3">
+                <div class="mb-3">
+                  <label class="form-label">候选数量</label>
+                  <input type="text" value="{% if Config.llm %}{{ Config.llm.search_max_results or 3 }}{% else %}3{% endif %}"
+                         class="form-control" id="llm.search_max_results" placeholder="3" autocomplete="off">
+                </div>
+              </div>
+              <div class="col-12 col-xl-3">
+                <div class="mb-3">
+                  <label class="form-label">检索超时(秒)</label>
+                  <input type="text" value="{% if Config.llm %}{{ Config.llm.search_timeout or 8 }}{% else %}8{% endif %}"
+                         class="form-control" id="llm.search_timeout" placeholder="8" autocomplete="off">
+                </div>
+              </div>
+            </div>
+            <div class="row">
               <div class="col-12 col-xl-6">
                 <div class="mb-3">
                   <label class="form-label required">Base URL</label>

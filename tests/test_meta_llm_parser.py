@@ -134,3 +134,25 @@ class LLMMetaParserTest(TestCase):
             status = self.parser.get_status()
 
         self.assertFalse(status)
+
+    def test_parse_with_search_context_should_attach_external_candidates(self):
+        self.parser._search_context_enable = True
+        mock_client = Mock()
+        mock_response = Mock()
+        mock_choice = Mock()
+        mock_choice.message.content = "{\"type\":\"movie\"}"
+        mock_response.choices = [mock_choice]
+        mock_client.chat.completions.create.return_value = mock_response
+
+        with patch.object(self.parser, "_LLMMetaParser__is_client_ready", return_value=True), \
+                patch.object(self.parser, "_LLMMetaParser__get_client", return_value=mock_client), \
+                patch.object(
+                    self.parser,
+                    "_LLMMetaParser__build_external_candidates",
+                    return_value="{\"tmdb\":[{\"id\":11,\"name\":\"Dune\",\"type\":\"movie\"}]}"
+                ):
+            self.parser.parse(title="Dune 2021", subtitle="", mtype_hint=MediaType.MOVIE)
+
+        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        user_prompt = call_kwargs.get("messages", [{}, {}])[1].get("content", "")
+        self.assertIn("external_candidates", user_prompt)

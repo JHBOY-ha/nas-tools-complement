@@ -230,7 +230,10 @@ def update_config():
         'api_key': '',
         'model': 'gpt-4o-mini',
         'timeout': 20,
-        'confidence_threshold': 0.75
+        'confidence_threshold': 0.75,
+        'search_context_enable': False,
+        'search_max_results': 3,
+        'search_timeout': 8
     }
     llm_config = _config.get("llm")
     if not isinstance(llm_config, dict):
@@ -283,6 +286,35 @@ def update_config():
         else:
             if llm_config.get("confidence_threshold") != confidence_threshold:
                 llm_config["confidence_threshold"] = confidence_threshold
+                overwrite_cofig = True
+        search_context_enable = StringUtils.to_bool(
+            llm_config.get("search_context_enable"),
+            llm_defaults["search_context_enable"]
+        )
+        if llm_config.get("search_context_enable") != search_context_enable:
+            llm_config["search_context_enable"] = search_context_enable
+            overwrite_cofig = True
+        try:
+            search_max_results = int(float(llm_config.get("search_max_results")))
+            if search_max_results < 1 or search_max_results > 10:
+                raise ValueError("search_max_results must be in [1, 10]")
+        except Exception:
+            llm_config["search_max_results"] = llm_defaults["search_max_results"]
+            overwrite_cofig = True
+        else:
+            if llm_config.get("search_max_results") != search_max_results:
+                llm_config["search_max_results"] = search_max_results
+                overwrite_cofig = True
+        try:
+            search_timeout = int(float(llm_config.get("search_timeout")))
+            if search_timeout < 1 or search_timeout > 30:
+                raise ValueError("search_timeout must be in [1, 30]")
+        except Exception:
+            llm_config["search_timeout"] = llm_defaults["search_timeout"]
+            overwrite_cofig = True
+        else:
+            if llm_config.get("search_timeout") != search_timeout:
+                llm_config["search_timeout"] = search_timeout
                 overwrite_cofig = True
 
     # 安全配置初始化

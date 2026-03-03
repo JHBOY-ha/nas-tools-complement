@@ -1,11 +1,15 @@
 import json
 import re
+import time
+from copy import deepcopy
+from urllib.parse import quote
 
 import log
-from app.utils import ExceptionUtils, StringUtils
+from app.media.tmdbv3api import TMDb, Search, TMDbException
+from app.utils import ExceptionUtils, RequestUtils, StringUtils
 from app.utils.commons import singleton
 from app.utils.types import MediaType
-from config import Config
+from config import Config, DEFAULT_TMDB_PROXY
 
 try:
     from openai import OpenAI
@@ -48,6 +52,11 @@ class LLMMetaParser(object):
         self._model = ""
         self._timeout = 20
         self._confidence_threshold = 0.75
+        self._search_context_enable = False
+        self._search_max_results = 3
+        self._search_timeout = 8
+        self._parse_cache = {}
+        self._parse_cache_ttl = 60
         self.init_config()
 
     def init_config(self):
@@ -66,6 +75,16 @@ class LLMMetaParser(object):
         self._confidence_threshold = self.__parse_float(
             config.get("confidence_threshold"), min_val=0, max_val=1, default=0.75
         )
+        self._search_context_enable = StringUtils.to_bool(
+            config.get("search_context_enable"), False
+        )
+        self._search_max_results = self.__parse_int(
+            config.get("search_max_results"), min_val=1, max_val=10, default=3
+        )
+        self._search_timeout = self.__parse_int(
+            config.get("search_timeout"), min_val=1, max_val=30, default=8
+        )
+        self._parse_cache = {}
         self._client = None
 
     def get_status(self):
@@ -99,6 +118,10 @@ class LLMMetaParser(object):
         """
         if not title or not self.__is_client_ready(require_enable=True):
             return {}
+        cache_key = self.__make_parse_cache_key(title=title, subtitle=subtitle, mtype_hint=mtype_hint)
+        cached_result = self.__get_cached_parse_result(cache_key)
+        if cached_result is not None:
+            return cached_result
         try:
             client = self.__get_client()
             if not client:
@@ -111,22 +134,29 @@ class LLMMetaParser(object):
                     hint = "anime"
                 else:
                     hint = "tv"
+            external_candidates = self.__build_external_candidates(
+                title=title,
+                subtitle=subtitle,
+                mtype_hint=mtype_hint
+            )
             system_prompt = (
                 "你是媒体文件名解析助手。"
                 "请严格返回 JSON 对象，不要输出任何额外文本。"
                 "字段仅允许："
                 "type,cn_name,en_name,year,begin_season,end_season,begin_episode,end_episode,"
-                "part,resource_type,resource_effect,resource_pix,resource_team,video_encode,audio_encode,"
-                "confidence,field_confidence。"
-                "其中 type 只允许 movie/tv/anime。confidence 和 field_confidence 取值范围 0~1。"
+                "part,resource_type,resource_effect,resource_pix,resource_team,video_encode,audio_encode。"
+                "其中 type 只允许 movie/tv/anime，不要返回任何其他字段。"
+                "你可能会收到 external_candidates 字段，包含 TMDB/Bangumi 检索候选，仅供参考。"
             )
             user_prompt = (
                 "请解析下列媒体名称并提取结构化信息。\n"
                 f"title: {title}\n"
                 f"subtitle: {subtitle or ''}\n"
                 f"type_hint: {hint}\n"
-                "若字段无法判断请省略该字段。"
             )
+            if external_candidates:
+                user_prompt += f"external_candidates: {external_candidates}\n"
+            user_prompt += "若字段无法判断请省略该字段。"
             response = client.chat.completions.create(
                 model=self._model,
                 messages=[
@@ -143,11 +173,15 @@ class LLMMetaParser(object):
                 log.info("【Meta】LLM原始返回为空")
             parsed = self.__parse_json(content)
             if not parsed:
+                self.__set_cached_parse_result(cache_key, {})
                 return {}
-            return self.__normalize_result(parsed)
+            result = self.__normalize_result(parsed)
+            self.__set_cached_parse_result(cache_key, result)
+            return result
         except Exception as err:
             ExceptionUtils.exception_traceback(err)
             log.error("【Meta】LLM 识别失败：%s" % str(err))
+            self.__set_cached_parse_result(cache_key, {})
             return {}
 
     def merge_into(self, meta_info, title, subtitle=None, mtype_hint=None):
@@ -268,6 +302,248 @@ class LLMMetaParser(object):
                     field_confidence[key] = val
         result["field_confidence"] = field_confidence
         return result
+
+    def __build_external_candidates(self, title, subtitle=None, mtype_hint=None):
+        if not self._search_context_enable:
+            return ""
+        query_list = self.__build_search_queries(title=title, subtitle=subtitle)
+        if not query_list:
+            return ""
+        query = query_list[0]
+
+        payload = {}
+        tmdb_candidates = self.__search_candidates_by_queries(
+            search_func=lambda q: self.__search_tmdb_candidates(query=q, mtype_hint=mtype_hint),
+            query_list=query_list
+        )
+        bangumi_candidates = self.__search_candidates_by_queries(
+            search_func=self.__search_bangumi_candidates,
+            query_list=query_list
+        )
+
+        if tmdb_candidates:
+            payload["tmdb"] = tmdb_candidates
+        if bangumi_candidates:
+            payload["bangumi"] = bangumi_candidates
+
+        log.info(
+            "【Meta】LLM检索增强候选：query=%s, tmdb=%s, bangumi=%s"
+            % (
+                self.__shorten_text(query, 80),
+                len(tmdb_candidates),
+                len(bangumi_candidates)
+            )
+        )
+        if not payload:
+            return ""
+        return self.__shorten_text(json.dumps(payload, ensure_ascii=False), 3000)
+
+    @classmethod
+    def __build_search_query(cls, title, subtitle=None):
+        text = "%s %s" % (title or "", subtitle or "")
+        return cls.__normalize_query_for_search(text)
+
+    @classmethod
+    def __build_search_queries(cls, title, subtitle=None):
+        query_set = []
+        raw_title = str(title or "").strip()
+        base_query = cls.__build_search_query(title=title, subtitle=subtitle)
+        if base_query:
+            query_set.append(base_query)
+        normalized_title = cls.__normalize_query_for_search(raw_title)
+        if normalized_title:
+            query_set.append(normalized_title)
+
+        # 标题含中英文双名时，尝试分别检索每一段
+        for segment in re.split(r"[／/|]+", raw_title):
+            segment_query = cls.__normalize_query_for_search(segment)
+            if segment_query:
+                query_set.append(segment_query)
+
+        # 额外构造去季集号候选
+        reduced_candidates = []
+        for query in list(query_set):
+            reduced = re.sub(r"第\s*\d+\s*季", " ", query, flags=re.IGNORECASE)
+            reduced = re.sub(r"第\s*\d+\s*[集话回]", " ", reduced, flags=re.IGNORECASE)
+            reduced = re.sub(r"\bS\d{1,2}\b", " ", reduced, flags=re.IGNORECASE)
+            reduced = re.sub(r"\b(?:E|EP)\d{1,4}\b", " ", reduced, flags=re.IGNORECASE)
+            reduced = re.sub(r"\s+", " ", reduced).strip()
+            reduced = cls.__normalize_query_for_search(reduced)
+            if reduced:
+                reduced_candidates.append(reduced)
+        query_set.extend(reduced_candidates)
+
+        # 去重并保持顺序
+        query_list = []
+        for query in query_set:
+            if query and query not in query_list:
+                query_list.append(query)
+        return query_list[:6]
+
+    @staticmethod
+    def __normalize_query_for_search(text):
+        text = str(text or "").strip()
+        if not text:
+            return ""
+        text = re.sub(r"\[[^\]]*]", " ", text)
+        text = re.sub(r"[【】\[\]\(\)\{\}]+", " ", text)
+        text = re.sub(r"[._\-]+", " ", text)
+        text = re.sub(
+            r"\b(?:S\d{1,2}E\d{1,4}|S\d{1,2}|E\d{1,4}|EP\d{1,4}|WEB[- ]?DL|WEBRIP|BLURAY|2160P|1080P|720P|HEVC|H265|X265|X264|AAC)\b",
+            " ",
+            text,
+            flags=re.IGNORECASE
+        )
+        text = re.sub(r"\s+", " ", text).strip()
+        return text[:120]
+
+    def __search_candidates_by_queries(self, search_func, query_list):
+        candidates = []
+        seen = set()
+        for query in query_list:
+            if len(candidates) >= self._search_max_results:
+                break
+            query_candidates = search_func(query) or []
+            for item in query_candidates:
+                item_key = json.dumps(item, ensure_ascii=False, sort_keys=True)
+                if item_key in seen:
+                    continue
+                seen.add(item_key)
+                candidates.append(item)
+                if len(candidates) >= self._search_max_results:
+                    break
+        return candidates
+
+    def __make_parse_cache_key(self, title, subtitle=None, mtype_hint=None):
+        mtype = ""
+        if mtype_hint:
+            mtype = str(getattr(mtype_hint, "value", mtype_hint))
+        return "%s|%s|%s|%s|%s|%s" % (
+            str(title or "").strip(),
+            str(subtitle or "").strip(),
+            mtype,
+            self._mode,
+            self._model,
+            str(self._search_context_enable)
+        )
+
+    def __get_cached_parse_result(self, cache_key):
+        cache_item = self._parse_cache.get(cache_key)
+        if not cache_item:
+            return None
+        ts = cache_item.get("ts", 0)
+        if time.time() - ts > self._parse_cache_ttl:
+            self._parse_cache.pop(cache_key, None)
+            return None
+        return deepcopy(cache_item.get("result", {}))
+
+    def __set_cached_parse_result(self, cache_key, result):
+        self._parse_cache[cache_key] = {
+            "ts": time.time(),
+            "result": deepcopy(result or {})
+        }
+
+    def __search_tmdb_candidates(self, query, mtype_hint=None):
+        app_conf = Config().get_config("app") or {}
+        tmdb_key = str(app_conf.get("rmt_tmdbkey") or "").strip()
+        if not tmdb_key:
+            return []
+        try:
+            tmdb = TMDb()
+            laboratory_conf = Config().get_config("laboratory") or {}
+            if laboratory_conf.get("tmdb_proxy"):
+                tmdb.domain = DEFAULT_TMDB_PROXY
+            else:
+                tmdb.domain = app_conf.get("tmdb_domain")
+            tmdb.cache = True
+            tmdb.api_key = tmdb_key
+            tmdb.language = "zh"
+            tmdb.proxies = Config().get_proxies()
+
+            search = Search()
+            params = {"query": query, "page": 1}
+            if mtype_hint == MediaType.MOVIE:
+                raw_results = search.movies(params)
+            elif mtype_hint in [MediaType.TV, MediaType.ANIME]:
+                raw_results = search.tv_shows(params)
+            else:
+                raw_results = search.multi(params)
+
+            candidates = []
+            for item in (raw_results or [])[:self._search_max_results]:
+                name = self.__clean_text(
+                    getattr(item, "title", None) or getattr(item, "name", None),
+                    max_len=120
+                )
+                if not name:
+                    continue
+                release_date = str(
+                    getattr(item, "release_date", "") or getattr(item, "first_air_date", "")
+                ).strip()
+                year = release_date[:4] if len(release_date) >= 4 and release_date[:4].isdigit() else ""
+                item_type = self.__clean_text(getattr(item, "media_type", ""), max_len=20).lower()
+                if not item_type:
+                    if mtype_hint == MediaType.MOVIE:
+                        item_type = "movie"
+                    elif mtype_hint in [MediaType.TV, MediaType.ANIME]:
+                        item_type = "tv"
+                candidate = {
+                    "id": getattr(item, "id", None),
+                    "name": name
+                }
+                if year:
+                    candidate["year"] = year
+                if item_type:
+                    candidate["type"] = item_type
+                candidates.append(candidate)
+            return candidates
+        except TMDbException as err:
+            log.debug("【Meta】TMDB候选检索失败：%s" % str(err))
+            return []
+        except Exception as err:
+            log.debug("【Meta】TMDB候选检索异常：%s" % str(err))
+            return []
+
+    def __search_bangumi_candidates(self, query):
+        try:
+            req_url = "https://api.bgm.tv/search/subject/%s" % quote(query)
+            response = RequestUtils(
+                proxies=Config().get_proxies(),
+                timeout=self._search_timeout
+            ).get_res(
+                url=req_url,
+                params={
+                    "type": 2,
+                    "responseGroup": "small",
+                    "max_results": self._search_max_results
+                }
+            )
+            if not response or not response.ok:
+                return []
+            data = response.json()
+            items = data.get("list") or data.get("data") or []
+            candidates = []
+            for item in items[:self._search_max_results]:
+                name = self.__clean_text(item.get("name"), max_len=120)
+                name_cn = self.__clean_text(item.get("name_cn"), max_len=120)
+                if not name and not name_cn:
+                    continue
+                air_date = str(item.get("air_date") or item.get("date") or "").strip()
+                year = air_date[:4] if len(air_date) >= 4 and air_date[:4].isdigit() else ""
+                candidate = {
+                    "id": item.get("id")
+                }
+                if name_cn:
+                    candidate["name_cn"] = name_cn
+                if name:
+                    candidate["name"] = name
+                if year:
+                    candidate["year"] = year
+                candidates.append(candidate)
+            return candidates
+        except Exception as err:
+            log.debug("【Meta】Bangumi候选检索异常：%s" % str(err))
+            return []
 
     def __extract_content(self, response):
         if not response or not getattr(response, "choices", None):
