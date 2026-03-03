@@ -32,11 +32,9 @@ if [ "${NASTOOL_AUTO_UPDATE}" = "true" ]; then
         if [ "${hash_old}" != "${hash_new}" ]; then
             echo "检测到requirements.txt有变化，重新安装依赖..."
             if [ "${NASTOOL_CN_UPDATE}" = "true" ]; then
-                pip install --upgrade pip setuptools wheel -i "${PYPI_MIRROR}"
-                pip install -r requirements.txt -i "${PYPI_MIRROR}"
+                pip install --disable-pip-version-check -r requirements.txt -i "${PYPI_MIRROR}"
             else
-                pip install --upgrade pip setuptools wheel
-                pip install -r requirements.txt
+                pip install --disable-pip-version-check -r requirements.txt
             fi
             if [ $? -ne 0 ]; then
                 echo "无法安装依赖，请更新镜像..."
