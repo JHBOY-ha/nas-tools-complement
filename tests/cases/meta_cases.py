@@ -910,4 +910,68 @@ meta_cases = [{
         "video_codec": "X264",
         "audio_codec": "DD 5.1"
     }
+}, {
+    "title": "[喵萌奶茶屋&LoliHouse] 超时空辉夜姬！ / Chou Kaguya-hime! v2 [WebRip 1080p HEVC-10bit AAC][简繁内封字幕]",
+    "subtitle": "",
+    "target": {
+        "type": "电影",
+        "cn_name": "超时空辉夜姬！",
+        "en_name": "Chou Kaguya Hime!",
+        "year": "",
+        "part": "",
+        "season": "",
+        "episode": "",
+        "restype": "WebRip",
+        "pix": "1080p",
+        "video_codec": "HEVC 10bit",
+        "audio_codec": "AAC"
+    }
+}, {
+    "title": "Movie Name V10 1080p WEB-DL",
+    "subtitle": "",
+    "target": {
+        "type": "电影",
+        "cn_name": "",
+        "en_name": "Movie Name",
+        "year": "",
+        "part": "",
+        "season": "",
+        "episode": "",
+        "restype": "WEB-DL",
+        "pix": "1080p",
+        "video_codec": "",
+        "audio_codec": ""
+    }
+}, {
+    "title": "Movie Name ver.2 1080p WEB-DL",
+    "subtitle": "",
+    "target": {
+        "type": "电影",
+        "cn_name": "",
+        "en_name": "Movie Name",
+        "year": "",
+        "part": "",
+        "season": "",
+        "episode": "",
+        "restype": "WEB-DL",
+        "pix": "1080p",
+        "video_codec": "",
+        "audio_codec": ""
+    }
+}, {
+    "title": "V for Vendetta 2005 1080p BluRay",
+    "subtitle": "",
+    "target": {
+        "type": "电影",
+        "cn_name": "",
+        "en_name": "V For Vendetta",
+        "year": "2005",
+        "part": "",
+        "season": "",
+        "episode": "",
+        "restype": "BluRay",
+        "pix": "1080p",
+        "video_codec": "",
+        "audio_codec": ""
+    }
 }]
