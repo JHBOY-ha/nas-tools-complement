@@ -156,3 +156,29 @@ class LLMMetaParserTest(TestCase):
         call_kwargs = mock_client.chat.completions.create.call_args.kwargs
         user_prompt = call_kwargs.get("messages", [{}, {}])[1].get("content", "")
         self.assertIn("external_candidates", user_prompt)
+
+    def test_parse_should_extract_tmdb_id(self):
+        result = self.parser._LLMMetaParser__normalize_result({
+            "type": "anime",
+            "tmdb_id": 226688,
+            "tmdb_type": "tv"
+        })
+        self.assertEqual(226688, result.get("tmdb_id"))
+        self.assertEqual("tv", result.get("tmdb_type"))
+
+    def test_merge_should_write_tmdb_id_to_note(self):
+        self.parser._enabled = False
+        meta_info = MetaInfo("Beyblade X 111")
+        self.parser._enabled = True
+        llm_result = {
+            "type": MediaType.ANIME,
+            "cn_name": "战斗陀螺X",
+            "tmdb_id": 226688,
+            "tmdb_type": "tv",
+            "confidence": 0.9,
+            "field_confidence": {}
+        }
+        with patch.object(self.parser, "parse", return_value=llm_result):
+            self.parser.merge_into(meta_info=meta_info, title=meta_info.org_string)
+        self.assertEqual(226688, meta_info.note.get("llm", {}).get("tmdb_id"))
+        self.assertEqual("tv", meta_info.note.get("llm", {}).get("tmdb_type"))

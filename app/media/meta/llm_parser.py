@@ -145,8 +145,10 @@ class LLMMetaParser(object):
                 "字段仅允许："
                 "type,cn_name,en_name,year,begin_season,end_season,begin_episode,end_episode,"
                 "part,resource_type,resource_effect,resource_pix,resource_team,video_encode,audio_encode。"
-                "其中 type 只允许 movie/tv/anime，不要返回任何其他字段。"
+                "其中 type 只允许 movie/tv/anime。"
                 "你可能会收到 external_candidates 字段，包含 TMDB/Bangumi 检索候选，仅供参考。"
+                "如果你能从 external_candidates.tmdb 明确匹配到目标，可额外返回 tmdb_id(整数) 和 tmdb_type(movie/tv)。"
+                "不要返回其他字段。"
             )
             user_prompt = (
                 "请解析下列媒体名称并提取结构化信息。\n"
@@ -207,6 +209,15 @@ class LLMMetaParser(object):
                 "confidence": llm_result.get("confidence", 0),
                 "field_confidence": llm_result.get("field_confidence", {})
             })
+            if llm_result.get("tmdb_id"):
+                note["llm"].update({
+                    "tmdb_id": llm_result.get("tmdb_id"),
+                    "tmdb_type": llm_result.get("tmdb_type")
+                })
+                log.info(
+                    "【Meta】LLM直出TMDB候选：id=%s, type=%s"
+                    % (llm_result.get("tmdb_id"), llm_result.get("tmdb_type") or "")
+                )
 
         meta_info.note = note
 
@@ -301,6 +312,17 @@ class LLMMetaParser(object):
                 if val is not None:
                     field_confidence[key] = val
         result["field_confidence"] = field_confidence
+        tmdb_id = self.__parse_int(parsed.get("tmdb_id"), min_val=1, max_val=999999999)
+        if tmdb_id:
+            result["tmdb_id"] = tmdb_id
+            tmdb_type = self.__normalize_tmdb_type(parsed.get("tmdb_type"))
+            if not tmdb_type:
+                if result.get("type") == MediaType.MOVIE:
+                    tmdb_type = "movie"
+                elif result.get("type") in [MediaType.TV, MediaType.ANIME]:
+                    tmdb_type = "tv"
+            if tmdb_type:
+                result["tmdb_type"] = tmdb_type
         return result
 
     def __build_external_candidates(self, title, subtitle=None, mtype_hint=None):
@@ -594,6 +616,17 @@ class LLMMetaParser(object):
             return MediaType.TV
         if text in ["anime", "ani", "动漫", "动画"]:
             return MediaType.ANIME
+        return None
+
+    @staticmethod
+    def __normalize_tmdb_type(value):
+        if not value:
+            return None
+        text = str(value).strip().lower()
+        if text in ["movie", "mov", "film", "电影"]:
+            return "movie"
+        if text in ["tv", "series", "show", "电视剧", "anime", "ani", "动漫", "动画"]:
+            return "tv"
         return None
 
     @staticmethod

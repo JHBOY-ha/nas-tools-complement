@@ -900,6 +900,41 @@ class Media:
         uniq_candidates.sort(key=lambda x: _score_candidate(x), reverse=True)
         return uniq_candidates[0]
 
+    @staticmethod
+    def __resolve_tmdb_mtype(meta_type=None, hint_type=None):
+        target_type = hint_type or meta_type
+        if target_type == MediaType.MOVIE:
+            return MediaType.MOVIE
+        if target_type in [MediaType.TV, MediaType.ANIME]:
+            return MediaType.TV
+        return None
+
+    def __extract_llm_tmdb_target(self, meta_info, mtype_hint=None):
+        if not meta_info:
+            return None, None
+        llm_note = {}
+        if isinstance(meta_info.note, dict):
+            llm_note = meta_info.note.get("llm") or {}
+        if not isinstance(llm_note, dict):
+            return None, None
+        tmdb_id = llm_note.get("tmdb_id")
+        if not tmdb_id:
+            return None, None
+        try:
+            tmdb_id = int(tmdb_id)
+        except Exception:
+            return None, None
+        if tmdb_id <= 0:
+            return None, None
+        tmdb_type = str(llm_note.get("tmdb_type") or "").strip().lower()
+        if tmdb_type == "movie":
+            mtype = MediaType.MOVIE
+        elif tmdb_type == "tv":
+            mtype = MediaType.TV
+        else:
+            mtype = self.__resolve_tmdb_mtype(meta_type=meta_info.type, hint_type=mtype_hint)
+        return tmdb_id, mtype
+
     def __search_media_with_name(self, meta_info, query_name, strict=None):
         """
         根据指定检索词执行媒体检索（含 tmdbweb/关键词辅助）
@@ -979,10 +1014,21 @@ class Media:
             meta_info.type = mtype
         media_key = self.__make_cache_key(meta_info)
         if not cache or not self.meta.get_meta_data_by_key(media_key):
+            file_media_info = None
+            llm_tmdb_id, llm_tmdb_type = self.__extract_llm_tmdb_target(meta_info=meta_info, mtype_hint=mtype)
+            if llm_tmdb_id:
+                log.info("【Meta】尝试使用LLM直出TMDBID：%s ..." % llm_tmdb_id)
+                file_media_info = self.get_tmdb_info(mtype=llm_tmdb_type,
+                                                     tmdbid=llm_tmdb_id,
+                                                     chinese=chinese,
+                                                     append_to_response=append_to_response)
+                if not file_media_info:
+                    log.warn("【Meta】LLM直出TMDBID无效或未命中，回退名称检索：%s" % llm_tmdb_id)
             main_query_name = meta_info.get_name()
-            file_media_info = self.__search_media_with_name(meta_info=meta_info,
-                                                            query_name=main_query_name,
-                                                            strict=strict)
+            if not file_media_info:
+                file_media_info = self.__search_media_with_name(meta_info=meta_info,
+                                                                query_name=main_query_name,
+                                                                strict=strict)
             # 主检索失败时，尝试使用中文名兜底检索
             cn_fallback_name = None
             if not file_media_info:
