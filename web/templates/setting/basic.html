@@ -668,7 +668,12 @@
               </div>
               <div class="col-12 col-xl-3">
                 <div class="mb-3">
-                  <label class="form-label required">识别模式</label>
+                  <label class="form-label required">识别模式
+                    <span class="form-help"
+                          data-bs-toggle="tooltip"
+                          data-bs-html="true"
+                          title="规则优先（rule_first）：先用规则识别，LLM仅补齐缺失字段，不覆盖已识别字段。<br>LLM优先（llm_first）：优先采用LLM字段，规则仅补齐LLM未提供字段。<br>混合（hybrid）：按字段置信度判断，field_confidence 大于等于阈值才用LLM覆盖，否则保留规则值。<br>LLM失败/超时/返回非法JSON时自动回退规则识别。">?</span>
+                  </label>
                   <select class="form-select" id="llm.mode">
                     <option value="rule_first" {% if not Config.llm or not Config.llm.mode or Config.llm.mode=='rule_first' or Config.llm.mode=='fallback' %}selected{% endif %}>规则优先</option>
                     <option value="llm_first" {% if Config.llm and (Config.llm.mode=='llm_first' or Config.llm.mode=='primary') %}selected{% endif %}>LLM优先</option>
@@ -698,7 +703,7 @@
                     <input class="form-check-input" type="checkbox" id="llm.search_context_enable"
                       {% if Config.llm and Config.llm.search_context_enable %}checked{% endif %}>
                     <span class="form-check-label">启用检索增强 <span class="form-help"
-                      title="先检索TMDB/Bangumi/IMDb候选，再作为参考上下文交给LLM解析"
+                      title="先检索TMDB/Bangumi候选，再作为参考上下文交给LLM解析"
                       data-bs-toggle="tooltip">?</span></span>
                   </label>
                 </div>
