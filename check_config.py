@@ -179,6 +179,22 @@ def check_config():
                 or not Config().get_config('douban').get('days'):
             print("豆瓣配置不完整")
 
+    # 检查LLM识别配置
+    llm_config = Config().get_config('llm') or {}
+    llm_enable = llm_config.get("enable")
+    if llm_enable is None:
+        llm_enable = llm_config.get("enabled")
+    if StringUtils.to_bool(llm_enable, False):
+        missing_fields = []
+        if not (llm_config.get("base_url") or llm_config.get("api_base")):
+            missing_fields.append("base_url")
+        if not llm_config.get("api_key"):
+            missing_fields.append("api_key")
+        if not llm_config.get("model"):
+            missing_fields.append("model")
+        if missing_fields:
+            print("【Config】LLM识别已开启，但以下配置缺失：%s" % ",".join(missing_fields))
+
 
 def update_config():
     """
@@ -205,6 +221,69 @@ def update_config():
             'chrome_browser': False
         }
         overwrite_cofig = True
+
+    # LLM识别配置初始化
+    llm_defaults = {
+        'enable': False,
+        'mode': 'rule_first',
+        'base_url': 'https://api.openai.com/v1',
+        'api_key': '',
+        'model': 'gpt-4o-mini',
+        'timeout': 20,
+        'confidence_threshold': 0.75
+    }
+    llm_config = _config.get("llm")
+    if not isinstance(llm_config, dict):
+        _config['llm'] = dict(llm_defaults)
+        overwrite_cofig = True
+    else:
+        # 兼容旧配置字段
+        if ("enable" not in llm_config or llm_config.get("enable") is None) and llm_config.get("enabled") is not None:
+            llm_config["enable"] = llm_config.get("enabled")
+            overwrite_cofig = True
+        if (not llm_config.get("base_url")) and llm_config.get("api_base"):
+            llm_config["base_url"] = llm_config.get("api_base")
+            overwrite_cofig = True
+        legacy_mode = str(llm_config.get("mode") or "").strip().lower()
+        if legacy_mode == "fallback":
+            llm_config["mode"] = "rule_first"
+            overwrite_cofig = True
+        elif legacy_mode == "primary":
+            llm_config["mode"] = "llm_first"
+            overwrite_cofig = True
+        for key, val in llm_defaults.items():
+            if key not in llm_config:
+                llm_config[key] = val
+                overwrite_cofig = True
+        llm_mode = str(llm_config.get("mode") or "").strip().lower()
+        if llm_mode not in ["rule_first", "llm_first", "hybrid"]:
+            llm_config["mode"] = "rule_first"
+            overwrite_cofig = True
+        elif llm_mode != llm_config.get("mode"):
+            llm_config["mode"] = llm_mode
+            overwrite_cofig = True
+        try:
+            timeout = int(float(llm_config.get("timeout")))
+            if timeout <= 0:
+                raise ValueError("timeout must be positive")
+        except Exception:
+            llm_config["timeout"] = llm_defaults["timeout"]
+            overwrite_cofig = True
+        else:
+            if llm_config.get("timeout") != timeout:
+                llm_config["timeout"] = timeout
+                overwrite_cofig = True
+        try:
+            confidence_threshold = float(llm_config.get("confidence_threshold"))
+            if confidence_threshold < 0 or confidence_threshold > 1:
+                raise ValueError("confidence_threshold must be in [0, 1]")
+        except Exception:
+            llm_config["confidence_threshold"] = llm_defaults["confidence_threshold"]
+            overwrite_cofig = True
+        else:
+            if llm_config.get("confidence_threshold") != confidence_threshold:
+                llm_config["confidence_threshold"] = confidence_threshold
+                overwrite_cofig = True
 
     # 安全配置初始化
     if not _config.get("security"):
