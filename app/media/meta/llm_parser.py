@@ -151,6 +151,19 @@ class LLMMetaParser(object):
                 "2) 含“月”字的时间表达（如 7月新番、04月新番、2022年7月番）是月份信息，不是季数，禁止据此填写 season。"
                 "3) 如果标题是“片名 + 单个数字”且没有明确季标记（例如“西部世界 12”），该数字优先视为单集，填写 begin_episode=12，不要推断多季或区间。"
                 "4) 只有原文明确出现区间（如 S01-S02、E01-E03、第1-3集）才填写 end_season/end_episode；单点值不要补 end 字段。"
+                "年份规则："
+                "1) 仅在出现明确四位年份时填写 year（1900-2100），例如 '(2022)'、' 2022 '。"
+                "2) '2022年7月番'、'7月新番'、'04月新番' 这类“年+月/仅月”发布时间标签，不作为 year。"
+                "3) 存在多个候选年份且无法确定时，省略 year。"
+                "4) 可参考 external_candidates 的候选结果回填 year；当候选冲突时优先与标题语义最一致的一项。"
+                "5) 若标题仅出现“\\d{4}年\\d{1,2}月番/新番”等发布时间标签，且候选无可靠年份，则 year 留空。"
+                "资源字段规则："
+                "1) resource_type 仅接受常见来源词：WEB-DL/WEBRip/BluRay/Remux/HDTV/DVD/BDRip。"
+                "2) 资源容器或字幕语言（如 MP4/MKV/内封/外挂/简繁/中日双语/GB/CHT）不要写入 resource_type/resource_effect/audio_encode。"
+                "2.1) resource_effect 仅填写画质/视觉效果（如 HDR/DoVi/3D/10bit/UHD），字幕与语言标签一律不要填写到 resource_effect。"
+                "3) video_encode 仅填写编码词（HEVC/H264/H265/X264/X265/AVC/AV1/VP9）；audio_encode 仅填写音频编码（AAC/AC3/EAC3/DDP/TrueHD/DTS/FLAC/LPCM，可带声道如 5.1/7.1）。"
+                "4) resource_type/resource_effect/video_encode/audio_encode 仅在 title/subtitle 明确出现对应关键词时填写，不得猜测或借 external_candidates 脑补。"
+                "5) 不确定就留空，不要猜测。"
                 "你可能会收到 external_candidates 字段，包含 TMDB/Bangumi 检索候选，仅供参考。"
                 "如果你能从 external_candidates.tmdb 明确匹配到目标，可额外返回 tmdb_id(整数) 和 tmdb_type(movie/tv)。"
                 "不要返回其他字段。"
@@ -374,6 +387,9 @@ class LLMMetaParser(object):
     def __build_search_queries(cls, title, subtitle=None):
         query_set = []
         raw_title = str(title or "").strip()
+        core_query = cls.__extract_core_title_query(raw_title)
+        if core_query:
+            query_set.append(core_query)
         base_query = cls.__build_search_query(title=title, subtitle=subtitle)
         if base_query:
             query_set.append(base_query)
@@ -415,14 +431,74 @@ class LLMMetaParser(object):
         text = re.sub(r"\[[^\]]*]", " ", text)
         text = re.sub(r"[【】\[\]\(\)\{\}]+", " ", text)
         text = re.sub(r"[._\-]+", " ", text)
+        text = text.replace("+", " ")
         text = re.sub(
-            r"\b(?:S\d{1,2}E\d{1,4}|S\d{1,2}|E\d{1,4}|EP\d{1,4}|WEB[- ]?DL|WEBRIP|BLURAY|2160P|1080P|720P|HEVC|H265|X265|X264|AAC)\b",
+            r"\b(?:S\d{1,2}E\d{1,4}|S\d{1,2}|E\d{1,4}|EP\d{1,4}|SEASON|WEB[- ]?DL|WEBRIP|WEB|"
+            r"BLURAY|BDRIP|REMUX|HDTV|UHD|2160P|1080P|720P|"
+            r"HEVC|H\.?26[45]|X26[45]|AVC|AV1|VP9|"
+            r"AAC|AC3|EAC3|DDP?|TRUEHD|DTS(?:-?HD)?|LPCM|ATMOS|"
+            r"NF|NETFLIX|AMZN|AMAZON|ATVP|APPLETV|DSNP|DISNEY\+?|HMAX|MAX|PARAMOUNT\+?|CR|KKTV|BAHA|"
+            r"BLACKTV)\b",
             " ",
             text,
             flags=re.IGNORECASE
         )
+        text = re.sub(r"\b\d\.\d\b", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"\b\d{4}\b", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"\bH\s*264\b|\bH\s*265\b", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"\bX\s*264\b|\bX\s*265\b", " ", text, flags=re.IGNORECASE)
         text = re.sub(r"\s+", " ", text).strip()
         return text[:120]
+
+    @classmethod
+    def __extract_core_title_query(cls, raw_title):
+        raw_title = str(raw_title or "").strip()
+        if not raw_title:
+            return ""
+        text = re.sub(r"\[[^\]]*]", " ", raw_title)
+        text = re.sub(r"[【】\[\]\(\)\{\}]+", " ", text)
+        text = text.replace("+", " ")
+        tokens = re.split(r"[.\s/_\-]+", text)
+        title_tokens = []
+        for token in tokens:
+            token = str(token or "").strip()
+            if not token:
+                continue
+            if cls.__is_meta_query_token(token):
+                break
+            title_tokens.append(token)
+            if len(title_tokens) >= 8:
+                break
+        if not title_tokens:
+            return ""
+        return cls.__normalize_query_for_search(" ".join(title_tokens))
+
+    @staticmethod
+    def __is_meta_query_token(token):
+        token = str(token or "").strip()
+        if not token:
+            return False
+        up = token.upper()
+        if re.match(r"^S\d{1,2}(E\d{1,4})?$", up):
+            return True
+        if re.match(r"^(E|EP)\d{1,4}$", up):
+            return True
+        if re.match(r"^\d{3,4}P$", up):
+            return True
+        if re.match(r"^\d\.\d$", up):
+            return True
+        if re.match(r"^\d{4}$", up):
+            return True
+        if up in {
+            "WEB", "WEBDL", "WEB-DL", "WEBRIP", "BLURAY", "BDRIP", "REMUX", "HDTV", "UHD",
+            "HEVC", "H264", "H265", "X264", "X265", "AVC", "AV1", "AAC", "AC3", "EAC3", "DD", "DDP",
+            "TRUEHD", "DTS", "LPCM", "ATMOS", "NF", "NETFLIX", "AMZN", "ATVP", "DSNP", "HMAX",
+            "MAX", "PARAMOUNT", "PARAMOUNT+", "CR", "KKTV", "BAHA", "BLACKTV"
+        }:
+            return True
+        if up.endswith("TV") and len(up) >= 5:
+            return True
+        return False
 
     def __search_candidates_by_queries(self, search_func, query_list):
         candidates = []
