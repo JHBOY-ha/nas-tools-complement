@@ -1158,8 +1158,9 @@ class Media:
                 if not tmdb_info:
                     # 识别名称
                     meta_info = MetaInfo(title=file_name)
-                    # 识别不到则使用上级的名称
-                    if not meta_info.get_name() or not meta_info.year:
+                    # 仅在主文件名未识别出有效名称时，才使用上级目录兜底；
+                    # 避免因“年份缺失”触发目录名（如 动漫/video3）进入LLM，导致季数被误覆盖。
+                    if not meta_info.get_name():
                         parent_info = MetaInfo(parent_name)
                         if not parent_info.get_name() or not parent_info.year:
                             parent_parent_info = MetaInfo(parent_parent_name)
