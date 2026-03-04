@@ -13,8 +13,10 @@ from config import Config, DEFAULT_TMDB_PROXY
 
 try:
     from openai import OpenAI
-except Exception:
+    OPENAI_IMPORT_ERROR = None
+except Exception as e:
     OpenAI = None
+    OPENAI_IMPORT_ERROR = e
 
 
 @singleton
@@ -766,7 +768,10 @@ class LLMMetaParser(object):
         if not self._base_url or not self._api_key or not self._model:
             return False
         if OpenAI is None:
-            log.error("【Meta】openai 依赖未安装，无法启用 LLM 识别")
+            if OPENAI_IMPORT_ERROR:
+                log.error("【Meta】openai 导入失败，无法启用 LLM 识别：%s" % str(OPENAI_IMPORT_ERROR))
+            else:
+                log.error("【Meta】openai 依赖未安装，无法启用 LLM 识别")
             return False
         return True
 
