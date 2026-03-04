@@ -55,6 +55,8 @@ if [ "${NASTOOL_AUTO_UPDATE}" = "true" ]; then
             cp requirements.txt "${runtime_requirements}"
             # fast-bencode 1.1.3 在较新 Python 环境下构建容易失败，自动更新时统一替换为兼容版本
             sed -i 's/fast-bencode==1.1.3/fast-bencode==1.1.8/g' "${runtime_requirements}"
+            # openai 1.30.x 依赖 typing_extensions>=4.7，旧版本会导致导入失败
+            sed -i 's/typing_extensions==4.3.0/typing_extensions==4.15.0/g' "${runtime_requirements}"
             if [ "${NASTOOL_CN_UPDATE}" = "true" ]; then
                 pip install --break-system-packages --disable-pip-version-check --use-deprecated=legacy-resolver -r "${runtime_requirements}" -i "${PYPI_MIRROR}"
             else

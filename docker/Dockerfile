@@ -35,6 +35,7 @@ RUN apk add --no-cache libffi-dev \
     && pip install --break-system-packages setuptools==70.3.0 \
     && pip install --break-system-packages cython \
     && sed -i 's/fast-bencode==1.1.3/fast-bencode==1.1.8/g' /tmp/requirements.txt \
+    && sed -i 's/typing_extensions==4.3.0/typing_extensions==4.15.0/g' /tmp/requirements.txt \
     && pip install --break-system-packages --use-deprecated=legacy-resolver -r /tmp/requirements.txt \
     && apk del libffi-dev \
     && npm install pm2 -g \
