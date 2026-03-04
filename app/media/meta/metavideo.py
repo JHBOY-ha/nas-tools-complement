@@ -152,7 +152,7 @@ class MetaVideo(MetaBase):
                 name = None
             elif self.is_in_episode(int(name)) and not self.begin_season:
                 name = None
-        return name
+        return self.normalize_release_version_suffix(name)
 
     def __init_name(self, token):
         if not token:
