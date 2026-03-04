@@ -57,6 +57,12 @@ if [ "${NASTOOL_AUTO_UPDATE}" = "true" ]; then
             sed -i 's/fast-bencode==1.1.3/fast-bencode==1.1.8/g' "${runtime_requirements}"
             # openai 1.30.x 依赖 typing_extensions>=4.7，旧版本会导致导入失败
             sed -i 's/typing_extensions==4.3.0/typing_extensions==4.15.0/g' "${runtime_requirements}"
+            # openai 1.30.x 与 httpx 0.28.x 存在 proxies 参数兼容问题，固定到 0.27.2
+            if grep -q '^httpx==' "${runtime_requirements}"; then
+                sed -i 's/^httpx==.*/httpx==0.27.2/g' "${runtime_requirements}"
+            else
+                echo 'httpx==0.27.2' >> "${runtime_requirements}"
+            fi
             if [ "${NASTOOL_CN_UPDATE}" = "true" ]; then
                 pip install --break-system-packages --disable-pip-version-check --use-deprecated=legacy-resolver -r "${runtime_requirements}" -i "${PYPI_MIRROR}"
             else
