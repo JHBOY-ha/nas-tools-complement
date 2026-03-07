@@ -346,28 +346,6 @@ docker pull jhboy/nastools-comp:2.10.2v1-amd64
 
 默认建议开启自动更新（`NASTOOL_AUTO_UPDATE=true`）。如无法连接 GitHub，可临时关闭自动更新（`NASTOOL_AUTO_UPDATE=false`），并将 `NASTOOL_CN_UPDATE=true` 以使用国内源加速依赖安装。
 
-### 2、本地运行
-python3.10版本，需要预安装cython，如发现缺少依赖包需额外安装
-```
-git clone -b master https://github.com/jxxghp/nas-tools --recurse-submodule 
-python3 -m pip install -r requirements.txt
-export NASTOOL_CONFIG="/xxx/config/config.yaml"
-nohup python3 run.py & 
-```
-
-### 3、Windows
-下载exe文件，双击运行即可，会自动生成配置文件目录
-
-https://github.com/jxxghp/nas-tools/releases
-
-### 4、群晖套件
-添加矿神群晖SPK套件源直接安装：
-
-https://spk.imnks.com/
-
-https://spk7.imnks.com/
-
-
 ## 配置
 ### 1、申请相关API KEY
 * 申请TMDB用户，在 https://www.themoviedb.org/ 申请用户，得到API KEY。
