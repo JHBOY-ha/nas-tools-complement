@@ -530,7 +530,7 @@ export class LayoutNavbar extends CustomElement {
     this._update_url = "https://github.com/jxxghp/nas-tools";
     this._is_update = false;
     this._filter_keyword = "";
-    this.classList.add("navbar","navbar-vertical","navbar-expand-lg","lit-navbar-fixed","lit-navbar","lit-navbar-hide-scrollbar");
+    this.classList.add("navbar","navbar-vertical","navbar-expand-lg","lit-navbar-fixed","lit-navbar");
   }
 
   firstUpdated() {
@@ -633,6 +633,9 @@ export class LayoutNavbar extends CustomElement {
 
         .lit-navbar-canvas {
           width:calc(var(--tblr-offcanvas-width) - 120px)!important;
+          min-height: 100%;
+          height: 100%;
+          flex-direction: column;
         }
 
         .theme-light .lit-navbar-canvas {
@@ -647,14 +650,21 @@ export class LayoutNavbar extends CustomElement {
           width: 80px;
         }
 
-        .lit-navbar-hide-scrollbar {
-          overflow-y: scroll!important;
-          overscroll-behavior-y: contain!important;
+        .lit-navbar-body {
+          min-height: 0;
+          width: 100%;
+          overflow: hidden;
+        }
+
+        .lit-navbar-menu-scroll {
+          min-height: 0;
+          overflow-x: hidden!important;
+          overflow-y: auto!important;
           scrollbar-width: none!important;
           -ms-overflow-style: none!important;
         }
 
-        .lit-navbar-hide-scrollbar::-webkit-scrollbar {
+        .lit-navbar-menu-scroll::-webkit-scrollbar {
           display: none;
         }
 
@@ -731,8 +741,7 @@ export class LayoutNavbar extends CustomElement {
       </style>
       <div class="container-fluid">
         <div class="offcanvas offcanvas-start d-flex lit-navbar-canvas shadow" tabindex="-1" id="litLayoutNavbar">
-          <div class="d-flex flex-row flex-grow-1 lit-navbar-hide-scrollbar">
-            <div class="d-flex flex-column flex-grow-1">
+          <div class="d-flex flex-column flex-grow-1 lit-navbar-body">
               <h1 class="mt-3" style="text-align:center;">
                 <img src="../static/img/logo-blue.png" alt="NAStool" class="lit-navbar-logo">
               </h1>
@@ -748,7 +757,7 @@ export class LayoutNavbar extends CustomElement {
                     </span>` : nothing}
                 </div>
               </div>
-              <div class="accordion px-2 py-2 flex-grow-1">
+              <div class="accordion px-2 py-2 flex-grow-1 lit-navbar-menu-scroll">
                 ${navbar_list.map((item, index) => {
                   if (!this.layout_userpris.includes(item.name)) return nothing;
                   const kw = this._filter_keyword.toLowerCase();
@@ -809,7 +818,6 @@ export class LayoutNavbar extends CustomElement {
                   : nothing }
                 </span>
               </div>
-            </div>
           </div>
         </div>
       </div>
