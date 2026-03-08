@@ -16,6 +16,7 @@ gen/
 .DS_Store
 *.out
 *.zip
+nas-tool-sandbox
 # 敏感配置和数据库文件
 config
 
