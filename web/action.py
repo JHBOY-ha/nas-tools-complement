@@ -2222,14 +2222,25 @@ class WebAction:
         max_bytes = 10 * 1024 * 1024   # 最多传输 10MB
         max_seconds = 10               # 最多测试 10 秒
         ua = Config().get_ua()
-        headers = {"User-Agent": ua, "Referer": seed_url or url}
 
-        try:
+        def _build_http_fallback(test_url, test_seed_url):
+            if test_url.startswith("https://test.ustc.edu.cn"):
+                fallback_url = "http://" + test_url[len("https://"):]
+                fallback_seed_url = ""
+                if test_seed_url and test_seed_url.startswith("https://test.ustc.edu.cn"):
+                    fallback_seed_url = "http://" + test_seed_url[len("https://"):]
+                return fallback_url, fallback_seed_url
+            return None, None
+
+        def _run_test(test_url, test_seed_url):
+            headers = {"User-Agent": ua, "Referer": test_seed_url or test_url}
             # 部分测速服务（如中科大）需要先访问主页以获取 cookie
             session = _requests.Session()
             session.headers.update({"User-Agent": ua})
-            if seed_url:
-                session.get(seed_url, timeout=8, verify=False)
+            # 网络测速仅使用应用内显式代理配置，避免继承容器 HTTP(S)_PROXY 导致误走代理。
+            session.trust_env = False
+            if test_seed_url:
+                session.get(test_seed_url, timeout=8, verify=False, proxies=proxies)
 
             start_time = datetime.datetime.now()
 
@@ -2237,7 +2248,7 @@ class WebAction:
                 # 上传测速：生成数据流 POST 到目标
                 upload_size = min(max_bytes, 5 * 1024 * 1024)  # 默认上传 5MB
                 payload = b"\x00" * upload_size
-                r = session.post(url, data=payload, timeout=max_seconds + 5,
+                r = session.post(test_url, data=payload, timeout=max_seconds + 5,
                                  verify=False, headers=headers, proxies=proxies)
                 elapsed = (datetime.datetime.now() - start_time).total_seconds()
                 if not r or not r.ok:
@@ -2245,7 +2256,7 @@ class WebAction:
                 total_bytes = upload_size
             else:
                 # 下载测速：流式 GET
-                r = session.get(url, stream=True, timeout=30, verify=False,
+                r = session.get(test_url, stream=True, timeout=30, verify=False,
                                 headers=headers, proxies=proxies)
                 if not r or not r.ok:
                     return {"code": -1, "msg": f"连接失败 HTTP {r.status_code if r else 'N/A'}", "speed": "N/A"}
@@ -2270,6 +2281,18 @@ class WebAction:
                 }
             else:
                 return {"code": -1, "msg": "未收到数据", "speed": "N/A"}
+
+        try:
+            return _run_test(url, seed_url)
+        except _requests.exceptions.SSLError as e:
+            fallback_url, fallback_seed_url = _build_http_fallback(url, seed_url)
+            if not fallback_url:
+                return {"code": -1, "msg": str(e), "speed": "N/A"}
+            try:
+                log.warn(f"测速站点 {url} HTTPS 握手失败，降级到 HTTP 重试：{e}")
+                return _run_test(fallback_url, fallback_seed_url)
+            except Exception as retry_err:
+                return {"code": -1, "msg": str(retry_err), "speed": "N/A"}
         except Exception as e:
             return {"code": -1, "msg": str(e), "speed": "N/A"}
 
