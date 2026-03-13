@@ -2239,8 +2239,15 @@ class WebAction:
                         ctx.set_ciphers("DEFAULT:@SECLEVEL=1")
                     except Exception:
                         pass
+                    # Python 3.11+ 忽略 SSL unexpected EOF（中科大测速服务器特征）
+                    if hasattr(_ssl, "OP_IGNORE_UNEXPECTED_EOF"):
+                        ctx.options |= _ssl.OP_IGNORE_UNEXPECTED_EOF
                     kwargs["ssl_context"] = ctx
                     super().init_poolmanager(*args, **kwargs)
+
+                def send(self, request, **kwargs):
+                    kwargs["verify"] = False
+                    return super().send(request, **kwargs)
 
             # 部分测速服务（如中科大）需要先访问主页以获取 cookie
             session = _requests.Session()
