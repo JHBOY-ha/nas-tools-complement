@@ -2205,22 +2205,19 @@ class WebAction:
             url = str(data.get("url") or "").strip()
             test_type = str(data.get("type") or "download").strip()
             seed_url = str(data.get("seed_url") or "").strip()
-            use_proxy = bool(data.get("proxy", False))
         else:
             url = str(data or "").strip()
             test_type = "download"
             seed_url = ""
-            use_proxy = False
 
         if not url:
             return {"code": -1, "msg": "测速URL不能为空"}
 
-        # proxy=True  → 使用系统代理（用于国际节点）
-        # proxy=False → 明确禁用代理（含环境变量 HTTP_PROXY/HTTPS_PROXY），用于国内节点
-        if use_proxy:
-            proxies = Config().get_proxies() or None
-        else:
-            proxies = {"http": "", "https": ""}  # 覆盖环境变量，强制直连
+        proxies = None
+        if any(k in url for k in ["cloudflare", "github", "themoviedb", "tmdb", "telegram", "fanart"]):
+            cfg_proxies = Config().get_proxies()
+            if cfg_proxies:
+                proxies = cfg_proxies
 
         max_bytes = 10 * 1024 * 1024   # 最多传输 10MB
         max_seconds = 10               # 最多测试 10 秒
@@ -2228,36 +2225,11 @@ class WebAction:
         headers = {"User-Agent": ua, "Referer": seed_url or url}
 
         try:
-            import ssl as _ssl
-            from requests.adapters import HTTPAdapter as _HTTPAdapter
-            from urllib3.util.ssl_ import create_urllib3_context
-
-            class _LegacySSLAdapter(_HTTPAdapter):
-                """宽松 SSL adapter，兼容旧版 TLS 服务器（如中科大测速）"""
-                def init_poolmanager(self, *args, **kwargs):
-                    ctx = create_urllib3_context()
-                    ctx.check_hostname = False
-                    ctx.verify_mode = _ssl.CERT_NONE
-                    try:
-                        ctx.set_ciphers("DEFAULT:@SECLEVEL=1")
-                    except Exception:
-                        pass
-                    # Python 3.11+ 忽略 SSL unexpected EOF（中科大测速服务器特征）
-                    if hasattr(_ssl, "OP_IGNORE_UNEXPECTED_EOF"):
-                        ctx.options |= _ssl.OP_IGNORE_UNEXPECTED_EOF
-                    kwargs["ssl_context"] = ctx
-                    super().init_poolmanager(*args, **kwargs)
-
-                def send(self, request, **kwargs):
-                    kwargs["verify"] = False
-                    return super().send(request, **kwargs)
-
             # 部分测速服务（如中科大）需要先访问主页以获取 cookie
             session = _requests.Session()
             session.headers.update({"User-Agent": ua})
-            session.mount("https://", _LegacySSLAdapter())
             if seed_url:
-                session.get(seed_url, timeout=8, verify=False, proxies=proxies)
+                session.get(seed_url, timeout=8, verify=False)
 
             start_time = datetime.datetime.now()
 
