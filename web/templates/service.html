@@ -250,7 +250,7 @@
             <tr>
               <td>
                 <span>{{ target.name }}</span>
-                <input name="speedtest_item" value="{{ target.url }}|{{ loop.index0 }}|{{ target.type }}|{{ target.seed_url|default('') }}" type="hidden">
+                <input name="speedtest_item" value="{{ target.url }}|{{ loop.index0 }}|{{ target.type }}|{{ target.seed_url|default('') }}|{{ target.proxy|default(false)|lower }}" type="hidden">
               </td>
               <td>
                 {% if target.type == "upload" %}
@@ -518,10 +518,11 @@
       let idx      = parts[1];
       let type     = parts[2] || "download";
       let seed_url = parts[3] || "";
+      let use_proxy = parts[4] === "true";
       $(`#speedtest_res_${idx}`).html('<span class="text-muted">测试中...</span>');
       $(`#speedtest_transferred_${idx}`).empty();
       $(`#speedtest_time_${idx}`).empty();
-      ajax_post("speed_test", {url: url, type: type, seed_url: seed_url}, function (ret) {
+      ajax_post("speed_test", {url: url, type: type, seed_url: seed_url, proxy: use_proxy}, function (ret) {
         if (ret.code === 0) {
           $(`#speedtest_res_${idx}`).html(`<span class="text-green fw-bold">${ret.speed}</span>`);
           $(`#speedtest_transferred_${idx}`).html(`<span class="text-muted">${ret.transferred}</span>`);

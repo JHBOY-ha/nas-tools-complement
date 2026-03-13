@@ -2205,19 +2205,22 @@ class WebAction:
             url = str(data.get("url") or "").strip()
             test_type = str(data.get("type") or "download").strip()
             seed_url = str(data.get("seed_url") or "").strip()
+            use_proxy = bool(data.get("proxy", False))
         else:
             url = str(data or "").strip()
             test_type = "download"
             seed_url = ""
+            use_proxy = False
 
         if not url:
             return {"code": -1, "msg": "测速URL不能为空"}
 
-        proxies = None
-        if any(k in url for k in ["cloudflare", "github", "themoviedb", "tmdb", "telegram", "fanart"]):
-            cfg_proxies = Config().get_proxies()
-            if cfg_proxies:
-                proxies = cfg_proxies
+        # proxy=True  → 使用系统代理（用于国际节点）
+        # proxy=False → 明确禁用代理（含环境变量 HTTP_PROXY/HTTPS_PROXY），用于国内节点
+        if use_proxy:
+            proxies = Config().get_proxies() or None
+        else:
+            proxies = {"http": "", "https": ""}  # 覆盖环境变量，强制直连
 
         max_bytes = 10 * 1024 * 1024   # 最多传输 10MB
         max_seconds = 10               # 最多测试 10 秒
@@ -2254,7 +2257,7 @@ class WebAction:
             session.headers.update({"User-Agent": ua})
             session.mount("https://", _LegacySSLAdapter())
             if seed_url:
-                session.get(seed_url, timeout=8, verify=False)
+                session.get(seed_url, timeout=8, verify=False, proxies=proxies)
 
             start_time = datetime.datetime.now()
 
