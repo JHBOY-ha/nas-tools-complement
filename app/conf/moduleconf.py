@@ -526,6 +526,13 @@ class ModuleConf(object):
         "mikanani.me"
     ]
 
+    # 网络测速目标
+    # seed_url: 测速前先访问该页面以获取必要 cookie（中科大需要 ustc=1）
+    SPEEDTEST_TARGETS = [
+        {"name": "utsc测速 下载", "url": "https://test.ustc.edu.cn/backend/garbage.php?ckSize=100&cors=true", "proxy": False, "type": "download", "seed_url": "https://test.ustc.edu.cn/"},
+        {"name": "utsc测速 上传", "url": "https://test.ustc.edu.cn/backend/empty.php?cors=true",  "proxy": False, "type": "upload", "seed_url": "https://test.ustc.edu.cn/"},
+    ]
+
     # 下载器
     DOWNLOADER_CONF = {
         "qbittorrent": {

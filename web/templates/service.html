@@ -226,6 +226,54 @@
     </div>
   </div>
 </div>
+<div class="modal modal-blur fade" id="modal-speedtest" tabindex="-1" role="dialog" aria-hidden="true"
+  data-bs-backdrop="static" data-bs-keyboard="false">
+  <div class="modal-dialog modal-lg modal-dialog-centered" role="document">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">网络测速</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="table-responsive">
+        <table class="table table-vcenter card-table">
+          <thead>
+            <tr>
+              <th>测速节点</th>
+              <th>类型</th>
+              <th>速度</th>
+              <th>传输量</th>
+              <th>耗时</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for target in SpeedTestTargets %}
+            <tr>
+              <td>
+                <span>{{ target.name }}</span>
+                <input name="speedtest_item" value="{{ target.url }}|{{ loop.index0 }}|{{ target.type }}|{{ target.seed_url|default('') }}" type="hidden">
+              </td>
+              <td>
+                {% if target.type == "upload" %}
+                <span class="badge bg-orange text-white">上传</span>
+                {% else %}
+                <span class="badge bg-blue text-white">下载</span>
+                {% endif %}
+              </td>
+              <td id="speedtest_res_{{ loop.index0 }}"></td>
+              <td id="speedtest_transferred_{{ loop.index0 }}"></td>
+              <td id="speedtest_time_{{ loop.index0 }}"></td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-link me-auto" data-bs-dismiss="modal">关闭</button>
+        <button id="speedtest_btn" class="btn btn-primary">开始测速</button>
+      </div>
+    </div>
+  </div>
+</div>
 <div class="modal modal-blur fade" id="modal-backup" tabindex="-1" role="dialog" aria-hidden="true"
   data-bs-backdrop="static" data-bs-keyboard="false">
   <div class="modal-dialog modal-lg modal-dialog-centered" role="document">
@@ -265,6 +313,9 @@
     } else if (id === "nettest_anime") {
       $('[id^="nettest_anime_item_res"]').empty();
       $('#modal-nettest-anime').modal('show');
+    } else if (id === "speedtest") {
+      $('[id^="speedtest_res_"], [id^="speedtest_transferred_"], [id^="speedtest_time_"]').empty();
+      $('#modal-speedtest').modal('show');
     } else if (id === "blacklist") {
       show_confirm_modal("清理文件整理缓存后，已转移过的文件允许重新转移（包括识别错误的文件），是否确认？", function () {
         hide_confirm_modal();
@@ -444,6 +495,48 @@
       }
       callBack(true)
     });
+  }
+
+  // 网络测速
+  $("#speedtest_btn").unbind("click").click(function () {
+    run_speed_test($(this));
+  });
+
+  function run_speed_test(btn_obj) {
+    let items = $('[name="speedtest_item"]');
+    if (!items.length) return;
+    btn_obj.text("测速中...").attr("disabled", true);
+    let index = 0;
+
+    function test_next() {
+      if (index >= items.length) {
+        btn_obj.text("开始测速").attr("disabled", false);
+        return;
+      }
+      let parts = $(items[index]).val().split("|");
+      let url      = parts[0];
+      let idx      = parts[1];
+      let type     = parts[2] || "download";
+      let seed_url = parts[3] || "";
+      $(`#speedtest_res_${idx}`).html('<span class="text-muted">测试中...</span>');
+      $(`#speedtest_transferred_${idx}`).empty();
+      $(`#speedtest_time_${idx}`).empty();
+      ajax_post("speed_test", {url: url, type: type, seed_url: seed_url}, function (ret) {
+        if (ret.code === 0) {
+          $(`#speedtest_res_${idx}`).html(`<span class="text-green fw-bold">${ret.speed}</span>`);
+          $(`#speedtest_transferred_${idx}`).html(`<span class="text-muted">${ret.transferred}</span>`);
+          $(`#speedtest_time_${idx}`).html(`<span class="text-muted">${ret.time}</span>`);
+        } else {
+          $(`#speedtest_res_${idx}`).html('<span class="badge bg-red me-1">失败</span>');
+          $(`#speedtest_transferred_${idx}`).html(`<span class="text-red small">${ret.msg || ""}</span>`);
+          $(`#speedtest_time_${idx}`).empty();
+        }
+        index++;
+        test_next();
+      });
+    }
+
+    test_next();
   }
 
   // 初始化DropZone
