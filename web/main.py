@@ -855,6 +855,19 @@ def service():
         {'name': '网络连通性测试-anime', 'time': '', 'state': 'OFF', 'id': 'nettest_anime', 'svg': svg, 'color': 'azure',
          "targets": anime_targets})
 
+    # 网络测速
+    speedtest_svg = '''
+    <svg xmlns="http://www.w3.org/2000/svg" class="icon icon-tabler icon-tabler-rocket" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round">
+       <path stroke="none" d="M0 0h24v24H0z" fill="none"></path>
+       <path d="M4 13a8 8 0 0 1 7 7a6 6 0 0 0 3 -5a9 9 0 0 0 6 -8a3 3 0 0 0 -3 -3a9 9 0 0 0 -8 6a6 6 0 0 0 -5 3"></path>
+       <path d="M7 14a6 6 0 0 0 -3 6a6 6 0 0 0 6 -3"></path>
+       <circle cx="15" cy="9" r="1"></circle>
+    </svg>
+    '''
+    speedtest_targets = ModuleConf.SPEEDTEST_TARGETS
+    scheduler_cfg_list.append(
+        {'name': '网络测速', 'time': '', 'state': 'OFF', 'id': 'speedtest', 'svg': speedtest_svg, 'color': 'indigo'})
+
     # 备份
     svg = '''
     <svg t="1660720525544" class="icon" viewBox="0 0 1024 1024" version="1.1" xmlns="http://www.w3.org/2000/svg" p-id="1559" width="16" height="16">
@@ -870,7 +883,8 @@ def service():
                            RuleGroups=RuleGroups,
                            SchedulerTasks=scheduler_cfg_list,
                            NetTestTargets=targets,
-                           NetTestAnimeTargets=anime_targets)
+                           NetTestAnimeTargets=anime_targets,
+                           SpeedTestTargets=speedtest_targets)
 
 
 # 历史记录页面

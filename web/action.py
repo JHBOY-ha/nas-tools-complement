@@ -107,6 +107,7 @@ class WebAction:
             "name_test": self.__name_test,
             "rule_test": self.__rule_test,
             "net_test": self.__net_test,
+            "speed_test": self.__speed_test,
             "add_filtergroup": self.__add_filtergroup,
             "restore_filtergroup": self.__restore_filtergroup,
             "set_default_filtergroup": self.__set_default_filtergroup,
@@ -2190,6 +2191,87 @@ class WebAction:
             return {"res": True, "time": "%s 毫秒" % seconds}
         else:
             return {"res": False, "time": "%s 毫秒" % seconds}
+
+    @staticmethod
+    def __speed_test(data):
+        """
+        网络测速 - 测量下载或上传速度
+        :param data: str（URL）或 dict（{"url":..., "type": "download"|"upload", "seed_url": ...}）
+        :return: {"code": 0, "speed": "12.34 Mbps", "transferred": "5.00 MB", "time": "3.21 秒"}
+        """
+        import requests as _requests
+
+        if isinstance(data, dict):
+            url = str(data.get("url") or "").strip()
+            test_type = str(data.get("type") or "download").strip()
+            seed_url = str(data.get("seed_url") or "").strip()
+        else:
+            url = str(data or "").strip()
+            test_type = "download"
+            seed_url = ""
+
+        if not url:
+            return {"code": -1, "msg": "测速URL不能为空"}
+
+        proxies = None
+        if any(k in url for k in ["cloudflare", "github", "themoviedb", "tmdb", "telegram", "fanart"]):
+            cfg_proxies = Config().get_proxies()
+            if cfg_proxies:
+                proxies = cfg_proxies
+
+        max_bytes = 10 * 1024 * 1024   # 最多传输 10MB
+        max_seconds = 10               # 最多测试 10 秒
+        ua = Config().get_ua()
+        headers = {"User-Agent": ua, "Referer": seed_url or url}
+
+        try:
+            # 部分测速服务（如中科大）需要先访问主页以获取 cookie
+            session = _requests.Session()
+            session.headers.update({"User-Agent": ua})
+            if seed_url:
+                session.get(seed_url, timeout=8, verify=False)
+
+            start_time = datetime.datetime.now()
+
+            if test_type == "upload":
+                # 上传测速：生成数据流 POST 到目标
+                upload_size = min(max_bytes, 5 * 1024 * 1024)  # 默认上传 5MB
+                payload = b"\x00" * upload_size
+                r = session.post(url, data=payload, timeout=max_seconds + 5,
+                                 verify=False, headers=headers, proxies=proxies)
+                elapsed = (datetime.datetime.now() - start_time).total_seconds()
+                if not r or not r.ok:
+                    return {"code": -1, "msg": f"上传失败 HTTP {r.status_code if r else 'N/A'}", "speed": "N/A"}
+                total_bytes = upload_size
+            else:
+                # 下载测速：流式 GET
+                r = session.get(url, stream=True, timeout=30, verify=False,
+                                headers=headers, proxies=proxies)
+                if not r or not r.ok:
+                    return {"code": -1, "msg": f"连接失败 HTTP {r.status_code if r else 'N/A'}", "speed": "N/A"}
+                total_bytes = 0
+                for chunk in r.iter_content(chunk_size=65536):
+                    if chunk:
+                        total_bytes += len(chunk)
+                    elapsed = (datetime.datetime.now() - start_time).total_seconds()
+                    if elapsed >= max_seconds or total_bytes >= max_bytes:
+                        break
+                r.close()
+                elapsed = (datetime.datetime.now() - start_time).total_seconds()
+
+            if elapsed > 0 and total_bytes > 0:
+                speed_mbps = round((total_bytes * 8) / elapsed / 1_000_000, 2)
+                transferred_mb = round(total_bytes / 1024 / 1024, 2)
+                return {
+                    "code": 0,
+                    "speed": f"{speed_mbps} Mbps",
+                    "transferred": f"{transferred_mb} MB",
+                    "time": f"{round(elapsed, 2)} 秒"
+                }
+            else:
+                return {"code": -1, "msg": "未收到数据", "speed": "N/A"}
+        except Exception as e:
+            return {"code": -1, "msg": str(e), "speed": "N/A"}
 
     @staticmethod
     def __get_site_activity(data):
