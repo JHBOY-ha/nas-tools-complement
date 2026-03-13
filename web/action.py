@@ -2225,9 +2225,27 @@ class WebAction:
         headers = {"User-Agent": ua, "Referer": seed_url or url}
 
         try:
+            import ssl as _ssl
+            from requests.adapters import HTTPAdapter as _HTTPAdapter
+            from urllib3.util.ssl_ import create_urllib3_context
+
+            class _LegacySSLAdapter(_HTTPAdapter):
+                """宽松 SSL adapter，兼容旧版 TLS 服务器（如中科大测速）"""
+                def init_poolmanager(self, *args, **kwargs):
+                    ctx = create_urllib3_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode = _ssl.CERT_NONE
+                    try:
+                        ctx.set_ciphers("DEFAULT:@SECLEVEL=1")
+                    except Exception:
+                        pass
+                    kwargs["ssl_context"] = ctx
+                    super().init_poolmanager(*args, **kwargs)
+
             # 部分测速服务（如中科大）需要先访问主页以获取 cookie
             session = _requests.Session()
             session.headers.update({"User-Agent": ua})
+            session.mount("https://", _LegacySSLAdapter())
             if seed_url:
                 session.get(seed_url, timeout=8, verify=False)
 
