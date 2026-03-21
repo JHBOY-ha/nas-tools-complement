@@ -182,3 +182,20 @@ class LLMMetaParserTest(TestCase):
             self.parser.merge_into(meta_info=meta_info, title=meta_info.org_string)
         self.assertEqual(226688, meta_info.note.get("llm", {}).get("tmdb_id"))
         self.assertEqual("tv", meta_info.note.get("llm", {}).get("tmdb_type"))
+
+    def test_build_search_queries_should_strip_episode_and_extension(self):
+        queries = self.parser._LLMMetaParser__build_search_queries(
+            "[LoliHouse] Yuusha no Kuzu - 10 [WebRip 1080p HEVC-10bit AAC SRTx2].mkv"
+        )
+
+        self.assertTrue(queries)
+        self.assertEqual("Yuusha no Kuzu", queries[0])
+        self.assertNotIn("Yuusha no Kuzu 10 mkv", queries)
+
+    def test_build_search_queries_should_keep_title_season_number(self):
+        queries = self.parser._LLMMetaParser__build_search_queries(
+            "Mato Seihei no Slave 2 - 01 [1080p].mkv"
+        )
+
+        self.assertTrue(queries)
+        self.assertEqual("Mato Seihei no Slave 2", queries[0])

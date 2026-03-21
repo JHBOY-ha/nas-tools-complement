@@ -382,7 +382,10 @@ class LLMMetaParser(object):
 
     @classmethod
     def __build_search_query(cls, title, subtitle=None):
-        text = "%s %s" % (title or "", subtitle or "")
+        text = "%s %s" % (
+            cls.__strip_title_tail_noise(title),
+            subtitle or ""
+        )
         return cls.__normalize_query_for_search(text)
 
     @classmethod
@@ -425,11 +428,12 @@ class LLMMetaParser(object):
                 query_list.append(query)
         return query_list[:6]
 
-    @staticmethod
-    def __normalize_query_for_search(text):
+    @classmethod
+    def __normalize_query_for_search(cls, text):
         text = str(text or "").strip()
         if not text:
             return ""
+        text = cls.__strip_title_tail_noise(text)
         text = re.sub(r"\[[^\]]*]", " ", text)
         text = re.sub(r"[【】\[\]\(\)\{\}]+", " ", text)
         text = re.sub(r"[._\-]+", " ", text)
@@ -445,6 +449,12 @@ class LLMMetaParser(object):
             text,
             flags=re.IGNORECASE
         )
+        text = re.sub(
+            r"\b(?:MKV|MP4|AVI|WMV|TS|M2TS|MOV|FLV|RMVB|ISO|MPG|MPEG)\b",
+            " ",
+            text,
+            flags=re.IGNORECASE
+        )
         text = re.sub(r"\b\d\.\d\b", " ", text, flags=re.IGNORECASE)
         text = re.sub(r"\b\d{4}\b", " ", text, flags=re.IGNORECASE)
         text = re.sub(r"\bH\s*264\b|\bH\s*265\b", " ", text, flags=re.IGNORECASE)
@@ -454,7 +464,7 @@ class LLMMetaParser(object):
 
     @classmethod
     def __extract_core_title_query(cls, raw_title):
-        raw_title = str(raw_title or "").strip()
+        raw_title = cls.__strip_title_tail_noise(raw_title)
         if not raw_title:
             return ""
         text = re.sub(r"\[[^\]]*]", " ", raw_title)
@@ -474,6 +484,39 @@ class LLMMetaParser(object):
         if not title_tokens:
             return ""
         return cls.__normalize_query_for_search(" ".join(title_tokens))
+
+    @staticmethod
+    def __strip_title_tail_noise(text):
+        text = str(text or "").strip()
+        if not text:
+            return ""
+
+        text = re.sub(
+            r"(?i)\.(?:mkv|mp4|avi|wmv|ts|m2ts|mov|flv|rmvb|iso|mpg|mpeg)$",
+            "",
+            text
+        ).strip()
+
+        while True:
+            bracket_trimmed = re.sub(
+                r"\s*(?:\[[^\]]*]|【[^】]*】|\([^\)]*\)|\{[^}]*})\s*$",
+                "",
+                text
+            ).strip()
+            if bracket_trimmed and bracket_trimmed != text:
+                text = bracket_trimmed
+
+            updated = re.sub(
+                r"(?i)\s*[-_.]+\s*(?:第\s*\d{1,4}\s*[集话回]|(?:E|EP)\s*\d{1,4}|\d{1,4}(?:v\d{1,2})?)\s*$",
+                "",
+                text
+            ).strip()
+            updated = re.sub(r"[\s._\-]+$", "", updated).strip()
+            if updated == text:
+                break
+            text = updated
+
+        return text
 
     @staticmethod
     def __is_meta_query_token(token):
