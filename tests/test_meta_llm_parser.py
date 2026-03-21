@@ -182,3 +182,39 @@ class LLMMetaParserTest(TestCase):
             self.parser.merge_into(meta_info=meta_info, title=meta_info.org_string)
         self.assertEqual(226688, meta_info.note.get("llm", {}).get("tmdb_id"))
         self.assertEqual("tv", meta_info.note.get("llm", {}).get("tmdb_type"))
+
+    def test_build_search_queries_should_strip_episode_and_extension(self):
+        queries = self.parser._LLMMetaParser__build_search_queries(
+            "[LoliHouse] Yuusha no Kuzu - 10 [WebRip 1080p HEVC-10bit AAC SRTx2].mkv"
+        )
+
+        self.assertTrue(queries)
+        self.assertEqual("Yuusha no Kuzu", queries[0])
+        self.assertNotIn("Yuusha no Kuzu 10 mkv", queries)
+
+    def test_build_search_queries_should_keep_title_season_number(self):
+        queries = self.parser._LLMMetaParser__build_search_queries(
+            "Mato Seihei no Slave 2 - 01 [1080p].mkv"
+        )
+
+        self.assertTrue(queries)
+        self.assertEqual("Mato Seihei no Slave 2", queries[0])
+
+    def test_build_search_queries_should_strip_episode_after_multiple_tail_tags(self):
+        queries = self.parser._LLMMetaParser__build_search_queries(
+            "[ANi] OVERLORD 第四季 - 04 [1080P][Baha][WEB-DL][AAC AVC][CHT].mp4"
+        )
+
+        self.assertTrue(queries)
+        self.assertEqual("OVERLORD 第四季", queries[0])
+        self.assertNotIn("OVERLORD 第四季 04", queries)
+
+    def test_build_search_queries_should_strip_episode_before_custom_tail_note(self):
+        queries = self.parser._LLMMetaParser__build_search_queries(
+            "[喵萌奶茶屋&LoliHouse] 金装的薇尔梅 / Kinsou no Vermeil - 01 "
+            "[WebRip 1080p HEVC-10bit AAC][简繁内封字幕]"
+        )
+
+        self.assertTrue(queries)
+        self.assertEqual("金装的薇尔梅", queries[0])
+        self.assertNotIn("金装的薇尔梅 01", queries)
