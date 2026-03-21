@@ -199,3 +199,22 @@ class LLMMetaParserTest(TestCase):
 
         self.assertTrue(queries)
         self.assertEqual("Mato Seihei no Slave 2", queries[0])
+
+    def test_build_search_queries_should_strip_episode_after_multiple_tail_tags(self):
+        queries = self.parser._LLMMetaParser__build_search_queries(
+            "[ANi] OVERLORD 第四季 - 04 [1080P][Baha][WEB-DL][AAC AVC][CHT].mp4"
+        )
+
+        self.assertTrue(queries)
+        self.assertEqual("OVERLORD 第四季", queries[0])
+        self.assertNotIn("OVERLORD 第四季 04", queries)
+
+    def test_build_search_queries_should_strip_episode_before_custom_tail_note(self):
+        queries = self.parser._LLMMetaParser__build_search_queries(
+            "[喵萌奶茶屋&LoliHouse] 金装的薇尔梅 / Kinsou no Vermeil - 01 "
+            "[WebRip 1080p HEVC-10bit AAC][简繁内封字幕]"
+        )
+
+        self.assertTrue(queries)
+        self.assertEqual("金装的薇尔梅", queries[0])
+        self.assertNotIn("金装的薇尔梅 01", queries)

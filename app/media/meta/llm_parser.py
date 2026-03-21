@@ -498,6 +498,7 @@ class LLMMetaParser(object):
         ).strip()
 
         while True:
+            original_text = text
             bracket_trimmed = re.sub(
                 r"\s*(?:\[[^\]]*]|【[^】]*】|\([^\)]*\)|\{[^}]*})\s*$",
                 "",
@@ -512,7 +513,7 @@ class LLMMetaParser(object):
                 text
             ).strip()
             updated = re.sub(r"[\s._\-]+$", "", updated).strip()
-            if updated == text:
+            if updated == original_text:
                 break
             text = updated
 
