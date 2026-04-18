@@ -817,11 +817,11 @@ class Media:
                 return False
 
             pure = re.sub(r"\s+", "", text)
-            if len(pure) < 4 or len(pure) > 40:
+            if len(pure) < 2 or len(pure) > 40:
                 return False
 
             zh_count = len(re.findall(r"[\u4e00-\u9fff]", text))
-            if zh_count < 4:
+            if zh_count < 2:
                 return False
 
             # 中文占比过低的混合串通常是发布信息而非片名
