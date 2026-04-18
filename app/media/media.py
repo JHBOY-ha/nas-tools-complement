@@ -1188,10 +1188,20 @@ class Media:
                     media_key = self.__make_cache_key(meta_info)
                     if not self.meta.get_meta_data_by_key(media_key):
                         # 没有缓存数据
+                        file_media_info = None
+                        llm_tmdb_id, llm_tmdb_type = self.__extract_llm_tmdb_target(meta_info=meta_info)
+                        if llm_tmdb_id:
+                            log.info("【Meta】尝试使用LLM直出TMDBID：%s ..." % llm_tmdb_id)
+                            file_media_info = self.get_tmdb_info(mtype=llm_tmdb_type,
+                                                                 tmdbid=llm_tmdb_id,
+                                                                 chinese=chinese)
+                            if not file_media_info:
+                                log.warn("【Meta】LLM直出TMDBID无效或未命中，回退名称检索：%s" % llm_tmdb_id)
                         main_query_name = meta_info.get_name()
-                        file_media_info = self.__search_media_with_name(meta_info=meta_info,
-                                                                        query_name=main_query_name,
-                                                                        strict=None)
+                        if not file_media_info:
+                            file_media_info = self.__search_media_with_name(meta_info=meta_info,
+                                                                            query_name=main_query_name,
+                                                                            strict=None)
                         cn_fallback_name = None
                         if not file_media_info:
                             cn_fallback_name = self.__extract_cn_fallback_name(meta_info)
