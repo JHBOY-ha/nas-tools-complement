@@ -806,6 +806,23 @@ class Media:
             text = re.sub(r"[\s._\-~:：]+$", "", text).strip()
             return text
 
+        def _is_cn_metadata_tag(pure):
+            if re.fullmatch(r"第?[0-9一二三四五六七八九十百两]+\s*[季部辑集话話期]", pure):
+                return True
+
+            lang_tags = (
+                "中文|国语|国配|普通话|汉语|华语|粤语|粤配|台配|日语|日配|"
+                "英语|英字|韩语|韩字|俄语|泰语|法语|德语|西语|"
+                "简中|繁中|简体|繁体|简繁|繁简|中字|中配|"
+                "中日|中英|中韩|双语|多语|"
+                "内封|外挂|内嵌|硬字幕|软字幕|特效字幕|官中|官译|"
+                "无字|生肉|熟肉|字幕|音轨|配音"
+            )
+            if re.fullmatch(rf"(?:{lang_tags})+", pure):
+                return True
+
+            return False
+
         def _is_valid_cn_candidate(text):
             if not text:
                 return False
@@ -817,11 +834,14 @@ class Media:
                 return False
 
             pure = re.sub(r"\s+", "", text)
-            if len(pure) < 4 or len(pure) > 40:
+            if len(pure) < 2 or len(pure) > 40:
+                return False
+
+            if _is_cn_metadata_tag(pure):
                 return False
 
             zh_count = len(re.findall(r"[\u4e00-\u9fff]", text))
-            if zh_count < 4:
+            if zh_count < 2:
                 return False
 
             # 中文占比过低的混合串通常是发布信息而非片名
@@ -1188,10 +1208,20 @@ class Media:
                     media_key = self.__make_cache_key(meta_info)
                     if not self.meta.get_meta_data_by_key(media_key):
                         # 没有缓存数据
+                        file_media_info = None
+                        llm_tmdb_id, llm_tmdb_type = self.__extract_llm_tmdb_target(meta_info=meta_info)
+                        if llm_tmdb_id:
+                            log.info("【Meta】尝试使用LLM直出TMDBID：%s ..." % llm_tmdb_id)
+                            file_media_info = self.get_tmdb_info(mtype=llm_tmdb_type,
+                                                                 tmdbid=llm_tmdb_id,
+                                                                 chinese=chinese)
+                            if not file_media_info:
+                                log.warn("【Meta】LLM直出TMDBID无效或未命中，回退名称检索：%s" % llm_tmdb_id)
                         main_query_name = meta_info.get_name()
-                        file_media_info = self.__search_media_with_name(meta_info=meta_info,
-                                                                        query_name=main_query_name,
-                                                                        strict=None)
+                        if not file_media_info:
+                            file_media_info = self.__search_media_with_name(meta_info=meta_info,
+                                                                            query_name=main_query_name,
+                                                                            strict=None)
                         cn_fallback_name = None
                         if not file_media_info:
                             cn_fallback_name = self.__extract_cn_fallback_name(meta_info)
