@@ -806,6 +806,23 @@ class Media:
             text = re.sub(r"[\s._\-~:：]+$", "", text).strip()
             return text
 
+        def _is_cn_metadata_tag(pure):
+            if re.fullmatch(r"第?[0-9一二三四五六七八九十百两]+\s*[季部辑集话話期]", pure):
+                return True
+
+            lang_tags = (
+                "中文|国语|国配|普通话|汉语|华语|粤语|粤配|台配|日语|日配|"
+                "英语|英字|韩语|韩字|俄语|泰语|法语|德语|西语|"
+                "简中|繁中|简体|繁体|简繁|繁简|中字|中配|"
+                "中日|中英|中韩|双语|多语|"
+                "内封|外挂|内嵌|硬字幕|软字幕|特效字幕|官中|官译|"
+                "无字|生肉|熟肉|字幕|音轨|配音"
+            )
+            if re.fullmatch(rf"(?:{lang_tags})+", pure):
+                return True
+
+            return False
+
         def _is_valid_cn_candidate(text):
             if not text:
                 return False
@@ -818,6 +835,9 @@ class Media:
 
             pure = re.sub(r"\s+", "", text)
             if len(pure) < 2 or len(pure) > 40:
+                return False
+
+            if _is_cn_metadata_tag(pure):
                 return False
 
             zh_count = len(re.findall(r"[\u4e00-\u9fff]", text))

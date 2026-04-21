@@ -64,6 +64,31 @@ class MediaCnFallbackTest(TestCase):
         self.assertIsNone(media_info.cn_name)
         self.assertEqual("Hell Mode", media_info.get_name())
 
+    def test_extract_cn_fallback_ignores_short_metadata_tags(self):
+        titles = [
+            "Some Movie 2024 [中文] [1080p]",
+            "Some Movie 2024 [国语] [1080p]",
+            "Some Show S02 [第2季] [1080p]",
+        ]
+        for title in titles:
+            with self.subTest(title=title):
+                meta_info = MetaInfo(title)
+                cn_name = self.media._Media__extract_cn_fallback_name(meta_info)
+                self.assertIsNone(cn_name)
+
+    def test_get_media_info_skips_cn_fallback_for_short_metadata_tags(self):
+        title = "Some Movie 2024 [中文] [1080p]"
+        with patch.object(self.media, "_Media__search_media_with_name", side_effect=[{}]) as mock_search:
+            media_info = self.media.get_media_info(title=title, cache=False)
+
+        self.assertEqual(1, mock_search.call_count)
+        self.assertIsNone(media_info.cn_name)
+
+    def test_extract_cn_fallback_allows_two_char_title(self):
+        meta_info = MetaInfo("[GM-Team][诛仙][Jade Dynasty][2022][08][AVC][GB][1080P]")
+        cn_name = self.media._Media__extract_cn_fallback_name(meta_info)
+        self.assertEqual("诛仙", cn_name)
+
     def test_extract_cn_fallback_ignores_noisy_cn_name(self):
         meta_info = MetaInfo(self._TSDM_TITLE)
         meta_info.cn_name = "_[TSDM字幕组]_[厄里斯的圣杯][Eris no Seihai]エリスの圣杯"
