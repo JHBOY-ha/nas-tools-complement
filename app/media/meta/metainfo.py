@@ -10,12 +10,13 @@ from app.utils.types import MediaType
 from config import RMT_MEDIAEXT
 
 
-def MetaInfo(title, subtitle=None, mtype=None):
+def MetaInfo(title, subtitle=None, mtype=None, use_llm=True):
     """
     媒体整理入口，根据名称和副标题，判断是哪种类型的识别，返回对应对象
     :param title: 标题、种子名、文件名
     :param subtitle: 副标题、描述
     :param mtype: 指定识别类型，为空则自动识别类型
+    :param use_llm: 是否启用LLM增强识别
     :return: MetaAnime、MetaVideo
     """
 
@@ -43,11 +44,12 @@ def MetaInfo(title, subtitle=None, mtype=None):
     meta_info.replaced_words = used_info.get("replaced")
     meta_info.offset_words = used_info.get("offset")
 
-    # LLM增强识别（配置关闭或调用失败时会自动回落规则识别结果）
-    meta_info = LLMMetaParser().merge_into(meta_info=meta_info,
-                                           title=title,
-                                           subtitle=subtitle,
-                                           mtype_hint=mtype)
+    if use_llm:
+        # LLM增强识别（配置关闭或调用失败时会自动回落规则识别结果）
+        meta_info = LLMMetaParser().merge_into(meta_info=meta_info,
+                                               title=title,
+                                               subtitle=subtitle,
+                                               mtype_hint=mtype)
 
     # 外部强制指定类型优先
     if mtype:
