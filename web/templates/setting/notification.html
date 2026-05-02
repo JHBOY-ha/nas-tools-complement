@@ -186,6 +186,19 @@
         {% for ClientId, ClientAttr in Channels.items() %}
         <div id="div_client_config_{{ ClientId }}">
           {{ FORM.gen_form_empty_elements(ClientAttr.config) }}
+          {% if ClientId == "wechat_openclaw" %}
+          <div class="row">
+            <div class="col-12 mb-3">
+              <button type="button" class="btn btn-outline-primary"
+                      onclick="show_openclaw_qr_modal()">
+                扫码登录获取 Token
+              </button>
+              <span class="form-help ms-2"
+                    title="点击后弹出微信二维码，扫码确认即可自动填入 Bot Token / 接收用户ID / API 地址"
+                    data-bs-toggle="tooltip">?</span>
+            </div>
+          </div>
+          {% endif %}
         </div>
         {% endfor %}
         <details>
@@ -256,6 +269,28 @@
     </div>
   </div>
 </div>
+<div class="modal modal-blur fade" id="modal-openclaw-qr" tabindex="-1" role="dialog" aria-hidden="true" data-bs-backdrop="static" data-bs-keyboard="false">
+  <div class="modal-dialog modal-sm modal-dialog-centered" role="document">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">微信扫码登录</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body text-center">
+        <div id="openclaw_qr_canvas" class="d-flex justify-content-center mb-3" style="min-height:240px"></div>
+        <div id="openclaw_qr_status" class="text-muted">正在获取二维码...</div>
+        <div class="mt-2">
+          <a id="openclaw_qr_link" href="#" target="_blank" class="text-muted small d-none">无法显示二维码？点此用浏览器打开链接</a>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-link me-auto" data-bs-dismiss="modal">关闭</button>
+        <button type="button" id="openclaw_qr_refresh_btn" class="btn" onclick="start_openclaw_qr()">刷新二维码</button>
+      </div>
+    </div>
+  </div>
+</div>
+<script src="../static/js/libs/qrcode.min.js"></script>
 <script type="text/javascript">
 
   // 恢复输入项为默认值
@@ -473,4 +508,97 @@
       }
     });
   }
+
+  // openclaw-weixin 扫码登录
+  let openclaw_qr_timer = null;
+  let openclaw_qr_token = null;
+  let openclaw_qr_obj = null;
+
+  function show_openclaw_qr_modal() {
+    $("#modal-openclaw-qr").modal("show");
+    start_openclaw_qr();
+  }
+
+  function stop_openclaw_qr_polling() {
+    if (openclaw_qr_timer) {
+      clearTimeout(openclaw_qr_timer);
+      openclaw_qr_timer = null;
+    }
+  }
+
+  function start_openclaw_qr() {
+    stop_openclaw_qr_polling();
+    openclaw_qr_token = null;
+    $("#openclaw_qr_status").removeClass("text-danger text-success").addClass("text-muted").text("正在获取二维码...");
+    $("#openclaw_qr_link").addClass("d-none");
+    $("#openclaw_qr_canvas").empty();
+    openclaw_qr_obj = null;
+
+    ajax_post("openclaw_qr_start", {}, function (ret) {
+      if (ret.code !== 0) {
+        $("#openclaw_qr_status").removeClass("text-muted").addClass("text-danger").text(ret.msg || "获取二维码失败");
+        return;
+      }
+      openclaw_qr_token = ret.qrcode;
+      const content = ret.qrcode_img_content;
+      try {
+        openclaw_qr_obj = new QRCode(document.getElementById("openclaw_qr_canvas"), {
+          text: content,
+          width: 220,
+          height: 220,
+          correctLevel: QRCode.CorrectLevel.M
+        });
+      } catch (e) {
+        $("#openclaw_qr_canvas").text("二维码渲染失败");
+      }
+      $("#openclaw_qr_link").attr("href", content).removeClass("d-none");
+      $("#openclaw_qr_status").text("请使用微信扫描二维码");
+      poll_openclaw_qr_status();
+    });
+  }
+
+  function poll_openclaw_qr_status() {
+    if (!openclaw_qr_token) return;
+    ajax_post("openclaw_qr_status", { qrcode: openclaw_qr_token }, function (ret) {
+      const r = (ret && ret.result) || {};
+      const st = r.status;
+      if (st === "wait") {
+        $("#openclaw_qr_status").removeClass("text-danger text-success").addClass("text-muted").text("等待扫码...");
+      } else if (st === "scaned") {
+        $("#openclaw_qr_status").removeClass("text-danger text-muted").addClass("text-success").text("已扫码，请在微信中确认...");
+      } else if (st === "expired") {
+        stop_openclaw_qr_polling();
+        $("#openclaw_qr_status").removeClass("text-success text-muted").addClass("text-danger").text("二维码已过期，请刷新");
+        return;
+      } else if (st === "confirmed") {
+        stop_openclaw_qr_polling();
+        $("#openclaw_qr_status")
+          .removeClass("text-danger text-muted")
+          .addClass("text-success")
+          .html("✅ 登录成功，已自动填入配置<br><br>" +
+                "<span class='text-danger'><strong>⚠️ 关键步骤，请按顺序操作：</strong></span><br>" +
+                "<span class='text-start d-inline-block'>" +
+                "1. 点击 <strong>确定</strong> 保存配置<br>" +
+                "2. 用刚扫码的微信号给 bot 发一条任意消息（如 \"hi\"）<br>" +
+                "3. 等几秒后再点 <strong>测试</strong>" +
+                "</span><br><br>" +
+                "<span class='text-muted small'>openclaw 协议限制：必须先收到用户消息以获得 context_token，nas-tools 才能主动推送</span>");
+        $("#wechat_openclaw_bot_token").val(r.bot_token || "").removeClass("is-invalid");
+        $("#wechat_openclaw_to_user_id").val(r.to_user_id || "").removeClass("is-invalid");
+        $("#wechat_openclaw_base_url").val(r.base_url || "");
+        // 不再自动关闭弹窗，让用户看到提示
+        return;
+      } else if (st === "error") {
+        stop_openclaw_qr_polling();
+        $("#openclaw_qr_status").removeClass("text-success text-muted").addClass("text-danger").text(r.msg || "状态异常");
+        return;
+      }
+      openclaw_qr_timer = setTimeout(poll_openclaw_qr_status, 1500);
+    });
+  }
+
+  $("#modal-openclaw-qr").on("hidden.bs.modal", function () {
+    stop_openclaw_qr_polling();
+    openclaw_qr_token = null;
+  });
 </script>

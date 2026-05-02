@@ -184,6 +184,8 @@ class WebAction:
             "check_message_client": self.__check_message_client,
             "get_message_client": self.__get_message_client,
             "test_message_client": self.__test_message_client,
+            "openclaw_qr_start": self.__openclaw_qr_start,
+            "openclaw_qr_status": self.__openclaw_qr_status,
             "get_sites": self.__get_sites,
             "get_indexers": self.__get_indexers,
             "get_download_dirs": self.__get_download_dirs,
@@ -4299,6 +4301,29 @@ class WebAction:
             return {"code": 0}
         else:
             return {"code": 1}
+
+    @staticmethod
+    def __openclaw_qr_start(data=None):
+        """
+        启动 openclaw-weixin 扫码登录：拉取二维码
+        """
+        from app.helper.openclaw_helper import OpenClawHelper
+        ret = OpenClawHelper().start()
+        if ret.get("ok"):
+            return {"code": 0,
+                    "qrcode": ret["qrcode"],
+                    "qrcode_img_content": ret["qrcode_img_content"]}
+        return {"code": 1, "msg": ret.get("msg") or "获取二维码失败"}
+
+    @staticmethod
+    def __openclaw_qr_status(data):
+        """
+        轮询扫码状态
+        """
+        from app.helper.openclaw_helper import OpenClawHelper
+        qrcode = (data or {}).get("qrcode")
+        ret = OpenClawHelper().status(qrcode)
+        return {"code": 0, "result": ret}
 
     @staticmethod
     def __get_indexers(data=None):
