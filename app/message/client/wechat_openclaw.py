@@ -4,6 +4,7 @@ import json
 import os
 import secrets
 import threading
+from urllib.parse import quote
 
 from app.message.client._base import _IMessageClient
 from app.utils import RequestUtils, ExceptionUtils
@@ -19,6 +20,12 @@ ILINK_APP_VERSION = "2.1.7"
 ILINK_APP_CLIENT_VERSION = (2 << 16) | (1 << 8) | 7  # 131335
 CHANNEL_VERSION = ILINK_APP_VERSION
 DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com"
+DEFAULT_CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c"
+UPLOAD_MEDIA_TYPE_IMAGE = 1
+MESSAGE_ITEM_TYPE_TEXT = 1
+MESSAGE_ITEM_TYPE_IMAGE = 2
+MESSAGE_TYPE_BOT = 2
+MESSAGE_STATE_FINISH = 2
 
 # session-guard
 SESSION_EXPIRED_ERRCODE = -14
@@ -56,6 +63,7 @@ class WeChatOpenClaw(_IMessageClient):
         self._bot_token = None
         self._to_user_id = None
         self._base_url = DEFAULT_BASE_URL
+        self._cdn_base_url = DEFAULT_CDN_BASE_URL
         self._route_tag = None
         self._test = False
         # context_token 缓存：{user_id: token}
@@ -75,6 +83,8 @@ class WeChatOpenClaw(_IMessageClient):
         self._test = bool(cfg.get("test"))
         base = (cfg.get("base_url") or "").strip()
         self._base_url = base.rstrip("/") if base else DEFAULT_BASE_URL
+        cdn_base = (cfg.get("cdn_base_url") or "").strip()
+        self._cdn_base_url = cdn_base.rstrip("/") if cdn_base else DEFAULT_CDN_BASE_URL
         self._route_tag = (cfg.get("route_tag") or "").strip() or None
         self.__load_state()
         if not self._test:
@@ -346,10 +356,10 @@ class WeChatOpenClaw(_IMessageClient):
             "to_user_id": to_user_id,
             "client_id": client_id,
             # MessageType.BOT=2, MessageState.FINISH=2, MessageItemType.TEXT=1
-            "message_type": 2,
-            "message_state": 2,
+            "message_type": MESSAGE_TYPE_BOT,
+            "message_state": MESSAGE_STATE_FINISH,
             "item_list": [
-                {"type": 1, "text_item": {"text": content}}
+                {"type": MESSAGE_ITEM_TYPE_TEXT, "text_item": {"text": content}}
             ],
         }
         if ctok:
@@ -358,6 +368,149 @@ class WeChatOpenClaw(_IMessageClient):
             "msg": msg,
             "base_info": {"channel_version": CHANNEL_VERSION},
         }
+
+    def __build_item_message(self, item, to_user_id):
+        client_id = "nastools-" + secrets.token_hex(8)
+        ctok = self.__read_context_token(to_user_id)
+        msg = {
+            "from_user_id": "",
+            "to_user_id": to_user_id,
+            "client_id": client_id,
+            "message_type": MESSAGE_TYPE_BOT,
+            "message_state": MESSAGE_STATE_FINISH,
+            "item_list": [item],
+        }
+        if ctok:
+            msg["context_token"] = ctok
+        return {
+            "msg": msg,
+            "base_info": {"channel_version": CHANNEL_VERSION},
+        }
+
+    @staticmethod
+    def __read_image_bytes(image):
+        if image.startswith("http://") or image.startswith("https://"):
+            res = RequestUtils(proxies=Config().get_proxies(),
+                               timeout=DEFAULT_API_TIMEOUT_S).get_res(image)
+            if not res:
+                return None, "图片下载失败：未获取到响应"
+            if res.status_code // 100 != 2:
+                return None, f"图片下载失败 HTTP {res.status_code}"
+            return res.content, ""
+
+        path = image[7:] if image.startswith("file://") else image
+        if not os.path.exists(path):
+            return None, "图片文件不存在"
+        with open(path, "rb") as f:
+            return f.read(), ""
+
+    @staticmethod
+    def __encrypt_aes_ecb(plaintext, aeskey):
+        from Crypto.Cipher import AES
+        from Crypto.Util.Padding import pad
+
+        cipher = AES.new(aeskey, AES.MODE_ECB)
+        return cipher.encrypt(pad(plaintext, AES.block_size))
+
+    def __get_upload_url(self, image_bytes, to_user_id, filekey, aeskey_hex, ciphertext_size):
+        payload = {
+            "filekey": filekey,
+            "media_type": UPLOAD_MEDIA_TYPE_IMAGE,
+            "to_user_id": to_user_id,
+            "rawsize": len(image_bytes),
+            "rawfilemd5": hashlib.md5(image_bytes).hexdigest(),
+            "filesize": ciphertext_size,
+            "no_need_thumb": True,
+            "aeskey": aeskey_hex,
+            "base_info": {"channel_version": CHANNEL_VERSION},
+        }
+        res = self.__post_raw("ilink/bot/getuploadurl", payload,
+                              timeout=DEFAULT_API_TIMEOUT_S)
+        if not res:
+            return None, "获取图片上传地址失败：未获取到响应"
+        try:
+            data = res.json() if res.text else {}
+        except Exception:
+            return None, f"获取图片上传地址失败 HTTP {res.status_code}: {res.text[:200] if res.text else ''}"
+        if res.status_code // 100 != 2:
+            return None, f"获取图片上传地址失败 HTTP {res.status_code}: {data}"
+        upload_full_url = (data.get("upload_full_url") or "").strip()
+        upload_param = data.get("upload_param")
+        if not upload_full_url and not upload_param:
+            return None, f"获取图片上传地址失败：服务端未返回 upload_full_url/upload_param，resp={data}"
+        return {
+            "upload_full_url": upload_full_url,
+            "upload_param": upload_param,
+        }, ""
+
+    def __upload_image_to_cdn(self, image_bytes, to_user_id):
+        aeskey = secrets.token_bytes(16)
+        aeskey_hex = aeskey.hex()
+        ciphertext = self.__encrypt_aes_ecb(image_bytes, aeskey)
+        filekey = secrets.token_hex(16)
+        upload_url_info, err = self.__get_upload_url(
+            image_bytes=image_bytes,
+            to_user_id=to_user_id,
+            filekey=filekey,
+            aeskey_hex=aeskey_hex,
+            ciphertext_size=len(ciphertext),
+        )
+        if err:
+            return None, err
+
+        upload_full_url = upload_url_info.get("upload_full_url")
+        if upload_full_url:
+            upload_url = upload_full_url
+        else:
+            upload_url = (
+                f"{self._cdn_base_url}/upload?"
+                f"encrypted_query_param={quote(upload_url_info.get('upload_param') or '', safe='')}"
+                f"&filekey={quote(filekey, safe='')}"
+            )
+
+        res = RequestUtils(headers={"Content-Type": "application/octet-stream"},
+                           timeout=DEFAULT_API_TIMEOUT_S).post_res(upload_url,
+                                                                   params=ciphertext)
+        if not res:
+            return None, "图片 CDN 上传失败：未获取到响应"
+        if res.status_code != 200:
+            return None, f"图片 CDN 上传失败 HTTP {res.status_code}: {res.text[:200] if res.text else ''}"
+        download_param = res.headers.get("x-encrypted-param")
+        if not download_param:
+            return None, "图片 CDN 上传失败：响应缺少 x-encrypted-param"
+        return {
+            "filekey": filekey,
+            "download_param": download_param,
+            "aeskey": aeskey,
+            "ciphertext_size": len(ciphertext),
+        }, ""
+
+    def __build_image_message(self, uploaded, to_user_id):
+        image_item = {
+            "type": MESSAGE_ITEM_TYPE_IMAGE,
+            "image_item": {
+                "media": {
+                    "encrypt_query_param": uploaded.get("download_param"),
+                    "aes_key": base64.b64encode(uploaded.get("aeskey")).decode("ascii"),
+                    "encrypt_type": 1,
+                },
+                "mid_size": uploaded.get("ciphertext_size"),
+            },
+        }
+        return self.__build_item_message(image_item, to_user_id)
+
+    def __send_image_message(self, caption, image, to_user_id):
+        image_bytes, err = self.__read_image_bytes(image)
+        if err:
+            return False, err
+        uploaded, err = self.__upload_image_to_cdn(image_bytes, to_user_id)
+        if err:
+            return False, err
+        if caption:
+            ok, msg = self.__post_send(self.__build_text_message(caption, to_user_id))
+            if not ok:
+                return False, msg
+        return self.__post_send(self.__build_image_message(uploaded, to_user_id))
 
     def __precheck(self, to_user_id):
         if not self._bot_token:
@@ -384,9 +537,16 @@ class WeChatOpenClaw(_IMessageClient):
             parts.append(text.replace("\n\n", "\n"))
         if url:
             parts.append(url)
-        if image:
-            parts.append(image)
         content = "\n".join(parts)
+        if image:
+            ok, msg = self.__send_image_message(content, image, to)
+            if ok:
+                return ok, msg
+            log.warn(f"【WeChatOpenClaw】图片消息发送失败，回退为文本链接：{msg}")
+            fallback = content
+            if image:
+                fallback = f"{fallback}\n{image}" if fallback else image
+            return self.__post_send(self.__build_text_message(fallback, to))
         return self.__post_send(self.__build_text_message(content, to))
 
     def send_list_msg(self, medias: list, user_id="", title="", **kwargs):

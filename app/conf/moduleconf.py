@@ -193,6 +193,14 @@ class ModuleConf(object):
                         "type": "text",
                         "placeholder": "https://ilinkai.weixin.qq.com"
                     },
+                    "cdn_base_url": {
+                        "id": "wechat_openclaw_cdn_base_url",
+                        "required": False,
+                        "title": "CDN 地址",
+                        "tooltip": "图片上传 CDN 地址，默认 https://novac2c.cdn.weixin.qq.com/c2c",
+                        "type": "text",
+                        "placeholder": "https://novac2c.cdn.weixin.qq.com/c2c"
+                    },
                     "route_tag": {
                         "id": "wechat_openclaw_route_tag",
                         "required": False,
