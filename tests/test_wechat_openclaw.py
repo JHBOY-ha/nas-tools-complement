@@ -28,6 +28,40 @@ class WeChatOpenClawTest(TestCase):
         self.assertTrue(client.match("wechat_openclaw"))
         start_poll.assert_not_called()
 
+    def test_start_poll_reuses_stopping_owner_until_thread_exits(self):
+        from app.message.client.wechat_openclaw import WeChatOpenClaw
+
+        class AliveThread:
+            def is_alive(self):
+                return True
+
+        with patch.object(WeChatOpenClaw, "_WeChatOpenClaw__start_poll_thread"), \
+                patch("app.message.client.wechat_openclaw.Config") as config_cls:
+            config_cls.return_value.get_temp_path.return_value = "/tmp"
+            owner = WeChatOpenClaw({
+                "bot_token": "token",
+                "to_user_id": "user-a",
+                "test": True,
+            })
+            replacement = WeChatOpenClaw({
+                "bot_token": "token",
+                "to_user_id": "user-a",
+                "test": True,
+            })
+
+        try:
+            owner._poll_thread = AliveThread()
+            owner._stop_event.set()
+            WeChatOpenClaw._poll_owners["token"] = owner
+
+            with patch("app.message.client.wechat_openclaw.threading.Thread") as thread_cls:
+                replacement._WeChatOpenClaw__start_poll_thread()
+
+            thread_cls.assert_not_called()
+            self.assertIs(owner, WeChatOpenClaw._poll_owners.get("token"))
+        finally:
+            WeChatOpenClaw._poll_owners.pop("token", None)
+
     def test_send_msg_builds_text_payload_with_cached_context_token(self):
         from app.message.client.wechat_openclaw import WeChatOpenClaw
 

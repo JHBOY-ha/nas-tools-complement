@@ -190,8 +190,7 @@ class WeChatOpenClaw(_IMessageClient):
         with WeChatOpenClaw._poll_owners_lock:
             owner = WeChatOpenClaw._poll_owners.get(self._bot_token)
             if owner is not None and owner._poll_thread \
-                    and owner._poll_thread.is_alive() \
-                    and not owner._stop_event.is_set():
+                    and owner._poll_thread.is_alive():
                 # 已有 owner 在跑；本实例只读它的 context_token/buf
                 log.debug(f"【WeChatOpenClaw】复用已有长轮询 owner，token={self._bot_token[:6]}...")
                 return
