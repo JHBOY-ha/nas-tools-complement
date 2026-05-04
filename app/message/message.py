@@ -38,10 +38,9 @@ class Message(object):
         # 停止旧服务
         if self._active_clients:
             for active_client in self._active_clients:
-                if active_client.get("search_type") in self.get_search_types():
-                    client = active_client.get("client")
-                    if client and hasattr(client, "stop_service"):
-                        client.stop_service()
+                client = active_client.get("client")
+                if client and hasattr(client, "stop_service"):
+                    client.stop_service()
         # 活跃的客户端
         self._active_clients = []
         # 活跃的交互客户端
@@ -71,7 +70,7 @@ class Message(object):
             }
             client.update(client_conf)
             self._active_clients.append(client)
-            if client.get("interactive"):
+            if client.get("interactive") and client.get("search_type"):
                 self._active_interactive_clients[client.get("search_type")] = client
 
     def __build_class(self, ctype, conf):
@@ -89,6 +88,10 @@ class Message(object):
         """
         if not config or not ctype:
             return False
+        config = dict(config)
+        config.update({
+            "test": True
+        })
         # 测试状态不启动监听服务
         state, ret_msg = self.__build_class(ctype=ctype,
                                             conf=config).send_msg(title="测试",

@@ -57,6 +57,7 @@ class WeChatOpenClaw(_IMessageClient):
         self._to_user_id = None
         self._base_url = DEFAULT_BASE_URL
         self._route_tag = None
+        self._test = False
         # context_token 缓存：{user_id: token}
         self._context_tokens = {}
         # get_updates_buf 持久化
@@ -71,11 +72,13 @@ class WeChatOpenClaw(_IMessageClient):
         cfg = self._client_config or {}
         self._bot_token = (cfg.get("bot_token") or "").strip() or None
         self._to_user_id = (cfg.get("to_user_id") or "").strip() or None
+        self._test = bool(cfg.get("test"))
         base = (cfg.get("base_url") or "").strip()
         self._base_url = base.rstrip("/") if base else DEFAULT_BASE_URL
         self._route_tag = (cfg.get("route_tag") or "").strip() or None
         self.__load_state()
-        self.__start_poll_thread()
+        if not self._test:
+            self.__start_poll_thread()
 
     @classmethod
     def match(cls, ctype):
