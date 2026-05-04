@@ -167,7 +167,8 @@
               <div class="mb-1">
                 <label class="form-selectgroup-item" for="type_{{ Id }}">
                   <input type="radio" name="client_type" id="type_{{ Id }}" value="{{ Id }}"
-                         class="form-selectgroup-input" {% if loop.first %}checked{% endif %}>
+                         class="form-selectgroup-input" onclick="show_client_type(this.value)"
+                         {% if loop.first %}checked{% endif %}>
                   <span class="form-selectgroup-label d-flex align-items-center p-3">
                   <span class="me-3">
                     <span class="form-selectgroup-check"></span>
@@ -454,15 +455,20 @@
     });
   }
 
-  // 单选框事件
-  $('input[type=radio][name=client_type]').change(function () {
-    let type = this.value;
-    show_client_type(type);
-  });
+  // 单选框事件，页面通过局部加载进入时用委托绑定避免挂到旧 DOM 上
+  $(document)
+    .off("change.messageClientType", "input[type=radio][name=client_type]")
+    .on("change.messageClientType", "input[type=radio][name=client_type]", function () {
+      show_client_type(this.value);
+    });
 
   // 消息服务端类型
   function show_client_type(type) {
+    if (!type) {
+      return;
+    }
     $("div[id^='div_client_config']").hide();
+    $("input:radio[name=client_type]").prop("checked", false);
     {% for ClientId, ClientAttr in Channels.items() %}
       if (type === "{{ ClientId }}") {
         $("#div_client_config_{{ ClientId }}").show();
