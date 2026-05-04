@@ -139,10 +139,11 @@ class WeChatOpenClawTest(TestCase):
             headers = {"x-encrypted-param": "download-param"}
 
         upload_calls = []
+        request_kwargs = []
 
         class FakeRequestUtils:
             def __init__(self, *args, **kwargs):
-                pass
+                request_kwargs.append(kwargs)
 
             def post_res(self, url, params=None):
                 upload_calls.append((url, params))
@@ -154,7 +155,9 @@ class WeChatOpenClawTest(TestCase):
                       return_value=b"0123456789abcdef"), \
                 patch("app.message.client.wechat_openclaw.secrets.token_hex",
                       return_value="file/key"), \
+                patch("app.message.client.wechat_openclaw.Config") as config_cls, \
                 patch("app.message.client.wechat_openclaw.RequestUtils", FakeRequestUtils):
+            config_cls.return_value.get_proxies.return_value = {"https": "http://proxy"}
             uploaded, err = client._WeChatOpenClaw__upload_image_to_cdn(b"img", "user-a")
 
         self.assertEqual("", err)
@@ -162,6 +165,7 @@ class WeChatOpenClawTest(TestCase):
         self.assertEqual(b"0123456789abcdef", uploaded["aeskey"])
         self.assertEqual(16, uploaded["ciphertext_size"])
         self.assertEqual(1, len(upload_calls))
+        self.assertEqual({"https": "http://proxy"}, request_kwargs[-1].get("proxies"))
         upload_url, encrypted_body = upload_calls[0]
         self.assertEqual(
             "https://cdn.example/c2c/upload?"

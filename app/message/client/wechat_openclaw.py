@@ -469,6 +469,7 @@ class WeChatOpenClaw(_IMessageClient):
             )
 
         res = RequestUtils(headers={"Content-Type": "application/octet-stream"},
+                           proxies=Config().get_proxies(),
                            timeout=DEFAULT_API_TIMEOUT_S).post_res(upload_url,
                                                                    params=ciphertext)
         if not res:
