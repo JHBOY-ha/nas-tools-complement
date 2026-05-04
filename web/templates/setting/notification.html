@@ -167,7 +167,7 @@
               <div class="mb-1">
                 <label class="form-selectgroup-item" for="type_{{ Id }}">
                   <input type="radio" name="client_type" id="type_{{ Id }}" value="{{ Id }}"
-                         class="form-selectgroup-input" checked>
+                         class="form-selectgroup-input" {% if loop.first %}checked{% endif %}>
                   <span class="form-selectgroup-label d-flex align-items-center p-3">
                   <span class="me-3">
                     <span class="form-selectgroup-check"></span>
@@ -319,7 +319,10 @@
     $("#client_id").val('');
     $("#client_modal_title").text("新增消息通知");
     reset_message_config_fields();
-    show_client_type("{{ Channels.keys()|first }}");
+    const default_type = "{{ Channels.keys()|first }}";
+    $("input:radio[name=client_type]").prop("checked", false);
+    $("#type_" + default_type).prop("checked", true);
+    show_client_type(default_type);
     $("#test_message_client_btn").text("测试").attr("disabled", false);
     select_SelectALL(true, "message_switchs")
     $("#modal-message-client").modal("show");
@@ -459,11 +462,9 @@
 
   // 消息服务端类型
   function show_client_type(type) {
+    $("div[id^='div_client_config']").hide();
     {% for ClientId, ClientAttr in Channels.items() %}
       if (type === "{{ ClientId }}") {
-        $("div[id^='div_client_config']").each(function () {
-          $(this).hide();
-        });
         $("#div_client_config_{{ ClientId }}").show();
           {% if ClientAttr.get("search_type") %}
             $("#div_client_name").attr('class', 'col-lg-6');
