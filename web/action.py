@@ -184,6 +184,8 @@ class WebAction:
             "check_message_client": self.__check_message_client,
             "get_message_client": self.__get_message_client,
             "test_message_client": self.__test_message_client,
+            "openclaw_qr_start": self.__openclaw_qr_start,
+            "openclaw_qr_status": self.__openclaw_qr_status,
             "get_sites": self.__get_sites,
             "get_indexers": self.__get_indexers,
             "get_download_dirs": self.__get_download_dirs,
@@ -4234,6 +4236,10 @@ class WebAction:
         switchs = data.get("switchs")
         interactive = data.get("interactive")
         enabled = data.get("enabled")
+        if not (ModuleConf.MESSAGE_CONF.get('client') or {}).get(ctype, {}).get('search_type'):
+            interactive = 0
+        if int(interactive or 0):
+            self.__disable_same_search_type_clients(ctype=ctype, current_cid=cid)
         if cid:
             self.dbhelper.delete_message_client(cid=cid)
         self.dbhelper.insert_message_client(name=name,
@@ -4266,7 +4272,11 @@ class WebAction:
         if flag == "interactive":
             # TG/WX只能开启一个交互
             if checked:
-                self.dbhelper.check_message_client(interactive=0, ctype=ctype)
+                if not (ModuleConf.MESSAGE_CONF.get('client') or {}).get(ctype, {}).get('search_type'):
+                    self.dbhelper.check_message_client(cid=cid, interactive=0)
+                    Message().init_config()
+                    return {"code": 0}
+                self.__disable_same_search_type_clients(ctype=ctype, current_cid=cid)
             self.dbhelper.check_message_client(cid=cid,
                                                interactive=1 if checked else 0)
             Message().init_config()
@@ -4278,6 +4288,26 @@ class WebAction:
             return {"code": 0}
         else:
             return {"code": 1}
+
+    def __disable_same_search_type_clients(self, ctype, current_cid=None):
+        """
+        同一个交互渠道只保留一个入口。
+        """
+        clients_conf = ModuleConf.MESSAGE_CONF.get('client') or {}
+        search_type = clients_conf.get(ctype, {}).get('search_type')
+        if not search_type:
+            self.dbhelper.check_message_client(interactive=0, ctype=ctype)
+            return
+        same_types = [
+            client_type for client_type, client_conf in clients_conf.items()
+            if client_conf.get('search_type') == search_type
+        ]
+        for client in self.dbhelper.get_message_client() or []:
+            if client.TYPE not in same_types:
+                continue
+            if current_cid and str(client.ID) == str(current_cid):
+                continue
+            self.dbhelper.check_message_client(cid=client.ID, interactive=0)
 
     @staticmethod
     def __get_message_client(data):
@@ -4299,6 +4329,29 @@ class WebAction:
             return {"code": 0}
         else:
             return {"code": 1}
+
+    @staticmethod
+    def __openclaw_qr_start(data=None):
+        """
+        启动 openclaw-weixin 扫码登录：拉取二维码
+        """
+        from app.helper.openclaw_helper import OpenClawHelper
+        ret = OpenClawHelper().start()
+        if ret.get("ok"):
+            return {"code": 0,
+                    "qrcode": ret["qrcode"],
+                    "qrcode_img_content": ret["qrcode_img_content"]}
+        return {"code": 1, "msg": ret.get("msg") or "获取二维码失败"}
+
+    @staticmethod
+    def __openclaw_qr_status(data):
+        """
+        轮询扫码状态
+        """
+        from app.helper.openclaw_helper import OpenClawHelper
+        qrcode = (data or {}).get("qrcode")
+        ret = OpenClawHelper().status(qrcode)
+        return {"code": 0, "result": ret}
 
     @staticmethod
     def __get_indexers(data=None):

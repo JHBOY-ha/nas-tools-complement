@@ -165,6 +165,51 @@ class ModuleConf(object):
                     }
                 }
             },
+            "wechat_openclaw": {
+                "name": "微信(OpenClaw)",
+                "img_url": "../static/img/wechat.png",
+                "config": {
+                    "bot_token": {
+                        "id": "wechat_openclaw_bot_token",
+                        "required": True,
+                        "title": "Bot Token",
+                        "tooltip": "扫码登录后自动填入。⚠️ 扫码完成后请立即用该微信号主动给 bot 发一条任意消息（如 hi），否则因 openclaw 协议限制无法主动推送通知（必须先收到用户消息才能获得发送凭证 context_token）",
+                        "type": "text",
+                        "placeholder": "扫码登录后填入"
+                    },
+                    "to_user_id": {
+                        "id": "wechat_openclaw_to_user_id",
+                        "required": True,
+                        "title": "接收用户ID",
+                        "tooltip": "扫码登录脚本输出的 ilink_user_id，即接收消息的微信账号",
+                        "type": "text",
+                        "placeholder": "ilink_user_id"
+                    },
+                    "base_url": {
+                        "id": "wechat_openclaw_base_url",
+                        "required": False,
+                        "title": "API 地址",
+                        "tooltip": "默认 https://ilinkai.weixin.qq.com，登录脚本若返回了重定向后的 baseurl 请填入",
+                        "type": "text",
+                        "placeholder": "https://ilinkai.weixin.qq.com"
+                    },
+                    "cdn_base_url": {
+                        "id": "wechat_openclaw_cdn_base_url",
+                        "required": False,
+                        "title": "CDN 地址",
+                        "tooltip": "图片上传 CDN 地址，默认 https://novac2c.cdn.weixin.qq.com/c2c",
+                        "type": "text",
+                        "placeholder": "https://novac2c.cdn.weixin.qq.com/c2c"
+                    },
+                    "route_tag": {
+                        "id": "wechat_openclaw_route_tag",
+                        "required": False,
+                        "title": "SKRouteTag",
+                        "tooltip": "可选，特殊路由标签，一般留空",
+                        "type": "text"
+                    }
+                }
+            },
             "serverchan": {
                 "name": "Server酱",
                 "img_url": "../static/img/serverchan.png",
