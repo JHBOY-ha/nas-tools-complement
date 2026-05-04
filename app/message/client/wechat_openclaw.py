@@ -491,7 +491,7 @@ class WeChatOpenClaw(_IMessageClient):
             "image_item": {
                 "media": {
                     "encrypt_query_param": uploaded.get("download_param"),
-                    "aes_key": base64.b64encode(uploaded.get("aeskey")).decode("ascii"),
+                    "aes_key": base64.b64encode(uploaded.get("aeskey").hex().encode("ascii")).decode("ascii"),
                     "encrypt_type": 1,
                 },
                 "mid_size": uploaded.get("ciphertext_size"),

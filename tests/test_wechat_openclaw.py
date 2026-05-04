@@ -89,7 +89,10 @@ class WeChatOpenClawTest(TestCase):
         image_item = image_payload["msg"]["item_list"][0]
         self.assertEqual(2, image_item["type"])
         self.assertEqual("download-param", image_item["image_item"]["media"]["encrypt_query_param"])
-        self.assertEqual("MDEyMzQ1Njc4OWFiY2RlZg==", image_item["image_item"]["media"]["aes_key"])
+        self.assertEqual(
+            "MzAzMTMyMzMzNDM1MzYzNzM4Mzk2MTYyNjM2NDY1NjY=",
+            image_item["image_item"]["media"]["aes_key"]
+        )
         self.assertEqual(32, image_item["image_item"]["mid_size"])
 
     def test_send_msg_falls_back_to_text_when_image_upload_fails(self):
