@@ -3,7 +3,7 @@
 openclaw-weixin 扫码登录 CLI（独立脚本，不依赖 nastools 主程序）
 
 用法:
-    python3 scripts/openclaw_wechat_login.py
+    python3 app/helper/openclaw_wechat_login.py
 
 流程:
     1. 调用 ilink/bot/get_bot_qrcode 获取二维码 URL
