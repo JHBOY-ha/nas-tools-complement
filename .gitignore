@@ -23,3 +23,5 @@ config
 config/user.db
 config/config.yaml
 CLAUDE.md
+.qoder
+.vscode
