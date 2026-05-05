@@ -23,6 +23,7 @@ COPY package_list.txt /tmp/package_list.txt
 COPY requirements.txt /tmp/requirements.txt
 
 RUN apk add --no-cache libffi-dev \
+    && sed -i 's/\r$//' /tmp/package_list.txt \
     && apk add --no-cache $(echo $(cat /tmp/package_list.txt)) \
     && ln -sf /usr/share/zoneinfo/${TZ} /etc/localtime \
     && echo "${TZ}" > /etc/timezone \
