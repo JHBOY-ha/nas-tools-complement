@@ -113,6 +113,28 @@ class LLMMetaParserTest(TestCase):
 
         self.assertEqual({}, result)
 
+    def test_parse_should_not_use_reasoning_content_as_result(self):
+        self.parser._parse_cache = {}
+        mock_client = Mock()
+        mock_response = Mock()
+        mock_choice = Mock()
+        mock_choice.message.content = ""
+        mock_choice.message.reasoning_content = "{\"type\":\"movie\",\"en_name\":\"Dune\"}"
+        mock_choice.finish_reason = "stop"
+        mock_response.choices = [mock_choice]
+        mock_client.chat.completions.create.return_value = mock_response
+
+        with patch.object(self.parser, "_LLMMetaParser__is_client_ready", return_value=True), \
+                patch.object(self.parser, "_LLMMetaParser__get_client", return_value=mock_client):
+            result = self.parser.parse(title="Dune 2022")
+
+        self.assertEqual({}, result)
+        self.assertEqual("", self.parser._LLMMetaParser__extract_content(mock_response))
+        self.assertEqual(
+            "{\"type\":\"movie\",\"en_name\":\"Dune\"}",
+            self.parser._LLMMetaParser__extract_reasoning_content(mock_response)
+        )
+
     def test_get_status_success(self):
         mock_client = Mock()
         mock_response = Mock()
