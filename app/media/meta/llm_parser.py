@@ -106,7 +106,8 @@ class LLMMetaParser(object):
                     {"role": "user", "content": "OK"}
                 ],
                 max_tokens=1,
-                temperature=0
+                temperature=0,
+                extra_body={"thinking": {"type": "disabled"}}
             )
             return True if response and getattr(response, "choices", None) else False
         except Exception as err:
@@ -186,7 +187,8 @@ class LLMMetaParser(object):
                     {"role": "user", "content": user_prompt}
                 ],
                 temperature=0,
-                max_tokens=512
+                max_tokens=512,
+                extra_body={"thinking": {"type": "disabled"}}
             )
             content = self.__extract_content(response)
             if content:
