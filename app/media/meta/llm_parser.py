@@ -106,7 +106,8 @@ class LLMMetaParser(object):
                     {"role": "user", "content": "OK"}
                 ],
                 max_tokens=1,
-                temperature=0
+                temperature=0,
+                extra_body={"thinking": {"type": "disabled"}}
             )
             return True if response and getattr(response, "choices", None) else False
         except Exception as err:
@@ -186,13 +187,24 @@ class LLMMetaParser(object):
                     {"role": "user", "content": user_prompt}
                 ],
                 temperature=0,
-                max_tokens=512
+                max_tokens=512,
+                extra_body={"thinking": {"type": "disabled"}}
             )
             content = self.__extract_content(response)
             if content:
                 log.info("【Meta】LLM原始返回：%s" % self.__shorten_text(content, 2000))
             else:
-                log.info("【Meta】LLM原始返回为空")
+                reasoning_content = self.__extract_reasoning_content(response)
+                if reasoning_content:
+                    log.info(
+                        "【Meta】LLM原始返回为空，检测到思考内容：reasoning_content_len=%s, finish_reason=%s"
+                        % (
+                            len(reasoning_content),
+                            self.__extract_finish_reason(response)
+                        )
+                    )
+                else:
+                    log.info("【Meta】LLM原始返回为空")
             parsed = self.__parse_json(content)
             if not parsed:
                 self.__set_cached_parse_result(cache_key, {})
@@ -697,8 +709,31 @@ class LLMMetaParser(object):
     def __extract_content(self, response):
         if not response or not getattr(response, "choices", None):
             return ""
-        message = response.choices[0].message
-        content = getattr(message, "content", "")
+        message = self.__extract_message(response)
+        content = self.__get_value(message, "content", "")
+        return self.__extract_text_content(content)
+
+    @classmethod
+    def __extract_reasoning_content(cls, response):
+        if not response or not getattr(response, "choices", None):
+            return ""
+        message = cls.__extract_message(response)
+        reasoning_content = cls.__get_value(message, "reasoning_content", "")
+        return cls.__extract_text_content(reasoning_content)
+
+    @classmethod
+    def __extract_message(cls, response):
+        choice = response.choices[0]
+        return cls.__get_value(choice, "message")
+
+    @classmethod
+    def __extract_finish_reason(cls, response):
+        if not response or not getattr(response, "choices", None):
+            return ""
+        return cls.__get_value(response.choices[0], "finish_reason", "") or ""
+
+    @classmethod
+    def __extract_text_content(cls, content):
         if isinstance(content, str):
             return content.strip()
         if isinstance(content, list):
@@ -706,10 +741,24 @@ class LLMMetaParser(object):
             for item in content:
                 if isinstance(item, str):
                     text_list.append(item)
-                elif isinstance(item, dict) and item.get("text"):
-                    text_list.append(str(item.get("text")))
+                elif isinstance(item, dict):
+                    text = item.get("text") or item.get("content")
+                    if text:
+                        text_list.append(str(text))
+                else:
+                    text = cls.__get_value(item, "text") or cls.__get_value(item, "content")
+                    if text:
+                        text_list.append(str(text))
             return "\n".join(text_list).strip()
-        return str(content).strip()
+        return str(content).strip() if content else ""
+
+    @staticmethod
+    def __get_value(obj, key, default=None):
+        if obj is None:
+            return default
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
 
     @staticmethod
     def __parse_json(content):
