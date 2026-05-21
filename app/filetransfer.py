@@ -642,6 +642,50 @@ class FileTransfer:
 
                 # 判断文件是否已存在，返回：目录存在标志、目录名、文件存在标志、文件名
                 dir_exist_flag, ret_dir_path, file_exist_flag, ret_file_path = self.__is_media_exists(dist_path, media)
+
+                # 跨盘去重：自动选盘时，若当前目标盘没有该媒体文件，但媒体文件已存在于其它配置的目标路径，
+                # 跳过本次转移（硬链接无法跨文件系统，避免在多个盘各存一份重复硬链接）
+                # 注意：仅在"具体媒体文件"已存在时才算重复，仅目录存在不应拦截，
+                # 否则缺失文件的重试或同季的新集会被误判为重复
+                if not target_dir and not file_exist_flag:
+                    if media.type == MediaType.MOVIE:
+                        all_dest_paths = self._movie_path
+                    elif media.type == MediaType.ANIME:
+                        all_dest_paths = self._anime_path
+                    else:
+                        all_dest_paths = self._tv_path
+                    if all_dest_paths and isinstance(all_dest_paths, list) and len(all_dest_paths) > 1 \
+                            and not (media.type != MediaType.MOVIE and dir_exist_flag):
+                        # 剧集/动漫：若当前盘已有该季目录，沿用本盘逻辑，不做跨盘去重
+                        dup_path = None
+                        for check_path in all_dest_paths:
+                            try:
+                                if os.path.normpath(check_path) == os.path.normpath(dist_path):
+                                    continue
+                            except Exception:
+                                if check_path == dist_path:
+                                    continue
+                            check_dir_exist, check_ret_dir, check_file_exist, check_ret_file = self.__is_media_exists(
+                                check_path, media
+                            )
+                            if check_file_exist:
+                                if rmt_mode not in [RmtMode.LINK, RmtMode.SOFTLINK] \
+                                        and ((self._filesize_cover and media.size > os.path.getsize(check_ret_file))
+                                             or udf_flag):
+                                    log.info("【Rmt】%s 已存在于 %s，切换目标路径以覆盖高质量版本" % (file_name, check_path))
+                                    dist_path = check_path
+                                    dir_exist_flag = check_dir_exist
+                                    ret_dir_path = check_ret_dir
+                                    file_exist_flag = check_file_exist
+                                    ret_file_path = check_ret_file
+                                    dup_path = None
+                                    break
+                                dup_path = check_path
+                                break
+                        if dup_path:
+                            log.warn("【Rmt】%s 已存在于 %s，跳过转移避免跨盘重复" % (file_name, dup_path))
+                            failed_count += 1
+                            continue
                 # 新文件后缀
                 file_ext = os.path.splitext(file_item)[-1]
                 new_file = ret_file_path
