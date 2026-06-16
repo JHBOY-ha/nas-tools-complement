@@ -21,11 +21,14 @@ nas-tool-sandbox
 config
 
 config/user.db
-config/config.yaml
-CLAUDE.md
-.qoder
-.vscode
-config/config.yaml
-config/user.db
 
-config/default-category.yaml
+config/config.yaml
+
+CLAUDE.md
+
+.qoder
+
+.vscode
+
+
+
