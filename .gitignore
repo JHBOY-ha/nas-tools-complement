@@ -25,3 +25,7 @@ config/config.yaml
 CLAUDE.md
 .qoder
 .vscode
+config/config.yaml
+config/user.db
+
+config/default-category.yaml
