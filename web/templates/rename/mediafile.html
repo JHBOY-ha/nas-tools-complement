@@ -122,8 +122,8 @@
         <div class="mb-3">
           <label class="form-label required">目标影视服务器</label>
           <select id="upload_subtitle_server" class="form-select">
+            <option value="jellyfin" selected>Jellyfin</option>
             <option value="emby">Emby</option>
-            <option value="jellyfin">Jellyfin</option>
           </select>
         </div>
         <div class="mb-3">
@@ -325,6 +325,7 @@
     $("#upload_subtitle_media_name").val(name);
     $("#upload_subtitle_target_path").val("");
     $("#upload_subtitle_file").val("");
+    $("#upload_subtitle_server").val("jellyfin");
     $("#modal-upload-subtitle").modal("show");
   }
 
