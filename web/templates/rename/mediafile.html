@@ -101,6 +101,44 @@
     </div>
   </div>
 </div>
+<div class="modal modal-blur fade" id="modal-upload-subtitle" tabindex="-1" role="dialog" aria-hidden="true"
+     data-bs-backdrop="static" data-bs-keyboard="false">
+  <div class="modal-dialog modal-lg modal-dialog-centered" role="document">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">上传字幕</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="upload_subtitle_media_path">
+        <div class="mb-3">
+          <label class="form-label">媒体文件</label>
+          <input type="text" id="upload_subtitle_media_name" class="form-control" readonly>
+        </div>
+        <div class="mb-3">
+          <label class="form-label required">字幕文件</label>
+          <input type="file" id="upload_subtitle_file" class="form-control" accept=".srt,.ass,.ssa">
+        </div>
+        <div class="mb-3">
+          <label class="form-label required">目标影视服务器</label>
+          <select id="upload_subtitle_server" class="form-select">
+            <option value="emby">Emby</option>
+            <option value="jellyfin">Jellyfin</option>
+          </select>
+        </div>
+        <div class="mb-3">
+          <label class="form-label">目标电影文件</label>
+          <input type="text" id="upload_subtitle_target_path" class="form-control filetree-files-only"
+                 placeholder="可选；为空时使用最新整理历史">
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-link me-auto" data-bs-dismiss="modal">取消</button>
+        <button type="button" id="upload_subtitle_btn" class="btn btn-primary">上传</button>
+      </div>
+    </div>
+  </div>
+</div>
 <div class="modal modal-blur fade" id="modal-hardlinks" tabindex="-1" role="dialog" aria-hidden="true">
   <div class="modal-dialog modal-lg modal-dialog-centered" role="document">
     <div class="modal-content">
@@ -280,6 +318,56 @@
     });
   }
 
+  // 显示上传字幕
+  function show_upload_subtitle_modal(name, id) {
+    let path = $(`#mediafilepath_${id}`).val();
+    $("#upload_subtitle_media_path").val(path);
+    $("#upload_subtitle_media_name").val(name);
+    $("#upload_subtitle_target_path").val("");
+    $("#upload_subtitle_file").val("");
+    $("#modal-upload-subtitle").modal("show");
+  }
+
+  // 上传字幕
+  $("#upload_subtitle_btn").unbind("click").click(function () {
+    let file = $("#upload_subtitle_file")[0].files[0];
+    if (!file) {
+      show_fail_modal("请选择字幕文件！");
+      return;
+    }
+    let form_data = new FormData();
+    form_data.append("path", $("#upload_subtitle_media_path").val());
+    form_data.append("target_path", $("#upload_subtitle_target_path").val());
+    form_data.append("server", $("#upload_subtitle_server").val());
+    form_data.append("file", file);
+    NProgress.start();
+    $.ajax({
+      type: "POST",
+      url: "/subtitle/upload?random=" + Math.random(),
+      dataType: "json",
+      data: form_data,
+      cache: false,
+      processData: false,
+      contentType: false,
+      timeout: 0,
+      success: function (ret) {
+        NProgress.done();
+        $("#modal-upload-subtitle").modal("hide");
+        if (ret.code === 0) {
+          show_success_modal(ret.msg, function () {
+            refresh_files();
+          });
+        } else {
+          show_fail_modal(`${ret.msg}！`);
+        }
+      },
+      error: function () {
+        NProgress.done();
+        show_fail_modal("网络错误！");
+      }
+    });
+  });
+
   // 查询硬链接
   function find_hardlinks(files, dir) {
     ajax_post("find_hardlinks", {files: files, dir: dir}, function (ret) {
@@ -388,6 +476,7 @@
                 <button onclick='mediafile_name_test("{FILENAME}", "testresults_{FILEPOS}")' class="btn btn-sm btn-pill">识别</button>
                 <button onclick='mediafile_transfer("{FILENAME}", "{FILEPOS}")' class="btn btn-sm btn-pill">转移</button>
                 <button onclick='mediafile_subtitle("{FILENAME}", "{FILEPOS}")' class="btn btn-sm btn-pill">下载字幕</button>
+                <button onclick='show_upload_subtitle_modal("{FILENAME}", "{FILEPOS}")' class="btn btn-sm btn-pill">上传字幕</button>
                 <button onclick='mediafile_findlinks("{FILENAME}", "{FILEPOS}")' class="btn btn-sm btn-pill">硬链接查询</button>
                 <button onclick='show_mediafile_rename_modal("{FILENAME}", "{FILEPOS}")' class="btn btn-sm btn-pill">重命名</button>
                 <button onclick='mediafile_delete("{FILENAME}", "{FILEPOS}")' class="btn btn-sm btn-pill">删除</button>

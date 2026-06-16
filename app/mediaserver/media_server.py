@@ -56,6 +56,15 @@ class MediaServer:
     def __get_server(self, ctype: MediaServerType, conf=None):
         return self.__build_class(ctype=ctype.value, conf=conf)
 
+    def get_server_by_type(self, server_type):
+        """
+        根据指定类型获取媒体服务器实例
+        """
+        ctype = ModuleConf.MEDIASERVER_DICT.get(server_type)
+        if not ctype:
+            return None
+        return self.__get_server(ctype)
+
     def get_type(self):
         """
         当前使用的媒体库服务器
@@ -95,6 +104,15 @@ class MediaServer:
         if not self.server:
             return
         return self.server.refresh_root_library()
+
+    def refresh_root_library_by_type(self, server_type):
+        """
+        刷新指定媒体服务器整个媒体库
+        """
+        server = self.get_server_by_type(server_type)
+        if not server:
+            return False
+        return server.refresh_root_library()
 
     def get_image_by_id(self, item_id, image_type):
         """

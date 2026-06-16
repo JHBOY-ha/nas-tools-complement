@@ -23,20 +23,21 @@ from app.brushtask import BrushTask
 from app.conf import ModuleConf, SystemConfig
 from app.downloader import Downloader
 from app.filter import Filter
-from app.helper import SecurityHelper, MetaHelper, ChromeHelper, ThreadHelper
+from app.helper import SecurityHelper, MetaHelper, ChromeHelper, ThreadHelper, DbHelper
 from app.indexer import Indexer
 from app.media.meta import MetaInfo
-from app.mediaserver import WebhookEvent
+from app.mediaserver import WebhookEvent, MediaServer
 from app.message import Message
 from app.rsschecker import RssChecker
 from app.sites import Sites
 from app.speedlimiter import SpeedLimiter
 from app.subscribe import Subscribe
 from app.sync import Sync
+from app.subtitle import Subtitle
 from app.torrentremover import TorrentRemover
 from app.utils import DomUtils, SystemUtils, ExceptionUtils, StringUtils
 from app.utils.types import *
-from config import PT_TRANSFER_INTERVAL, Config
+from config import PT_TRANSFER_INTERVAL, Config, RMT_MEDIAEXT
 from web.action import WebAction
 from web.apiv1 import apiv1_bp
 from web.backend.WXBizMsgCrypt3 import WXBizMsgCrypt
@@ -1750,6 +1751,57 @@ def upload():
     except Exception as e:
         ExceptionUtils.exception_traceback(e)
         return {"code": 1, "msg": str(e), "filepath": ""}
+
+
+# 手动上传字幕
+@App.route('/subtitle/upload', methods=['POST'])
+@login_required
+def upload_subtitle():
+    try:
+        media_file = request.form.get("path")
+        target_file = request.form.get("target_path") or ""
+        server_type = request.form.get("server") or ""
+        upload_file = request.files.get("file")
+        if not media_file:
+            return {"code": -1, "msg": "媒体文件不能为空"}
+        media_file = os.path.normpath(media_file)
+        if not os.path.exists(media_file) or not os.path.isfile(media_file):
+            return {"code": -1, "msg": "媒体文件不存在"}
+        if os.path.splitext(media_file)[-1].lower() not in RMT_MEDIAEXT:
+            return {"code": -1, "msg": "请选择有效的媒体文件"}
+        if server_type not in ["emby", "jellyfin"]:
+            return {"code": -1, "msg": "请选择目标影视服务器"}
+        if not upload_file:
+            return {"code": -1, "msg": "请选择字幕文件"}
+
+        history = DbHelper().get_latest_transfer_history_by_source_full_path(media_file)
+        rmt_mode = ModuleConf.get_enum_item(RmtMode, history.MODE) if history and history.MODE else None
+        if not rmt_mode:
+            rmt_mode = ModuleConf.RMT_MODES.get(Config().get_config('pt').get('rmt_mode') or "link")
+        if target_file:
+            target_file = os.path.normpath(target_file)
+        elif history and history.DEST_PATH and history.DEST_FILENAME:
+            target_file = os.path.join(history.DEST_PATH, history.DEST_FILENAME)
+
+        success, message, data = Subtitle().upload_subtitle(upload_file=upload_file,
+                                                           media_file=media_file,
+                                                           target_media_file=target_file,
+                                                           rmt_mode=rmt_mode)
+        refresh_msg = ""
+        if success and data.get("synced"):
+            try:
+                refreshed = MediaServer().refresh_root_library_by_type(server_type)
+                if refreshed is False:
+                    refresh_msg = "，但刷新媒体服务器失败"
+            except Exception as e:
+                ExceptionUtils.exception_traceback(e)
+                refresh_msg = f"，但刷新媒体服务器失败：{str(e)}"
+        return {"code": 0 if success else -1,
+                "msg": f"{message}{refresh_msg}",
+                "data": data}
+    except Exception as e:
+        ExceptionUtils.exception_traceback(e)
+        return {"code": -1, "msg": str(e)}
 
 
 # base64模板过滤器

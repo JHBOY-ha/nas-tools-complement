@@ -299,6 +299,20 @@ class DbHelper:
         else:
             return False
 
+    def get_latest_transfer_history_by_source_full_path(self, source_full_path):
+        """
+        据源文件的全路径查询最新识别转移记录
+        """
+        if not source_full_path:
+            return None
+        source_full_path = os.path.normpath(source_full_path)
+        path = os.path.dirname(source_full_path)
+        filename = os.path.basename(source_full_path)
+        return self._db.query(TRANSFERHISTORY).filter(TRANSFERHISTORY.SOURCE_PATH == path,
+                                                      TRANSFERHISTORY.SOURCE_FILENAME == filename).order_by(
+            TRANSFERHISTORY.DATE.desc(), TRANSFERHISTORY.ID.desc()
+        ).first()
+
     @DbPersist(_db)
     def delete_transfer_log_by_id(self, logid):
         """
