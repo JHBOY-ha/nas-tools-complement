@@ -252,6 +252,10 @@ body, .page {
     display: block;
 }
 
+.lit-library-card-poster img:not([src]) {
+    visibility: hidden;
+}
+
 .lit-library-card-poster.no-poster {
     background:
         linear-gradient(145deg, rgba(var(--tblr-primary-rgb), 0.1), rgba(var(--tblr-primary-rgb), 0.02)),

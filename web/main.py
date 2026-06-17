@@ -1000,6 +1000,13 @@ def mediafile():
                            Dir=DirR or DirD)
 
 
+# 媒体库字幕管理页面
+@App.route('/medialibrary', methods=['POST', 'GET'])
+@login_required
+def medialibrary():
+    return render_template("rename/medialibrary.html")
+
+
 # 基础设置页面
 @App.route('/basic', methods=['POST', 'GET'])
 @login_required
@@ -1099,7 +1106,7 @@ def library():
 @login_required
 def library_items():
     """
-    首页媒体库项目列表
+    媒体库项目列表
     """
     try:
         data = request.get_json(silent=True) or request.form.to_dict() or {}
@@ -1113,7 +1120,7 @@ def library_items():
 @login_required
 def library_episodes():
     """
-    首页媒体库剧集列表
+    媒体库剧集列表
     """
     try:
         data = request.get_json(silent=True) or request.form.to_dict() or {}
