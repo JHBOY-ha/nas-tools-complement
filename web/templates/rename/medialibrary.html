@@ -14,7 +14,14 @@
       <div class="col-12 lit-library-section">
         <div class="card lit-library-panel">
           <div class="card-header">
-            <h3 class="card-title">媒体库</h3>
+            <h3 class="card-title d-flex align-items-center gap-2">
+              <span>媒体库</span>
+              <button class="btn btn-icon btn-sm btn-ghost-secondary" type="button"
+                      data-bs-toggle="modal" data-bs-target="#index-library-help-modal"
+                      aria-label="查看媒体库字幕状态说明" title="查看说明">
+                {{ SVG.circle_question() }}
+              </button>
+            </h3>
             <div class="card-actions">
               <button class="btn" type="button" onclick="load_library_items(1)">
                 {{ SVG.refresh() }}
@@ -70,6 +77,67 @@
             </button>
           </div>
         </div>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="modal modal-blur fade" id="index-library-help-modal" tabindex="-1" role="dialog" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable" role="document">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">媒体库字幕状态说明</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div class="divide-y">
+          <div class="py-3">
+            <div class="fw-bold mb-1">为什么显示“未检测”？</div>
+            <div class="text-muted">
+              常见原因是媒体还没有整理/链接记录、媒体服务器同步项缺少本地路径、剧集还没有展开到单集文件，或当前筛选阶段只做快速检测。
+              先点击“媒体库同步”，再回到本页点击“刷新”；电视剧和番剧请点击“选择剧集”查看单集状态。
+            </div>
+          </div>
+          <div class="py-3">
+            <div class="fw-bold mb-1">为什么已经有字幕但仍显示“缺中文字幕”？</div>
+            <div class="text-muted">
+              系统按媒体文件同目录、同文件名前缀检测外挂字幕，并识别中文语言标记。请确认字幕在媒体链接后的目标目录里，
+              且文件名类似 <code>Movie.zh-CN.srt</code>、<code>Movie.zh-TW.ass</code>、<code>Movie.chi.srt</code>。
+            </div>
+          </div>
+          <div class="py-3">
+            <div class="fw-bold mb-1">上传字幕后媒体服务器没有立刻显示怎么办？</div>
+            <div class="text-muted">
+              上传成功后会刷新所选目标影视服务器。若仍未显示，请确认上传弹窗里的服务器类型与当前使用的 Emby/Jellyfin/Plex 一致，
+              并在媒体服务器中手动刷新对应媒体或整个媒体库。
+            </div>
+          </div>
+          <div class="py-3">
+            <div class="fw-bold mb-1">Plex 字幕命名应该是什么？</div>
+            <div class="text-muted">
+              Plex 会保留简繁标签，例如 <code>Movie.zh-CN.srt</code>、<code>Movie.zh-TW.srt</code>。
+              英文和特殊字幕可用 <code>Movie.en.forced.srt</code>、<code>Movie.en.sdh.vtt</code>。
+            </div>
+          </div>
+          <div class="py-3">
+            <div class="fw-bold mb-1">按字幕状态筛选为什么和单集弹窗结果不同？</div>
+            <div class="text-muted">
+              为避免大媒体库请求卡住，列表筛选阶段不会对全库逐项运行 ffprobe，只使用已有流信息和外挂字幕快速检测。
+              打开电视剧/番剧的“选择剧集”弹窗可以查看更细的单集检测结果。
+            </div>
+          </div>
+          <div class="py-3">
+            <div class="fw-bold mb-1">手动排查顺序</div>
+            <ol class="text-muted mb-0 ps-3">
+              <li>确认媒体已经完成整理/链接，并且目标媒体文件存在。</li>
+              <li>确认字幕文件在目标媒体文件同目录，文件名前缀和媒体文件一致。</li>
+              <li>点击“媒体库同步”，再点击本页“刷新”。</li>
+              <li>电视剧/番剧进入“选择剧集”，逐集确认字幕状态。</li>
+            </ol>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-primary" data-bs-dismiss="modal">知道了</button>
       </div>
     </div>
   </div>
