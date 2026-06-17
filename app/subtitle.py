@@ -10,8 +10,8 @@ from app.conf import SiteConf
 from app.helper import OpenSubtitles
 from app.utils import RequestUtils, PathUtils, SystemUtils, StringUtils, ExceptionUtils
 from app.utils.commons import singleton
-from app.utils.types import MediaType
-from config import Config, RMT_SUBEXT
+from app.utils.types import MediaType, RmtMode
+from config import Config, RMT_MEDIAEXT, RMT_SUBEXT
 
 
 @singleton
@@ -67,6 +67,127 @@ class Subtitle:
         elif _server == "chinesesubfinder":
             return self.__download_chinesesubfinder(items)
         return False, "未配置字幕下载器"
+
+    def upload_subtitle(self, upload_file, media_file, target_media_file=None, rmt_mode=None):
+        """
+        手动上传字幕并同步到目标媒体文件目录
+        :param upload_file: Flask上传文件对象
+        :param media_file: 原媒体文件路径
+        :param target_media_file: 媒体库目标媒体文件路径
+        :param rmt_mode: 目标同步方式
+        """
+        if not upload_file or not media_file:
+            return False, "参数有误", {}
+        if not os.path.exists(media_file) or not os.path.isfile(media_file):
+            return False, "媒体文件不存在", {}
+        if os.path.splitext(media_file)[-1].lower() not in RMT_MEDIAEXT:
+            return False, "请选择有效的媒体文件", {}
+
+        upload_name = os.path.basename(upload_file.filename or "")
+        sub_ext = os.path.splitext(upload_name)[-1].lower()
+        if sub_ext not in RMT_SUBEXT:
+            return False, "仅支持上传 srt、ass、ssa 字幕文件", {}
+
+        language_tag = self.__guess_language_tag(upload_name)
+        try:
+            source_sub_file = self.__build_subtitle_path(media_file, language_tag, sub_ext)
+        except Exception as e:
+            ExceptionUtils.exception_traceback(e)
+            return False, f"生成源字幕文件名失败：{str(e)}", {}
+        try:
+            upload_file.save(source_sub_file)
+        except Exception as e:
+            ExceptionUtils.exception_traceback(e)
+            return False, f"保存源字幕失败：{str(e)}", {}
+
+        result = {
+            "source_subtitle": source_sub_file,
+            "target_subtitle": "",
+            "language": language_tag,
+            "synced": False
+        }
+        if not target_media_file:
+            return True, "字幕已保存到源目录，未找到媒体库目标文件", result
+        if not os.path.exists(target_media_file) or not os.path.isfile(target_media_file):
+            return True, "字幕已保存到源目录，媒体库目标文件不存在，未同步", result
+        if os.path.splitext(target_media_file)[-1].lower() not in RMT_MEDIAEXT:
+            return True, "字幕已保存到源目录，目标文件不是有效媒体文件，未同步", result
+
+        if os.path.normpath(media_file) == os.path.normpath(target_media_file):
+            result["target_subtitle"] = source_sub_file
+            result["synced"] = True
+            return True, "字幕已保存到媒体目录", result
+
+        source_norm = os.path.normpath(source_sub_file)
+        try:
+            target_sub_file = self.__build_subtitle_path(target_media_file, language_tag, sub_ext)
+        except Exception as e:
+            ExceptionUtils.exception_traceback(e)
+            return False, f"生成目标字幕文件名失败：{str(e)}", result
+        target_norm = os.path.normpath(target_sub_file)
+        if source_norm == target_norm:
+            result["target_subtitle"] = target_sub_file
+            result["synced"] = True
+            return True, "字幕已保存到媒体目录", result
+
+        retcode, retmsg = self.__sync_manual_subtitle(source_sub_file, target_sub_file, rmt_mode)
+        result["target_subtitle"] = target_sub_file
+        if retcode != 0:
+            return False, f"字幕已保存到源目录，同步到媒体库失败：{retmsg}", result
+        result["synced"] = True
+        return True, "字幕已保存并同步到媒体库目录", result
+
+    @staticmethod
+    def __guess_language_tag(file_name):
+        """
+        根据字幕文件名识别语言标签
+        """
+        name = file_name or ""
+        _zhcn_sub_re = r"([.\[(](((zh[-_])?(cn|ch[si]|sg|sc))|zho?|chi|chinese" \
+                       r"|简[体中]?)[.\])])|中文字幕|简体|简中"
+        _zhtw_sub_re = r"([.\[(](((zh[-_])?(hk|tw|cht|tc))|繁[体中]?)[.\])])" \
+                       r"|繁体中[文字]|中[文字]繁体|繁体|繁中"
+        _eng_sub_re = r"([.\[(](eng|english)[.\])])|英文"
+        if re.search(_zhtw_sub_re, name, re.I):
+            return "zh-TW"
+        if re.search(_eng_sub_re, name, re.I):
+            return "eng"
+        if re.search(_zhcn_sub_re, name, re.I):
+            return "zh-CN"
+        return "zh-CN"
+
+    @staticmethod
+    def __build_subtitle_path(media_file, language_tag, sub_ext):
+        """
+        生成不覆盖已有文件的外挂字幕路径
+        """
+        media_base = os.path.splitext(media_file)[0]
+        target = f"{media_base}.{language_tag}{sub_ext}"
+        if not os.path.exists(target):
+            return target
+        for index in range(1, 100):
+            target = f"{media_base}.{language_tag}({index}){sub_ext}"
+            if not os.path.exists(target):
+                return target
+        raise FileExistsError("字幕文件重名过多")
+
+    @staticmethod
+    def __sync_manual_subtitle(source_sub_file, target_sub_file, rmt_mode=None):
+        """
+        根据整理模式同步手动上传字幕
+        """
+        try:
+            target_dir = os.path.dirname(target_sub_file)
+            if target_dir and not os.path.exists(target_dir):
+                os.makedirs(target_dir)
+            if rmt_mode == RmtMode.LINK:
+                return SystemUtils.link(source_sub_file, target_sub_file)
+            if rmt_mode == RmtMode.SOFTLINK:
+                return SystemUtils.softlink(source_sub_file, target_sub_file)
+            return SystemUtils.copy(source_sub_file, target_sub_file)
+        except Exception as e:
+            ExceptionUtils.exception_traceback(e)
+            return -1, str(e)
 
     def __search_opensubtitles(self, item):
         """

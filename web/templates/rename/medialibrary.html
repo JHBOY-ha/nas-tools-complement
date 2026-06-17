@@ -1,0 +1,127 @@
+{% import 'macro/svg.html' as SVG %}
+<div class="container-xl">
+  <div class="page-header d-print-none">
+    <div class="row align-items-center">
+      <div class="col">
+        <h2 class="page-title">媒体库</h2>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="page-body">
+  <div class="container-xl">
+    <div class="row row-cards">
+      <div class="col-12 lit-library-section">
+        <div class="card lit-library-panel">
+          <div class="card-header">
+            <h3 class="card-title">媒体库</h3>
+            <div class="card-actions">
+              <button class="btn" type="button" onclick="load_library_items(1)">
+                {{ SVG.refresh() }}
+                刷新
+              </button>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="row g-2 align-items-end">
+              <div class="col-6 col-md-3 col-xl-2">
+                <label class="form-label">类型</label>
+                <select id="library_filter_type" class="form-select">
+                  <option value="all">全部</option>
+                  <option value="movie">电影</option>
+                  <option value="tv">电视剧</option>
+                  <option value="anime">动漫</option>
+                </select>
+              </div>
+              <div class="col-6 col-md-3 col-xl-2">
+                <label class="form-label">小分类</label>
+                <select id="library_filter_category" class="form-select">
+                  <option value="">全部</option>
+                </select>
+              </div>
+              <div class="col-6 col-md-3 col-xl-2">
+                <label class="form-label">字幕状态</label>
+                <select id="library_filter_subtitle" class="form-select">
+                  <option value="all">全部</option>
+                  <option value="missing">缺中文字幕</option>
+                  <option value="ok">已有中文字幕</option>
+                </select>
+              </div>
+              <div class="col-12 col-md-3 col-xl-4">
+                <label class="form-label">搜索</label>
+                <input id="library_filter_keyword" type="text" class="form-control" placeholder="标题、原名、年份">
+              </div>
+              <div class="col-12 col-xl-2">
+                <button class="btn btn-primary w-100" type="button" onclick="load_library_items(1)">筛选</button>
+              </div>
+            </div>
+            <div id="library_items_summary" class="text-muted mt-3"></div>
+          </div>
+          <div id="library_items_grid" class="lit-library-grid"></div>
+          <div class="card-footer d-flex align-items-center">
+            <button id="library_prev_btn" class="btn" type="button" onclick="load_library_items(library_page - 1)">
+              {{ SVG.chevron_left() }}
+              上一页
+            </button>
+            <div id="library_page_text" class="text-muted mx-auto"></div>
+            <button id="library_next_btn" class="btn" type="button" onclick="load_library_items(library_page + 1)">
+              下一页
+              {{ SVG.chevron_right() }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="modal modal-blur fade" id="index-library-episodes-modal" tabindex="-1" role="dialog" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable" role="document">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="index_library_episodes_title">选择剧集</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div id="index_library_episodes_body" class="divide-y"></div>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="modal modal-blur fade" id="index-upload-subtitle-modal" tabindex="-1" role="dialog" aria-hidden="true"
+     data-bs-backdrop="static" data-bs-keyboard="false">
+  <div class="modal-dialog modal-md modal-dialog-centered" role="document">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">上传字幕</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="index_upload_subtitle_path">
+        <input type="hidden" id="index_upload_subtitle_target_path">
+        <div class="mb-3">
+          <label class="form-label">媒体文件</label>
+          <input type="text" id="index_upload_subtitle_name" class="form-control" readonly>
+        </div>
+        <div class="mb-3">
+          <label class="form-label required">字幕文件</label>
+          <input type="file" id="index_upload_subtitle_file" class="form-control" accept=".srt,.ass,.ssa">
+        </div>
+        <div class="mb-3">
+          <label class="form-label required">目标影视服务器</label>
+          <select id="index_upload_subtitle_server" class="form-select">
+            <option value="jellyfin" selected>Jellyfin</option>
+            <option value="emby">Emby</option>
+          </select>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn me-auto" data-bs-dismiss="modal">取消</button>
+        <button type="button" id="index_upload_subtitle_btn" class="btn btn-primary">上传</button>
+      </div>
+    </div>
+  </div>
+</div>
+<script type="text/javascript" src="../static/js/media-library.js"></script>
+<script type="text/javascript">
+  init_media_library_page({page_size: 18});
+</script>

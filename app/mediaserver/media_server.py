@@ -56,6 +56,15 @@ class MediaServer:
     def __get_server(self, ctype: MediaServerType, conf=None):
         return self.__build_class(ctype=ctype.value, conf=conf)
 
+    def get_server_by_type(self, server_type):
+        """
+        根据指定类型获取媒体服务器实例
+        """
+        ctype = ModuleConf.MEDIASERVER_DICT.get(server_type)
+        if not ctype:
+            return None
+        return self.__get_server(ctype)
+
     def get_type(self):
         """
         当前使用的媒体库服务器
@@ -96,6 +105,15 @@ class MediaServer:
             return
         return self.server.refresh_root_library()
 
+    def refresh_root_library_by_type(self, server_type):
+        """
+        刷新指定媒体服务器整个媒体库
+        """
+        server = self.get_server_by_type(server_type)
+        if not server:
+            return False
+        return server.refresh_root_library()
+
     def get_image_by_id(self, item_id, image_type):
         """
         根据ItemId从媒体服务器查询图片地址
@@ -106,6 +124,14 @@ class MediaServer:
         if not self.server:
             return None
         return self.server.get_image_by_id(item_id, image_type)
+
+    def get_item_image(self, item_id, image_type="Primary"):
+        """
+        获取媒体服务器项目图片响应
+        """
+        if not self.server:
+            return None
+        return self.server.get_item_image(item_id, image_type)
 
     def get_no_exists_episodes(self, meta_info,
                                season_number,
@@ -159,6 +185,14 @@ class MediaServer:
         if not self.server:
             return []
         return self.server.get_items(parent)
+
+    def get_episodes(self, series_id):
+        """
+        获取电视剧/动漫下所有剧集
+        """
+        if not self.server:
+            return []
+        return self.server.get_episodes(series_id)
 
     def sync_mediaserver(self):
         """
