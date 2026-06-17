@@ -313,6 +313,17 @@ class DbHelper:
             TRANSFERHISTORY.DATE.desc(), TRANSFERHISTORY.ID.desc()
         ).first()
 
+    def get_transfer_histories_with_dest(self):
+        """
+        查询已有目标文件的识别转移记录
+        """
+        return self._db.query(TRANSFERHISTORY).filter(TRANSFERHISTORY.DEST_PATH.isnot(None),
+                                                      TRANSFERHISTORY.DEST_FILENAME.isnot(None),
+                                                      TRANSFERHISTORY.DEST_PATH != '',
+                                                      TRANSFERHISTORY.DEST_FILENAME != '').order_by(
+            TRANSFERHISTORY.DATE.desc(), TRANSFERHISTORY.ID.desc()
+        ).all()
+
     @DbPersist(_db)
     def delete_transfer_log_by_id(self, logid):
         """

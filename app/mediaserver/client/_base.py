@@ -100,6 +100,21 @@ class _IMediaClient(metaclass=ABCMeta):
         """
         pass
 
+    def get_episodes(self, series_id):
+        """
+        获取电视剧/动漫下的所有剧集
+        :param series_id: 电视剧/动漫项目ID
+        """
+        return []
+
+    def get_item_image(self, item_id, image_type="Primary"):
+        """
+        获取媒体服务器项目图片响应
+        :param item_id: 媒体服务器项目ID
+        :param image_type: 图片类型
+        """
+        return None
+
     @abstractmethod
     def get_playing_sessions(self):
         """

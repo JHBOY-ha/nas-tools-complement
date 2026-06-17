@@ -25,6 +25,7 @@ from app.downloader import Downloader
 from app.filter import Filter
 from app.helper import SecurityHelper, MetaHelper, ChromeHelper, ThreadHelper, DbHelper
 from app.indexer import Indexer
+from app.library import MediaLibrary
 from app.media.meta import MetaInfo
 from app.mediaserver import WebhookEvent, MediaServer
 from app.message import Message
@@ -1092,6 +1093,57 @@ def indexer():
 @login_required
 def library():
     return render_template("setting/library.html", Config=Config().get_config())
+
+
+@App.route('/library/items', methods=['POST'])
+@login_required
+def library_items():
+    """
+    首页媒体库项目列表
+    """
+    try:
+        data = request.get_json(silent=True) or request.form.to_dict() or {}
+        return MediaLibrary().list_items(data)
+    except Exception as e:
+        ExceptionUtils.exception_traceback(e)
+        return {"code": -1, "msg": str(e)}
+
+
+@App.route('/library/episodes', methods=['POST'])
+@login_required
+def library_episodes():
+    """
+    首页媒体库剧集列表
+    """
+    try:
+        data = request.get_json(silent=True) or request.form.to_dict() or {}
+        return MediaLibrary().get_episodes(data)
+    except Exception as e:
+        ExceptionUtils.exception_traceback(e)
+        return {"code": -1, "msg": str(e)}
+
+
+@App.route('/library/image/<itemid>', methods=['GET'])
+@login_required
+def library_image(itemid):
+    """
+    代理媒体服务器封面，避免前端暴露媒体服务器API Key
+    """
+    try:
+        image_type = request.args.get("type") or "Primary"
+        res = MediaServer().get_item_image(itemid, image_type)
+        if not res or res.status_code != 200:
+            poster_file = MediaLibrary().get_local_poster_file(itemid)
+            if poster_file:
+                return send_file(poster_file)
+            return "", 404
+        response = make_response(res.content)
+        response.headers["Content-Type"] = res.headers.get("Content-Type") or "image/jpeg"
+        response.headers["Cache-Control"] = "private, max-age=3600"
+        return response
+    except Exception as e:
+        ExceptionUtils.exception_traceback(e)
+        return "", 404
 
 
 # 媒体服务器页面

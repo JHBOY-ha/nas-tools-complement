@@ -1,4 +1,5 @@
 import os
+import json
 import threading
 import time
 from sqlalchemy import create_engine
@@ -51,7 +52,8 @@ class MediaDb:
                 YEAR=iteminfo.get("year"),
                 TMDBID=iteminfo.get("tmdbid"),
                 IMDBID=iteminfo.get("imdbid"),
-                PATH=iteminfo.get("path")
+                PATH=iteminfo.get("path"),
+                JSON=iteminfo.get("json") if iteminfo.get("json") else json.dumps(iteminfo, ensure_ascii=False)
             ))
             self.session.commit()
             return True
@@ -124,3 +126,17 @@ class MediaDb:
         if not server_type:
             return None
         return self.session.query(MEDIASYNCSTATISTIC).filter(MEDIASYNCSTATISTIC.SERVER == server_type).first()
+
+    def list_items(self, server_type=None):
+        """
+        查询媒体库同步项目
+        """
+        try:
+            query = self.session.query(MEDIASYNCITEMS)
+            if server_type:
+                server_names = {server_type, str(server_type).lower(), str(server_type).capitalize()}
+                query = query.filter(MEDIASYNCITEMS.SERVER.in_(list(server_names)))
+            return query.order_by(MEDIASYNCITEMS.TITLE.asc()).all()
+        except Exception as e:
+            ExceptionUtils.exception_traceback(e)
+            return []

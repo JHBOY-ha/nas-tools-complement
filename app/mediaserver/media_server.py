@@ -125,6 +125,14 @@ class MediaServer:
             return None
         return self.server.get_image_by_id(item_id, image_type)
 
+    def get_item_image(self, item_id, image_type="Primary"):
+        """
+        获取媒体服务器项目图片响应
+        """
+        if not self.server:
+            return None
+        return self.server.get_item_image(item_id, image_type)
+
     def get_no_exists_episodes(self, meta_info,
                                season_number,
                                episode_count):
@@ -177,6 +185,14 @@ class MediaServer:
         if not self.server:
             return []
         return self.server.get_items(parent)
+
+    def get_episodes(self, series_id):
+        """
+        获取电视剧/动漫下所有剧集
+        """
+        if not self.server:
+            return []
+        return self.server.get_episodes(series_id)
 
     def sync_mediaserver(self):
         """
