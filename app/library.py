@@ -68,7 +68,7 @@ class MediaLibrary:
         if subtitle != "all":
             enriched_items = []
             for item in items:
-                self.__fill_subtitle_summary(item)
+                self.__fill_subtitle_summary(item, allow_ffprobe=False)
                 if subtitle == "missing" and item["subtitle_status"] != "missing_chinese":
                     continue
                 if subtitle == "ok" and item["subtitle_status"] == "missing_chinese":
@@ -216,15 +216,19 @@ class MediaLibrary:
             self.__fill_subtitle_summary(item)
         return item
 
-    def __fill_subtitle_summary(self, item):
+    def __fill_subtitle_summary(self, item, allow_ffprobe=True):
         if item.get("media_type") == "movie":
             detect_path = item.get("target_path") or item.get("path")
-            status = self.detect_subtitle_status(detect_path, item.get("media_streams") or [])
+            status = self.detect_subtitle_status(detect_path, item.get("media_streams") or [], allow_ffprobe=allow_ffprobe)
             item["missing_count"] = 1 if status.get("status") == "missing_chinese" else 0
         else:
             linked_episodes = item.get("linked_episodes") or []
             episode_statuses = [
-                self.detect_subtitle_status(episode.get("path") or "", episode.get("media_streams") or [])
+                self.detect_subtitle_status(
+                    episode.get("path") or "",
+                    episode.get("media_streams") or [],
+                    allow_ffprobe=allow_ffprobe
+                )
                 for episode in linked_episodes
             ]
             missing_count = len([status for status in episode_statuses if status.get("status") == "missing_chinese"])
@@ -313,7 +317,7 @@ class MediaLibrary:
         return items
 
     @classmethod
-    def detect_subtitle_status(cls, media_file, media_streams=None):
+    def detect_subtitle_status(cls, media_file, media_streams=None, allow_ffprobe=True):
         """
         判断单个媒体文件是否已有中文字幕
         """
@@ -325,7 +329,7 @@ class MediaLibrary:
         has_subtitle_stream, has_chinese_stream = cls.__detect_streams(media_streams or [])
         if has_chinese_stream:
             return {"status": "has_chinese_internal", "label": "已有内嵌中文字幕", "badge": "bg-azure"}
-        if not media_streams:
+        if allow_ffprobe and not media_streams:
             has_subtitle_stream, has_chinese_stream = cls.__ffprobe_subtitle_streams(media_file)
             if has_chinese_stream:
                 return {"status": "has_chinese_internal", "label": "已有内嵌中文字幕", "badge": "bg-azure"}

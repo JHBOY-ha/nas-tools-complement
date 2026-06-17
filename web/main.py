@@ -997,14 +997,16 @@ def mediafile():
         DirD = "/"
     DirR = request.args.get("dir")
     return render_template("rename/mediafile.html",
-                           Dir=DirR or DirD)
+                           Dir=DirR or DirD,
+                           MediaServerType=Config().get_config('media').get('media_server') or "emby")
 
 
 # 媒体库字幕管理页面
 @App.route('/medialibrary', methods=['POST', 'GET'])
 @login_required
 def medialibrary():
-    return render_template("rename/medialibrary.html")
+    return render_template("rename/medialibrary.html",
+                           MediaServerType=Config().get_config('media').get('media_server') or "emby")
 
 
 # 基础设置页面
@@ -1819,7 +1821,7 @@ def upload_subtitle():
     try:
         media_file = request.form.get("path")
         target_file = request.form.get("target_path") or ""
-        server_type = request.form.get("server") or ""
+        server_type = str(request.form.get("server") or Config().get_config('media').get('media_server') or "emby").lower()
         upload_file = request.files.get("file")
         if not media_file:
             return {"code": -1, "msg": "媒体文件不能为空"}
@@ -1828,7 +1830,7 @@ def upload_subtitle():
             return {"code": -1, "msg": "媒体文件不存在"}
         if os.path.splitext(media_file)[-1].lower() not in RMT_MEDIAEXT:
             return {"code": -1, "msg": "请选择有效的媒体文件"}
-        if server_type not in ["emby", "jellyfin"]:
+        if server_type not in ["emby", "jellyfin", "plex"]:
             return {"code": -1, "msg": "请选择目标影视服务器"}
         if not upload_file:
             return {"code": -1, "msg": "请选择字幕文件"}
@@ -1845,7 +1847,8 @@ def upload_subtitle():
         success, message, data = Subtitle().upload_subtitle(upload_file=upload_file,
                                                            media_file=media_file,
                                                            target_media_file=target_file,
-                                                           rmt_mode=rmt_mode)
+                                                           rmt_mode=rmt_mode,
+                                                           server_type=server_type)
         refresh_msg = ""
         if success and data.get("synced"):
             try:

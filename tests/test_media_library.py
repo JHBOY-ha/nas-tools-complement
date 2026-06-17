@@ -307,6 +307,86 @@ class MediaLibraryTest(TestCase):
             finally:
                 MediaLibrary._MediaLibrary__ffprobe_subtitle_streams = old_ffprobe
 
+    def test_subtitle_filter_does_not_ffprobe_all_items(self):
+        class _ServerType:
+            value = "Jellyfin"
+
+        class _MediaServer:
+            def get_type(self):
+                return _ServerType()
+
+        class _Category:
+            @staticmethod
+            def get_movie_categorys():
+                return []
+
+            @staticmethod
+            def get_tv_categorys():
+                return []
+
+            @staticmethod
+            def get_anime_categorys():
+                return []
+
+        class _Row:
+            ITEM_ID = "item1"
+            LIBRARY = "lib"
+            ITEM_TYPE = "Movie"
+            TITLE = "Movie"
+            ORGIN_TITLE = ""
+            YEAR = "2024"
+            TMDBID = "100"
+            IMDBID = ""
+            PATH = "/server/raw/Movie.mkv"
+            JSON = "{}"
+
+        class _MediaDb:
+            @staticmethod
+            def list_items(server_type=None):
+                return [_Row()]
+
+        class _DbHelper:
+            def __init__(self, histories):
+                self.histories = histories
+
+            def get_transfer_histories_with_dest(self):
+                return self.histories
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target_file = os.path.join(tmpdir, "Movie (2024).mkv")
+            open(target_file, "wb").close()
+
+            class _History:
+                ID = 1
+                MODE = "link"
+                TYPE = "电影"
+                CATEGORY = ""
+                TMDBID = 100
+                TITLE = "Movie"
+                YEAR = "2024"
+                SEASON_EPISODE = ""
+                DEST_PATH = tmpdir
+                DEST_FILENAME = "Movie (2024).mkv"
+
+            library = MediaLibrary.__new__(MediaLibrary)
+            library.mediadb = _MediaDb()
+            library.dbhelper = _DbHelper([_History()])
+            library.media_server = _MediaServer()
+            library.category = _Category()
+            old_ffprobe = MediaLibrary._MediaLibrary__ffprobe_subtitle_streams
+            try:
+                MediaLibrary._MediaLibrary__ffprobe_subtitle_streams = classmethod(
+                    lambda cls, media_file: (_ for _ in ()).throw(AssertionError("ffprobe should not run"))
+                )
+
+                ret = library.list_items({"subtitle": "missing"})
+
+                self.assertEqual(ret["code"], 0)
+                self.assertEqual(ret["total"], 1)
+                self.assertEqual(ret["items"][0]["subtitle_status"], "missing_chinese")
+            finally:
+                MediaLibrary._MediaLibrary__ffprobe_subtitle_streams = old_ffprobe
+
     def test_local_poster_prefers_poster_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             media_dir = os.path.join(tmpdir, "Movie")

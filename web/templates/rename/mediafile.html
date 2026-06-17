@@ -117,13 +117,14 @@
         </div>
         <div class="mb-3">
           <label class="form-label required">字幕文件</label>
-          <input type="file" id="upload_subtitle_file" class="form-control" accept=".srt,.ass,.ssa">
+          <input type="file" id="upload_subtitle_file" class="form-control" accept=".srt,.ass,.ssa,.smi,.vtt">
         </div>
         <div class="mb-3">
           <label class="form-label required">目标影视服务器</label>
           <select id="upload_subtitle_server" class="form-select">
-            <option value="jellyfin" selected>Jellyfin</option>
-            <option value="emby">Emby</option>
+            <option value="jellyfin" {% if MediaServerType|lower == "jellyfin" %}selected{% endif %}>Jellyfin</option>
+            <option value="emby" {% if MediaServerType|lower == "emby" %}selected{% endif %}>Emby</option>
+            <option value="plex" {% if MediaServerType|lower == "plex" %}selected{% endif %}>Plex</option>
           </select>
         </div>
         <div class="mb-3">
@@ -163,6 +164,10 @@
   </div>
 </div>
 <script type="text/javascript">
+  const mediafile_config_media_server = "{{ MediaServerType or 'emby' }}".toLowerCase();
+  const mediafile_default_media_server = ["emby", "jellyfin", "plex"].includes(mediafile_config_media_server)
+      ? mediafile_config_media_server
+      : "emby";
 
   function js_change_card() {
     const card_a = document.querySelector(".js-change-card-a");
@@ -325,7 +330,7 @@
     $("#upload_subtitle_media_name").val(name);
     $("#upload_subtitle_target_path").val("");
     $("#upload_subtitle_file").val("");
-    $("#upload_subtitle_server").val("jellyfin");
+    $("#upload_subtitle_server").val(mediafile_default_media_server);
     $("#modal-upload-subtitle").modal("show");
   }
 

@@ -206,3 +206,48 @@ class SubtitleUploadTest(TestCase):
             self.assertTrue(data["synced"])
             self.assertTrue(os.path.exists(os.path.join(tmpdir, "Movie.eng.srt")))
             self.assertFalse(os.path.exists(os.path.join(tmpdir, "Movie.eng(1).srt")))
+
+    def test_plex_upload_preserves_chinese_region_tag(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            movie = os.path.join(tmpdir, "Movie.mkv")
+            open(movie, "wb").close()
+
+            success, msg, data = Subtitle().upload_subtitle(
+                _UploadFile("Movie.zh-cn.srt"),
+                movie,
+                server_type="plex"
+            )
+
+            self.assertTrue(success, msg)
+            self.assertEqual(data["language"], "zh-CN")
+            self.assertTrue(os.path.exists(os.path.join(tmpdir, "Movie.zh-CN.srt")))
+
+    def test_plex_upload_preserves_forced_and_sdh_flags(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            movie = os.path.join(tmpdir, "Movie.mkv")
+            open(movie, "wb").close()
+
+            success, msg, _ = Subtitle().upload_subtitle(
+                _UploadFile("Movie.en.forced.sdh.vtt"),
+                movie,
+                server_type="plex"
+            )
+
+            self.assertTrue(success, msg)
+            self.assertTrue(os.path.exists(os.path.join(tmpdir, "Movie.en.forced.sdh.vtt")))
+
+    def test_plex_upload_collision_keeps_language_token_clean(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            movie = os.path.join(tmpdir, "Movie.mkv")
+            open(movie, "wb").close()
+            open(os.path.join(tmpdir, "Movie.zh-TW.srt"), "wb").close()
+
+            success, msg, _ = Subtitle().upload_subtitle(
+                _UploadFile("Movie.zh-tw.srt"),
+                movie,
+                server_type="plex"
+            )
+
+            self.assertTrue(success, msg)
+            self.assertTrue(os.path.exists(os.path.join(tmpdir, "Movie(1).zh-TW.srt")))
+            self.assertFalse(os.path.exists(os.path.join(tmpdir, "Movie.zh-TW(1).srt")))

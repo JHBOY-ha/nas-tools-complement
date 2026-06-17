@@ -5,6 +5,7 @@ var library_current_series_id = "";
 var library_current_series_title = "";
 var library_poster_observer = null;
 var library_eager_poster_count = 6;
+var library_default_media_server = "emby";
 
 function library_escape_html(value) {
   if (value === null || value === undefined) {
@@ -268,12 +269,16 @@ function show_index_upload_subtitle_modal(name, media_path) {
   $("#index_upload_subtitle_target_path").val(media_path);
   $("#index_upload_subtitle_name").val(name || media_path);
   $("#index_upload_subtitle_file").val("");
-  $("#index_upload_subtitle_server").val("jellyfin");
+  $("#index_upload_subtitle_server").val(library_default_media_server);
   $("#index-upload-subtitle-modal").modal("show");
 }
 
 function init_media_library_page(options) {
   options = options || {};
+  library_default_media_server = (options.default_server || window.CURRENT_MEDIA_SERVER_TYPE || library_default_media_server || "emby").toLowerCase();
+  if (["emby", "jellyfin", "plex"].indexOf(library_default_media_server) === -1) {
+    library_default_media_server = "emby";
+  }
   if (options.page_size) {
     library_page_size = options.page_size;
   }
