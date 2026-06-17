@@ -115,6 +115,8 @@ class MediaLibrary:
         media_type, _ = self.classify_path(row.PATH, row.ITEM_TYPE)
         matches = self.__find_transfer_matches(row, media_type, self.dbhelper.get_transfer_histories_with_dest())
         episodes = self.__series_history_items(matches)
+        if not episodes:
+            episodes = self.media_server.get_episodes(item_id) or []
         ret_items = []
         for episode in episodes:
             media_path = episode.get("path") or ""
@@ -166,20 +168,24 @@ class MediaLibrary:
         if not media_type:
             return None
         matches = self.__find_transfer_matches(row, media_type, transfer_histories or [])
-        if not matches:
-            return None
-        primary_history = matches[0]
-        history_media_type = self.__history_media_type(primary_history.TYPE)
-        if history_media_type:
-            media_type = history_media_type
-        target_path = self.__history_target_file(primary_history)
-        category = primary_history.CATEGORY or self.classify_path(target_path, row.ITEM_TYPE)[1]
-        display_path = target_path
-        if media_type == "movie":
-            target_path = target_path if target_path and os.path.isfile(target_path) else ""
+        linked = bool(matches)
+        target_path = ""
+        display_path = media_path
+        if linked:
+            primary_history = matches[0]
+            history_media_type = self.__history_media_type(primary_history.TYPE)
+            if history_media_type:
+                media_type = history_media_type
+            target_path = self.__history_target_file(primary_history)
+            category = primary_history.CATEGORY or self.classify_path(target_path, row.ITEM_TYPE)[1]
             display_path = target_path
-        elif primary_history.DEST_PATH:
-            display_path = primary_history.DEST_PATH
+            if media_type == "movie":
+                target_path = target_path if target_path and os.path.isfile(target_path) else ""
+                display_path = target_path
+            elif primary_history.DEST_PATH:
+                display_path = primary_history.DEST_PATH
+        elif media_type == "movie" and media_path and os.path.isfile(media_path):
+            target_path = media_path
 
         item = {
             "id": row.ITEM_ID,
@@ -196,6 +202,8 @@ class MediaLibrary:
             "path": display_path,
             "server_path": media_path,
             "target_path": target_path,
+            "linked": linked,
+            "can_upload": bool(target_path and os.path.isfile(target_path)),
             "poster_url": f"/library/image/{row.ITEM_ID}",
             "media_streams": item_json.get("MediaStreams") or [],
             "linked_episodes": self.__series_history_items(matches) if media_type != "movie" else [],

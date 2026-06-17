@@ -416,10 +416,11 @@
     const indicator_class = ok ? "has-chinese" : missing ? "missing-chinese" : "unknown";
 
     const is_movie = item.media_type === "movie";
+    const movie_upload_disabled = is_movie && !item.can_upload;
     const btn_attr = is_movie
-        ? `onclick="open_library_movie_upload(&quot;${item_id}&quot;)"`
+        ? `${movie_upload_disabled ? "disabled" : ""} onclick="open_library_movie_upload(&quot;${item_id}&quot;)"`
         : `onclick="open_library_episodes(&quot;${item_id}&quot;)"`;
-    const btn_text = is_movie ? "上传字幕" : "选择剧集";
+    const btn_text = is_movie ? (movie_upload_disabled ? "不可上传" : "上传字幕") : "选择剧集";
     return `
       <div class="lit-library-card">
         <div class="lit-library-card-poster" data-type="${library_escape_html(item.media_type || "")}">

@@ -139,7 +139,7 @@ class MediaLibraryTest(TestCase):
         self.assertEqual(ret["code"], 0)
         self.assertEqual(library.mediadb.queried_server, "Jellyfin")
 
-    def test_list_items_only_returns_linked_transfer_history_items(self):
+    def test_list_items_prefers_linked_transfer_history_but_keeps_synced_items(self):
         class _ServerType:
             value = "Jellyfin"
 
@@ -190,7 +190,12 @@ class MediaLibraryTest(TestCase):
         library.category = _Category()
 
         library.dbhelper = _DbHelper([])
-        self.assertEqual(library.list_items({})["total"], 0)
+        unlinked_ret = library.list_items({})
+        self.assertEqual(unlinked_ret["total"], 1)
+        self.assertFalse(unlinked_ret["items"][0]["linked"])
+        self.assertEqual(unlinked_ret["items"][0]["path"], "/server/raw/Movie.mkv")
+        self.assertEqual(unlinked_ret["items"][0]["target_path"], "")
+        self.assertFalse(unlinked_ret["items"][0]["can_upload"])
 
         with tempfile.TemporaryDirectory() as tmpdir:
             target_dir = os.path.join(tmpdir, "外语电影", "Movie (2024)")
@@ -217,6 +222,7 @@ class MediaLibraryTest(TestCase):
             self.assertEqual(ret["items"][0]["target_path"], target_file)
             self.assertEqual(ret["items"][0]["category"], "外语电影")
             self.assertEqual(ret["items"][0]["poster_url"], "/library/image/item1")
+            self.assertTrue(ret["items"][0]["can_upload"])
 
     def test_classify_path_uses_media_root_and_second_level_category(self):
         with tempfile.TemporaryDirectory() as tmpdir:
