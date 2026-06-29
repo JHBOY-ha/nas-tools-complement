@@ -1,4 +1,5 @@
 import datetime
+import errno
 import os.path
 import re
 import shutil
@@ -8,6 +9,7 @@ from lxml import etree
 import log
 from app.conf import SiteConf
 from app.helper import OpenSubtitles
+from app.helper.subtitle_align import SubtitleAligner
 from app.utils import RequestUtils, PathUtils, SystemUtils, StringUtils, ExceptionUtils
 from app.utils.commons import singleton
 from app.utils.types import MediaType, RmtMode
@@ -68,14 +70,21 @@ class Subtitle:
             return self.__download_chinesesubfinder(items)
         return False, "未配置字幕下载器"
 
-    def upload_subtitle(self, upload_file, media_file, target_media_file=None, rmt_mode=None, server_type=None):
+    def upload_subtitle(self, upload_file, media_file, target_media_file=None, rmt_mode=None, server_type=None,
+                        align_mode=None):
         """
-        手动上传字幕并同步到目标媒体文件目录
+        手动上传字幕并同步到目标媒体文件目录。
+        流程：
+          1. 校验参数（媒体文件、字幕格式）
+          2. 从文件名识别语言和标记
+          3. 生成不重名字幕路径并原子写入源目录（防并发覆盖）
+          4. 若目标媒体文件存在且路径不同，按 rmt_mode 同步到媒体库目录
         :param upload_file: Flask上传文件对象
-        :param media_file: 原媒体文件路径
-        :param target_media_file: 媒体库目标媒体文件路径
-        :param rmt_mode: 目标同步方式
-        :param server_type: 目标媒体服务器类型
+        :param media_file: 原媒体文件路径（字幕首先保存在该文件同目录）
+        :param target_media_file: 媒体库目标媒体文件路径（字幕同步到该文件同目录）
+        :param rmt_mode: 目标同步方式（link/softlink/copy）
+        :param server_type: 目标媒体服务器类型（emby/jellyfin/plex）
+        :param align_mode: 字幕时间轴对齐模式（auto/none）
         """
         if not upload_file or not media_file:
             return False, "参数有误", {}
@@ -87,26 +96,43 @@ class Subtitle:
         upload_name = os.path.basename(upload_file.filename or "")
         sub_ext = os.path.splitext(upload_name)[-1].lower()
         if sub_ext not in RMT_SUBEXT:
-            return False, "仅支持上传 srt、ass、ssa、smi、vtt 字幕文件", {}
+            return False, "仅支持上传 srt、ass、ssa、smi、vtt、sub 字幕文件", {}
 
         subtitle_profile = self.__guess_subtitle_profile(upload_name)
-        try:
-            source_sub_file = self.__build_subtitle_path(media_file, subtitle_profile, sub_ext, server_type)
-        except Exception as e:
-            ExceptionUtils.exception_traceback(e)
-            return False, f"生成源字幕文件名失败：{str(e)}", {}
-        try:
-            upload_file.save(source_sub_file)
-        except Exception as e:
-            ExceptionUtils.exception_traceback(e)
-            return False, f"保存源字幕失败：{str(e)}", {}
+
+        # 通过重试机制规避并发上传导致的 TOCTOU 竞态条件
+        # __build_subtitle_path 检查文件不存在后返回路径，但 save 期间可能被其他请求先创建
+        _max_retry = 3
+        source_sub_file = None
+        for _retry in range(_max_retry):
+            try:
+                src_path = self.__build_subtitle_path(media_file, subtitle_profile, sub_ext, server_type)
+            except FileExistsError:
+                return False, "字幕文件重名过多", {}
+            try:
+                self.__save_upload_file_exclusive(upload_file, src_path)
+                source_sub_file = src_path
+                break
+            except FileExistsError:
+                if _retry < _max_retry - 1:
+                    continue
+                return False, "字幕文件保存失败，重试次数耗尽", {}
+            except OSError as e:
+                ExceptionUtils.exception_traceback(e)
+                return False, f"保存源字幕失败：{str(e)}", {}
+            except Exception as e:
+                ExceptionUtils.exception_traceback(e)
+                return False, f"保存源字幕失败：{str(e)}", {}
+        if not source_sub_file:
+            return False, "保存源字幕失败", {}
 
         result = {
             "source_subtitle": source_sub_file,
             "target_subtitle": "",
             "language": subtitle_profile.get("language"),
             "server": server_type or "",
-            "synced": False
+            "synced": False,
+            "alignment": {"applied": False, "skipped": False, "message": "", "mode": ""}
         }
         if not target_media_file:
             return True, "字幕已保存到源目录，未找到媒体库目标文件", result
@@ -115,34 +141,51 @@ class Subtitle:
         if os.path.splitext(target_media_file)[-1].lower() not in RMT_MEDIAEXT:
             return True, "字幕已保存到源目录，目标文件不是有效媒体文件，未同步", result
 
+        alignment_msg = ""
+        if str(align_mode or "").lower() in ["auto", "offset", "segmented"]:
+            alignment = SubtitleAligner.align_subtitle(source_sub_file, target_media_file, align_mode=align_mode)
+            result["alignment"] = alignment
+            if alignment.get("applied"):
+                alignment_msg = "，已自动对齐字幕"
+            elif alignment.get("message"):
+                alignment_msg = f"，自动对齐跳过：{alignment.get('message')}"
+
         if os.path.normpath(media_file) == os.path.normpath(target_media_file):
             result["target_subtitle"] = source_sub_file
             result["synced"] = True
-            return True, "字幕已保存到媒体目录", result
+            return True, f"字幕已保存到媒体目录{alignment_msg}", result
 
         source_norm = os.path.normpath(source_sub_file)
-        try:
-            target_sub_file = self.__build_subtitle_path(target_media_file, subtitle_profile, sub_ext, server_type)
-        except Exception as e:
-            ExceptionUtils.exception_traceback(e)
-            return False, f"生成目标字幕文件名失败：{str(e)}", result
-        target_norm = os.path.normpath(target_sub_file)
-        if source_norm == target_norm:
-            result["target_subtitle"] = target_sub_file
-            result["synced"] = True
-            return True, "字幕已保存到媒体目录", result
+        target_sub_file = ""
+        retmsg = ""
+        for _retry in range(_max_retry):
+            try:
+                target_sub_file = self.__build_subtitle_path(target_media_file, subtitle_profile, sub_ext, server_type)
+            except Exception as e:
+                ExceptionUtils.exception_traceback(e)
+                return False, f"生成目标字幕文件名失败：{str(e)}", result
+            target_norm = os.path.normpath(target_sub_file)
+            if source_norm == target_norm:
+                result["target_subtitle"] = target_sub_file
+                result["synced"] = True
+                return True, "字幕已保存到媒体目录", result
 
-        retcode, retmsg = self.__sync_manual_subtitle(source_sub_file, target_sub_file, rmt_mode)
-        result["target_subtitle"] = target_sub_file
-        if retcode != 0:
+            retcode, retmsg = self.__sync_manual_subtitle(source_sub_file, target_sub_file, rmt_mode)
+            result["target_subtitle"] = target_sub_file
+            if retcode == 0:
+                break
+            if retmsg == "目标字幕文件已存在" and _retry < _max_retry - 1:
+                continue
             return False, f"字幕已保存到源目录，同步到媒体库失败：{retmsg}", result
         result["synced"] = True
-        return True, "字幕已保存并同步到媒体库目录", result
+        return True, f"字幕已保存并同步到媒体库目录{alignment_msg}", result
 
     @staticmethod
     def __guess_subtitle_profile(file_name):
         """
         根据字幕文件名识别语言标签和字幕标记
+        匹配优先级：简体中文 > 繁体中文 > 英文 > 默认简体中文
+        zh-CN 优先级最高，避免文件名同时含中英文标记（如 .chinese.eng.）时误判为英文
         """
         name = file_name or ""
         _zhcn_sub_re = r"([.\[(](((zh[-_])?(cn|ch[si]|sg|sc))|zho?|chi|chinese" \
@@ -150,14 +193,15 @@ class Subtitle:
         _zhtw_sub_re = r"([.\[(](((zh[-_])?(hk|tw|cht|tc))|繁[体中]?)[.\])])" \
                        r"|繁体中[文字]|中[文字]繁体|繁体|繁中"
         _eng_sub_re = r"([.\[(](en|eng|english)[.\])])|英文"
-        if re.search(_zhtw_sub_re, name, re.I):
+        if re.search(_zhcn_sub_re, name, re.I):
+            language = "zh-CN"
+        elif re.search(_zhtw_sub_re, name, re.I):
             language = "zh-TW"
         elif re.search(_eng_sub_re, name, re.I):
             language = "eng"
-        elif re.search(_zhcn_sub_re, name, re.I):
-            language = "zh-CN"
         else:
             language = "zh-CN"
+        # 识别字幕特殊标记（forced / SDH / CC）
         lower_name = name.lower()
         flags = []
         if re.search(r"(^|[.\-_\[( ])forced($|[.\-_\]) ])", lower_name):
@@ -171,7 +215,12 @@ class Subtitle:
     @classmethod
     def __build_subtitle_path(cls, media_file, subtitle_profile, sub_ext, server_type=None):
         """
-        生成不覆盖已有文件的外挂字幕路径
+        生成不覆盖已有文件的外挂字幕路径。
+        命名格式：
+          - Emby/Jellyfin: Movie.zh-CN.srt → Movie.zh-CN(1).srt → ...
+          - Plex:          Movie.zh-CN.srt → Movie(1).zh-CN.srt → ...
+                           (forced/sdh/cc 标记拼接在语言标签后: Movie.en.forced.sdh.srt)
+        重名时最多尝试 100 个编号，超过则抛出 FileExistsError。
         """
         media_base = os.path.splitext(media_file)[0]
         suffix_parts = [cls.__subtitle_language_tag(subtitle_profile.get("language"), server_type)]
@@ -194,7 +243,8 @@ class Subtitle:
     @staticmethod
     def __subtitle_language_tag(language_tag, server_type=None):
         """
-        按媒体服务器规范转换外挂字幕语言标签
+        按媒体服务器规范转换外挂字幕语言标签。
+        Emby/Jellyfin 直接使用原始标签（如 eng），Plex 要求使用 ISO 639-1（en）。
         """
         language_tag = language_tag or "zh-CN"
         if str(server_type or "").lower() != "plex":
@@ -207,19 +257,92 @@ class Subtitle:
         return plex_tags.get(language_tag, language_tag.lower())
 
     @staticmethod
-    def __sync_manual_subtitle(source_sub_file, target_sub_file, rmt_mode=None):
+    def __save_upload_file_exclusive(upload_file, target_file):
         """
-        根据整理模式同步手动上传字幕
+        独占创建并保存上传文件，避免并发上传覆盖同名字幕。
+        """
+        fd = None
+        try:
+            fd = os.open(target_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "wb") as file_obj:
+                fd = None
+                upload_file.save(file_obj)
+        except OSError as e:
+            if e.errno == errno.EEXIST:
+                raise FileExistsError(target_file)
+            if fd is not None:
+                os.close(fd)
+            if os.path.exists(target_file):
+                try:
+                    os.remove(target_file)
+                except Exception:
+                    pass
+            raise
+        except Exception:
+            if fd is not None:
+                os.close(fd)
+            if os.path.exists(target_file):
+                try:
+                    os.remove(target_file)
+                except Exception:
+                    pass
+            raise
+
+    @staticmethod
+    def __copy_subtitle_exclusive(source_sub_file, target_sub_file):
+        """
+        独占复制字幕，目标存在时直接失败，避免硬链接降级复制时覆盖其它请求刚写入的字幕。
+        """
+        fd = None
+        try:
+            fd = os.open(target_sub_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with open(os.path.normpath(source_sub_file), "rb") as src_obj:
+                with os.fdopen(fd, "wb") as dest_obj:
+                    fd = None
+                    shutil.copyfileobj(src_obj, dest_obj)
+            shutil.copystat(os.path.normpath(source_sub_file), os.path.normpath(target_sub_file))
+            return 0, ""
+        except OSError as e:
+            if fd is not None:
+                os.close(fd)
+            if e.errno == errno.EEXIST:
+                return -1, "目标字幕文件已存在"
+            if os.path.exists(target_sub_file):
+                try:
+                    os.remove(target_sub_file)
+                except Exception:
+                    pass
+            ExceptionUtils.exception_traceback(e)
+            return -1, str(e)
+        except Exception as e:
+            if fd is not None:
+                os.close(fd)
+            if os.path.exists(target_sub_file):
+                try:
+                    os.remove(target_sub_file)
+                except Exception:
+                    pass
+            ExceptionUtils.exception_traceback(e)
+            return -1, str(e)
+
+    @classmethod
+    def __sync_manual_subtitle(cls, source_sub_file, target_sub_file, rmt_mode=None):
+        """
+        根据整理模式同步手动上传字幕（链接/复制）
+        硬链接失败时自动降级为复制，兼容跨文件系统场景
         """
         try:
             target_dir = os.path.dirname(target_sub_file)
             if target_dir and not os.path.exists(target_dir):
                 os.makedirs(target_dir)
             if rmt_mode == RmtMode.LINK:
-                return SystemUtils.link(source_sub_file, target_sub_file)
+                retcode, retmsg = SystemUtils.link(source_sub_file, target_sub_file)
+                if retcode != 0:
+                    return cls.__copy_subtitle_exclusive(source_sub_file, target_sub_file)
+                return 0, ""
             if rmt_mode == RmtMode.SOFTLINK:
                 return SystemUtils.softlink(source_sub_file, target_sub_file)
-            return SystemUtils.copy(source_sub_file, target_sub_file)
+            return cls.__copy_subtitle_exclusive(source_sub_file, target_sub_file)
         except Exception as e:
             ExceptionUtils.exception_traceback(e)
             return -1, str(e)

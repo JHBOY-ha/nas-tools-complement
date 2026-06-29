@@ -269,6 +269,7 @@ function show_index_upload_subtitle_modal(name, media_path) {
   $("#index_upload_subtitle_target_path").val(media_path);
   $("#index_upload_subtitle_name").val(name || media_path);
   $("#index_upload_subtitle_file").val("");
+  $("#index_upload_subtitle_align").val("none");
   $("#index_upload_subtitle_server").val(library_default_media_server);
   $("#index-upload-subtitle-modal").modal("show");
 }
@@ -292,6 +293,7 @@ function init_media_library_page(options) {
     form_data.append("path", $("#index_upload_subtitle_path").val());
     form_data.append("target_path", $("#index_upload_subtitle_target_path").val());
     form_data.append("server", $("#index_upload_subtitle_server").val());
+    form_data.append("align", $("#index_upload_subtitle_align").val() || "none");
     form_data.append("file", file);
     NProgress.start();
     $.ajax({

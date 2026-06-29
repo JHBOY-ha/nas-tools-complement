@@ -36,7 +36,7 @@ from app.subscribe import Subscribe
 from app.sync import Sync
 from app.subtitle import Subtitle
 from app.torrentremover import TorrentRemover
-from app.utils import DomUtils, SystemUtils, ExceptionUtils, StringUtils
+from app.utils import DomUtils, SystemUtils, ExceptionUtils, StringUtils, PathUtils
 from app.utils.types import *
 from config import PT_TRANSFER_INTERVAL, Config, RMT_MEDIAEXT
 from web.action import WebAction
@@ -1814,7 +1814,29 @@ def upload():
         return {"code": 1, "msg": str(e), "filepath": ""}
 
 
+def _get_all_media_library_root_paths():
+    """汇总所有已配置的媒体库根路径（电影/电视剧/动漫）"""
+    media = Config().get_config('media') or {}
+    roots = []
+    for key in ("movie_path", "tv_path", "anime_path"):
+        val = media.get(key)
+        if val:
+            roots.extend(val if isinstance(val, list) else [val])
+    return [p for p in roots if p]
+
+
+def _is_within_media_library(path):
+    """判断路径是否在任一媒体库根目录范围内"""
+    if not path:
+        return False
+    for root in _get_all_media_library_root_paths():
+        if PathUtils.is_path_in_path(root, path):
+            return True
+    return False
+
+
 # 手动上传字幕
+# 流程：校验参数 → 查找转移历史 → 校验 target_file 安全性 → 调用 Subtitle.upload_subtitle() → 刷新媒体服务器
 @App.route('/subtitle/upload', methods=['POST'])
 @login_required
 def upload_subtitle():
@@ -1822,6 +1844,7 @@ def upload_subtitle():
         media_file = request.form.get("path")
         target_file = request.form.get("target_path") or ""
         server_type = str(request.form.get("server") or Config().get_config('media').get('media_server') or "emby").lower()
+        align_mode = str(request.form.get("align") or "none").lower()
         upload_file = request.files.get("file")
         if not media_file:
             return {"code": -1, "msg": "媒体文件不能为空"}
@@ -1832,9 +1855,12 @@ def upload_subtitle():
             return {"code": -1, "msg": "请选择有效的媒体文件"}
         if server_type not in ["emby", "jellyfin", "plex"]:
             return {"code": -1, "msg": "请选择目标影视服务器"}
+        if align_mode not in ["auto", "offset", "segmented", "none"]:
+            return {"code": -1, "msg": "请选择有效的字幕对齐模式"}
         if not upload_file:
             return {"code": -1, "msg": "请选择字幕文件"}
 
+        # 查找该媒体文件的转移历史，获取整理模式和目标路径
         history = DbHelper().get_latest_transfer_history_by_source_full_path(media_file)
         rmt_mode = ModuleConf.get_enum_item(RmtMode, history.MODE) if history and history.MODE else None
         if not rmt_mode:
@@ -1842,14 +1868,20 @@ def upload_subtitle():
         if target_file:
             target_file = os.path.normpath(target_file)
         elif history and history.DEST_PATH and history.DEST_FILENAME:
-            target_file = os.path.join(history.DEST_PATH, history.DEST_FILENAME)
+            target_file = os.path.normpath(os.path.join(history.DEST_PATH, history.DEST_FILENAME))
+        # 校验目标路径必须在已配置的媒体库根目录内，防止路径穿越攻击
+        if target_file and not _is_within_media_library(target_file):
+            return {"code": -1, "msg": "目标文件不在媒体库目录范围内"}
 
+        # 调用核心逻辑保存并同步字幕
         success, message, data = Subtitle().upload_subtitle(upload_file=upload_file,
                                                            media_file=media_file,
                                                            target_media_file=target_file,
                                                            rmt_mode=rmt_mode,
-                                                           server_type=server_type)
+                                                           server_type=server_type,
+                                                           align_mode=align_mode)
         refresh_msg = ""
+        # 同步成功后刷新媒体服务器库，使新字幕被媒体服务器识别
         if success and data.get("synced"):
             try:
                 refreshed = MediaServer().refresh_root_library_by_type(server_type)

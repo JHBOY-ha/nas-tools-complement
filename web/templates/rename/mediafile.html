@@ -117,7 +117,7 @@
         </div>
         <div class="mb-3">
           <label class="form-label required">字幕文件</label>
-          <input type="file" id="upload_subtitle_file" class="form-control" accept=".srt,.ass,.ssa,.smi,.vtt">
+          <input type="file" id="upload_subtitle_file" class="form-control" accept=".srt,.ass,.ssa,.smi,.vtt,.sub">
         </div>
         <div class="mb-3">
           <label class="form-label required">目标影视服务器</label>
@@ -131,6 +131,15 @@
           <label class="form-label">目标电影文件</label>
           <input type="text" id="upload_subtitle_target_path" class="form-control filetree-files-only"
                  placeholder="可选；为空时使用最新整理历史">
+        </div>
+        <div class="mb-3">
+          <label class="form-label">字幕对齐模式</label>
+          <select id="upload_subtitle_align" class="form-select">
+            <option value="none" selected>不对齐</option>
+            <option value="auto">自动选择</option>
+            <option value="offset">仅整体偏移</option>
+            <option value="segmented">多锚点分段</option>
+          </select>
         </div>
       </div>
       <div class="modal-footer">
@@ -330,6 +339,7 @@
     $("#upload_subtitle_media_name").val(name);
     $("#upload_subtitle_target_path").val("");
     $("#upload_subtitle_file").val("");
+    $("#upload_subtitle_align").val("none");
     $("#upload_subtitle_server").val(mediafile_default_media_server);
     $("#modal-upload-subtitle").modal("show");
   }
@@ -345,6 +355,7 @@
     form_data.append("path", $("#upload_subtitle_media_path").val());
     form_data.append("target_path", $("#upload_subtitle_target_path").val());
     form_data.append("server", $("#upload_subtitle_server").val());
+    form_data.append("align", $("#upload_subtitle_align").val() || "none");
     form_data.append("file", file);
     NProgress.start();
     $.ajax({

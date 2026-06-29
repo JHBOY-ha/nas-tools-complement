@@ -100,7 +100,7 @@ if "pyquery" not in sys.modules:
     pyquery_stub.PyQuery = _PyQuery
     sys.modules["pyquery"] = pyquery_stub
 
-from app.subtitle import Subtitle
+from app.subtitle import Subtitle, SystemUtils, SubtitleAligner
 from app.utils.types import RmtMode
 
 
@@ -110,8 +110,21 @@ class _UploadFile:
         self._content = content
 
     def save(self, path):
+        if hasattr(path, "write"):
+            path.write(self._content)
+            return
         with open(path, "wb") as file_obj:
             file_obj.write(self._content)
+
+
+class _FailingUploadFile(_UploadFile):
+    def save(self, path):
+        if hasattr(path, "write"):
+            path.write(b"partial")
+        else:
+            with open(path, "wb") as file_obj:
+                file_obj.write(b"partial")
+        raise IOError("simulated save failure")
 
 
 class SubtitleUploadTest(TestCase):
@@ -251,3 +264,155 @@ class SubtitleUploadTest(TestCase):
             self.assertTrue(success, msg)
             self.assertTrue(os.path.exists(os.path.join(tmpdir, "Movie(1).zh-TW.srt")))
             self.assertFalse(os.path.exists(os.path.join(tmpdir, "Movie.zh-TW(1).srt")))
+
+    def test_upload_accepts_sub_extension(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            movie = os.path.join(tmpdir, "Movie.mkv")
+            open(movie, "wb").close()
+
+            success, msg, _ = Subtitle().upload_subtitle(_UploadFile("Movie.chinese.sub"), movie)
+
+            self.assertTrue(success, msg)
+            self.assertTrue(os.path.exists(os.path.join(tmpdir, "Movie.zh-CN.sub")))
+
+    def test_upload_chinese_priority_over_english(self):
+        """文件名同时含中英文标记时，简体中文优先级高于英文"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            movie = os.path.join(tmpdir, "Movie.mkv")
+            open(movie, "wb").close()
+
+            success, msg, data = Subtitle().upload_subtitle(_UploadFile("Movie.chinese.eng.srt"), movie)
+
+            self.assertTrue(success, msg)
+            self.assertEqual(data["language"], "zh-CN")
+            self.assertTrue(os.path.exists(os.path.join(tmpdir, "Movie.zh-CN.srt")))
+
+    def test_upload_target_subtitle_renamed_to_match_target_media(self):
+        """同步时字幕文件名应与目标媒体文件名一致"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_dir = os.path.join(tmpdir, "src")
+            target_dir = os.path.join(tmpdir, "target")
+            os.makedirs(src_dir)
+            os.makedirs(target_dir)
+            src_movie = os.path.join(src_dir, "Source.mkv")
+            target_movie = os.path.join(target_dir, "Target.mkv")
+            open(src_movie, "wb").close()
+            open(target_movie, "wb").close()
+
+            success, msg, data = Subtitle().upload_subtitle(
+                _UploadFile("subtitle.eng.srt"),
+                src_movie,
+                target_movie,
+                RmtMode.COPY
+            )
+
+            self.assertTrue(success, msg)
+            self.assertTrue(data["synced"])
+            self.assertTrue(os.path.exists(os.path.join(src_dir, "Source.eng.srt")))
+            self.assertTrue(os.path.exists(os.path.join(target_dir, "Target.eng.srt")))
+
+    def test_upload_save_failure_removes_partial_source_subtitle(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            movie = os.path.join(tmpdir, "Movie.mkv")
+            open(movie, "wb").close()
+
+            success, msg, _ = Subtitle().upload_subtitle(_FailingUploadFile("Movie.eng.srt"), movie)
+
+            self.assertFalse(success)
+            self.assertIn("保存源字幕失败", msg)
+            self.assertFalse(os.path.exists(os.path.join(tmpdir, "Movie.eng.srt")))
+
+    def test_sync_does_not_overwrite_existing_target_subtitle(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_subtitle = os.path.join(tmpdir, "Source.eng.srt")
+            target_subtitle = os.path.join(tmpdir, "Target.eng.srt")
+            with open(source_subtitle, "wb") as file_obj:
+                file_obj.write(b"new subtitle")
+            with open(target_subtitle, "wb") as file_obj:
+                file_obj.write(b"existing subtitle")
+
+            original_link = SystemUtils.__dict__["link"]
+            try:
+                SystemUtils.link = staticmethod(lambda src, dest: (-1, "link failed"))
+                retcode, retmsg = Subtitle()._Subtitle__sync_manual_subtitle(
+                    source_subtitle,
+                    target_subtitle,
+                    RmtMode.LINK
+                )
+            finally:
+                SystemUtils.link = original_link
+
+            self.assertNotEqual(retcode, 0)
+            self.assertIn("已存在", retmsg)
+            with open(target_subtitle, "rb") as file_obj:
+                self.assertEqual(file_obj.read(), b"existing subtitle")
+
+    def test_upload_default_does_not_call_auto_alignment(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_dir = os.path.join(tmpdir, "src")
+            target_dir = os.path.join(tmpdir, "target")
+            os.makedirs(src_dir)
+            os.makedirs(target_dir)
+            src_movie = os.path.join(src_dir, "Source.mkv")
+            target_movie = os.path.join(target_dir, "Target.mkv")
+            open(src_movie, "wb").close()
+            open(target_movie, "wb").close()
+
+            original_align = SubtitleAligner.align_subtitle
+            try:
+                SubtitleAligner.align_subtitle = staticmethod(
+                    lambda source, target: (_ for _ in ()).throw(AssertionError("alignment should not run"))
+                )
+                success, msg, data = Subtitle().upload_subtitle(
+                    _UploadFile("subtitle.eng.srt"),
+                    src_movie,
+                    target_movie,
+                    RmtMode.COPY
+                )
+            finally:
+                SubtitleAligner.align_subtitle = original_align
+
+            self.assertTrue(success, msg)
+            self.assertFalse(data["alignment"]["applied"])
+
+    def test_upload_auto_alignment_reports_result(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_dir = os.path.join(tmpdir, "src")
+            target_dir = os.path.join(tmpdir, "target")
+            os.makedirs(src_dir)
+            os.makedirs(target_dir)
+            src_movie = os.path.join(src_dir, "Source.mkv")
+            target_movie = os.path.join(target_dir, "Target.mkv")
+            open(src_movie, "wb").close()
+            open(target_movie, "wb").close()
+
+            original_align = SubtitleAligner.align_subtitle
+            try:
+                captured = {}
+
+                def _align(source, target, align_mode="auto"):
+                    captured["align_mode"] = align_mode
+                    return {
+                        "applied": True,
+                        "skipped": False,
+                        "message": "自动对齐完成",
+                        "mode": "segmented",
+                        "anchors": 6
+                    }
+
+                SubtitleAligner.align_subtitle = staticmethod(_align)
+                success, msg, data = Subtitle().upload_subtitle(
+                    _UploadFile("subtitle.eng.srt"),
+                    src_movie,
+                    target_movie,
+                    RmtMode.COPY,
+                    align_mode="segmented"
+                )
+            finally:
+                SubtitleAligner.align_subtitle = original_align
+
+            self.assertTrue(success, msg)
+            self.assertIn("已自动对齐字幕", msg)
+            self.assertTrue(data["alignment"]["applied"])
+            self.assertEqual(data["alignment"]["mode"], "segmented")
+            self.assertEqual(captured["align_mode"], "segmented")
