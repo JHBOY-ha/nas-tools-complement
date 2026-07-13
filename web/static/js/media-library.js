@@ -9,7 +9,7 @@ var library_default_media_server = "emby";
 var library_subtitle_audit_categories = {};
 var library_items_loading = false;
 var library_pending_page = null;
-var library_load_timer = null;
+var library_categories_cache = {};
 
 function library_escape_html(value) {
   if (value === null || value === undefined) {
@@ -64,6 +64,10 @@ function library_filter_data(page) {
 }
 
 function update_library_category_options(categories) {
+  if (categories) {
+    library_categories_cache = categories;
+  }
+  categories = library_categories_cache || {};
   const type = $("#library_filter_type").val();
   const selected = $("#library_filter_category").val();
   const category_list = type === "all"
@@ -78,10 +82,6 @@ function update_library_category_options(categories) {
 }
 
 function load_library_items(page) {
-  if (library_load_timer) {
-    clearTimeout(library_load_timer);
-    library_load_timer = null;
-  }
   page = page || 1;
   if (page < 1) {
     return;
@@ -93,7 +93,7 @@ function load_library_items(page) {
   library_items_loading = true;
   library_pending_page = null;
   library_page = page;
-  $("#library_prev_btn,#library_next_btn,#library_filter_btn,#library_refresh_btn").prop("disabled", true);
+  $("#library_prev_btn,#library_next_btn,#library_filter_btn,#library_filter_trigger,#library_refresh_btn").prop("disabled", true);
   $("#library_items_summary").html(
       '<span class="d-inline-flex align-items-center gap-2"><span class="spinner-border spinner-border-sm" aria-hidden="true"></span><span>正在加载字幕状态...</span></span>'
   );
@@ -143,7 +143,7 @@ function load_library_items(page) {
     complete: function () {
       NProgress.done();
       library_items_loading = false;
-      $("#library_filter_btn,#library_refresh_btn").prop("disabled", false);
+      $("#library_filter_btn,#library_filter_trigger,#library_refresh_btn").prop("disabled", false);
       const pending_page = library_pending_page;
       library_pending_page = null;
       if (pending_page !== null) {
@@ -155,16 +155,6 @@ function load_library_items(page) {
   });
 }
 
-function schedule_library_items_load(page) {
-  if (library_load_timer) {
-    clearTimeout(library_load_timer);
-  }
-  library_load_timer = setTimeout(function () {
-    library_load_timer = null;
-    load_library_items(page || 1);
-  }, 300);
-}
-
 function reset_library_filters() {
   $("#library_filter_type").val("all");
   $("#library_filter_category").html('<option value="">全部</option>').val("");
@@ -173,7 +163,55 @@ function reset_library_filters() {
   $("#library_sort_order").val("desc");
   $("#library_filter_keyword").val("");
   update_library_sort_order_labels();
+  update_library_filter_badge();
+  hide_library_filter_menu();
   load_library_items(1);
+}
+
+function apply_library_filters() {
+  update_library_filter_badge();
+  hide_library_filter_menu();
+  load_library_items(1);
+}
+
+function hide_library_filter_menu() {
+  const trigger = document.getElementById("library_filter_trigger");
+  if (!trigger) {
+    return;
+  }
+  if (window.bootstrap && window.bootstrap.Dropdown) {
+    let instance = window.bootstrap.Dropdown.getInstance
+        ? window.bootstrap.Dropdown.getInstance(trigger)
+        : null;
+    if (!instance) {
+      instance = new window.bootstrap.Dropdown(trigger);
+    }
+    instance.hide();
+  } else if ($.fn.dropdown) {
+    $(trigger).dropdown("hide");
+  }
+}
+
+function update_library_filter_badge() {
+  let active_count = 0;
+  if ($("#library_filter_type").val() !== "all") {
+    active_count += 1;
+  }
+  if ($("#library_filter_category").val()) {
+    active_count += 1;
+  }
+  if ($("#library_filter_subtitle").val() !== "all") {
+    active_count += 1;
+  }
+  if ($("#library_sort_by").val() !== "default") {
+    active_count += 1;
+  }
+  if (String($("#library_filter_keyword").val() || "").trim()) {
+    active_count += 1;
+  }
+  $("#library_filter_count").text(active_count).toggleClass("d-none", active_count === 0);
+  $("#library_filter_count").attr("aria-label", `已启用 ${active_count} 个筛选条件`);
+  $("#library_filter_trigger").toggleClass("active", active_count > 0);
 }
 
 function update_library_sort_order_labels() {
@@ -396,6 +434,10 @@ function library_item_card(item, index) {
   const subtitle_audit_label = library_escape_html(item.subtitle_audit_label || "");
   const subtitle_audit_badge = library_escape_html(item.subtitle_audit_badge || "");
   const subtitle_audit_checked_at = library_escape_html(item.subtitle_audit_checked_at || "");
+  const subtitle_audit_count = Math.max(parseInt(item.subtitle_audit_count || 0, 10), 0);
+  const subtitle_audit_text = subtitle_audit_count > 1
+      ? `${subtitle_audit_label} · ${subtitle_audit_count} 条`
+      : subtitle_audit_label;
   const type_name = library_escape_html(item.media_type_name);
   const category = library_escape_html(item.category || "未分类");
   const eager = index < library_eager_poster_count;
@@ -415,6 +457,7 @@ function library_item_card(item, index) {
   }
 
   const is_movie = item.media_type === "movie";
+  const can_repair = is_movie && item.can_upload && item.subtitle_audit_status === "warning";
   const movie_upload_disabled = is_movie && !item.can_upload;
   const btn_attr = is_movie
       ? `${movie_upload_disabled ? "disabled" : ""} onclick="open_library_movie_upload(&quot;${item_id}&quot;)"`
@@ -443,13 +486,60 @@ function library_item_card(item, index) {
         </div>
         ${is_movie && subtitle_audit_label ? `
         <div class="mt-2">
-          <span class="badge ${subtitle_audit_badge} lit-library-card-audit-badge" title="最近检测：${subtitle_audit_checked_at}">${subtitle_audit_label}</span>
+          <span class="badge ${subtitle_audit_badge} lit-library-card-audit-badge" title="最近检测：${subtitle_audit_checked_at}">${subtitle_audit_text}</span>
         </div>` : ""}
       </div>
       <div class="lit-library-card-footer">
+        ${can_repair ? `<button type="button" class="btn btn-sm btn-outline-warning w-100"
+          title="按全局影视服务器规则规范化现有外挂字幕"
+          aria-label="二次处理 ${title} 的外挂字幕"
+          onclick="repair_library_subtitles(&quot;${item_id}&quot;, this)">二次处理</button>` : ""}
         <button type="button" class="btn btn-sm btn-primary w-100" ${btn_attr}>${btn_text}</button>
       </div>
     </div>`;
+}
+
+function repair_library_subtitles(item_id, button) {
+  const item = library_items_cache[item_id];
+  if (!item || !item.target_path) {
+    show_fail_modal("未找到可处理的媒体文件");
+    return;
+  }
+  show_confirm_modal(
+      "将按全局影视服务器规则规范化现有外挂字幕。多来源字幕会保留为独立轨道，不会相互覆盖。是否继续？",
+      function () {
+        hide_confirm_modal();
+        const repair_button = $(button);
+        const original_html = repair_button.html();
+        repair_button.prop("disabled", true).html(
+            '<span class="spinner-border spinner-border-sm me-1" aria-hidden="true"></span>处理中'
+        );
+        NProgress.start();
+        $.ajax({
+          type: "POST",
+          url: "/library/subtitle/repair?random=" + Math.random(),
+          dataType: "json",
+          contentType: "application/json",
+          data: JSON.stringify({media_path: item.target_path}),
+          timeout: 0,
+          success: function (ret) {
+            if (ret && ret.code === 0) {
+              show_success_modal(ret.msg || "外挂字幕二次处理完成");
+              load_library_items(library_page);
+            } else {
+              show_fail_modal((ret && ret.msg) || "外挂字幕二次处理失败");
+            }
+          },
+          error: function () {
+            show_fail_modal("网络错误或处理请求中断");
+          },
+          complete: function () {
+            NProgress.done();
+            repair_button.prop("disabled", false).html(original_html);
+          }
+        });
+      }
+  );
 }
 
 function init_library_posters() {
@@ -573,17 +663,24 @@ function init_media_library_page(options) {
     library_page_size = options.page_size;
   }
   $("#index_upload_subtitle_btn").unbind("click").click(function () {
-    let file = $("#index_upload_subtitle_file")[0].files[0];
-    if (!file) {
+    const files = Array.from($("#index_upload_subtitle_file")[0].files || []);
+    if (!files.length) {
       show_fail_modal("请选择字幕文件");
       return;
     }
+    const upload_button = $("#index_upload_subtitle_btn");
+    const original_html = upload_button.html();
     let form_data = new FormData();
     form_data.append("path", $("#index_upload_subtitle_path").val());
     form_data.append("target_path", $("#index_upload_subtitle_target_path").val());
     form_data.append("server", $("#index_upload_subtitle_server").val());
     form_data.append("align", $("#index_upload_subtitle_align").val() || "none");
-    form_data.append("file", file);
+    files.forEach(function (file) {
+      form_data.append("file", file);
+    });
+    upload_button.prop("disabled", true).html(
+        '<span class="spinner-border spinner-border-sm me-1" aria-hidden="true"></span>上传中'
+    );
     NProgress.start();
     $.ajax({
       type: "POST",
@@ -594,7 +691,6 @@ function init_media_library_page(options) {
       contentType: false,
       dataType: "json",
       success: function (ret) {
-        NProgress.done();
         if (ret.code === 0) {
           $("#index-upload-subtitle-modal").modal("hide");
           show_success_modal(ret.msg || "字幕上传成功");
@@ -607,33 +703,38 @@ function init_media_library_page(options) {
         }
       },
       error: function () {
-        NProgress.done();
         show_fail_modal("网络错误");
+      },
+      complete: function () {
+        NProgress.done();
+        upload_button.prop("disabled", false).html(original_html);
       }
     });
   });
 
   $("#library_filter_type").unbind("change").change(function () {
     $("#library_filter_category").val("");
-    schedule_library_items_load(1);
+    update_library_category_options();
+    update_library_filter_badge();
   });
   $("#library_sort_by").unbind("change").change(function () {
     update_library_sort_order_labels();
-    schedule_library_items_load(1);
+    update_library_filter_badge();
   });
   $("#library_filter_category,#library_filter_subtitle,#library_sort_order").unbind("change").change(function () {
-    schedule_library_items_load(1);
+    update_library_filter_badge();
   });
   $("#library_filter_keyword").unbind("input").on("input", function () {
-    schedule_library_items_load(1);
+    update_library_filter_badge();
   });
   $("#library_filter_keyword").unbind("keydown").keydown(function (event) {
     if (event.key === "Enter") {
       event.preventDefault();
-      load_library_items(1);
+      apply_library_filters();
     }
   });
 
   update_library_sort_order_labels();
+  update_library_filter_badge();
   load_library_items(1);
 }

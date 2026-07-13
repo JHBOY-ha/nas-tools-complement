@@ -5,6 +5,7 @@ import sys
 import tempfile
 import types
 from unittest import TestCase
+from unittest.mock import patch
 
 if not os.environ.get("NASTOOL_CONFIG"):
     _ROOT_PATH = os.path.dirname(os.path.dirname(__file__))
@@ -155,6 +156,61 @@ class SubtitleUploadTest(TestCase):
             self.assertTrue(success, msg)
             self.assertEqual(data["language"], "zh-CN")
             self.assertTrue(os.path.exists(os.path.join(tmpdir, "Movie.chi.zh-cn.srt")))
+
+    def test_jellyfin_upload_preserves_source_title_before_language(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            movie = os.path.join(tmpdir, "Movie.mkv")
+            open(movie, "wb").close()
+
+            success, msg, data = Subtitle().upload_subtitle(
+                _UploadFile("Movie.YYeTs.zh-cn.srt"),
+                movie,
+                server_type="jellyfin"
+            )
+
+            self.assertTrue(success, msg)
+            self.assertEqual(data["source"], "YYeTs")
+            self.assertTrue(os.path.exists(os.path.join(tmpdir, "Movie.YYeTs.chi.zh-cn.srt")))
+
+    def test_jellyfin_same_language_collision_uses_readable_source_title(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            movie = os.path.join(tmpdir, "Movie.mkv")
+            open(movie, "wb").close()
+            open(os.path.join(tmpdir, "Movie.chi.zh-cn.srt"), "wb").close()
+
+            success, msg, _ = Subtitle().upload_subtitle(
+                _UploadFile("subtitle.zh-cn.srt"),
+                movie,
+                server_type="jellyfin"
+            )
+
+            self.assertTrue(success, msg)
+            self.assertTrue(os.path.exists(os.path.join(tmpdir, "Movie.source-2.chi.zh-cn.srt")))
+            self.assertFalse(os.path.exists(os.path.join(tmpdir, "Movie.chi.zh-cn(1).srt")))
+
+    def test_repair_jellyfin_warning_subtitles_keeps_multiple_sources(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            movie = os.path.join(tmpdir, "Movie.mkv")
+            first = os.path.join(tmpdir, "Movie.zh-CN.srt")
+            second = os.path.join(tmpdir, "Movie.YYeTs.zh-CN.srt")
+            open(movie, "wb").close()
+            for subtitle_file in [first, second]:
+                with open(subtitle_file, "wb") as file_obj:
+                    file_obj.write(b"subtitle")
+
+            valid = {"valid": True, "probe_available": True, "message": "ok"}
+            with patch.object(SubtitleHealth, "validate_subtitle", return_value=valid), \
+                    patch.object(SubtitleHealth, "normalize_uploaded_subtitle", return_value=valid):
+                success, msg, data = Subtitle().repair_external_subtitles(movie, "jellyfin")
+
+            self.assertTrue(success, msg)
+            self.assertEqual(len(data["processed"]), 2)
+            self.assertEqual(data["subtitle_count"], 2)
+            self.assertEqual(data["status"], "ok")
+            self.assertFalse(os.path.exists(first))
+            self.assertFalse(os.path.exists(second))
+            self.assertTrue(os.path.exists(os.path.join(tmpdir, "Movie.chi.zh-cn.srt")))
+            self.assertTrue(os.path.exists(os.path.join(tmpdir, "Movie.YYeTs.chi.zh-cn.srt")))
 
     def test_upload_repairs_blank_line_between_srt_index_and_timing(self):
         with tempfile.TemporaryDirectory() as tmpdir:

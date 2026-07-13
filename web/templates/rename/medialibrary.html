@@ -38,64 +38,79 @@
             </div>
           </div>
           <div class="card-body">
-            <div class="d-flex align-items-center gap-2 mb-3">
-              <span class="text-primary">{{ SVG.filter() }}</span>
-              <div>
-                <div class="fw-bold">筛选与排序</div>
-                <div class="text-muted small">更改条件后点击“应用”；搜索输入会在短暂停顿后自动更新</div>
+            <div class="lit-library-toolbar">
+              <div class="dropdown">
+                <button class="btn btn-outline-primary lit-library-filter-trigger" id="library_filter_trigger"
+                        type="button" data-bs-toggle="dropdown" data-bs-auto-close="outside"
+                        aria-expanded="false" aria-controls="library_filter_menu">
+                  {{ SVG.filter() }}
+                  <span>筛选与排序</span>
+                  <span id="library_filter_count" class="badge bg-primary text-white d-none" aria-label="已启用筛选数量">0</span>
+                </button>
+                <div class="dropdown-menu lit-library-filter-menu p-0" id="library_filter_menu"
+                     aria-labelledby="library_filter_trigger">
+                  <div class="lit-library-filter-menu-header">
+                    <div>
+                      <div class="fw-bold">筛选与排序</div>
+                      <div class="text-muted small">设置完成后统一应用，避免短时间内重复读取 NAS 目录</div>
+                    </div>
+                  </div>
+                  <div class="p-3">
+                    <div class="row g-3 align-items-end">
+                      <div class="col-12 col-sm-6 col-lg-4">
+                        <label class="form-label" for="library_filter_type">类型</label>
+                        <select id="library_filter_type" class="form-select">
+                          <option value="all">全部</option>
+                          <option value="movie">电影</option>
+                          <option value="tv">电视剧</option>
+                          <option value="anime">动漫</option>
+                        </select>
+                      </div>
+                      <div class="col-12 col-sm-6 col-lg-4">
+                        <label class="form-label" for="library_filter_category">小分类</label>
+                        <select id="library_filter_category" class="form-select">
+                          <option value="">全部</option>
+                        </select>
+                      </div>
+                      <div class="col-12 col-sm-6 col-lg-4">
+                        <label class="form-label" for="library_filter_subtitle">字幕状态</label>
+                        <select id="library_filter_subtitle" class="form-select">
+                          <option value="all">全部</option>
+                          <option value="missing">缺中文字幕</option>
+                          <option value="ok">已有中文字幕</option>
+                        </select>
+                      </div>
+                      <div class="col-12 col-sm-6 col-lg-4">
+                        <label class="form-label" for="library_sort_by">排序字段</label>
+                        <select id="library_sort_by" class="form-select">
+                          <option value="default">默认顺序</option>
+                          <option value="internal">是否有内嵌字幕</option>
+                          <option value="external">是否有外挂字幕</option>
+                          <option value="audit">字幕检测问题程度</option>
+                        </select>
+                      </div>
+                      <div class="col-12 col-sm-6 col-lg-4">
+                        <label class="form-label" for="library_sort_order">排序方向</label>
+                        <select id="library_sort_order" class="form-select">
+                          <option value="desc">降序</option>
+                          <option value="asc">升序</option>
+                        </select>
+                      </div>
+                      <div class="col-12 col-sm-6 col-lg-4">
+                        <label class="form-label" for="library_filter_keyword">搜索</label>
+                        <input id="library_filter_keyword" type="search" class="form-control" placeholder="标题、原名、年份">
+                      </div>
+                    </div>
+                  </div>
+                  <div class="lit-library-filter-menu-footer">
+                    <button class="btn" type="button" onclick="reset_library_filters()">重置</button>
+                    <button class="btn btn-primary" id="library_filter_btn" type="button" onclick="apply_library_filters()">应用筛选</button>
+                  </div>
+                </div>
               </div>
-            </div>
-            <div class="row g-2 align-items-end">
-              <div class="col-6 col-md-3 col-xl-1">
-                <label class="form-label" for="library_filter_type">类型</label>
-                <select id="library_filter_type" class="form-select">
-                  <option value="all">全部</option>
-                  <option value="movie">电影</option>
-                  <option value="tv">电视剧</option>
-                  <option value="anime">动漫</option>
-                </select>
-              </div>
-              <div class="col-6 col-md-3 col-xl-2">
-                <label class="form-label" for="library_filter_category">小分类</label>
-                <select id="library_filter_category" class="form-select">
-                  <option value="">全部</option>
-                </select>
-              </div>
-              <div class="col-6 col-md-3 col-xl-2">
-                <label class="form-label" for="library_filter_subtitle">字幕状态</label>
-                <select id="library_filter_subtitle" class="form-select">
-                  <option value="all">全部</option>
-                  <option value="missing">缺中文字幕</option>
-                  <option value="ok">已有中文字幕</option>
-                </select>
-              </div>
-              <div class="col-6 col-md-3 col-xl-2">
-                <label class="form-label" for="library_sort_by">排序字段</label>
-                <select id="library_sort_by" class="form-select">
-                  <option value="default">默认顺序</option>
-                  <option value="internal">是否有内嵌字幕</option>
-                  <option value="external">是否有外挂字幕</option>
-                  <option value="audit">字幕检测问题程度</option>
-                </select>
-              </div>
-              <div class="col-6 col-md-3 col-xl-2">
-                <label class="form-label" for="library_sort_order">方向</label>
-                <select id="library_sort_order" class="form-select">
-                  <option value="desc">降序</option>
-                  <option value="asc">升序</option>
-                </select>
-              </div>
-              <div class="col-12 col-md-6 col-xl-2">
-                <label class="form-label" for="library_filter_keyword">搜索</label>
-                <input id="library_filter_keyword" type="text" class="form-control" placeholder="标题、原名、年份">
-              </div>
-              <div class="col-12 col-md-6 col-xl-1">
-                <button class="btn btn-primary w-100" id="library_filter_btn" type="button" onclick="load_library_items(1)">应用</button>
-              </div>
-            </div>
-            <div class="lit-library-result-bar mt-3">
+              <div class="lit-library-result-bar">
               <div id="library_items_summary" class="text-muted" aria-live="polite"></div>
-              <button class="btn btn-sm btn-ghost-secondary" type="button" onclick="reset_library_filters()">重置筛选</button>
+              </div>
             </div>
           </div>
           <div class="lit-library-legend" aria-label="字幕状态图例">
@@ -174,7 +189,7 @@
             </div>
             <div class="lit-library-help-status-item">
               <span class="badge bg-yellow-lt text-yellow">外挂字幕语言需规范</span>
-              <span class="text-muted">字幕可读取，但语言标签或命名可能在客户端显示为“未定义”。</span>
+              <span class="text-muted">字幕可读取，但语言标签或命名可能显示为“未定义”；电影卡片会提供“二次处理”。</span>
             </div>
             <div class="lit-library-help-status-item">
               <span class="badge bg-green-lt text-green">外挂字幕检测通过</span>
@@ -201,6 +216,8 @@
             字幕必须位于媒体链接后的目标视频同目录，且文件名前缀与视频一致。
             Jellyfin 简体中文字幕建议使用 <code>Movie.chi.zh-cn.srt</code>；
             Plex 建议使用 <code>Movie.zh-CN.srt</code> 或 <code>Movie.zh-TW.srt</code>。
+            同语种多来源字幕在 Jellyfin 下会保留独立标题，例如
+            <code>Movie.YYeTs.chi.zh-cn.srt</code>、<code>Movie.source-2.chi.zh-cn.srt</code>。
             上传后会按所选影视服务器规范化文件名并触发刷新。
           </div>
         </section>
@@ -297,7 +314,9 @@
         </div>
         <div class="mb-3">
           <label class="form-label required">字幕文件</label>
-          <input type="file" id="index_upload_subtitle_file" class="form-control" accept=".srt,.ass,.ssa,.smi,.vtt,.sub">
+          <input type="file" id="index_upload_subtitle_file" class="form-control"
+                 accept=".srt,.ass,.ssa,.smi,.vtt,.sub" multiple>
+          <div class="form-hint">单次最多选择 20 个字幕；同电影、同语种的不同来源会保留为独立轨道，不会相互覆盖。</div>
         </div>
         <div class="mb-3">
           <label class="form-label required">目标影视服务器</label>

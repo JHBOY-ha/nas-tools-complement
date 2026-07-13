@@ -1169,6 +1169,43 @@ def library_subtitle_audit_categories():
         return {"code": -1, "msg": str(e)}
 
 
+@App.route('/library/subtitle/repair', methods=['POST'])
+@login_required
+def library_subtitle_repair():
+    """按全局影视服务器规则二次处理单个电影的现有外挂字幕。"""
+    try:
+        data = request.get_json(silent=True) or request.form.to_dict() or {}
+        media_file = os.path.normpath(str(data.get("media_path") or ""))
+        media_config = Config().get_config('media') or {}
+        server_type = str(media_config.get('media_server') or "emby").lower()
+        if not media_file or not os.path.isfile(media_file):
+            return {"code": -1, "msg": "媒体文件不存在"}
+        if os.path.splitext(media_file)[-1].lower() not in RMT_MEDIAEXT:
+            return {"code": -1, "msg": "请选择有效的媒体文件"}
+        if not _is_within_media_library(media_file):
+            return {"code": -1, "msg": "媒体文件不在媒体库目录范围内"}
+        if server_type not in ["emby", "jellyfin", "plex"]:
+            return {"code": -1, "msg": "全局影视服务器配置无效"}
+
+        success, message, result = Subtitle().repair_external_subtitles(media_file, server_type)
+        if not success:
+            return {"code": -1, "msg": message, "data": result}
+        MediaLibrary.invalidate_subtitle_directory_cache(media_file)
+        result["audit_status"] = MediaLibrary.update_external_subtitle_audit_status(media_file, server_type)
+        refresh_msg = ""
+        try:
+            refreshed = MediaServer().refresh_root_library_by_type(server_type)
+            if refreshed is False:
+                refresh_msg = "，但刷新媒体服务器失败"
+        except Exception as e:
+            ExceptionUtils.exception_traceback(e)
+            refresh_msg = f"，但刷新媒体服务器失败：{str(e)}"
+        return {"code": 0, "msg": f"{message}{refresh_msg}", "data": result}
+    except Exception as e:
+        ExceptionUtils.exception_traceback(e)
+        return {"code": -1, "msg": str(e)}
+
+
 @App.route('/library/image/<itemid>', methods=['GET'])
 @login_required
 def library_image(itemid):
@@ -1882,7 +1919,7 @@ def upload_subtitle():
         target_file = request.form.get("target_path") or ""
         server_type = str(request.form.get("server") or Config().get_config('media').get('media_server') or "emby").lower()
         align_mode = str(request.form.get("align") or "none").lower()
-        upload_file = request.files.get("file")
+        upload_files = request.files.getlist("file")
         if not media_file:
             return {"code": -1, "msg": "媒体文件不能为空"}
         media_file = os.path.normpath(media_file)
@@ -1894,8 +1931,10 @@ def upload_subtitle():
             return {"code": -1, "msg": "请选择目标影视服务器"}
         if align_mode not in ["auto", "offset", "segmented", "llm", "none"]:
             return {"code": -1, "msg": "请选择有效的字幕对齐模式"}
-        if not upload_file:
+        if not upload_files:
             return {"code": -1, "msg": "请选择字幕文件"}
+        if len(upload_files) > 20:
+            return {"code": -1, "msg": "单次最多上传 20 个字幕文件"}
 
         # 查找该媒体文件的转移历史，获取整理模式和目标路径
         history = DbHelper().get_latest_transfer_history_by_source_full_path(media_file)
@@ -1910,17 +1949,53 @@ def upload_subtitle():
         if target_file and not _is_within_media_library(target_file):
             return {"code": -1, "msg": "目标文件不在媒体库目录范围内"}
 
-        # 调用核心逻辑保存并同步字幕
-        success, message, data = Subtitle().upload_subtitle(upload_file=upload_file,
-                                                           media_file=media_file,
-                                                           target_media_file=target_file,
-                                                           rmt_mode=rmt_mode,
-                                                           server_type=server_type,
-                                                           align_mode=align_mode)
-        if success:
+        # 调用核心逻辑保存并同步字幕；多文件共用一次路径校验和媒体服务器刷新
+        service = Subtitle()
+        upload_results = []
+        successful_data = []
+        for upload_file in upload_files:
+            item_success, item_message, item_data = service.upload_subtitle(
+                upload_file=upload_file,
+                media_file=media_file,
+                target_media_file=target_file,
+                rmt_mode=rmt_mode,
+                server_type=server_type,
+                align_mode=align_mode
+            )
+            upload_results.append({
+                "filename": os.path.basename(upload_file.filename or ""),
+                "success": item_success,
+                "message": item_message,
+                "data": item_data
+            })
+            if item_success:
+                successful_data.append(item_data)
+
+        if len(upload_results) == 1:
+            success = upload_results[0]["success"]
+            message = upload_results[0]["message"]
+            data = upload_results[0]["data"]
+        else:
+            success_count = len(successful_data)
+            failure_count = len(upload_results) - success_count
+            success = success_count > 0
+            message = f"已处理 {len(upload_results)} 个字幕：成功 {success_count} 个"
+            if failure_count:
+                message += f"，失败 {failure_count} 个"
+                first_failure = next((item for item in upload_results if not item.get("success")), {})
+                if first_failure:
+                    message += f"（{first_failure.get('filename') or '字幕'}：{first_failure.get('message') or '处理失败'}）"
+            data = {
+                "results": upload_results,
+                "success_count": success_count,
+                "failure_count": failure_count,
+                "synced": any(item.get("synced") for item in successful_data)
+            }
+
+        for item_data in successful_data:
             for cache_path in [
-                data.get("source_subtitle"),
-                data.get("target_subtitle"),
+                item_data.get("source_subtitle"),
+                item_data.get("target_subtitle"),
                 target_file,
                 media_file
             ]:

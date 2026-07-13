@@ -337,7 +337,7 @@ class MediaLibraryTest(TestCase):
             snapshot = {
                 "checked_at": "2026-07-13T20:00:00+08:00",
                 "media_statuses": {
-                    key: {"status": "error", "reason": "Invalid data"}
+                    key: {"status": "error", "reason": "Invalid data", "subtitle_count": 2}
                 }
             }
 
@@ -349,7 +349,47 @@ class MediaLibraryTest(TestCase):
 
             self.assertEqual(item["subtitle_audit_status"], "error")
             self.assertEqual(item["subtitle_audit_label"], "外挂字幕无法识别")
+            self.assertEqual(item["subtitle_audit_count"], 2)
             self.assertEqual(item["subtitle_audit_checked_at"], snapshot["checked_at"])
+
+    def test_single_movie_recheck_updates_latest_status_without_rewriting_history(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            movie = os.path.join(tmpdir, "Movie.mkv")
+            open(movie, "wb").close()
+            key = os.path.normcase(os.path.normpath(movie))
+            history_file = os.path.join(tmpdir, "subtitle-audit-history.json")
+            with open(history_file, "w", encoding="utf-8") as file_obj:
+                json.dump({
+                    "version": 1,
+                    "latest": {
+                        "movie": {
+                            "checked_at": "2026-07-13T20:00:00+08:00",
+                            "server": "jellyfin",
+                            "media_statuses": {key: {"status": "warning", "subtitle_count": 1}}
+                        }
+                    },
+                    "history": [{"scope_name": "全部电影", "summary": {"warning": 1}}]
+                }, file_obj, ensure_ascii=False)
+
+            MediaLibrary._subtitle_audit_store_cache = None
+            aggregate = {
+                "media_path": movie,
+                "status": "ok",
+                "reason": "文件名关联、语言标签和字幕内容均可识别",
+                "subtitle_count": 2
+            }
+            with patch("app.library.Config") as config_cls, \
+                    patch.object(SubtitleHealth, "inspect_media_subtitles", return_value=[{"status": "ok"}]), \
+                    patch.object(SubtitleHealth, "aggregate_media_subtitles", return_value=aggregate):
+                config_cls.return_value.get_config_path.return_value = tmpdir
+                ret = MediaLibrary.update_external_subtitle_audit_status(movie, "jellyfin")
+
+            MediaLibrary._subtitle_audit_store_cache = None
+            with open(history_file, "r", encoding="utf-8") as file_obj:
+                store = json.load(file_obj)
+            self.assertEqual(ret["status"], "ok")
+            self.assertEqual(store["latest"]["movie"]["media_statuses"][key]["subtitle_count"], 2)
+            self.assertEqual(store["history"], [{"scope_name": "全部电影", "summary": {"warning": 1}}])
 
     def test_full_library_subtitle_audit_reports_ffprobe_failure(self):
         with tempfile.TemporaryDirectory() as tmpdir:

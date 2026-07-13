@@ -229,6 +229,44 @@ class MediaLibrary:
         store = self.__load_subtitle_audit_store()
         return {"code": 0, "history": store.get("history") or []}
 
+    @classmethod
+    def update_external_subtitle_audit_status(cls, media_file, server_type):
+        """二次处理后仅复检并更新单个电影的最新状态，不触发全库扫描。"""
+        server_type = str(server_type or "emby").lower()
+        media_file = os.path.normpath(media_file or "")
+        if not media_file:
+            return {}
+        results = SubtitleHealth.inspect_media_subtitles(media_file, server_type)
+        aggregate = SubtitleHealth.aggregate_media_subtitles(results)
+        checked_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        key = os.path.normcase(media_file)
+        with cls._subtitle_audit_lock:
+            store = cls.__load_subtitle_audit_store()
+            latest = dict(store.get("latest") or {})
+            snapshot = dict(latest.get("movie") or {})
+            if str(snapshot.get("server") or "").lower() != server_type:
+                snapshot = {"checked_at": checked_at, "server": server_type, "media_statuses": {}}
+            media_statuses = dict(snapshot.get("media_statuses") or {})
+            if aggregate:
+                aggregate = dict(aggregate)
+                aggregate["checked_at"] = checked_at
+                media_statuses[key] = aggregate
+            else:
+                media_statuses.pop(key, None)
+            snapshot.update({
+                "checked_at": checked_at,
+                "server": server_type,
+                "media_statuses": media_statuses
+            })
+            latest["movie"] = snapshot
+            store = {
+                "version": 1,
+                "latest": latest,
+                "history": (store.get("history") or [])[:3]
+            }
+            cls.__write_subtitle_audit_store(store)
+        return aggregate
+
     def get_external_subtitle_audit_categories(self):
         """返回当前分类 YAML 中配置的媒体小分类。"""
         return {
@@ -319,6 +357,7 @@ class MediaLibrary:
             "subtitle_audit_label": "",
             "subtitle_audit_badge": "",
             "subtitle_audit_checked_at": "",
+            "subtitle_audit_count": 0,
             "missing_count": 0
         }
         if include_status:
@@ -372,6 +411,7 @@ class MediaLibrary:
         item["subtitle_audit_badge"] = badge
         item["subtitle_audit_checked_at"] = audit_status.get("checked_at") \
             or audit_snapshot.get("checked_at") or ""
+        item["subtitle_audit_count"] = audit_status.get("subtitle_count") or 0
 
     @classmethod
     def __fill_sort_metrics(cls, item, audit_snapshots):

@@ -151,6 +151,40 @@ class SubtitleHealth:
         return result
 
     @classmethod
+    def list_external_subtitles(cls, media_file):
+        """返回与指定媒体文件同目录、同名前缀的全部外挂字幕。"""
+        if not media_file or not os.path.isfile(media_file):
+            return []
+        media_dir = os.path.dirname(media_file)
+        media_base = os.path.splitext(os.path.basename(media_file))[0]
+        media_bases = [(media_base, media_file)]
+        try:
+            file_names = sorted(os.listdir(media_dir))
+        except OSError:
+            return []
+        subtitles = []
+        for file_name in file_names:
+            if os.path.splitext(file_name)[-1].lower() not in RMT_SUBEXT:
+                continue
+            if cls.__match_media_file(file_name, media_bases) == media_file:
+                subtitles.append(os.path.join(media_dir, file_name))
+        return subtitles
+
+    @classmethod
+    def inspect_media_subtitles(cls, media_file, server_type):
+        """检查单个媒体文件关联的全部外挂字幕。"""
+        return [
+            cls.inspect_external_subtitle(subtitle_file, media_file, server_type)
+            for subtitle_file in cls.list_external_subtitles(media_file)
+        ]
+
+    @classmethod
+    def aggregate_media_subtitles(cls, results):
+        """汇总单个媒体的多字幕结果，保留最严重状态并统计字幕数量。"""
+        key_statuses = cls.__aggregate_media_statuses(results)
+        return next(iter(key_statuses.values()), {})
+
+    @classmethod
     def audit_roots(cls, roots, server_type, issue_limit=1000):
         roots = cls.__normalize_roots(roots)
         subtitle_pairs = []
