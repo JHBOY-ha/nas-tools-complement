@@ -1138,7 +1138,32 @@ def library_subtitle_audit():
     """按全局影视服务器规则检测指定分类的外挂字幕。"""
     try:
         data = request.get_json(silent=True) or request.form.to_dict() or {}
-        return MediaLibrary().audit_external_subtitles(data.get("category"))
+        return MediaLibrary().audit_external_subtitles(
+            data.get("category"),
+            data.get("subcategory")
+        )
+    except Exception as e:
+        ExceptionUtils.exception_traceback(e)
+        return {"code": -1, "msg": str(e)}
+
+
+@App.route('/library/subtitle/audit/history', methods=['GET'])
+@login_required
+def library_subtitle_audit_history():
+    """读取最近 3 次外挂字幕检测记录。"""
+    try:
+        return MediaLibrary().get_external_subtitle_audit_history()
+    except Exception as e:
+        ExceptionUtils.exception_traceback(e)
+        return {"code": -1, "msg": str(e)}
+
+
+@App.route('/library/subtitle/audit/categories', methods=['GET'])
+@login_required
+def library_subtitle_audit_categories():
+    """读取字幕检测可用的媒体小分类。"""
+    try:
+        return MediaLibrary().get_external_subtitle_audit_categories()
     except Exception as e:
         ExceptionUtils.exception_traceback(e)
         return {"code": -1, "msg": str(e)}

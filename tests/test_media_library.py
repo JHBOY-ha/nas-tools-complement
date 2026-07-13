@@ -111,6 +111,100 @@ from app.helper.subtitle_health import SubtitleHealth
 
 
 class MediaLibraryTest(TestCase):
+    class _AuditCategory:
+        @staticmethod
+        def get_movie_categorys():
+            return ["国产电影", "外国电影", "动画电影"]
+
+        @staticmethod
+        def get_tv_categorys():
+            return ["国产剧", "欧美剧"]
+
+        @staticmethod
+        def get_anime_categorys():
+            return ["动漫"]
+
+    def test_subtitle_audit_scans_selected_movie_subcategory_only(self):
+        library = MediaLibrary.__new__(MediaLibrary)
+        library.category = self._AuditCategory()
+        with patch("app.library.Config") as config_cls, \
+                patch.object(SubtitleHealth, "audit_roots", return_value={"code": 0}) as audit_roots, \
+                patch.object(MediaLibrary, "_MediaLibrary__save_subtitle_audit", return_value=[]):
+            config_cls.return_value.get_config.return_value = {
+                "media_server": "jellyfin",
+                "movie_path": ["/media/movies"]
+            }
+            ret = library.audit_external_subtitles("movie", "动画电影")
+
+        audit_roots.assert_called_once_with([os.path.join("/media/movies", "动画电影")], "jellyfin")
+        self.assertEqual(ret["subcategory"], "动画电影")
+        self.assertEqual(ret["scope_name"], "电影 / 动画电影")
+
+    def test_subtitle_audit_rejects_unknown_subcategory(self):
+        library = MediaLibrary.__new__(MediaLibrary)
+        library.category = self._AuditCategory()
+        with patch("app.library.Config") as config_cls, \
+                patch.object(SubtitleHealth, "audit_roots") as audit_roots:
+            config_cls.return_value.get_config.return_value = {
+                "media_server": "jellyfin",
+                "movie_path": ["/media/movies"]
+            }
+            ret = library.audit_external_subtitles("movie", "../other")
+
+        self.assertEqual(ret["code"], -1)
+        self.assertIn("小分类无效", ret["msg"])
+        audit_roots.assert_not_called()
+
+    def test_subtitle_audit_categories_follow_category_yaml(self):
+        library = MediaLibrary.__new__(MediaLibrary)
+        library.category = self._AuditCategory()
+
+        ret = library.get_external_subtitle_audit_categories()
+
+        self.assertEqual(ret["categories"]["movie"], ["国产电影", "外国电影", "动画电影"])
+        self.assertEqual(ret["categories"]["tv"], ["国产剧", "欧美剧"])
+
+    def test_subcategory_audits_preserve_other_movie_subcategory_labels(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            domestic_root = os.path.join(tmpdir, "国产电影")
+            foreign_root = os.path.join(tmpdir, "外国电影")
+            os.makedirs(domestic_root)
+            os.makedirs(foreign_root)
+            domestic_movie = os.path.join(domestic_root, "Domestic.mkv")
+            foreign_movie = os.path.join(foreign_root, "Foreign.mkv")
+            library = MediaLibrary.__new__(MediaLibrary)
+            library.category = self._AuditCategory()
+
+            def audit_result(roots, server):
+                media_path = domestic_movie if roots[0] == domestic_root else foreign_movie
+                key = os.path.normcase(os.path.normpath(media_path))
+                return {
+                    "code": 0,
+                    "server": server,
+                    "roots": roots,
+                    "inaccessible_roots": [],
+                    "summary": {"total": 1, "ok": 1, "warning": 0, "error": 0},
+                    "issues": [],
+                    "issues_truncated": 0,
+                    "probe_available": True,
+                    "media_statuses": {key: {"media_path": media_path, "status": "ok"}}
+                }
+
+            with patch("app.library.Config") as config_cls, \
+                    patch.object(SubtitleHealth, "audit_roots", side_effect=audit_result):
+                config_cls.return_value.get_config.return_value = {
+                    "media_server": "jellyfin",
+                    "movie_path": [tmpdir]
+                }
+                config_cls.return_value.get_config_path.return_value = tmpdir
+                library.audit_external_subtitles("movie", "国产电影")
+                library.audit_external_subtitles("movie", "外国电影")
+                snapshot = library._MediaLibrary__latest_audit_snapshot("movie", "jellyfin")
+
+            self.assertEqual(len(snapshot["media_statuses"]), 2)
+            self.assertIn(os.path.normcase(os.path.normpath(domestic_movie)), snapshot["media_statuses"])
+            self.assertIn(os.path.normcase(os.path.normpath(foreign_movie)), snapshot["media_statuses"])
+
     def test_subtitle_audit_scans_only_selected_category(self):
         media_config = {
             "media_server": "jellyfin",
@@ -124,7 +218,8 @@ class MediaLibraryTest(TestCase):
         }
         library = MediaLibrary.__new__(MediaLibrary)
         with patch("app.library.Config") as config_cls, \
-                patch.object(SubtitleHealth, "audit_roots", return_value=audit_result) as audit_roots:
+                patch.object(SubtitleHealth, "audit_roots", return_value=audit_result) as audit_roots, \
+                patch.object(MediaLibrary, "_MediaLibrary__save_subtitle_audit", return_value=[]):
             config_cls.return_value.get_config.return_value = media_config
             ret = library.audit_external_subtitles("tv")
 
@@ -146,7 +241,8 @@ class MediaLibraryTest(TestCase):
     def test_anime_subtitle_audit_falls_back_to_tv_path(self):
         library = MediaLibrary.__new__(MediaLibrary)
         with patch("app.library.Config") as config_cls, \
-                patch.object(SubtitleHealth, "audit_roots", return_value={"code": 0}) as audit_roots:
+                patch.object(SubtitleHealth, "audit_roots", return_value={"code": 0}) as audit_roots, \
+                patch.object(MediaLibrary, "_MediaLibrary__save_subtitle_audit", return_value=[]):
             config_cls.return_value.get_config.return_value = {
                 "media_server": "emby",
                 "tv_path": ["/media/tv"],
@@ -187,6 +283,72 @@ class MediaLibraryTest(TestCase):
             self.assertIn("语言未定义", issues["Movie.zh-CN.srt"]["reason"])
             self.assertEqual(issues["Other.zh-CN.srt"]["status"], "error")
             self.assertIn("未找到", issues["Other.zh-CN.srt"]["reason"])
+            media_status = ret["media_statuses"][os.path.normcase(os.path.normpath(movie))]
+            self.assertEqual(media_status["status"], "warning")
+            self.assertEqual(media_status["subtitle_count"], 2)
+
+    def test_subtitle_audit_keeps_only_latest_three_records(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            library = MediaLibrary.__new__(MediaLibrary)
+            counter = {"value": 0}
+
+            def audit_result(*_):
+                counter["value"] += 1
+                value = counter["value"]
+                return {
+                    "code": 0,
+                    "server": "jellyfin",
+                    "roots": [tmpdir],
+                    "summary": {"total": value, "ok": value, "warning": 0, "error": 0},
+                    "issues": [],
+                    "issues_truncated": 0,
+                    "probe_available": True,
+                    "media_statuses": {}
+                }
+
+            with patch("app.library.Config") as config_cls, \
+                    patch.object(SubtitleHealth, "audit_roots", side_effect=audit_result):
+                config_cls.return_value.get_config.return_value = {
+                    "media_server": "jellyfin",
+                    "movie_path": [tmpdir]
+                }
+                config_cls.return_value.get_config_path.return_value = tmpdir
+                for _ in range(4):
+                    library.audit_external_subtitles("movie")
+                history = library.get_external_subtitle_audit_history()["history"]
+
+            self.assertEqual(len(history), 3)
+            self.assertEqual([item["summary"]["total"] for item in history], [4, 3, 2])
+            self.assertTrue(os.path.isfile(os.path.join(tmpdir, "subtitle-audit-history.json")))
+
+    def test_movie_card_receives_latest_external_subtitle_audit_label(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            movie = os.path.join(tmpdir, "Movie.mkv")
+            open(movie, "wb").close()
+            key = os.path.normcase(os.path.normpath(movie))
+            item = {
+                "media_type": "movie",
+                "target_path": movie,
+                "path": movie,
+                "media_streams": [],
+                "linked_episodes": []
+            }
+            snapshot = {
+                "checked_at": "2026-07-13T20:00:00+08:00",
+                "media_statuses": {
+                    key: {"status": "error", "reason": "Invalid data"}
+                }
+            }
+
+            MediaLibrary.__new__(MediaLibrary)._MediaLibrary__fill_subtitle_summary(
+                item,
+                allow_ffprobe=False,
+                audit_snapshot=snapshot
+            )
+
+            self.assertEqual(item["subtitle_audit_status"], "error")
+            self.assertEqual(item["subtitle_audit_label"], "外挂字幕无法识别")
+            self.assertEqual(item["subtitle_audit_checked_at"], snapshot["checked_at"])
 
     def test_full_library_subtitle_audit_reports_ffprobe_failure(self):
         with tempfile.TemporaryDirectory() as tmpdir:

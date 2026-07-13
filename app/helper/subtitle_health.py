@@ -193,6 +193,7 @@ class SubtitleHealth:
             "warning": len([item for item in results if item.get("status") == "warning"]),
             "error": len([item for item in results if item.get("status") == "error"])
         }
+        media_statuses = cls.__aggregate_media_statuses(results)
         issues = [item for item in results if item.get("status") != "ok"]
         return {
             "code": 0,
@@ -201,10 +202,35 @@ class SubtitleHealth:
             "inaccessible_roots": inaccessible_roots,
             "scan_errors": scan_errors[:100],
             "summary": summary,
+            "media_statuses": media_statuses,
             "issues": issues[:issue_limit],
             "issues_truncated": max(len(issues) - issue_limit, 0),
             "probe_available": bool(shutil.which("ffprobe"))
         }
+
+    @staticmethod
+    def __aggregate_media_statuses(results):
+        """按媒体文件汇总外挂字幕状态，多个字幕时保留最严重的结果。"""
+        priorities = {"ok": 0, "warning": 1, "error": 2}
+        statuses = {}
+        for item in results or []:
+            media_path = str(item.get("media_path") or "").strip()
+            if not media_path:
+                continue
+            key = os.path.normcase(os.path.normpath(media_path))
+            status = item.get("status") or "error"
+            current = statuses.get(key)
+            if current:
+                current["subtitle_count"] += 1
+                if priorities.get(status, 2) <= priorities.get(current.get("status"), 2):
+                    continue
+            statuses[key] = {
+                "media_path": media_path,
+                "status": status,
+                "reason": item.get("reason") or "",
+                "subtitle_count": current.get("subtitle_count", 0) if current else 1
+            }
+        return statuses
 
     @staticmethod
     def __decode_text(raw):

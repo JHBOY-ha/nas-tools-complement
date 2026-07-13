@@ -6,6 +6,7 @@ var library_current_series_title = "";
 var library_poster_observer = null;
 var library_eager_poster_count = 6;
 var library_default_media_server = "emby";
+var library_subtitle_audit_categories = {};
 
 function library_escape_html(value) {
   if (value === null || value === undefined) {
@@ -110,10 +111,13 @@ function run_library_subtitle_audit(retry) {
     $("#index-library-subtitle-audit-modal").modal("show");
     $("#index_library_subtitle_audit_summary").html('<div class="text-muted">请选择分类后开始检测。</div>');
     $("#index_library_subtitle_audit_issues").html("");
+    load_library_subtitle_audit_categories();
+    load_library_subtitle_audit_history();
     return;
   }
   const category = $("#index_library_subtitle_audit_category").val();
-  const category_name = $("#index_library_subtitle_audit_category option:selected").text();
+  const subcategory = $("#index_library_subtitle_audit_subcategory").val();
+  const category_name = subcategory || $("#index_library_subtitle_audit_category option:selected").text();
   const retry_btn = $("#index_library_subtitle_audit_retry");
   retry_btn.prop("disabled", true);
   $("#index_library_subtitle_audit_summary").html(
@@ -126,7 +130,7 @@ function run_library_subtitle_audit(retry) {
     url: "/library/subtitle/audit?random=" + Math.random(),
     dataType: "json",
     contentType: "application/json",
-    data: JSON.stringify({category: category}),
+    data: JSON.stringify({category: category, subcategory: subcategory}),
     timeout: 0,
     success: function (ret) {
       if (!ret || ret.code !== 0) {
@@ -136,6 +140,10 @@ function run_library_subtitle_audit(retry) {
         return;
       }
       render_library_subtitle_audit(ret);
+      render_library_subtitle_audit_history(ret.history || []);
+      if (ret.category === "movie") {
+        load_library_items(library_page);
+      }
     },
     error: function () {
       $("#index_library_subtitle_audit_summary").html('<div class="alert alert-danger mb-0">网络错误或检测请求中断</div>');
@@ -150,7 +158,7 @@ function run_library_subtitle_audit(retry) {
 function render_library_subtitle_audit(ret) {
   const summary = ret.summary || {};
   const server = library_escape_html(String(ret.server || "").toUpperCase());
-  const category = library_escape_html(ret.category_name || "");
+  const category = library_escape_html(ret.scope_name || ret.category_name || "");
   const probe_text = ret.probe_available ? "ffprobe 已启用" : "ffprobe 不可用，仅完成基础检查";
   let summary_html = `
     <div class="row row-cards">
@@ -169,6 +177,9 @@ function render_library_subtitle_audit(ret) {
   const scan_errors = ret.scan_errors || [];
   if (scan_errors.length) {
     summary_html += `<div class="alert alert-warning mt-3 mb-0">扫描中有 ${scan_errors.length} 个目录或文件无法读取；首条错误：${library_escape_html(scan_errors[0])}</div>`;
+  }
+  if (ret.history_warning) {
+    summary_html += `<div class="alert alert-warning mt-3 mb-0">${library_escape_html(ret.history_warning)}</div>`;
   }
   $("#index_library_subtitle_audit_summary").html(summary_html);
 
@@ -200,6 +211,96 @@ function render_library_subtitle_audit(ret) {
   $("#index_library_subtitle_audit_issues").html(issues_html);
 }
 
+function load_library_subtitle_audit_history() {
+  $("#index_library_subtitle_audit_history").html('<div class="text-muted small">正在读取检测记录...</div>');
+  $.ajax({
+    type: "GET",
+    url: "/library/subtitle/audit/history?random=" + Math.random(),
+    dataType: "json",
+    success: function (ret) {
+      if (!ret || ret.code !== 0) {
+        $("#index_library_subtitle_audit_history").html(
+            `<div class="text-danger small">${library_escape_html((ret && ret.msg) || "读取检测记录失败")}</div>`
+        );
+        return;
+      }
+      render_library_subtitle_audit_history(ret.history || []);
+    },
+    error: function () {
+      $("#index_library_subtitle_audit_history").html('<div class="text-danger small">读取检测记录失败</div>');
+    }
+  });
+}
+
+function load_library_subtitle_audit_categories() {
+  $.ajax({
+    type: "GET",
+    url: "/library/subtitle/audit/categories?random=" + Math.random(),
+    dataType: "json",
+    success: function (ret) {
+      if (!ret || ret.code !== 0) {
+        library_subtitle_audit_categories = {};
+      } else {
+        library_subtitle_audit_categories = ret.categories || {};
+      }
+      update_library_subtitle_audit_subcategories();
+    },
+    error: function () {
+      library_subtitle_audit_categories = {};
+      update_library_subtitle_audit_subcategories();
+    }
+  });
+}
+
+function update_library_subtitle_audit_subcategories() {
+  const category = $("#index_library_subtitle_audit_category").val();
+  const category_name = $("#index_library_subtitle_audit_category option:selected").text();
+  const current = $("#index_library_subtitle_audit_subcategory").val();
+  const categories = library_subtitle_audit_categories[category] || [];
+  let html = `<option value="">全部${library_escape_html(category_name)}</option>`;
+  categories.forEach(function (name) {
+    const escaped = library_escape_html(name);
+    html += `<option value="${escaped}" ${name === current ? "selected" : ""}>${escaped}</option>`;
+  });
+  $("#index_library_subtitle_audit_subcategory").html(html);
+  $("#index_library_subtitle_audit_subcategory").prop("disabled", categories.length === 0);
+}
+
+function render_library_subtitle_audit_history(history) {
+  if (!history.length) {
+    $("#index_library_subtitle_audit_history").html('<div class="text-muted small">暂无检测记录</div>');
+    return;
+  }
+  let html = '<div class="row row-cards">';
+  history.slice(0, 3).forEach(function (record) {
+    const summary = record.summary || {};
+    const issues = record.issues || [];
+    let issue_html = "";
+    issues.slice(0, 10).forEach(function (issue) {
+      issue_html += `<div class="text-muted small text-break mt-1">· ${library_escape_html(issue.path || "")}：${library_escape_html(issue.reason || "")}</div>`;
+    });
+    const hidden_count = Math.max(issues.length - 10, 0) + (record.issues_truncated || 0);
+    if (hidden_count) {
+      issue_html += `<div class="text-muted small mt-1">另有 ${hidden_count} 条问题未展开</div>`;
+    }
+    html += `
+      <div class="col-12">
+        <div class="card card-sm">
+          <div class="card-body">
+            <div class="d-flex flex-wrap justify-content-between gap-2">
+              <div class="fw-bold">${library_escape_html(record.scope_name || record.category_name || "")} · ${library_escape_html(String(record.server || "").toUpperCase())}</div>
+              <div class="text-muted small">${library_escape_html(record.checked_at || "")}</div>
+            </div>
+            <div class="mt-2">总数 ${summary.total || 0}，<span class="text-success">通过 ${summary.ok || 0}</span>，<span class="text-warning">需规范 ${summary.warning || 0}</span>，<span class="text-danger">无法识别 ${summary.error || 0}</span></div>
+            ${issue_html ? `<details class="mt-2"><summary class="text-muted small">查看问题摘要</summary>${issue_html}</details>` : ""}
+          </div>
+        </div>
+      </div>`;
+  });
+  html += "</div>";
+  $("#index_library_subtitle_audit_history").html(html);
+}
+
 function library_item_card(item, index) {
   const item_id = library_escape_js(item.id);
   const title = library_escape_html(item.title || item.original_title || "未命名媒体");
@@ -207,6 +308,9 @@ function library_item_card(item, index) {
   const poster = library_escape_html(item.poster_url || "");
   const type_initial = library_escape_html((item.media_type_name || "媒").substring(0, 1));
   const subtitle_label = library_escape_html(item.subtitle_label || "未检测");
+  const subtitle_audit_label = library_escape_html(item.subtitle_audit_label || "");
+  const subtitle_audit_badge = library_escape_html(item.subtitle_audit_badge || "");
+  const subtitle_audit_checked_at = library_escape_html(item.subtitle_audit_checked_at || "");
   const type_name = library_escape_html(item.media_type_name);
   const category = library_escape_html(item.category || "未分类");
   const eager = index < library_eager_poster_count;
@@ -251,6 +355,10 @@ function library_item_card(item, index) {
           <span class="dot ${dot_class}"></span>
           <span class="lit-library-card-meta">${subtitle_label}</span>
         </div>
+        ${is_movie && subtitle_audit_label ? `
+        <div class="mt-2">
+          <span class="badge ${subtitle_audit_badge}" title="最近检测：${subtitle_audit_checked_at}">${subtitle_audit_label}</span>
+        </div>` : ""}
       </div>
       <div class="lit-library-card-footer">
         <button type="button" class="btn btn-sm btn-primary w-100" ${btn_attr}>${btn_text}</button>

@@ -3,7 +3,7 @@
   <div class="page-header d-print-none">
     <div class="row align-items-center">
       <div class="col">
-        <h2 class="page-title">媒体库</h2>
+        <h2 class="page-title">字幕库</h2>
       </div>
     </div>
   </div>
@@ -15,10 +15,10 @@
         <div class="card lit-library-panel">
           <div class="card-header">
             <h3 class="card-title d-flex align-items-center gap-2">
-              <span>媒体库</span>
+              <span>字幕库</span>
               <button class="btn btn-icon btn-sm btn-ghost-secondary" type="button"
                       data-bs-toggle="modal" data-bs-target="#index-library-help-modal"
-                      aria-label="查看媒体库字幕状态说明" title="查看说明">
+                      aria-label="查看字幕库状态说明" title="查看说明">
                 {{ SVG.circle_question() }}
               </button>
             </h3>
@@ -89,7 +89,7 @@
   <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable" role="document">
     <div class="modal-content">
       <div class="modal-header">
-        <h5 class="modal-title">媒体库字幕状态说明</h5>
+        <h5 class="modal-title">字幕库状态说明</h5>
         <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
       </div>
       <div class="modal-body">
@@ -162,14 +162,24 @@
         </div>
         <div class="mb-3">
           <label class="form-label" for="index_library_subtitle_audit_category">检测分类</label>
-          <select class="form-select" id="index_library_subtitle_audit_category">
+          <select class="form-select" id="index_library_subtitle_audit_category"
+                  onchange="update_library_subtitle_audit_subcategories()">
             <option value="movie" selected>电影</option>
             <option value="tv">电视剧</option>
             <option value="anime">动漫</option>
           </select>
         </div>
+        <div class="mb-3">
+          <label class="form-label" for="index_library_subtitle_audit_subcategory">详细小分类</label>
+          <select class="form-select" id="index_library_subtitle_audit_subcategory">
+            <option value="">全部电影</option>
+          </select>
+          <div class="form-hint">小分类来自当前分类 YAML，例如华语电影、外语电影、动画电影。</div>
+        </div>
         <div id="index_library_subtitle_audit_summary"></div>
         <div id="index_library_subtitle_audit_issues" class="divide-y mt-3"></div>
+        <div class="hr-text mt-4">最近 3 次检测记录</div>
+        <div id="index_library_subtitle_audit_history"></div>
       </div>
       <div class="modal-footer">
         <button type="button" class="btn me-auto" data-bs-dismiss="modal">关闭</button>

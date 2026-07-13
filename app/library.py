@@ -4,6 +4,8 @@ import os
 import re
 import shutil
 import subprocess
+import threading
+from datetime import datetime
 
 import log
 from app.db.media_db import MediaDb
@@ -16,6 +18,8 @@ from config import Config, RMT_MEDIAEXT, RMT_SUBEXT
 
 
 class MediaLibrary:
+    _subtitle_audit_filename = "subtitle-audit-history.json"
+    _subtitle_audit_lock = threading.RLock()
     _chinese_sub_re = re.compile(
         r"(^|[.\-_\[\( ])(zh[-_]?(cn|hans|chs|sg|sc|tw|hant|cht|hk)|"
         r"zho|chi|chs|cht|cn|sc|tc|简|简中|简体|繁|繁中|繁体|中文|中文字幕)"
@@ -50,6 +54,7 @@ class MediaLibrary:
 
         rows = self.mediadb.list_items(server_type=server_type)
         transfer_histories = self.dbhelper.get_transfer_histories_with_dest()
+        movie_audit_snapshot = self.__latest_audit_snapshot("movie", server_type)
         items = []
         categories = {"movie": set(), "tv": set(), "anime": set()}
         for row in rows:
@@ -69,7 +74,11 @@ class MediaLibrary:
         if subtitle != "all":
             enriched_items = []
             for item in items:
-                self.__fill_subtitle_summary(item, allow_ffprobe=False)
+                self.__fill_subtitle_summary(
+                    item,
+                    allow_ffprobe=False,
+                    audit_snapshot=movie_audit_snapshot
+                )
                 if subtitle == "missing" and item["subtitle_status"] != "missing_chinese":
                     continue
                 if subtitle == "ok" and item["subtitle_status"] == "missing_chinese":
@@ -83,7 +92,7 @@ class MediaLibrary:
         page_items = items[start:end]
         for item in page_items:
             if not item.get("subtitle_status"):
-                self.__fill_subtitle_summary(item)
+                self.__fill_subtitle_summary(item, audit_snapshot=movie_audit_snapshot)
             item.pop("media_streams", None)
             item.pop("linked_episodes", None)
         return {
@@ -136,11 +145,12 @@ class MediaLibrary:
             })
         return {"code": 0, "items": ret_items, "total": len(ret_items)}
 
-    def audit_external_subtitles(self, category):
+    def audit_external_subtitles(self, category, subcategory=None):
         """按媒体分类检测外挂字幕能否被当前影视服务器识别。"""
         media_config = Config().get_config('media') or {}
         server_type = str(media_config.get('media_server') or "emby").lower()
         category = str(category or "").lower()
+        subcategory = str(subcategory or "").strip()
         category_config = {
             "movie": ("电影", "movie_path"),
             "tv": ("电视剧", "tv_path"),
@@ -161,10 +171,41 @@ class MediaLibrary:
                 roots.append(path)
         if not roots:
             return {"code": -1, "msg": f"全局设置中未配置{category_name}媒体库目录"}
+        if subcategory:
+            valid_subcategories = set(self.__category_names(category))
+            if subcategory not in valid_subcategories:
+                return {"code": -1, "msg": f"{category_name}小分类无效或已从分类配置中删除"}
+            roots = [os.path.join(root, subcategory) for root in roots]
         result = SubtitleHealth.audit_roots(roots, server_type)
         result["category"] = category
         result["category_name"] = category_name
+        result["subcategory"] = subcategory
+        result["scope_name"] = f"{category_name} / {subcategory}" if subcategory else f"全部{category_name}"
+        try:
+            result["history"] = self.__save_subtitle_audit(result)
+        except Exception as e:
+            ExceptionUtils.exception_traceback(e)
+            log.error("【MediaLibrary】保存字幕检测记录失败：%s" % str(e))
+            result["history"] = self.get_external_subtitle_audit_history().get("history") or []
+            result["history_warning"] = "检测完成，但保存检测记录失败"
+        result.pop("media_statuses", None)
         return result
+
+    def get_external_subtitle_audit_history(self):
+        """返回最近 3 次外挂字幕检测记录。"""
+        store = self.__load_subtitle_audit_store()
+        return {"code": 0, "history": store.get("history") or []}
+
+    def get_external_subtitle_audit_categories(self):
+        """返回当前分类 YAML 中配置的媒体小分类。"""
+        return {
+            "code": 0,
+            "categories": {
+                "movie": self.__category_names("movie"),
+                "tv": self.__category_names("tv"),
+                "anime": self.__category_names("anime")
+            }
+        }
 
     def get_local_poster_file(self, item_id):
         """
@@ -241,13 +282,17 @@ class MediaLibrary:
             "subtitle_status": "",
             "subtitle_label": "",
             "subtitle_badge": "",
+            "subtitle_audit_status": "",
+            "subtitle_audit_label": "",
+            "subtitle_audit_badge": "",
+            "subtitle_audit_checked_at": "",
             "missing_count": 0
         }
         if include_status:
             self.__fill_subtitle_summary(item)
         return item
 
-    def __fill_subtitle_summary(self, item, allow_ffprobe=True):
+    def __fill_subtitle_summary(self, item, allow_ffprobe=True, audit_snapshot=None):
         if item.get("media_type") == "movie":
             detect_path = item.get("target_path") or item.get("path")
             status = self.detect_subtitle_status(detect_path, item.get("media_streams") or [], allow_ffprobe=allow_ffprobe)
@@ -271,9 +316,139 @@ class MediaLibrary:
         item["subtitle_status"] = status.get("status")
         item["subtitle_label"] = status.get("label")
         item["subtitle_badge"] = status.get("badge")
+        if item.get("media_type") == "movie":
+            self.__fill_movie_audit_summary(item, audit_snapshot)
         item.pop("media_streams", None)
         item.pop("linked_episodes", None)
         return item
+
+    @classmethod
+    def __fill_movie_audit_summary(cls, item, audit_snapshot):
+        audit_snapshot = audit_snapshot or {}
+        media_statuses = audit_snapshot.get("media_statuses") or {}
+        media_path = item.get("target_path") or item.get("path") or ""
+        key = os.path.normcase(os.path.normpath(media_path)) if media_path else ""
+        audit_status = media_statuses.get(key) or {}
+        status = audit_status.get("status") or ""
+        labels = {
+            "ok": ("外挂字幕检测通过", "bg-green-lt text-green"),
+            "warning": ("外挂字幕语言需规范", "bg-yellow-lt text-yellow"),
+            "error": ("外挂字幕无法识别", "bg-red-lt text-red")
+        }
+        label, badge = labels.get(status, ("", ""))
+        item["subtitle_audit_status"] = status
+        item["subtitle_audit_label"] = label
+        item["subtitle_audit_badge"] = badge
+        item["subtitle_audit_checked_at"] = audit_status.get("checked_at") \
+            or audit_snapshot.get("checked_at") or ""
+
+    @classmethod
+    def __latest_audit_snapshot(cls, category, server_type):
+        store = cls.__load_subtitle_audit_store()
+        snapshot = (store.get("latest") or {}).get(category) or {}
+        if str(snapshot.get("server") or "").lower() != str(server_type or "").lower():
+            return {}
+        return snapshot
+
+    @classmethod
+    def __save_subtitle_audit(cls, result):
+        checked_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        category = result.get("category") or ""
+        record = {
+            "checked_at": checked_at,
+            "category": category,
+            "category_name": result.get("category_name") or "",
+            "subcategory": result.get("subcategory") or "",
+            "scope_name": result.get("scope_name") or result.get("category_name") or "",
+            "server": result.get("server") or "",
+            "roots": result.get("roots") or [],
+            "summary": result.get("summary") or {},
+            "issues": result.get("issues") or [],
+            "issues_truncated": result.get("issues_truncated") or 0,
+            "probe_available": bool(result.get("probe_available"))
+        }
+        with cls._subtitle_audit_lock:
+            store = cls.__load_subtitle_audit_store()
+            latest = store.get("latest") or {}
+            previous = latest.get(category) or {}
+            if str(previous.get("server") or "").lower() == str(result.get("server") or "").lower():
+                media_statuses = dict(previous.get("media_statuses") or {})
+            else:
+                media_statuses = {}
+            inaccessible = {
+                os.path.normcase(os.path.normpath(path))
+                for path in (result.get("inaccessible_roots") or [])
+            }
+            scanned_roots = [
+                root for root in (result.get("roots") or [])
+                if os.path.normcase(os.path.normpath(root)) not in inaccessible
+            ]
+            for media_path in list(media_statuses.keys()):
+                if cls.__path_in_roots(media_path, scanned_roots):
+                    media_statuses.pop(media_path, None)
+            for media_path, media_status in (result.get("media_statuses") or {}).items():
+                media_status = dict(media_status or {})
+                media_status["checked_at"] = checked_at
+                media_statuses[media_path] = media_status
+            latest[category] = {
+                "checked_at": checked_at,
+                "server": result.get("server") or "",
+                "media_statuses": media_statuses
+            }
+            history = [record] + (store.get("history") or [])
+            store = {"version": 1, "latest": latest, "history": history[:3]}
+            cls.__write_subtitle_audit_store(store)
+        return store["history"]
+
+    @classmethod
+    def __load_subtitle_audit_store(cls):
+        with cls._subtitle_audit_lock:
+            history_file = cls.__subtitle_audit_path()
+            if not os.path.isfile(history_file):
+                return {"version": 1, "latest": {}, "history": []}
+            try:
+                with open(history_file, "r", encoding="utf-8") as file_obj:
+                    store = json.load(file_obj)
+                if not isinstance(store, dict):
+                    raise ValueError("字幕检测记录格式无效")
+                return {
+                    "version": 1,
+                    "latest": store.get("latest") or {},
+                    "history": (store.get("history") or [])[:3]
+                }
+            except Exception as e:
+                ExceptionUtils.exception_traceback(e)
+                log.error("【MediaLibrary】读取字幕检测记录失败：%s" % str(e))
+                return {"version": 1, "latest": {}, "history": []}
+
+    @classmethod
+    def __write_subtitle_audit_store(cls, store):
+        history_file = cls.__subtitle_audit_path()
+        os.makedirs(os.path.dirname(history_file), exist_ok=True)
+        temp_file = "%s.tmp" % history_file
+        try:
+            with open(temp_file, "w", encoding="utf-8") as file_obj:
+                json.dump(store, file_obj, ensure_ascii=False, indent=2)
+            os.replace(temp_file, history_file)
+        finally:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+
+    @classmethod
+    def __subtitle_audit_path(cls):
+        return os.path.join(Config().get_config_path(), cls._subtitle_audit_filename)
+
+    @staticmethod
+    def __path_in_roots(path, roots):
+        try:
+            path = os.path.abspath(os.path.normpath(path))
+            for root in roots or []:
+                root = os.path.abspath(os.path.normpath(root))
+                if os.path.commonpath([path, root]) == root:
+                    return True
+        except (OSError, ValueError):
+            return False
+        return False
 
     def __get_series_episode_statuses(self, item_id, fallback_path):
         episodes = self.media_server.get_episodes(item_id) or []
