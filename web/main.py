@@ -1135,9 +1135,10 @@ def library_episodes():
 @App.route('/library/subtitle/audit', methods=['POST'])
 @login_required
 def library_subtitle_audit():
-    """按全局影视服务器规则检测全部媒体库外挂字幕。"""
+    """按全局影视服务器规则检测指定分类的外挂字幕。"""
     try:
-        return MediaLibrary().audit_external_subtitles()
+        data = request.get_json(silent=True) or request.form.to_dict() or {}
+        return MediaLibrary().audit_external_subtitles(data.get("category"))
     except Exception as e:
         ExceptionUtils.exception_traceback(e)
         return {"code": -1, "msg": str(e)}

@@ -152,13 +152,21 @@
   <div class="modal-dialog modal-xl modal-dialog-centered modal-dialog-scrollable" role="document">
     <div class="modal-content">
       <div class="modal-header">
-        <h5 class="modal-title">外挂字幕全库检测</h5>
+        <h5 class="modal-title">外挂字幕分类检测</h5>
         <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
       </div>
       <div class="modal-body">
         <div class="text-muted mb-3">
           按全局设置的影视服务器检查字幕与视频文件名关联、语言标签、格式支持及 ffprobe 解析结果。
-          全库检测可能需要数分钟，请勿重复提交。
+          每次仅扫描一个媒体分类，减少 NAS 磁盘与 CPU 压力。
+        </div>
+        <div class="mb-3">
+          <label class="form-label" for="index_library_subtitle_audit_category">检测分类</label>
+          <select class="form-select" id="index_library_subtitle_audit_category">
+            <option value="movie" selected>电影</option>
+            <option value="tv">电视剧</option>
+            <option value="anime">动漫</option>
+          </select>
         </div>
         <div id="index_library_subtitle_audit_summary"></div>
         <div id="index_library_subtitle_audit_issues" class="divide-y mt-3"></div>
@@ -166,7 +174,7 @@
       <div class="modal-footer">
         <button type="button" class="btn me-auto" data-bs-dismiss="modal">关闭</button>
         <button type="button" id="index_library_subtitle_audit_retry" class="btn btn-primary"
-                onclick="run_library_subtitle_audit(true)">重新检测</button>
+                onclick="run_library_subtitle_audit(true)">开始/重新检测</button>
       </div>
     </div>
   </div>

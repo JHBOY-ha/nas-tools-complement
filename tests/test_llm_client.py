@@ -6,6 +6,8 @@ import types
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
+import requests
+
 if not os.environ.get("NASTOOL_CONFIG"):
     _ROOT_PATH = os.path.dirname(os.path.dirname(__file__))
     os.environ["NASTOOL_CONFIG"] = os.path.join(_ROOT_PATH, "config", "config.yaml")
@@ -118,9 +120,11 @@ class LLMClientTest(TestCase):
         self.assertEqual("", client.complete_text("system", "user"))
 
     def test_http_error_returns_empty_text(self):
-        response = Mock()
-        response.status_code = 500
-        with patch("app.utils.llm_client.requests.post", return_value=response):
+        response = requests.Response()
+        response.status_code = 401
+        response._content = b'{"error":{"message":"invalid api key"}}'
+        with patch("app.utils.llm_client.requests.post", return_value=response), \
+                patch("app.utils.llm_client.log.warn") as warn:
             client = LLMClient({
                 "provider": "openai",
                 "base_url": "https://api.example/v1",
@@ -128,6 +132,27 @@ class LLMClientTest(TestCase):
                 "model": "gpt-test"
             })
             self.assertEqual("", client.complete_text("system", "user"))
+        warning = warn.call_args.args[0]
+        self.assertIn("status=401", warning)
+        self.assertNotIn("status=none", warning)
+        self.assertIn("invalid api key", warning)
+
+    def test_anthropic_http_error_keeps_real_status(self):
+        response = requests.Response()
+        response.status_code = 429
+        response._content = b'{"error":{"message":"rate limited"}}'
+        with patch("app.utils.llm_client.requests.post", return_value=response), \
+                patch("app.utils.llm_client.log.warn") as warn:
+            client = LLMClient({
+                "provider": "anthropic",
+                "base_url": "https://api.anthropic.com/v1",
+                "api_key": "key",
+                "model": "claude-test"
+            })
+            self.assertEqual("", client.complete_text("system", "user"))
+        warning = warn.call_args.args[0]
+        self.assertIn("status=429", warning)
+        self.assertNotIn("status=none", warning)
 
     def test_invalid_json_returns_none(self):
         response = Mock()

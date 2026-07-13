@@ -136,22 +136,35 @@ class MediaLibrary:
             })
         return {"code": 0, "items": ret_items, "total": len(ret_items)}
 
-    def audit_external_subtitles(self):
-        """检测全局媒体库中的外挂字幕能否被当前影视服务器识别。"""
+    def audit_external_subtitles(self, category):
+        """按媒体分类检测外挂字幕能否被当前影视服务器识别。"""
         media_config = Config().get_config('media') or {}
         server_type = str(media_config.get('media_server') or "emby").lower()
+        category = str(category or "").lower()
+        category_config = {
+            "movie": ("电影", "movie_path"),
+            "tv": ("电视剧", "tv_path"),
+            "anime": ("动漫", "anime_path")
+        }
+        if category not in category_config:
+            return {"code": -1, "msg": "请选择要检测的媒体分类"}
+        category_name, path_key = category_config[category]
+        paths = media_config.get(path_key) or []
+        if category == "anime" and not paths:
+            paths = media_config.get("tv_path") or []
+        if isinstance(paths, str):
+            paths = [paths]
         roots = []
-        for key in ["movie_path", "tv_path", "anime_path"]:
-            paths = media_config.get(key) or []
-            if isinstance(paths, str):
-                paths = [paths]
-            for path in paths:
-                path = str(path or "").strip()
-                if path and path not in roots:
-                    roots.append(path)
+        for path in paths:
+            path = str(path or "").strip()
+            if path and path not in roots:
+                roots.append(path)
         if not roots:
-            return {"code": -1, "msg": "全局设置中未配置电影、电视剧或动漫媒体库目录"}
-        return SubtitleHealth.audit_roots(roots, server_type)
+            return {"code": -1, "msg": f"全局设置中未配置{category_name}媒体库目录"}
+        result = SubtitleHealth.audit_roots(roots, server_type)
+        result["category"] = category
+        result["category_name"] = category_name
+        return result
 
     def get_local_poster_file(self, item_id):
         """

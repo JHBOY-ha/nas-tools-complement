@@ -5,6 +5,7 @@ import sys
 import tempfile
 import types
 from unittest import TestCase
+from unittest.mock import patch
 
 if not os.environ.get("NASTOOL_CONFIG"):
     _ROOT_PATH = os.path.dirname(os.path.dirname(__file__))
@@ -110,6 +111,52 @@ from app.helper.subtitle_health import SubtitleHealth
 
 
 class MediaLibraryTest(TestCase):
+    def test_subtitle_audit_scans_only_selected_category(self):
+        media_config = {
+            "media_server": "jellyfin",
+            "movie_path": ["/media/movies"],
+            "tv_path": ["/media/tv"],
+            "anime_path": ["/media/anime"]
+        }
+        audit_result = {
+            "code": 0,
+            "summary": {"total": 0, "ok": 0, "warning": 0, "error": 0}
+        }
+        library = MediaLibrary.__new__(MediaLibrary)
+        with patch("app.library.Config") as config_cls, \
+                patch.object(SubtitleHealth, "audit_roots", return_value=audit_result) as audit_roots:
+            config_cls.return_value.get_config.return_value = media_config
+            ret = library.audit_external_subtitles("tv")
+
+        audit_roots.assert_called_once_with(["/media/tv"], "jellyfin")
+        self.assertEqual(ret["category"], "tv")
+        self.assertEqual(ret["category_name"], "电视剧")
+
+    def test_subtitle_audit_requires_a_category(self):
+        library = MediaLibrary.__new__(MediaLibrary)
+        with patch("app.library.Config") as config_cls, \
+                patch.object(SubtitleHealth, "audit_roots") as audit_roots:
+            config_cls.return_value.get_config.return_value = {"media_server": "jellyfin"}
+            ret = library.audit_external_subtitles("")
+
+        self.assertEqual(ret["code"], -1)
+        self.assertIn("请选择", ret["msg"])
+        audit_roots.assert_not_called()
+
+    def test_anime_subtitle_audit_falls_back_to_tv_path(self):
+        library = MediaLibrary.__new__(MediaLibrary)
+        with patch("app.library.Config") as config_cls, \
+                patch.object(SubtitleHealth, "audit_roots", return_value={"code": 0}) as audit_roots:
+            config_cls.return_value.get_config.return_value = {
+                "media_server": "emby",
+                "tv_path": ["/media/tv"],
+                "anime_path": []
+            }
+            ret = library.audit_external_subtitles("anime")
+
+        audit_roots.assert_called_once_with(["/media/tv"], "emby")
+        self.assertEqual(ret["category"], "anime")
+
     def test_full_library_subtitle_audit_reports_server_recognition_states(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             movie = os.path.join(tmpdir, "Movie.mkv")

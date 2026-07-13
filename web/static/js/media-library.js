@@ -108,11 +108,16 @@ function load_library_items(page) {
 function run_library_subtitle_audit(retry) {
   if (!retry) {
     $("#index-library-subtitle-audit-modal").modal("show");
+    $("#index_library_subtitle_audit_summary").html('<div class="text-muted">请选择分类后开始检测。</div>');
+    $("#index_library_subtitle_audit_issues").html("");
+    return;
   }
+  const category = $("#index_library_subtitle_audit_category").val();
+  const category_name = $("#index_library_subtitle_audit_category option:selected").text();
   const retry_btn = $("#index_library_subtitle_audit_retry");
   retry_btn.prop("disabled", true);
   $("#index_library_subtitle_audit_summary").html(
-      '<div class="d-flex align-items-center gap-2 text-muted"><span class="spinner-border spinner-border-sm"></span><span>正在扫描全部媒体库外挂字幕...</span></div>'
+      `<div class="d-flex align-items-center gap-2 text-muted"><span class="spinner-border spinner-border-sm"></span><span>正在扫描${library_escape_html(category_name)}外挂字幕...</span></div>`
   );
   $("#index_library_subtitle_audit_issues").html("");
   NProgress.start();
@@ -121,7 +126,7 @@ function run_library_subtitle_audit(retry) {
     url: "/library/subtitle/audit?random=" + Math.random(),
     dataType: "json",
     contentType: "application/json",
-    data: "{}",
+    data: JSON.stringify({category: category}),
     timeout: 0,
     success: function (ret) {
       if (!ret || ret.code !== 0) {
@@ -145,13 +150,15 @@ function run_library_subtitle_audit(retry) {
 function render_library_subtitle_audit(ret) {
   const summary = ret.summary || {};
   const server = library_escape_html(String(ret.server || "").toUpperCase());
+  const category = library_escape_html(ret.category_name || "");
   const probe_text = ret.probe_available ? "ffprobe 已启用" : "ffprobe 不可用，仅完成基础检查";
   let summary_html = `
     <div class="row row-cards">
       <div class="col-6 col-md-3"><div class="card card-sm"><div class="card-body"><div class="text-muted">服务器</div><div class="h3 mb-0">${server}</div></div></div></div>
-      <div class="col-6 col-md-3"><div class="card card-sm"><div class="card-body"><div class="text-muted">字幕总数</div><div class="h3 mb-0">${summary.total || 0}</div></div></div></div>
-      <div class="col-6 col-md-2"><div class="card card-sm"><div class="card-body"><div class="text-muted">可识别</div><div class="h3 text-success mb-0">${summary.ok || 0}</div></div></div></div>
-      <div class="col-6 col-md-2"><div class="card card-sm"><div class="card-body"><div class="text-muted">需规范</div><div class="h3 text-warning mb-0">${summary.warning || 0}</div></div></div></div>
+      <div class="col-6 col-md-3"><div class="card card-sm"><div class="card-body"><div class="text-muted">检测分类</div><div class="h3 mb-0">${category}</div></div></div></div>
+      <div class="col-6 col-md-2"><div class="card card-sm"><div class="card-body"><div class="text-muted">字幕总数</div><div class="h3 mb-0">${summary.total || 0}</div></div></div></div>
+      <div class="col-6 col-md-1"><div class="card card-sm"><div class="card-body"><div class="text-muted">可识别</div><div class="h3 text-success mb-0">${summary.ok || 0}</div></div></div></div>
+      <div class="col-6 col-md-1"><div class="card card-sm"><div class="card-body"><div class="text-muted">需规范</div><div class="h3 text-warning mb-0">${summary.warning || 0}</div></div></div></div>
       <div class="col-6 col-md-2"><div class="card card-sm"><div class="card-body"><div class="text-muted">无法识别</div><div class="h3 text-danger mb-0">${summary.error || 0}</div></div></div></div>
     </div>
     <div class="text-muted small mt-2">${library_escape_html(probe_text)}</div>`;

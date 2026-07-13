@@ -90,10 +90,9 @@ class LLMClient:
             timeout=self._timeout,
             verify=False
         )
-        if not response or response.status_code >= 400:
-            log.warn("【LLM】OpenAI兼容接口请求失败：status=%s" % (
-                response.status_code if response else "none"
-            ))
+        if response is None or response.status_code >= 400:
+            status, detail = self.__http_error_detail(response)
+            log.warn("【LLM】OpenAI兼容接口请求失败：status=%s%s" % (status, detail))
             return ""
         data = response.json()
         choices = data.get("choices") or []
@@ -123,10 +122,9 @@ class LLMClient:
             timeout=self._timeout,
             verify=False
         )
-        if not response or response.status_code >= 400:
-            log.warn("【LLM】Anthropic接口请求失败：status=%s" % (
-                response.status_code if response else "none"
-            ))
+        if response is None or response.status_code >= 400:
+            status, detail = self.__http_error_detail(response)
+            log.warn("【LLM】Anthropic接口请求失败：status=%s%s" % (status, detail))
             return ""
         data = response.json()
         return self.extract_text_content(data.get("content"))
@@ -165,6 +163,17 @@ class LLMClient:
                         text_list.append(str(text))
             return "\n".join(text_list).strip()
         return str(content).strip() if content else ""
+
+    @staticmethod
+    def __http_error_detail(response):
+        if response is None:
+            return "none", ""
+        status = getattr(response, "status_code", "none")
+        try:
+            body = re.sub(r"\s+", " ", str(response.text or "")).strip()[:1000]
+        except Exception:
+            body = ""
+        return status, ", body=%s" % body if body else ""
 
     @staticmethod
     def __strip_json_fence(content):
