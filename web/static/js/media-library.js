@@ -485,7 +485,7 @@ function library_item_card(item, index) {
           <span class="lit-library-card-meta">${subtitle_label}</span>
         </div>
         ${is_movie && subtitle_audit_label ? `
-        <div class="mt-2">
+        <div class="lit-library-card-audit">
           <span class="badge ${subtitle_audit_badge} lit-library-card-audit-badge" title="最近检测：${subtitle_audit_checked_at}">${subtitle_audit_text}</span>
         </div>` : ""}
       </div>
