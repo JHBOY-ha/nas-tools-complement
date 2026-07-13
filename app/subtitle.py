@@ -3,6 +3,7 @@ import errno
 import os.path
 import re
 import shutil
+import tempfile
 import threading
 
 from lxml import etree
@@ -29,6 +30,14 @@ class Subtitle:
     _local_path = None
     _opensubtitles_enable = False
     _repair_lock = threading.RLock()
+    _jellyfin_iso639_2 = {
+        "ar": "ara", "bg": "bul", "zh": "chi", "cs": "cze", "da": "dan", "nl": "dut",
+        "en": "eng", "fi": "fin", "fr": "fre", "de": "ger", "el": "gre", "he": "heb",
+        "hi": "hin", "hu": "hun", "id": "ind", "it": "ita", "ja": "jpn", "ko": "kor",
+        "ms": "may", "no": "nor", "fa": "per", "pl": "pol", "pt": "por", "ro": "rum",
+        "ru": "rus", "es": "spa", "sv": "swe", "th": "tha", "tr": "tur", "uk": "ukr",
+        "vi": "vie"
+    }
 
     def __init__(self):
         self.init_config()
@@ -224,70 +233,96 @@ class Subtitle:
                 if inspection.get("status") == "ok":
                     skipped.append({"path": subtitle_file, "reason": "已符合影视服务器规范"})
                     continue
-                if inspection.get("status") != "warning":
-                    failures.append({"path": subtitle_file, "reason": inspection.get("reason") or "字幕无法解析"})
+                if not SubtitleHealth.is_supported_extension(subtitle_file, server_type):
+                    failures.append({"path": subtitle_file, "reason": inspection.get("reason") or "字幕格式不受支持"})
                     continue
 
-                validation = SubtitleHealth.normalize_uploaded_subtitle(subtitle_file)
-                if not validation.get("valid"):
-                    failures.append({
-                        "path": subtitle_file,
-                        "reason": validation.get("message") or "字幕内容无法解析"
-                    })
-                    continue
-
-                subtitle_profile = self.__guess_subtitle_profile(os.path.basename(subtitle_file))
-                subtitle_profile["source"] = self.__guess_subtitle_source(
-                    os.path.basename(subtitle_file),
-                    media_file
-                )
                 sub_ext = os.path.splitext(subtitle_file)[-1].lower()
+                work_file = ""
                 try:
-                    target_subtitle = self.__build_subtitle_path(
-                        media_file,
-                        subtitle_profile,
-                        sub_ext,
-                        server_type
+                    fd, work_file = tempfile.mkstemp(
+                        prefix=".subtitle-repair-",
+                        suffix=sub_ext,
+                        dir=os.path.dirname(subtitle_file)
                     )
+                    os.close(fd)
+                    shutil.copy2(subtitle_file, work_file)
+
+                    validation = SubtitleHealth.normalize_uploaded_subtitle(work_file)
+                    if not validation.get("valid"):
+                        failures.append({
+                            "path": subtitle_file,
+                            "reason": validation.get("message") or "字幕内容无法解析"
+                        })
+                        continue
+
+                    subtitle_profile = self.__guess_subtitle_profile(
+                        os.path.basename(subtitle_file),
+                        default_language=""
+                    )
+                    if not subtitle_profile.get("language"):
+                        failures.append({"path": subtitle_file, "reason": "无法从文件名判断字幕语言，已保留原文件"})
+                        continue
+                    subtitle_profile["source"] = self.__guess_subtitle_source(
+                        os.path.basename(subtitle_file),
+                        media_file
+                    )
+
+                    if SubtitleHealth.language_defined(subtitle_file, media_file, server_type):
+                        os.replace(work_file, subtitle_file)
+                        work_file = ""
+                        target_subtitle = subtitle_file
+                    else:
+                        target_subtitle = self.__build_subtitle_path(
+                            media_file,
+                            subtitle_profile,
+                            sub_ext,
+                            server_type
+                        )
+                        retcode, retmsg = self.__copy_subtitle_exclusive(work_file, target_subtitle)
+                        if retcode != 0:
+                            failures.append({"path": subtitle_file, "reason": retmsg or "生成规范字幕失败"})
+                            continue
+
+                        repaired_inspection = SubtitleHealth.inspect_external_subtitle(
+                            target_subtitle,
+                            media_file,
+                            server_type
+                        )
+                        if repaired_inspection.get("status") != "ok":
+                            try:
+                                os.remove(target_subtitle)
+                            except OSError:
+                                pass
+                            failures.append({
+                                "path": subtitle_file,
+                                "reason": repaired_inspection.get("reason") or "规范化后仍无法识别"
+                            })
+                            continue
+                        try:
+                            os.remove(subtitle_file)
+                        except OSError as e:
+                            try:
+                                os.remove(target_subtitle)
+                            except OSError:
+                                pass
+                            failures.append({"path": subtitle_file, "reason": f"替换原字幕失败：{str(e)}"})
+                            continue
+
+                    processed.append({
+                        "source": subtitle_file,
+                        "target": target_subtitle,
+                        "language": subtitle_profile.get("language") or "",
+                        "source_name": subtitle_profile.get("source") or ""
+                    })
                 except (FileExistsError, OSError) as e:
                     failures.append({"path": subtitle_file, "reason": str(e)})
-                    continue
-
-                retcode, retmsg = self.__copy_subtitle_exclusive(subtitle_file, target_subtitle)
-                if retcode != 0:
-                    failures.append({"path": subtitle_file, "reason": retmsg or "生成规范字幕失败"})
-                    continue
-
-                repaired_inspection = SubtitleHealth.inspect_external_subtitle(
-                    target_subtitle,
-                    media_file,
-                    server_type
-                )
-                if repaired_inspection.get("status") != "ok":
-                    try:
-                        os.remove(target_subtitle)
-                    except OSError:
-                        pass
-                    failures.append({
-                        "path": subtitle_file,
-                        "reason": repaired_inspection.get("reason") or "规范化后仍无法识别"
-                    })
-                    continue
-                try:
-                    os.remove(subtitle_file)
-                except OSError as e:
-                    try:
-                        os.remove(target_subtitle)
-                    except OSError:
-                        pass
-                    failures.append({"path": subtitle_file, "reason": f"替换原字幕失败：{str(e)}"})
-                    continue
-                processed.append({
-                    "source": subtitle_file,
-                    "target": target_subtitle,
-                    "language": subtitle_profile.get("language") or "",
-                    "source_name": subtitle_profile.get("source") or ""
-                })
+                finally:
+                    if work_file and os.path.exists(work_file):
+                        try:
+                            os.remove(work_file)
+                        except OSError:
+                            pass
 
             results = SubtitleHealth.inspect_media_subtitles(media_file, server_type)
             aggregate = SubtitleHealth.aggregate_media_subtitles(results)
@@ -311,11 +346,11 @@ class Subtitle:
                 message += f"，另有 {len(failures)} 个字幕处理失败"
             return True, message, data
 
-    @staticmethod
-    def __guess_subtitle_profile(file_name):
+    @classmethod
+    def __guess_subtitle_profile(cls, file_name, default_language="zh-CN"):
         """
         根据字幕文件名识别语言标签和字幕标记
-        匹配优先级：简体中文 > 繁体中文 > 英文 > 默认简体中文
+        匹配优先级：简体中文 > 繁体中文 > 英文 > 通用 ISO/BCP-47 标签 > 默认语言
         zh-CN 优先级最高，避免文件名同时含中英文标记（如 .chinese.eng.）时误判为英文
         """
         name = file_name or ""
@@ -331,7 +366,14 @@ class Subtitle:
         elif re.search(_eng_sub_re, name, re.I):
             language = "eng"
         else:
-            language = "zh-CN"
+            language = ""
+            base_name = os.path.splitext(os.path.basename(name))[0]
+            for token in reversed(re.split(r"[.\s\[\](){}]+", base_name)):
+                language = cls.__normalize_language_token(token)
+                if language:
+                    break
+            if not language:
+                language = default_language
         # 识别字幕特殊标记（forced / SDH / CC）
         lower_name = name.lower()
         flags = []
@@ -343,8 +385,8 @@ class Subtitle:
             flags.append("cc")
         return {"language": language, "flags": flags}
 
-    @staticmethod
-    def __guess_subtitle_source(file_name, media_file):
+    @classmethod
+    def __guess_subtitle_source(cls, file_name, media_file):
         """从同名字幕后缀提取来源标题，供 Jellyfin 区分同语种多字幕。"""
         subtitle_base = os.path.splitext(os.path.basename(file_name or ""))[0]
         media_base = os.path.splitext(os.path.basename(media_file or ""))[0]
@@ -362,12 +404,26 @@ class Subtitle:
         tokens = []
         for token in re.split(r"[.\s\[\](){}]+", suffix):
             token = token.strip(" .-_")
-            if not token or token.casefold() in ignored:
+            if not token or token.casefold() in ignored or cls.__normalize_language_token(token):
                 continue
             tokens.append(token)
         source = "-".join(tokens)
         source = re.sub(r"[^\w-]+", "-", source, flags=re.UNICODE).strip("-_")
         return source[:32]
+
+    @staticmethod
+    def __normalize_language_token(token):
+        token = str(token or "").strip().lower().replace("_", "-")
+        if not token:
+            return ""
+        primary, _, region = token.partition("-")
+        if primary not in SubtitleHealth._iso639_1_tokens \
+                and token not in SubtitleHealth._jellyfin_language_tokens:
+            return ""
+        if region and re.fullmatch(r"[a-z0-9]{2,8}", region):
+            region = region.upper() if len(region) == 2 and region.isalpha() else region
+            return f"{primary}-{region}"
+        return token
 
     @classmethod
     def __build_subtitle_path(cls, media_file, subtitle_profile, sub_ext, server_type=None):
@@ -405,8 +461,8 @@ class Subtitle:
                 return target
         raise FileExistsError("字幕文件重名过多")
 
-    @staticmethod
-    def __subtitle_language_tag(language_tag, server_type=None):
+    @classmethod
+    def __subtitle_language_tag(cls, language_tag, server_type=None):
         """
         按媒体服务器规范转换外挂字幕语言标签。
         Jellyfin 使用 ISO 639-2 语言码并保留简繁标题，Plex 使用 ISO 639-1，Emby保留原始标签。
@@ -419,7 +475,14 @@ class Subtitle:
                 "zh-TW": "chi.zh-tw",
                 "eng": "eng"
             }
-            return jellyfin_tags.get(language_tag, language_tag.lower())
+            if language_tag in jellyfin_tags:
+                return jellyfin_tags[language_tag]
+            normalized = language_tag.lower().replace("_", "-")
+            primary, _, region = normalized.partition("-")
+            jellyfin_language = cls._jellyfin_iso639_2.get(primary, primary)
+            if region:
+                return f"{jellyfin_language}.{normalized}"
+            return jellyfin_language
         if server_type != "plex":
             return language_tag
         plex_tags = {

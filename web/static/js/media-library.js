@@ -211,7 +211,9 @@ function update_library_filter_badge() {
   }
   $("#library_filter_count").text(active_count).toggleClass("d-none", active_count === 0);
   $("#library_filter_count").attr("aria-label", `已启用 ${active_count} 个筛选条件`);
-  $("#library_filter_trigger").toggleClass("active", active_count > 0);
+  $("#library_filter_trigger")
+      .toggleClass("active", active_count > 0)
+      .attr("data-filter-active", active_count > 0 ? "true" : "false");
 }
 
 function update_library_sort_order_labels() {
@@ -398,6 +400,7 @@ function render_library_subtitle_audit_history(history) {
   history.slice(0, 3).forEach(function (record) {
     const summary = record.summary || {};
     const issues = record.issues || [];
+    const incomplete_count = (record.inaccessible_roots || []).length + (record.scan_errors || []).length;
     let issue_html = "";
     issues.slice(0, 10).forEach(function (issue) {
       issue_html += `<div class="text-muted small text-break mt-1">· ${library_escape_html(issue.path || "")}：${library_escape_html(issue.reason || "")}</div>`;
@@ -415,6 +418,7 @@ function render_library_subtitle_audit_history(history) {
               <div class="text-muted small">${library_escape_html(record.checked_at || "")}</div>
             </div>
             <div class="mt-2">总数 ${summary.total || 0}，<span class="text-success">通过 ${summary.ok || 0}</span>，<span class="text-warning">需规范 ${summary.warning || 0}</span>，<span class="text-danger">无法识别 ${summary.error || 0}</span></div>
+            ${incomplete_count ? `<div class="text-warning small mt-2">本次检测有 ${incomplete_count} 个路径未完整读取，未覆盖对应路径的旧状态。</div>` : ""}
             ${issue_html ? `<details class="mt-2"><summary class="text-muted small">查看问题摘要</summary>${issue_html}</details>` : ""}
           </div>
         </div>
@@ -457,7 +461,8 @@ function library_item_card(item, index) {
   }
 
   const is_movie = item.media_type === "movie";
-  const can_repair = is_movie && item.can_upload && item.subtitle_audit_status === "warning";
+  const can_repair = is_movie && item.can_upload
+      && ["warning", "error"].indexOf(item.subtitle_audit_status) !== -1;
   const movie_upload_disabled = is_movie && !item.can_upload;
   const btn_attr = is_movie
       ? `${movie_upload_disabled ? "disabled" : ""} onclick="open_library_movie_upload(&quot;${item_id}&quot;)"`

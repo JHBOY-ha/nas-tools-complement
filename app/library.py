@@ -482,7 +482,9 @@ class MediaLibrary:
             "summary": result.get("summary") or {},
             "issues": result.get("issues") or [],
             "issues_truncated": result.get("issues_truncated") or 0,
-            "probe_available": bool(result.get("probe_available"))
+            "probe_available": bool(result.get("probe_available")),
+            "inaccessible_roots": result.get("inaccessible_roots") or [],
+            "scan_errors": result.get("scan_errors") or []
         }
         with cls._subtitle_audit_lock:
             store = cls.__load_subtitle_audit_store()
@@ -500,8 +502,10 @@ class MediaLibrary:
                 root for root in (result.get("roots") or [])
                 if os.path.normcase(os.path.normpath(root)) not in inaccessible
             ]
+            scan_error_paths = result.get("scan_error_paths") or []
             for media_path in list(media_statuses.keys()):
-                if cls.__path_in_roots(media_path, scanned_roots):
+                if cls.__path_in_roots(media_path, scanned_roots) \
+                        and not cls.__path_in_roots(media_path, scan_error_paths):
                     media_statuses.pop(media_path, None)
             for media_path, media_status in (result.get("media_statuses") or {}).items():
                 media_status = dict(media_status or {})

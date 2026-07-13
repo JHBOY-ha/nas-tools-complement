@@ -88,7 +88,7 @@ class LLMClient:
             },
             json=payload,
             timeout=self._timeout,
-            verify=False
+            verify=True
         )
         if response is None or response.status_code >= 400:
             status, detail = self.__http_error_detail(response)
@@ -120,7 +120,7 @@ class LLMClient:
             },
             json=payload,
             timeout=self._timeout,
-            verify=False
+            verify=True
         )
         if response is None or response.status_code >= 400:
             status, detail = self.__http_error_detail(response)

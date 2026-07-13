@@ -206,6 +206,56 @@ class MediaLibraryTest(TestCase):
             self.assertIn(os.path.normcase(os.path.normpath(domestic_movie)), snapshot["media_statuses"])
             self.assertIn(os.path.normcase(os.path.normpath(foreign_movie)), snapshot["media_statuses"])
 
+    def test_partial_scan_error_preserves_statuses_below_failed_directory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            blocked_dir = os.path.join(tmpdir, "blocked")
+            healthy_dir = os.path.join(tmpdir, "healthy")
+            os.makedirs(blocked_dir)
+            os.makedirs(healthy_dir)
+            blocked_movie = os.path.join(blocked_dir, "Blocked.mkv")
+            healthy_movie = os.path.join(healthy_dir, "Healthy.mkv")
+            blocked_key = os.path.normcase(os.path.normpath(blocked_movie))
+            healthy_key = os.path.normcase(os.path.normpath(healthy_movie))
+
+            def result(media_statuses, scan_errors=None, scan_error_paths=None):
+                return {
+                    "category": "movie",
+                    "category_name": "电影",
+                    "scope_name": "全部电影",
+                    "server": "jellyfin",
+                    "roots": [tmpdir],
+                    "inaccessible_roots": [],
+                    "scan_errors": scan_errors or [],
+                    "scan_error_paths": scan_error_paths or [],
+                    "summary": {"total": len(media_statuses), "ok": 0, "warning": 0, "error": 0},
+                    "issues": [],
+                    "issues_truncated": 0,
+                    "probe_available": True,
+                    "media_statuses": media_statuses
+                }
+
+            first = result({
+                blocked_key: {"media_path": blocked_movie, "status": "warning"},
+                healthy_key: {"media_path": healthy_movie, "status": "warning"}
+            })
+            second = result(
+                {healthy_key: {"media_path": healthy_movie, "status": "ok"}},
+                scan_errors=["permission denied"],
+                scan_error_paths=[blocked_dir]
+            )
+
+            MediaLibrary._subtitle_audit_store_cache = None
+            with patch("app.library.Config") as config_cls:
+                config_cls.return_value.get_config_path.return_value = tmpdir
+                MediaLibrary._MediaLibrary__save_subtitle_audit(first)
+                history = MediaLibrary._MediaLibrary__save_subtitle_audit(second)
+                snapshot = MediaLibrary._MediaLibrary__latest_audit_snapshot("movie", "jellyfin")
+            MediaLibrary._subtitle_audit_store_cache = None
+
+            self.assertEqual(snapshot["media_statuses"][blocked_key]["status"], "warning")
+            self.assertEqual(snapshot["media_statuses"][healthy_key]["status"], "ok")
+            self.assertEqual(history[0]["scan_errors"], ["permission denied"])
+
     def test_subtitle_audit_scans_only_selected_category(self):
         media_config = {
             "media_server": "jellyfin",

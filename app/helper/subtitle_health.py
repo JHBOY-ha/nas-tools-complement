@@ -5,6 +5,8 @@ import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
+from charset_normalizer import from_bytes
+
 from app.utils import ExceptionUtils
 from config import RMT_MEDIAEXT, RMT_SUBEXT
 
@@ -32,6 +34,25 @@ class SubtitleHealth:
         "per", "fas", "pol", "por", "rum", "ron", "rus", "spa", "swe",
         "tha", "tur", "ukr", "vie"
     }
+    _iso639_1_tokens = {
+        "aa", "ab", "ae", "af", "ak", "am", "an", "ar", "as", "av", "ay", "az",
+        "ba", "be", "bg", "bh", "bi", "bm", "bn", "bo", "br", "bs", "ca", "ce",
+        "ch", "co", "cr", "cs", "cu", "cv", "cy", "da", "de", "dv", "dz", "ee",
+        "el", "en", "eo", "es", "et", "eu", "fa", "ff", "fi", "fj", "fo", "fr",
+        "fy", "ga", "gd", "gl", "gn", "gu", "gv", "ha", "he", "hi", "ho", "hr",
+        "ht", "hu", "hy", "hz", "ia", "id", "ie", "ig", "ii", "ik", "io", "is",
+        "it", "iu", "ja", "jv", "ka", "kg", "ki", "kj", "kk", "kl", "km", "kn",
+        "ko", "kr", "ks", "ku", "kv", "kw", "ky", "la", "lb", "lg", "li", "ln",
+        "lo", "lt", "lu", "lv", "mg", "mh", "mi", "mk", "ml", "mn", "mr", "ms",
+        "mt", "my", "na", "nb", "nd", "ne", "ng", "nl", "nn", "no", "nr", "nv",
+        "ny", "oc", "oj", "om", "or", "os", "pa", "pi", "pl", "ps", "pt", "qu",
+        "rm", "rn", "ro", "ru", "rw", "sa", "sc", "sd", "se", "sg", "si", "sk",
+        "sl", "sm", "sn", "so", "sq", "sr", "ss", "st", "su", "sv", "sw", "ta",
+        "te", "tg", "th", "ti", "tk", "tl", "tn", "to", "tr", "ts", "tt", "tw",
+        "ty", "ug", "uk", "ur", "uz", "ve", "vi", "vo", "wa", "wo", "xh", "yi",
+        "yo", "za", "zh", "zu"
+    }
+    _charset_candidates = ["utf_8", "utf_16", "utf_16_le", "utf_16_be", "gb18030", "big5"]
 
     @classmethod
     def normalize_uploaded_subtitle(cls, subtitle_file):
@@ -185,14 +206,30 @@ class SubtitleHealth:
         return next(iter(key_statuses.values()), {})
 
     @classmethod
+    def language_defined(cls, subtitle_file, media_file, server_type):
+        """公开文件名语言判断，供安全修复流程在替换原文件前复用。"""
+        return cls.__language_defined(subtitle_file, media_file, str(server_type or "emby").lower())
+
+    @classmethod
+    def is_supported_extension(cls, subtitle_file, server_type):
+        """判断字幕扩展名是否受目标影视服务器支持。"""
+        server_type = str(server_type or "emby").lower()
+        supported = cls._server_extensions.get(server_type, set(RMT_SUBEXT))
+        return os.path.splitext(subtitle_file or "")[-1].lower() in supported
+
+    @classmethod
     def audit_roots(cls, roots, server_type, issue_limit=1000):
         roots = cls.__normalize_roots(roots)
         subtitle_pairs = []
         inaccessible_roots = []
         scan_errors = []
+        scan_error_paths = []
 
         def _onerror(error):
             scan_errors.append(str(error))
+            error_path = os.path.normpath(str(getattr(error, "filename", "") or "").strip())
+            if error_path and error_path not in scan_error_paths:
+                scan_error_paths.append(error_path)
 
         for root in roots:
             if not os.path.isdir(root):
@@ -235,6 +272,7 @@ class SubtitleHealth:
             "roots": roots,
             "inaccessible_roots": inaccessible_roots,
             "scan_errors": scan_errors[:100],
+            "scan_error_paths": scan_error_paths,
             "summary": summary,
             "media_statuses": media_statuses,
             "issues": issues[:issue_limit],
@@ -268,15 +306,26 @@ class SubtitleHealth:
 
     @staticmethod
     def __decode_text(raw):
-        if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
-            encodings = ["utf-16", "utf-8-sig", "gb18030", "big5"]
-        else:
-            encodings = ["utf-8-sig", "gb18030", "big5", "utf-16"]
-        for encoding in encodings:
+        if raw.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
             try:
-                return encoding, raw.decode(encoding)
-            except (UnicodeDecodeError, UnicodeError):
-                continue
+                return "utf-32", raw.decode("utf-32")
+            except UnicodeError:
+                return "", None
+        if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+            try:
+                return "utf-16", raw.decode("utf-16")
+            except UnicodeError:
+                return "", None
+        try:
+            return "utf-8-sig", raw.decode("utf-8-sig")
+        except UnicodeError:
+            pass
+        try:
+            match = from_bytes(raw, cp_isolation=SubtitleHealth._charset_candidates).best()
+            if match:
+                return str(match.encoding or ""), str(match)
+        except Exception as e:
+            ExceptionUtils.exception_traceback(e)
         return "", None
 
     @classmethod
@@ -352,9 +401,23 @@ class SubtitleHealth:
         suffix = sub_base[len(media_base):].lower() if sub_base.startswith(media_base) else ""
         tokens = [token.strip("-_") for token in re.split(r"[.()\[\] ]+", suffix) if token.strip("-_")]
         if server_type == "jellyfin":
-            return any(token in cls._jellyfin_language_tokens for token in tokens)
+            return any(
+                token in cls._jellyfin_language_tokens or token in cls._iso639_1_tokens
+                for token in tokens
+            )
         region_tokens = {"zh-cn", "zh-tw", "zh-hans", "zh-hant", "en-us", "en-gb", "pt-br"}
-        return any(token in cls._jellyfin_language_tokens or token in region_tokens for token in tokens)
+        return any(cls.__is_language_token(token) or token in region_tokens for token in tokens)
+
+    @classmethod
+    def __is_language_token(cls, token):
+        token = str(token or "").strip().lower().replace("_", "-")
+        if token in cls._jellyfin_language_tokens or token in cls._iso639_1_tokens:
+            return True
+        primary = token.split("-", 1)[0]
+        return bool(
+            primary in cls._iso639_1_tokens
+            and re.fullmatch(r"[a-z]{2,3}(?:-[a-z0-9]{2,8})+", token)
+        )
 
     @staticmethod
     def __match_media_file(subtitle_name, media_bases):

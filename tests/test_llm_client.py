@@ -86,6 +86,7 @@ class LLMClientTest(TestCase):
         self.assertEqual("gpt-test", kwargs["json"]["model"])
         self.assertEqual(128, kwargs["json"]["max_tokens"])
         self.assertEqual("system", kwargs["json"]["messages"][0]["content"])
+        self.assertIs(kwargs["verify"], True)
 
     def test_anthropic_provider_builds_messages_request(self):
         response = Mock()
@@ -113,6 +114,7 @@ class LLMClientTest(TestCase):
         self.assertEqual("system", kwargs["json"]["system"])
         self.assertEqual("user", kwargs["json"]["messages"][0]["content"])
         self.assertNotIn("temperature", kwargs["json"])
+        self.assertIs(kwargs["verify"], True)
 
     def test_missing_config_is_not_ready(self):
         client = LLMClient({"provider": "openai", "base_url": "", "api_key": "", "model": ""})
