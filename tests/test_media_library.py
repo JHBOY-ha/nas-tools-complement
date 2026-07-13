@@ -106,9 +106,86 @@ if "zhconv" not in sys.modules:
     sys.modules["zhconv"] = zhconv_stub
 
 from app.library import MediaLibrary
+from app.helper.subtitle_health import SubtitleHealth
 
 
 class MediaLibraryTest(TestCase):
+    def test_full_library_subtitle_audit_reports_server_recognition_states(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            movie = os.path.join(tmpdir, "Movie.mkv")
+            defined = os.path.join(tmpdir, "Movie.chi.zh-cn.srt")
+            undefined = os.path.join(tmpdir, "Movie.zh-CN.srt")
+            orphan = os.path.join(tmpdir, "Other.zh-CN.srt")
+            open(movie, "wb").close()
+            for subtitle_file in [defined, undefined, orphan]:
+                with open(subtitle_file, "wb") as file_obj:
+                    file_obj.write(b"1\n00:00:01,000 --> 00:00:02,000\nHello\n")
+
+            original_validate = SubtitleHealth.__dict__["validate_subtitle"]
+            try:
+                SubtitleHealth.validate_subtitle = classmethod(
+                    lambda cls, path: {
+                        "valid": True,
+                        "probe_available": True,
+                        "message": "ffprobe 解析通过"
+                    }
+                )
+                ret = SubtitleHealth.audit_roots([tmpdir], "jellyfin")
+            finally:
+                SubtitleHealth.validate_subtitle = original_validate
+
+            self.assertEqual(ret["summary"], {"total": 3, "ok": 1, "warning": 1, "error": 1})
+            issues = {os.path.basename(item["path"]): item for item in ret["issues"]}
+            self.assertEqual(issues["Movie.zh-CN.srt"]["status"], "warning")
+            self.assertIn("语言未定义", issues["Movie.zh-CN.srt"]["reason"])
+            self.assertEqual(issues["Other.zh-CN.srt"]["status"], "error")
+            self.assertIn("未找到", issues["Other.zh-CN.srt"]["reason"])
+
+    def test_full_library_subtitle_audit_reports_ffprobe_failure(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            movie = os.path.join(tmpdir, "Movie.mkv")
+            subtitle = os.path.join(tmpdir, "Movie.chi.zh-cn.srt")
+            open(movie, "wb").close()
+            open(subtitle, "wb").close()
+
+            original_validate = SubtitleHealth.__dict__["validate_subtitle"]
+            try:
+                SubtitleHealth.validate_subtitle = classmethod(
+                    lambda cls, path: {
+                        "valid": False,
+                        "probe_available": True,
+                        "message": "Invalid data found when processing input"
+                    }
+                )
+                ret = SubtitleHealth.audit_roots([tmpdir], "jellyfin")
+            finally:
+                SubtitleHealth.validate_subtitle = original_validate
+
+            self.assertEqual(ret["summary"]["error"], 1)
+            self.assertIn("Invalid data", ret["issues"][0]["reason"])
+
+    def test_jellyfin_two_letter_language_is_defined_but_region_only_tag_is_not(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            movie = os.path.join(tmpdir, "Movie.mkv")
+            short_tag = os.path.join(tmpdir, "Movie.zh.srt")
+            region_tag = os.path.join(tmpdir, "Movie.zh-CN.srt")
+            open(movie, "wb").close()
+            for subtitle_file in [short_tag, region_tag]:
+                open(subtitle_file, "wb").close()
+
+            old_validate = SubtitleHealth.__dict__["validate_subtitle"]
+            try:
+                SubtitleHealth.validate_subtitle = classmethod(
+                    lambda cls, path: {"valid": True, "probe_available": True, "message": "ok"}
+                )
+                short_result = SubtitleHealth.inspect_external_subtitle(short_tag, movie, "jellyfin")
+                region_result = SubtitleHealth.inspect_external_subtitle(region_tag, movie, "jellyfin")
+            finally:
+                SubtitleHealth.validate_subtitle = old_validate
+
+            self.assertEqual(short_result["status"], "ok")
+            self.assertEqual(region_result["status"], "warning")
+
     def test_list_items_uses_media_server_enum_value_for_query(self):
         class _ServerType:
             value = "Jellyfin"

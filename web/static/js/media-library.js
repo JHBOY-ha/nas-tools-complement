@@ -105,6 +105,94 @@ function load_library_items(page) {
   });
 }
 
+function run_library_subtitle_audit(retry) {
+  if (!retry) {
+    $("#index-library-subtitle-audit-modal").modal("show");
+  }
+  const retry_btn = $("#index_library_subtitle_audit_retry");
+  retry_btn.prop("disabled", true);
+  $("#index_library_subtitle_audit_summary").html(
+      '<div class="d-flex align-items-center gap-2 text-muted"><span class="spinner-border spinner-border-sm"></span><span>正在扫描全部媒体库外挂字幕...</span></div>'
+  );
+  $("#index_library_subtitle_audit_issues").html("");
+  NProgress.start();
+  $.ajax({
+    type: "POST",
+    url: "/library/subtitle/audit?random=" + Math.random(),
+    dataType: "json",
+    contentType: "application/json",
+    data: "{}",
+    timeout: 0,
+    success: function (ret) {
+      if (!ret || ret.code !== 0) {
+        $("#index_library_subtitle_audit_summary").html(
+            `<div class="alert alert-danger mb-0">${library_escape_html((ret && ret.msg) || "检测失败")}</div>`
+        );
+        return;
+      }
+      render_library_subtitle_audit(ret);
+    },
+    error: function () {
+      $("#index_library_subtitle_audit_summary").html('<div class="alert alert-danger mb-0">网络错误或检测请求中断</div>');
+    },
+    complete: function () {
+      NProgress.done();
+      retry_btn.prop("disabled", false);
+    }
+  });
+}
+
+function render_library_subtitle_audit(ret) {
+  const summary = ret.summary || {};
+  const server = library_escape_html(String(ret.server || "").toUpperCase());
+  const probe_text = ret.probe_available ? "ffprobe 已启用" : "ffprobe 不可用，仅完成基础检查";
+  let summary_html = `
+    <div class="row row-cards">
+      <div class="col-6 col-md-3"><div class="card card-sm"><div class="card-body"><div class="text-muted">服务器</div><div class="h3 mb-0">${server}</div></div></div></div>
+      <div class="col-6 col-md-3"><div class="card card-sm"><div class="card-body"><div class="text-muted">字幕总数</div><div class="h3 mb-0">${summary.total || 0}</div></div></div></div>
+      <div class="col-6 col-md-2"><div class="card card-sm"><div class="card-body"><div class="text-muted">可识别</div><div class="h3 text-success mb-0">${summary.ok || 0}</div></div></div></div>
+      <div class="col-6 col-md-2"><div class="card card-sm"><div class="card-body"><div class="text-muted">需规范</div><div class="h3 text-warning mb-0">${summary.warning || 0}</div></div></div></div>
+      <div class="col-6 col-md-2"><div class="card card-sm"><div class="card-body"><div class="text-muted">无法识别</div><div class="h3 text-danger mb-0">${summary.error || 0}</div></div></div></div>
+    </div>
+    <div class="text-muted small mt-2">${library_escape_html(probe_text)}</div>`;
+  const inaccessible = ret.inaccessible_roots || [];
+  if (inaccessible.length) {
+    summary_html += `<div class="alert alert-warning mt-3 mb-0">无法访问的媒体库目录：${inaccessible.map(library_escape_html).join("、")}</div>`;
+  }
+  const scan_errors = ret.scan_errors || [];
+  if (scan_errors.length) {
+    summary_html += `<div class="alert alert-warning mt-3 mb-0">扫描中有 ${scan_errors.length} 个目录或文件无法读取；首条错误：${library_escape_html(scan_errors[0])}</div>`;
+  }
+  $("#index_library_subtitle_audit_summary").html(summary_html);
+
+  const issues = ret.issues || [];
+  if (!issues.length) {
+    $("#index_library_subtitle_audit_issues").html('<div class="empty py-4"><p class="empty-title">全部外挂字幕均通过检测</p></div>');
+    return;
+  }
+  let issues_html = '<div class="fw-bold py-2">问题明细</div>';
+  issues.forEach(function (issue) {
+    const warning = issue.status === "warning";
+    const badge = warning ? "bg-yellow-lt text-yellow" : "bg-red-lt text-red";
+    const label = warning ? "语言需规范" : "无法识别";
+    issues_html += `
+      <div class="py-3">
+        <div class="d-flex align-items-start gap-3">
+          <span class="badge ${badge}">${label}</span>
+          <div class="flex-fill min-w-0">
+            <div class="fw-bold text-break">${library_escape_html(issue.path || "")}</div>
+            <div class="text-muted small mt-1">${library_escape_html(issue.reason || "")}</div>
+            ${issue.media_path ? `<div class="text-muted small text-break mt-1">媒体：${library_escape_html(issue.media_path)}</div>` : ""}
+          </div>
+        </div>
+      </div>`;
+  });
+  if (ret.issues_truncated) {
+    issues_html += `<div class="alert alert-warning mt-3">另有 ${ret.issues_truncated} 条问题未在页面展开，请先处理当前明细后重新检测。</div>`;
+  }
+  $("#index_library_subtitle_audit_issues").html(issues_html);
+}
+
 function library_item_card(item, index) {
   const item_id = library_escape_js(item.id);
   const title = library_escape_html(item.title || item.original_title || "未命名媒体");

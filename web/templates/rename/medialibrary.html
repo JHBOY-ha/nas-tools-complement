@@ -23,6 +23,10 @@
               </button>
             </h3>
             <div class="card-actions">
+              <button class="btn btn-outline-primary" type="button" onclick="run_library_subtitle_audit()">
+                {{ SVG.check() }}
+                检测外挂字幕
+              </button>
               <button class="btn" type="button" onclick="load_library_items(1)">
                 {{ SVG.refresh() }}
                 刷新
@@ -101,7 +105,8 @@
             <div class="fw-bold mb-1">为什么已经有字幕但仍显示“缺中文字幕”？</div>
             <div class="text-muted">
               系统按媒体文件同目录、同文件名前缀检测外挂字幕，并识别中文语言标记。请确认字幕在媒体链接后的目标目录里，
-              且文件名类似 <code>Movie.zh-CN.srt</code>、<code>Movie.zh-TW.ass</code>、<code>Movie.chi.srt</code>。
+              且文件名符合全局影视服务器规范。Jellyfin简体中文建议使用 <code>Movie.chi.zh-cn.srt</code>，
+              避免只使用 <code>Movie.zh-CN.srt</code> 导致语言显示“未定义”。
             </div>
           </div>
           <div class="py-3">
@@ -138,6 +143,30 @@
       </div>
       <div class="modal-footer">
         <button type="button" class="btn btn-primary" data-bs-dismiss="modal">知道了</button>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="modal modal-blur fade" id="index-library-subtitle-audit-modal" tabindex="-1" role="dialog" aria-hidden="true"
+     data-bs-backdrop="static" data-bs-keyboard="false">
+  <div class="modal-dialog modal-xl modal-dialog-centered modal-dialog-scrollable" role="document">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">外挂字幕全库检测</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div class="text-muted mb-3">
+          按全局设置的影视服务器检查字幕与视频文件名关联、语言标签、格式支持及 ffprobe 解析结果。
+          全库检测可能需要数分钟，请勿重复提交。
+        </div>
+        <div id="index_library_subtitle_audit_summary"></div>
+        <div id="index_library_subtitle_audit_issues" class="divide-y mt-3"></div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn me-auto" data-bs-dismiss="modal">关闭</button>
+        <button type="button" id="index_library_subtitle_audit_retry" class="btn btn-primary"
+                onclick="run_library_subtitle_audit(true)">重新检测</button>
       </div>
     </div>
   </div>
@@ -189,6 +218,7 @@
             <option value="auto">自动选择</option>
             <option value="offset">仅整体偏移</option>
             <option value="segmented">多锚点分段</option>
+            <option value="llm">LLM跨语言对齐</option>
           </select>
         </div>
       </div>

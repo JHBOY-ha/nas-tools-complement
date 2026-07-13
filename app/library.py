@@ -8,6 +8,7 @@ import subprocess
 import log
 from app.db.media_db import MediaDb
 from app.helper.db_helper import DbHelper
+from app.helper.subtitle_health import SubtitleHealth
 from app.media.category import Category
 from app.mediaserver import MediaServer
 from app.utils import ExceptionUtils, PathUtils
@@ -134,6 +135,23 @@ class MediaLibrary:
                 "can_upload": bool(media_path and os.path.isfile(media_path))
             })
         return {"code": 0, "items": ret_items, "total": len(ret_items)}
+
+    def audit_external_subtitles(self):
+        """检测全局媒体库中的外挂字幕能否被当前影视服务器识别。"""
+        media_config = Config().get_config('media') or {}
+        server_type = str(media_config.get('media_server') or "emby").lower()
+        roots = []
+        for key in ["movie_path", "tv_path", "anime_path"]:
+            paths = media_config.get(key) or []
+            if isinstance(paths, str):
+                paths = [paths]
+            for path in paths:
+                path = str(path or "").strip()
+                if path and path not in roots:
+                    roots.append(path)
+        if not roots:
+            return {"code": -1, "msg": "全局设置中未配置电影、电视剧或动漫媒体库目录"}
+        return SubtitleHealth.audit_roots(roots, server_type)
 
     def get_local_poster_file(self, item_id):
         """

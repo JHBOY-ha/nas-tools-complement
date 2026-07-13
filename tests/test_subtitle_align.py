@@ -5,6 +5,7 @@ import sys
 import tempfile
 import types
 from unittest import TestCase
+from unittest.mock import Mock, patch
 
 if not os.environ.get("NASTOOL_CONFIG"):
     _ROOT_PATH = os.path.dirname(os.path.dirname(__file__))
@@ -350,6 +351,88 @@ class SubtitleAlignTest(TestCase):
 
             self.assertFalse(ret["applied"])
             self.assertIn("处理预算", ret["message"])
+
+    def test_llm_cross_language_translation_aligns_reference(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = os.path.join(tmpdir, "source.zh-cn.srt")
+            reference = os.path.join(tmpdir, "reference.eng.srt")
+            _write(source, _srt([
+                ("00:00:01,000", "00:00:02,000", "第一句对白"),
+                ("00:00:03,000", "00:00:04,000", "第二句对白"),
+                ("00:00:05,000", "00:00:06,000", "第三句对白"),
+                ("00:00:07,000", "00:00:08,000", "第四句对白"),
+                ("00:00:09,000", "00:00:10,000", "第五句对白"),
+            ]))
+            _write(reference, _srt([
+                ("00:00:03,000", "00:00:04,000", "first line"),
+                ("00:00:05,000", "00:00:06,000", "second line"),
+                ("00:00:07,000", "00:00:08,000", "third line"),
+                ("00:00:09,000", "00:00:10,000", "fourth line"),
+                ("00:00:11,000", "00:00:12,000", "fifth line"),
+            ]))
+            mock_client = Mock()
+            mock_client.provider = "openai"
+            mock_client.is_ready.return_value = True
+            mock_client.complete_json.return_value = [
+                {"id": 0, "text": "第一句对白"},
+                {"id": 1, "text": "第二句对白"},
+                {"id": 2, "text": "第三句对白"},
+                {"id": 3, "text": "第四句对白"},
+                {"id": 4, "text": "第五句对白"},
+            ]
+
+            with patch("app.helper.subtitle_align.LLMClient", return_value=mock_client):
+                ret = SubtitleAligner.align_with_reference_file(
+                    source,
+                    reference,
+                    source_language="zh-CN",
+                    reference_language="eng",
+                    allow_llm=True
+                )
+
+            self.assertTrue(ret["applied"], ret)
+            self.assertTrue(ret["cross_language"])
+            self.assertEqual(ret["reference_language"], "eng")
+            with open(source, "r", encoding="utf-8") as file_obj:
+                self.assertIn("00:00:03,000 --> 00:00:04,000", file_obj.read())
+
+    def test_llm_cross_language_invalid_translation_keeps_original(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = os.path.join(tmpdir, "source.zh-cn.srt")
+            reference = os.path.join(tmpdir, "reference.eng.srt")
+            original = _srt([
+                ("00:00:01,000", "00:00:02,000", "第一句对白"),
+                ("00:00:03,000", "00:00:04,000", "第二句对白"),
+                ("00:00:05,000", "00:00:06,000", "第三句对白"),
+                ("00:00:07,000", "00:00:08,000", "第四句对白"),
+                ("00:00:09,000", "00:00:10,000", "第五句对白"),
+            ])
+            _write(source, original)
+            _write(reference, _srt([
+                ("00:00:03,000", "00:00:04,000", "first line"),
+                ("00:00:05,000", "00:00:06,000", "second line"),
+                ("00:00:07,000", "00:00:08,000", "third line"),
+                ("00:00:09,000", "00:00:10,000", "fourth line"),
+                ("00:00:11,000", "00:00:12,000", "fifth line"),
+            ]))
+            mock_client = Mock()
+            mock_client.provider = "anthropic"
+            mock_client.is_ready.return_value = True
+            mock_client.complete_json.return_value = [{"id": 0, "text": "第一句对白"}]
+
+            with patch("app.helper.subtitle_align.LLMClient", return_value=mock_client):
+                ret = SubtitleAligner.align_with_reference_file(
+                    source,
+                    reference,
+                    source_language="zh-CN",
+                    reference_language="eng",
+                    allow_llm=True
+                )
+
+            self.assertFalse(ret["applied"])
+            self.assertIn("不完整", ret["message"])
+            with open(source, "r", encoding="utf-8") as file_obj:
+                self.assertEqual(original, file_obj.read())
 
     def test_align_subtitle_skips_when_ffmpeg_missing(self):
         with tempfile.TemporaryDirectory() as tmpdir:

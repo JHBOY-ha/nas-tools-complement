@@ -10,6 +10,7 @@ import log
 from app.conf import SiteConf
 from app.helper import OpenSubtitles
 from app.helper.subtitle_align import SubtitleAligner
+from app.helper.subtitle_health import SubtitleHealth
 from app.utils import RequestUtils, PathUtils, SystemUtils, StringUtils, ExceptionUtils
 from app.utils.commons import singleton
 from app.utils.types import MediaType, RmtMode
@@ -84,7 +85,7 @@ class Subtitle:
         :param target_media_file: 媒体库目标媒体文件路径（字幕同步到该文件同目录）
         :param rmt_mode: 目标同步方式（link/softlink/copy）
         :param server_type: 目标媒体服务器类型（emby/jellyfin/plex）
-        :param align_mode: 字幕时间轴对齐模式（auto/none）
+        :param align_mode: 字幕时间轴对齐模式（auto/offset/segmented/llm/none）
         """
         if not upload_file or not media_file:
             return False, "参数有误", {}
@@ -126,23 +127,39 @@ class Subtitle:
         if not source_sub_file:
             return False, "保存源字幕失败", {}
 
+        validation = SubtitleHealth.normalize_uploaded_subtitle(source_sub_file)
+        if not validation.get("valid"):
+            try:
+                os.remove(source_sub_file)
+            except OSError:
+                pass
+            return False, f"字幕无法被媒体服务器解析：{validation.get('message') or '格式无效'}", {}
+
+        normalize_messages = []
+        if validation.get("normalized"):
+            normalize_messages.append("已转换为 UTF-8")
+        if validation.get("repaired"):
+            normalize_messages.append(f"已修复 {validation.get('removed_blank_lines') or 0} 处 SRT 异常空行")
+        normalize_msg = f"，{'，'.join(normalize_messages)}" if normalize_messages else ""
+
         result = {
             "source_subtitle": source_sub_file,
             "target_subtitle": "",
             "language": subtitle_profile.get("language"),
             "server": server_type or "",
             "synced": False,
+            "validation": validation,
             "alignment": {"applied": False, "skipped": False, "message": "", "mode": ""}
         }
         if not target_media_file:
-            return True, "字幕已保存到源目录，未找到媒体库目标文件", result
+            return True, f"字幕已保存到源目录{normalize_msg}，未找到媒体库目标文件", result
         if not os.path.exists(target_media_file) or not os.path.isfile(target_media_file):
-            return True, "字幕已保存到源目录，媒体库目标文件不存在，未同步", result
+            return True, f"字幕已保存到源目录{normalize_msg}，媒体库目标文件不存在，未同步", result
         if os.path.splitext(target_media_file)[-1].lower() not in RMT_MEDIAEXT:
-            return True, "字幕已保存到源目录，目标文件不是有效媒体文件，未同步", result
+            return True, f"字幕已保存到源目录{normalize_msg}，目标文件不是有效媒体文件，未同步", result
 
         alignment_msg = ""
-        if str(align_mode or "").lower() in ["auto", "offset", "segmented"]:
+        if str(align_mode or "").lower() in ["auto", "offset", "segmented", "llm"]:
             alignment = SubtitleAligner.align_subtitle(source_sub_file, target_media_file, align_mode=align_mode)
             result["alignment"] = alignment
             if alignment.get("applied"):
@@ -153,7 +170,7 @@ class Subtitle:
         if os.path.normpath(media_file) == os.path.normpath(target_media_file):
             result["target_subtitle"] = source_sub_file
             result["synced"] = True
-            return True, f"字幕已保存到媒体目录{alignment_msg}", result
+            return True, f"字幕已保存到媒体目录{normalize_msg}{alignment_msg}", result
 
         source_norm = os.path.normpath(source_sub_file)
         target_sub_file = ""
@@ -178,7 +195,7 @@ class Subtitle:
                 continue
             return False, f"字幕已保存到源目录，同步到媒体库失败：{retmsg}", result
         result["synced"] = True
-        return True, f"字幕已保存并同步到媒体库目录{alignment_msg}", result
+        return True, f"字幕已保存并同步到媒体库目录{normalize_msg}{alignment_msg}", result
 
     @staticmethod
     def __guess_subtitle_profile(file_name):
@@ -224,8 +241,9 @@ class Subtitle:
         """
         media_base = os.path.splitext(media_file)[0]
         suffix_parts = [cls.__subtitle_language_tag(subtitle_profile.get("language"), server_type)]
-        is_plex = str(server_type or "").lower() == "plex"
-        if is_plex:
+        normalized_server = str(server_type or "").lower()
+        is_plex = normalized_server == "plex"
+        if normalized_server in ["plex", "jellyfin"]:
             suffix_parts.extend(subtitle_profile.get("flags") or [])
         suffix = ".".join([part for part in suffix_parts if part])
         target = f"{media_base}.{suffix}{sub_ext}"
@@ -244,10 +262,18 @@ class Subtitle:
     def __subtitle_language_tag(language_tag, server_type=None):
         """
         按媒体服务器规范转换外挂字幕语言标签。
-        Emby/Jellyfin 直接使用原始标签（如 eng），Plex 要求使用 ISO 639-1（en）。
+        Jellyfin 使用 ISO 639-2 语言码并保留简繁标题，Plex 使用 ISO 639-1，Emby保留原始标签。
         """
         language_tag = language_tag or "zh-CN"
-        if str(server_type or "").lower() != "plex":
+        server_type = str(server_type or "").lower()
+        if server_type == "jellyfin":
+            jellyfin_tags = {
+                "zh-CN": "chi.zh-cn",
+                "zh-TW": "chi.zh-tw",
+                "eng": "eng"
+            }
+            return jellyfin_tags.get(language_tag, language_tag.lower())
+        if server_type != "plex":
             return language_tag
         plex_tags = {
             "zh-CN": "zh-CN",

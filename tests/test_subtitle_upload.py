@@ -101,12 +101,24 @@ if "pyquery" not in sys.modules:
     sys.modules["pyquery"] = pyquery_stub
 
 from app.subtitle import Subtitle, SystemUtils, SubtitleAligner
+from app.helper.subtitle_health import SubtitleHealth
 from app.utils.types import RmtMode
 
 
 class _UploadFile:
-    def __init__(self, filename, content=b"subtitle"):
+    def __init__(self, filename, content=None):
         self.filename = filename
+        if content is None:
+            ext = os.path.splitext(filename)[-1].lower()
+            defaults = {
+                ".srt": b"1\n00:00:01,000 --> 00:00:02,000\nSubtitle\n",
+                ".ass": b"[Script Info]\nTitle: Test\n[Events]\nFormat: Start, End, Text\nDialogue: 0:00:01.00,0:00:02.00,Subtitle\n",
+                ".ssa": b"[Script Info]\nTitle: Test\n[Events]\nFormat: Start, End, Text\nDialogue: 0:00:01.00,0:00:02.00,Subtitle\n",
+                ".vtt": b"WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nSubtitle\n",
+                ".smi": b"<SAMI><BODY><SYNC Start=1000><P>Subtitle</BODY></SAMI>",
+                ".sub": b"{1}{25}Subtitle"
+            }
+            content = defaults.get(ext, b"subtitle")
         self._content = content
 
     def save(self, path):
@@ -128,6 +140,83 @@ class _FailingUploadFile(_UploadFile):
 
 
 class SubtitleUploadTest(TestCase):
+    def test_jellyfin_upload_uses_defined_chinese_language_tag(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            movie = os.path.join(tmpdir, "Movie.mkv")
+            open(movie, "wb").close()
+            content = b"1\r\n00:00:01,000 --> 00:00:02,000\r\nHello\r\n"
+
+            success, msg, data = Subtitle().upload_subtitle(
+                _UploadFile("Movie.zh-cn.srt", content),
+                movie,
+                server_type="jellyfin"
+            )
+
+            self.assertTrue(success, msg)
+            self.assertEqual(data["language"], "zh-CN")
+            self.assertTrue(os.path.exists(os.path.join(tmpdir, "Movie.chi.zh-cn.srt")))
+
+    def test_upload_repairs_blank_line_between_srt_index_and_timing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            movie = os.path.join(tmpdir, "Movie.mkv")
+            open(movie, "wb").close()
+            content = "\ufeff0\r\n\r\n00:00:01,000 --> 00:00:02,000\r\nHello\r\n".encode("utf-8")
+
+            success, msg, data = Subtitle().upload_subtitle(
+                _UploadFile("Movie.zh-cn.srt", content),
+                movie,
+                server_type="jellyfin"
+            )
+
+            self.assertTrue(success, msg)
+            subtitle_file = os.path.join(tmpdir, "Movie.chi.zh-cn.srt")
+            with open(subtitle_file, "rb") as file_obj:
+                normalized = file_obj.read()
+            self.assertNotIn(b"0\n\n00:00:01,000", normalized)
+            self.assertIn(b"0\n00:00:01,000", normalized)
+            self.assertTrue(data["validation"]["repaired"])
+            self.assertIn("已修复 1 处 SRT 异常空行", msg)
+
+    def test_upload_rejects_subtitle_when_ffprobe_validation_fails(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            movie = os.path.join(tmpdir, "Movie.mkv")
+            open(movie, "wb").close()
+            original_normalize = SubtitleHealth.__dict__["normalize_uploaded_subtitle"]
+            try:
+                SubtitleHealth.normalize_uploaded_subtitle = classmethod(
+                    lambda cls, path: {
+                        "valid": False,
+                        "probe_available": True,
+                        "message": "Invalid data found when processing input"
+                    }
+                )
+                success, msg, _ = Subtitle().upload_subtitle(
+                    _UploadFile("Movie.zh-cn.srt"),
+                    movie,
+                    server_type="jellyfin"
+                )
+            finally:
+                SubtitleHealth.normalize_uploaded_subtitle = original_normalize
+
+            self.assertFalse(success)
+            self.assertIn("字幕无法被媒体服务器解析", msg)
+            self.assertFalse(os.path.exists(os.path.join(tmpdir, "Movie.chi.zh-cn.srt")))
+
+    def test_upload_rejects_invalid_srt_with_basic_validation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            movie = os.path.join(tmpdir, "Movie.mkv")
+            open(movie, "wb").close()
+
+            success, msg, _ = Subtitle().upload_subtitle(
+                _UploadFile("Movie.zh-cn.srt", b"this is not an srt subtitle"),
+                movie,
+                server_type="jellyfin"
+            )
+
+            self.assertFalse(success)
+            self.assertIn("字幕无法被媒体服务器解析", msg)
+            self.assertFalse(os.path.exists(os.path.join(tmpdir, "Movie.chi.zh-cn.srt")))
+
     def test_upload_uses_target_media_basename_when_syncing(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             src_dir = os.path.join(tmpdir, "src")
@@ -358,7 +447,7 @@ class SubtitleUploadTest(TestCase):
             open(src_movie, "wb").close()
             open(target_movie, "wb").close()
 
-            original_align = SubtitleAligner.align_subtitle
+            original_align = SubtitleAligner.__dict__["align_subtitle"]
             try:
                 SubtitleAligner.align_subtitle = staticmethod(
                     lambda source, target: (_ for _ in ()).throw(AssertionError("alignment should not run"))
@@ -386,7 +475,7 @@ class SubtitleUploadTest(TestCase):
             open(src_movie, "wb").close()
             open(target_movie, "wb").close()
 
-            original_align = SubtitleAligner.align_subtitle
+            original_align = SubtitleAligner.__dict__["align_subtitle"]
             try:
                 captured = {}
 

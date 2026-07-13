@@ -1132,6 +1132,17 @@ def library_episodes():
         return {"code": -1, "msg": str(e)}
 
 
+@App.route('/library/subtitle/audit', methods=['POST'])
+@login_required
+def library_subtitle_audit():
+    """按全局影视服务器规则检测全部媒体库外挂字幕。"""
+    try:
+        return MediaLibrary().audit_external_subtitles()
+    except Exception as e:
+        ExceptionUtils.exception_traceback(e)
+        return {"code": -1, "msg": str(e)}
+
+
 @App.route('/library/image/<itemid>', methods=['GET'])
 @login_required
 def library_image(itemid):
@@ -1855,7 +1866,7 @@ def upload_subtitle():
             return {"code": -1, "msg": "请选择有效的媒体文件"}
         if server_type not in ["emby", "jellyfin", "plex"]:
             return {"code": -1, "msg": "请选择目标影视服务器"}
-        if align_mode not in ["auto", "offset", "segmented", "none"]:
+        if align_mode not in ["auto", "offset", "segmented", "llm", "none"]:
             return {"code": -1, "msg": "请选择有效的字幕对齐模式"}
         if not upload_file:
             return {"code": -1, "msg": "请选择字幕文件"}
