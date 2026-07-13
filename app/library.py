@@ -395,7 +395,8 @@ class MediaLibrary:
             )
         snapshot = (audit_snapshots or {}).get(media_type) or {}
         media_statuses = snapshot.get("media_statuses") or {}
-        audit_priority = {"ok": 3, "warning": 2, "error": 1}
+        # 数值表示待处理严重度：降序时将有问题的字幕排在最前。
+        audit_priority = {"error": 3, "warning": 2, "ok": 0}
         audit_ranks = []
         has_external = False
         for media_path in paths:
@@ -408,7 +409,7 @@ class MediaLibrary:
                 has_external = True
         item["_sort_internal"] = 1 if has_internal else 0
         item["_sort_external"] = 1 if has_external else 0
-        item["_sort_audit"] = min(audit_ranks) if audit_ranks else 0
+        item["_sort_audit"] = max(audit_ranks) if audit_ranks else 1
 
     @classmethod
     def __latest_audit_snapshot(cls, category, server_type):

@@ -4,6 +4,7 @@
     <div class="row align-items-center">
       <div class="col">
         <h2 class="page-title">字幕库</h2>
+        <div class="text-muted mt-1">集中查看中文字幕覆盖情况、外挂字幕识别结果与最近检测状态</div>
       </div>
     </div>
   </div>
@@ -14,14 +15,17 @@
       <div class="col-12 lit-library-section">
         <div class="card lit-library-panel">
           <div class="card-header">
-            <h3 class="card-title d-flex align-items-center gap-2">
-              <span>字幕库</span>
-              <button class="btn btn-icon btn-sm btn-ghost-secondary" type="button"
-                      data-bs-toggle="modal" data-bs-target="#index-library-help-modal"
-                      aria-label="查看字幕库状态说明" title="查看说明">
-                {{ SVG.circle_question() }}
-              </button>
-            </h3>
+            <div>
+              <h3 class="card-title d-flex align-items-center gap-2">
+                <span>字幕状态总览</span>
+                <button class="btn btn-icon btn-sm btn-ghost-secondary" type="button"
+                        data-bs-toggle="modal" data-bs-target="#index-library-help-modal"
+                        aria-label="查看字幕库状态说明" title="查看说明">
+                  {{ SVG.circle_question() }}
+                </button>
+              </h3>
+              <div class="card-subtitle mt-1">筛选媒体后，可上传字幕或按分类检测影视服务器识别情况</div>
+            </div>
             <div class="card-actions">
               <button class="btn btn-outline-primary" type="button" onclick="run_library_subtitle_audit()">
                 {{ SVG.check() }}
@@ -34,8 +38,15 @@
             </div>
           </div>
           <div class="card-body">
+            <div class="d-flex align-items-center gap-2 mb-3">
+              <span class="text-primary">{{ SVG.filter() }}</span>
+              <div>
+                <div class="fw-bold">筛选与排序</div>
+                <div class="text-muted small">更改条件后点击“应用”；搜索输入会在短暂停顿后自动更新</div>
+              </div>
+            </div>
             <div class="row g-2 align-items-end">
-              <div class="col-6 col-md-3 col-xl-2">
+              <div class="col-6 col-md-3 col-xl-1">
                 <label class="form-label" for="library_filter_type">类型</label>
                 <select id="library_filter_type" class="form-select">
                   <option value="all">全部</option>
@@ -64,10 +75,10 @@
                   <option value="default">默认顺序</option>
                   <option value="internal">是否有内嵌字幕</option>
                   <option value="external">是否有外挂字幕</option>
-                  <option value="audit">字幕检测准确性</option>
+                  <option value="audit">字幕检测问题程度</option>
                 </select>
               </div>
-              <div class="col-6 col-md-3 col-xl-1">
+              <div class="col-6 col-md-3 col-xl-2">
                 <label class="form-label" for="library_sort_order">方向</label>
                 <select id="library_sort_order" class="form-select">
                   <option value="desc">降序</option>
@@ -79,10 +90,22 @@
                 <input id="library_filter_keyword" type="text" class="form-control" placeholder="标题、原名、年份">
               </div>
               <div class="col-12 col-md-6 col-xl-1">
-                <button class="btn btn-primary w-100" id="library_filter_btn" type="button" onclick="load_library_items(1)">筛选</button>
+                <button class="btn btn-primary w-100" id="library_filter_btn" type="button" onclick="load_library_items(1)">应用</button>
               </div>
             </div>
-            <div id="library_items_summary" class="text-muted mt-3" aria-live="polite"></div>
+            <div class="lit-library-result-bar mt-3">
+              <div id="library_items_summary" class="text-muted" aria-live="polite"></div>
+              <button class="btn btn-sm btn-ghost-secondary" type="button" onclick="reset_library_filters()">重置筛选</button>
+            </div>
+          </div>
+          <div class="lit-library-legend" aria-label="字幕状态图例">
+            <span class="lit-library-legend-title">卡片状态</span>
+            <span class="lit-library-legend-item"><span class="lit-library-legend-dot external"></span>外挂中文</span>
+            <span class="lit-library-legend-item"><span class="lit-library-legend-dot internal"></span>内嵌中文</span>
+            <span class="lit-library-legend-item"><span class="lit-library-legend-dot missing"></span>缺中文字幕</span>
+            <span class="lit-library-legend-item"><span class="lit-library-legend-dot unknown"></span>未检测</span>
+            <span class="lit-library-legend-divider" aria-hidden="true"></span>
+            <span class="lit-library-legend-note">电影卡片的文字标签表示最近一次外挂字幕检测结果</span>
           </div>
           <div id="library_items_grid" class="lit-library-grid"></div>
           <div class="card-footer d-flex align-items-center">
@@ -106,56 +129,95 @@
     <div class="modal-content">
       <div class="modal-header">
         <h5 class="modal-title">字幕库状态说明</h5>
-        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
       </div>
       <div class="modal-body">
-        <div class="divide-y">
-          <div class="py-3">
-            <div class="fw-bold mb-1">为什么显示“未检测”？</div>
-            <div class="text-muted">
-              常见原因是媒体还没有整理/链接记录、媒体服务器同步项缺少本地路径、剧集还没有展开到单集文件，或当前筛选阶段只做快速检测。
-              先点击“媒体库同步”，再回到本页点击“刷新”；电视剧和番剧请点击“选择剧集”查看单集状态。
+        <div class="alert alert-info d-flex gap-2 align-items-start">
+          <span class="flex-shrink-0">{{ SVG.info_circle() }}</span>
+          <div>
+            <div class="fw-bold mb-1">页面同时展示两套独立状态</div>
+            <div>
+              <strong>中文字幕状态</strong>用于判断媒体是否已有可用的外挂或内嵌中文字幕；
+              <strong>外挂检测状态</strong>用于判断最近一次分类检测时，影视服务器能否正确识别外挂字幕。
             </div>
-          </div>
-          <div class="py-3">
-            <div class="fw-bold mb-1">为什么已经有字幕但仍显示“缺中文字幕”？</div>
-            <div class="text-muted">
-              系统按媒体文件同目录、同文件名前缀检测外挂字幕，并识别中文语言标记。请确认字幕在媒体链接后的目标目录里，
-              且文件名符合全局影视服务器规范。Jellyfin简体中文建议使用 <code>Movie.chi.zh-cn.srt</code>，
-              避免只使用 <code>Movie.zh-CN.srt</code> 导致语言显示“未定义”。
-            </div>
-          </div>
-          <div class="py-3">
-            <div class="fw-bold mb-1">上传字幕后媒体服务器没有立刻显示怎么办？</div>
-            <div class="text-muted">
-              上传成功后会刷新所选目标影视服务器。若仍未显示，请确认上传弹窗里的服务器类型与当前使用的 Emby/Jellyfin/Plex 一致，
-              并在媒体服务器中手动刷新对应媒体或整个媒体库。
-            </div>
-          </div>
-          <div class="py-3">
-            <div class="fw-bold mb-1">Plex 字幕命名应该是什么？</div>
-            <div class="text-muted">
-              Plex 会保留简繁标签，例如 <code>Movie.zh-CN.srt</code>、<code>Movie.zh-TW.srt</code>。
-              英文和特殊字幕可用 <code>Movie.en.forced.srt</code>、<code>Movie.en.sdh.vtt</code>。
-            </div>
-          </div>
-          <div class="py-3">
-            <div class="fw-bold mb-1">按字幕状态筛选/排序为什么和单集弹窗结果不同？</div>
-            <div class="text-muted">
-              为避免大媒体库请求卡住，列表筛选阶段不会对全库逐项运行 ffprobe，只使用已有流信息和外挂字幕快速检测。
-              外挂字幕排序首次会读取相关目录，结果会短时缓存 30 秒；打开电视剧/番剧的“选择剧集”弹窗可以查看更细的单集检测结果。
-            </div>
-          </div>
-          <div class="py-3">
-            <div class="fw-bold mb-1">手动排查顺序</div>
-            <ol class="text-muted mb-0 ps-3">
-              <li>确认媒体已经完成整理/链接，并且目标媒体文件存在。</li>
-              <li>确认字幕文件在目标媒体文件同目录，文件名前缀和媒体文件一致。</li>
-              <li>点击“媒体库同步”，再点击本页“刷新”。</li>
-              <li>电视剧/番剧进入“选择剧集”，逐集确认字幕状态。</li>
-            </ol>
           </div>
         </div>
+
+        <section class="lit-library-help-section">
+          <h6 class="lit-library-help-title">中文字幕状态</h6>
+          <div class="lit-library-help-status-grid">
+            <div class="lit-library-help-status-item">
+              <span class="badge bg-green text-white">已有外挂中文字幕</span>
+              <span class="text-muted">目标视频同目录中存在同名前缀、带中文语言标记的字幕文件。</span>
+            </div>
+            <div class="lit-library-help-status-item">
+              <span class="badge bg-azure text-white">已有内嵌中文字幕</span>
+              <span class="text-muted">媒体服务器流信息中存在中文内嵌字幕。</span>
+            </div>
+            <div class="lit-library-help-status-item">
+              <span class="badge bg-orange text-white">缺中文字幕</span>
+              <span class="text-muted">已检查到媒体文件，但未找到可识别的中文外挂或内嵌字幕。</span>
+            </div>
+            <div class="lit-library-help-status-item">
+              <span class="badge bg-secondary text-white">未检测</span>
+              <span class="text-muted">通常表示缺少整理/链接记录、本地路径不可用，或剧集尚未展开到单集。</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="lit-library-help-section">
+          <h6 class="lit-library-help-title">外挂字幕检测状态</h6>
+          <div class="lit-library-help-status-grid">
+            <div class="lit-library-help-status-item">
+              <span class="badge bg-red-lt text-red">外挂字幕无法识别</span>
+              <span class="text-muted">文件关联、格式或解析存在错误，需要优先处理。</span>
+            </div>
+            <div class="lit-library-help-status-item">
+              <span class="badge bg-yellow-lt text-yellow">外挂字幕语言需规范</span>
+              <span class="text-muted">字幕可读取，但语言标签或命名可能在客户端显示为“未定义”。</span>
+            </div>
+            <div class="lit-library-help-status-item">
+              <span class="badge bg-green-lt text-green">外挂字幕检测通过</span>
+              <span class="text-muted">最近一次分类检测中，字幕关联、语言和格式均通过检查。</span>
+            </div>
+          </div>
+          <div class="text-muted small mt-2">
+            电影卡片保留最近一次检测状态；检测窗口中保留最近 3 次分类检测记录。
+          </div>
+        </section>
+
+        <section class="lit-library-help-section">
+          <h6 class="lit-library-help-title">排序规则</h6>
+          <ul class="text-muted mb-0 ps-3">
+            <li>按“内嵌字幕”或“外挂字幕”降序时，已有对应字幕的媒体排在前面。</li>
+            <li>按“字幕检测问题程度”降序时，依次为：无法识别 → 语言需规范 → 未检测 → 检测通过。</li>
+            <li>选择升序会反转上述顺序，使正常项目优先。</li>
+          </ul>
+        </section>
+
+        <section class="lit-library-help-section">
+          <h6 class="lit-library-help-title">命名与识别建议</h6>
+          <div class="text-muted">
+            字幕必须位于媒体链接后的目标视频同目录，且文件名前缀与视频一致。
+            Jellyfin 简体中文字幕建议使用 <code>Movie.chi.zh-cn.srt</code>；
+            Plex 建议使用 <code>Movie.zh-CN.srt</code> 或 <code>Movie.zh-TW.srt</code>。
+            上传后会按所选影视服务器规范化文件名并触发刷新。
+          </div>
+        </section>
+
+        <section class="lit-library-help-section">
+          <h6 class="lit-library-help-title">性能与排查</h6>
+          <div class="text-muted mb-2">
+            列表使用媒体服务器已有流信息和外挂字幕目录缓存，不会为全库逐项运行 ffprobe；目录结果短时缓存 30 秒，上传成功后立即失效。
+            “检测外挂字幕”会执行更完整的解析，因此建议每次只选择一个分类或小分类。
+          </div>
+          <ol class="text-muted mb-0 ps-3">
+            <li>确认媒体已完成整理/链接，且目标媒体文件存在。</li>
+            <li>确认字幕位于目标视频同目录，文件名前缀与视频一致。</li>
+            <li>执行“媒体库同步”，再回到字幕库点击“刷新”。</li>
+            <li>电视剧或番剧点击“选择剧集”，逐集确认实际状态。</li>
+          </ol>
+        </section>
       </div>
       <div class="modal-footer">
         <button type="button" class="btn btn-primary" data-bs-dismiss="modal">知道了</button>

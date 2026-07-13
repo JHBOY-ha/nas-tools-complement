@@ -700,7 +700,9 @@ class MediaLibraryTest(TestCase):
             definitions = [
                 ("1", "Internal", [{"Type": "Subtitle", "Language": "eng"}]),
                 ("2", "External", []),
-                ("3", "Audited", [])
+                ("3", "Broken", []),
+                ("4", "Warning", []),
+                ("5", "Passed", [])
             ]
             rows = []
             histories = []
@@ -749,7 +751,13 @@ class MediaLibraryTest(TestCase):
             audit_snapshot = {
                 "server": "jellyfin",
                 "media_statuses": {
-                    os.path.normcase(os.path.normpath(target_paths["Audited"])): {
+                    os.path.normcase(os.path.normpath(target_paths["Broken"])): {
+                        "status": "error"
+                    },
+                    os.path.normcase(os.path.normpath(target_paths["Warning"])): {
+                        "status": "warning"
+                    },
+                    os.path.normcase(os.path.normpath(target_paths["Passed"])): {
                         "status": "ok"
                     }
                 }
@@ -771,14 +779,19 @@ class MediaLibraryTest(TestCase):
                 internal_asc = library.list_items({"sort_by": "internal", "sort_order": "asc"})
                 external_desc = library.list_items({"sort_by": "external", "sort_order": "desc"})
                 audit_desc = library.list_items({"sort_by": "audit", "sort_order": "desc"})
+                audit_asc = library.list_items({"sort_by": "audit", "sort_order": "asc"})
 
             self.assertEqual(internal_desc["items"][0]["title"], "Internal")
             self.assertEqual(internal_asc["items"][-1]["title"], "Internal")
+            self.assertEqual(external_desc["items"][-1]["title"], "Internal")
             self.assertEqual(
-                {item["title"] for item in external_desc["items"][:2]},
-                {"Audited", "External"}
+                [item["title"] for item in audit_desc["items"]],
+                ["Broken", "Warning", "External", "Internal", "Passed"]
             )
-            self.assertEqual(audit_desc["items"][0]["title"], "Audited")
+            self.assertEqual(
+                [item["title"] for item in audit_asc["items"]],
+                ["Passed", "External", "Internal", "Warning", "Broken"]
+            )
 
     def test_external_subtitle_directory_cache_and_invalidation(self):
         with tempfile.TemporaryDirectory() as tmpdir:

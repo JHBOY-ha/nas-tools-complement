@@ -94,6 +94,9 @@ function load_library_items(page) {
   library_pending_page = null;
   library_page = page;
   $("#library_prev_btn,#library_next_btn,#library_filter_btn,#library_refresh_btn").prop("disabled", true);
+  $("#library_items_summary").html(
+      '<span class="d-inline-flex align-items-center gap-2"><span class="spinner-border spinner-border-sm" aria-hidden="true"></span><span>正在加载字幕状态...</span></span>'
+  );
   NProgress.start();
   $.ajax({
     type: "POST",
@@ -105,6 +108,7 @@ function load_library_items(page) {
     success: function (ret) {
       ret = ret || {};
       if (ret.code !== 0) {
+        $("#library_items_summary").text("字幕库加载失败");
         show_fail_modal(ret.msg || "字幕库列表加载失败");
         return;
       }
@@ -113,7 +117,9 @@ function load_library_items(page) {
       const items = ret.items || [];
       const total = ret.total || 0;
       const total_pages = Math.max(Math.ceil(total / library_page_size), 1);
-      $("#library_items_summary").text(`共 ${total} 个媒体项目，当前第 ${ret.page || 1} / ${total_pages} 页`);
+      $("#library_items_summary").text(
+          `找到 ${total} 个媒体项目 · 本页展示 ${items.length} 个 · 第 ${ret.page || 1} / ${total_pages} 页`
+      );
       $("#library_page_text").text(`${ret.page || 1} / ${total_pages}`);
       $("#library_prev_btn").prop("disabled", (ret.page || 1) <= 1);
       $("#library_next_btn").prop("disabled", (ret.page || 1) >= total_pages);
@@ -131,6 +137,7 @@ function load_library_items(page) {
     },
     error: function () {
       $("#library_prev_btn,#library_next_btn").prop("disabled", false);
+      $("#library_items_summary").text("字幕库加载失败，请稍后重试");
       show_fail_modal("网络错误");
     },
     complete: function () {
@@ -156,6 +163,32 @@ function schedule_library_items_load(page) {
     library_load_timer = null;
     load_library_items(page || 1);
   }, 300);
+}
+
+function reset_library_filters() {
+  $("#library_filter_type").val("all");
+  $("#library_filter_category").html('<option value="">全部</option>').val("");
+  $("#library_filter_subtitle").val("all");
+  $("#library_sort_by").val("default");
+  $("#library_sort_order").val("desc");
+  $("#library_filter_keyword").val("");
+  update_library_sort_order_labels();
+  load_library_items(1);
+}
+
+function update_library_sort_order_labels() {
+  const sort_by = $("#library_sort_by").val();
+  const current = $("#library_sort_order").val() || "desc";
+  if (sort_by === "audit") {
+    $("#library_sort_order").html(
+        '<option value="desc">降序（问题优先）</option><option value="asc">升序（正常优先）</option>'
+    );
+  } else {
+    $("#library_sort_order").html(
+        '<option value="desc">降序</option><option value="asc">升序</option>'
+    );
+  }
+  $("#library_sort_order").val(current);
 }
 
 function run_library_subtitle_audit(retry) {
@@ -369,16 +402,17 @@ function library_item_card(item, index) {
 
   const sub_status = item.subtitle_status || "unknown";
   let dot_class = "unknown";
-  let ok = false;
-  let missing = false;
-  if (sub_status === "has_chinese_external" || sub_status === "has_chinese_internal") {
-    dot_class = "ok";
-    ok = true;
+  let indicator_class = "unknown";
+  if (sub_status === "has_chinese_external") {
+    dot_class = "external";
+    indicator_class = "external";
+  } else if (sub_status === "has_chinese_internal") {
+    dot_class = "internal";
+    indicator_class = "internal";
   } else if (sub_status === "missing_chinese") {
     dot_class = "missing";
-    missing = true;
+    indicator_class = "missing-chinese";
   }
-  const indicator_class = ok ? "has-chinese" : missing ? "missing-chinese" : "unknown";
 
   const is_movie = item.media_type === "movie";
   const movie_upload_disabled = is_movie && !item.can_upload;
@@ -409,7 +443,7 @@ function library_item_card(item, index) {
         </div>
         ${is_movie && subtitle_audit_label ? `
         <div class="mt-2">
-          <span class="badge ${subtitle_audit_badge}" title="最近检测：${subtitle_audit_checked_at}">${subtitle_audit_label}</span>
+          <span class="badge ${subtitle_audit_badge} lit-library-card-audit-badge" title="最近检测：${subtitle_audit_checked_at}">${subtitle_audit_label}</span>
         </div>` : ""}
       </div>
       <div class="lit-library-card-footer">
@@ -583,14 +617,23 @@ function init_media_library_page(options) {
     $("#library_filter_category").val("");
     schedule_library_items_load(1);
   });
-  $("#library_filter_category,#library_filter_subtitle,#library_sort_by,#library_sort_order").unbind("change").change(function () {
+  $("#library_sort_by").unbind("change").change(function () {
+    update_library_sort_order_labels();
+    schedule_library_items_load(1);
+  });
+  $("#library_filter_category,#library_filter_subtitle,#library_sort_order").unbind("change").change(function () {
+    schedule_library_items_load(1);
+  });
+  $("#library_filter_keyword").unbind("input").on("input", function () {
     schedule_library_items_load(1);
   });
   $("#library_filter_keyword").unbind("keydown").keydown(function (event) {
     if (event.key === "Enter") {
+      event.preventDefault();
       load_library_items(1);
     }
   });
 
+  update_library_sort_order_labels();
   load_library_items(1);
 }
