@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+import json
 import os
 import sys
 import tempfile
@@ -672,6 +673,157 @@ class MediaLibraryTest(TestCase):
                 self.assertEqual(ret["items"][0]["subtitle_status"], "missing_chinese")
             finally:
                 MediaLibrary._MediaLibrary__ffprobe_subtitle_streams = old_ffprobe
+
+    def test_list_items_sorts_by_internal_external_and_audit_status(self):
+        class _ServerType:
+            value = "Jellyfin"
+
+        class _MediaServer:
+            @staticmethod
+            def get_type():
+                return _ServerType()
+
+        class _Category:
+            @staticmethod
+            def get_movie_categorys():
+                return []
+
+            @staticmethod
+            def get_tv_categorys():
+                return []
+
+            @staticmethod
+            def get_anime_categorys():
+                return []
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            definitions = [
+                ("1", "Internal", [{"Type": "Subtitle", "Language": "eng"}]),
+                ("2", "External", []),
+                ("3", "Audited", [])
+            ]
+            rows = []
+            histories = []
+            target_paths = {}
+            for item_id, title, streams in definitions:
+                target_file = os.path.join(tmpdir, "%s.mkv" % title)
+                open(target_file, "wb").close()
+                target_paths[title] = target_file
+                rows.append(types.SimpleNamespace(
+                    ITEM_ID=item_id,
+                    LIBRARY="lib",
+                    ITEM_TYPE="Movie",
+                    TITLE=title,
+                    ORGIN_TITLE="",
+                    YEAR="2024",
+                    TMDBID=item_id,
+                    IMDBID="",
+                    PATH="/server/%s.mkv" % title,
+                    JSON=json.dumps({"MediaStreams": streams})
+                ))
+                histories.append(types.SimpleNamespace(
+                    ID=int(item_id),
+                    MODE="link",
+                    TYPE="电影",
+                    CATEGORY="",
+                    TMDBID=item_id,
+                    TITLE=title,
+                    YEAR="2024",
+                    SEASON_EPISODE="",
+                    DEST_PATH=tmpdir,
+                    DEST_FILENAME="%s.mkv" % title
+                ))
+            with open(os.path.join(tmpdir, "External.eng.srt"), "wb") as file_obj:
+                file_obj.write(b"subtitle")
+
+            class _MediaDb:
+                @staticmethod
+                def list_items(server_type=None):
+                    return rows
+
+            class _DbHelper:
+                @staticmethod
+                def get_transfer_histories_with_dest():
+                    return histories
+
+            audit_snapshot = {
+                "server": "jellyfin",
+                "media_statuses": {
+                    os.path.normcase(os.path.normpath(target_paths["Audited"])): {
+                        "status": "ok"
+                    }
+                }
+            }
+            library = MediaLibrary.__new__(MediaLibrary)
+            library.mediadb = _MediaDb()
+            library.dbhelper = _DbHelper()
+            library.media_server = _MediaServer()
+            library.category = _Category()
+
+            with patch.object(
+                    MediaLibrary,
+                    "_MediaLibrary__latest_audit_snapshots",
+                    return_value={"movie": audit_snapshot, "tv": {}, "anime": {}}
+            ), \
+                    patch.object(MediaLibrary, "_MediaLibrary__ffprobe_subtitle_streams",
+                                 side_effect=AssertionError("list sorting must not run ffprobe")):
+                internal_desc = library.list_items({"sort_by": "internal", "sort_order": "desc"})
+                internal_asc = library.list_items({"sort_by": "internal", "sort_order": "asc"})
+                external_desc = library.list_items({"sort_by": "external", "sort_order": "desc"})
+                audit_desc = library.list_items({"sort_by": "audit", "sort_order": "desc"})
+
+            self.assertEqual(internal_desc["items"][0]["title"], "Internal")
+            self.assertEqual(internal_asc["items"][-1]["title"], "Internal")
+            self.assertEqual(
+                {item["title"] for item in external_desc["items"][:2]},
+                {"Audited", "External"}
+            )
+            self.assertEqual(audit_desc["items"][0]["title"], "Audited")
+
+    def test_external_subtitle_directory_cache_and_invalidation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            movie = os.path.join(tmpdir, "Movie.mkv")
+            subtitle = os.path.join(tmpdir, "Movie.eng.srt")
+            open(movie, "wb").close()
+            open(subtitle, "wb").close()
+            MediaLibrary.invalidate_subtitle_directory_cache()
+
+            with patch("app.library.os.listdir", wraps=os.listdir) as listdir:
+                self.assertTrue(MediaLibrary.has_external_subtitle(movie))
+                self.assertTrue(MediaLibrary.has_external_subtitle(movie))
+                self.assertEqual(listdir.call_count, 1)
+                MediaLibrary.invalidate_subtitle_directory_cache(movie)
+                self.assertTrue(MediaLibrary.has_external_subtitle(movie))
+                self.assertEqual(listdir.call_count, 2)
+
+    def test_default_library_page_does_not_run_ffprobe(self):
+        class _ServerType:
+            value = "Jellyfin"
+
+        class _MediaServer:
+            @staticmethod
+            def get_type():
+                return _ServerType()
+
+        class _MediaDb:
+            @staticmethod
+            def list_items(server_type=None):
+                return []
+
+        class _DbHelper:
+            @staticmethod
+            def get_transfer_histories_with_dest():
+                return []
+
+        library = MediaLibrary.__new__(MediaLibrary)
+        library.media_server = _MediaServer()
+        library.mediadb = _MediaDb()
+        library.dbhelper = _DbHelper()
+        with patch.object(MediaLibrary, "_MediaLibrary__ffprobe_subtitle_streams",
+                          side_effect=AssertionError("default page must not run ffprobe")):
+            ret = library.list_items({})
+
+        self.assertEqual(ret["code"], 0)
 
     def test_local_poster_prefers_poster_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:

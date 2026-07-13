@@ -7,6 +7,9 @@ var library_poster_observer = null;
 var library_eager_poster_count = 6;
 var library_default_media_server = "emby";
 var library_subtitle_audit_categories = {};
+var library_items_loading = false;
+var library_pending_page = null;
+var library_load_timer = null;
 
 function library_escape_html(value) {
   if (value === null || value === undefined) {
@@ -52,6 +55,8 @@ function library_filter_data(page) {
     type: $("#library_filter_type").val(),
     category: $("#library_filter_category").val(),
     subtitle: $("#library_filter_subtitle").val(),
+    sort_by: $("#library_sort_by").val(),
+    sort_order: $("#library_sort_order").val(),
     keyword: $("#library_filter_keyword").val(),
     page: page,
     page_size: library_page_size
@@ -73,37 +78,84 @@ function update_library_category_options(categories) {
 }
 
 function load_library_items(page) {
+  if (library_load_timer) {
+    clearTimeout(library_load_timer);
+    library_load_timer = null;
+  }
   page = page || 1;
   if (page < 1) {
     return;
   }
+  if (library_items_loading) {
+    library_pending_page = page;
+    return;
+  }
+  library_items_loading = true;
+  library_pending_page = null;
   library_page = page;
-  library_post_json("/library/items", library_filter_data(page), function (ret) {
-    if (ret.code !== 0) {
-      show_fail_modal(ret.msg || "媒体库列表加载失败");
-      return;
+  $("#library_prev_btn,#library_next_btn,#library_filter_btn,#library_refresh_btn").prop("disabled", true);
+  NProgress.start();
+  $.ajax({
+    type: "POST",
+    url: "/library/items?random=" + Math.random(),
+    dataType: "json",
+    contentType: "application/json",
+    data: JSON.stringify(library_filter_data(page)),
+    timeout: 0,
+    success: function (ret) {
+      ret = ret || {};
+      if (ret.code !== 0) {
+        show_fail_modal(ret.msg || "字幕库列表加载失败");
+        return;
+      }
+      update_library_category_options(ret.categories || {});
+      library_items_cache = {};
+      const items = ret.items || [];
+      const total = ret.total || 0;
+      const total_pages = Math.max(Math.ceil(total / library_page_size), 1);
+      $("#library_items_summary").text(`共 ${total} 个媒体项目，当前第 ${ret.page || 1} / ${total_pages} 页`);
+      $("#library_page_text").text(`${ret.page || 1} / ${total_pages}`);
+      $("#library_prev_btn").prop("disabled", (ret.page || 1) <= 1);
+      $("#library_next_btn").prop("disabled", (ret.page || 1) >= total_pages);
+      if (!items.length) {
+        $("#library_items_grid").html('<div class="empty" style="grid-column:1/-1;margin:3rem 0"><p class="empty-title">暂无媒体</p><p class="empty-subtitle text-muted">请先点击“媒体库同步”，或调整筛选条件。</p></div>');
+        return;
+      }
+      let html = "";
+      items.forEach(function (item, index) {
+        library_items_cache[item.id] = item;
+        html += library_item_card(item, index);
+      });
+      $("#library_items_grid").html(html);
+      init_library_posters();
+    },
+    error: function () {
+      $("#library_prev_btn,#library_next_btn").prop("disabled", false);
+      show_fail_modal("网络错误");
+    },
+    complete: function () {
+      NProgress.done();
+      library_items_loading = false;
+      $("#library_filter_btn,#library_refresh_btn").prop("disabled", false);
+      const pending_page = library_pending_page;
+      library_pending_page = null;
+      if (pending_page !== null) {
+        setTimeout(function () {
+          load_library_items(pending_page);
+        }, 50);
+      }
     }
-    update_library_category_options(ret.categories || {});
-    library_items_cache = {};
-    const items = ret.items || [];
-    const total = ret.total || 0;
-    const total_pages = Math.max(Math.ceil(total / library_page_size), 1);
-    $("#library_items_summary").text(`共 ${total} 个媒体项目，当前第 ${ret.page || 1} / ${total_pages} 页`);
-    $("#library_page_text").text(`${ret.page || 1} / ${total_pages}`);
-    $("#library_prev_btn").prop("disabled", (ret.page || 1) <= 1);
-    $("#library_next_btn").prop("disabled", (ret.page || 1) >= total_pages);
-    if (!items.length) {
-      $("#library_items_grid").html('<div class="empty" style="grid-column:1/-1;margin:3rem 0"><p class="empty-title">暂无媒体</p><p class="empty-subtitle text-muted">请先点击“媒体库同步”，或调整筛选条件。</p></div>');
-      return;
-    }
-    let html = "";
-    items.forEach(function (item, index) {
-      library_items_cache[item.id] = item;
-      html += library_item_card(item, index);
-    });
-    $("#library_items_grid").html(html);
-    init_library_posters();
   });
+}
+
+function schedule_library_items_load(page) {
+  if (library_load_timer) {
+    clearTimeout(library_load_timer);
+  }
+  library_load_timer = setTimeout(function () {
+    library_load_timer = null;
+    load_library_items(page || 1);
+  }, 300);
 }
 
 function run_library_subtitle_audit(retry) {
@@ -529,10 +581,10 @@ function init_media_library_page(options) {
 
   $("#library_filter_type").unbind("change").change(function () {
     $("#library_filter_category").val("");
-    load_library_items(1);
+    schedule_library_items_load(1);
   });
-  $("#library_filter_category,#library_filter_subtitle").unbind("change").change(function () {
-    load_library_items(1);
+  $("#library_filter_category,#library_filter_subtitle,#library_sort_by,#library_sort_order").unbind("change").change(function () {
+    schedule_library_items_load(1);
   });
   $("#library_filter_keyword").unbind("keydown").keydown(function (event) {
     if (event.key === "Enter") {

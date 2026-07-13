@@ -27,7 +27,7 @@
                 {{ SVG.check() }}
                 检测外挂字幕
               </button>
-              <button class="btn" type="button" onclick="load_library_items(1)">
+              <button class="btn" id="library_refresh_btn" type="button" onclick="load_library_items(1)">
                 {{ SVG.refresh() }}
                 刷新
               </button>
@@ -36,7 +36,7 @@
           <div class="card-body">
             <div class="row g-2 align-items-end">
               <div class="col-6 col-md-3 col-xl-2">
-                <label class="form-label">类型</label>
+                <label class="form-label" for="library_filter_type">类型</label>
                 <select id="library_filter_type" class="form-select">
                   <option value="all">全部</option>
                   <option value="movie">电影</option>
@@ -45,28 +45,44 @@
                 </select>
               </div>
               <div class="col-6 col-md-3 col-xl-2">
-                <label class="form-label">小分类</label>
+                <label class="form-label" for="library_filter_category">小分类</label>
                 <select id="library_filter_category" class="form-select">
                   <option value="">全部</option>
                 </select>
               </div>
               <div class="col-6 col-md-3 col-xl-2">
-                <label class="form-label">字幕状态</label>
+                <label class="form-label" for="library_filter_subtitle">字幕状态</label>
                 <select id="library_filter_subtitle" class="form-select">
                   <option value="all">全部</option>
                   <option value="missing">缺中文字幕</option>
                   <option value="ok">已有中文字幕</option>
                 </select>
               </div>
-              <div class="col-12 col-md-3 col-xl-4">
-                <label class="form-label">搜索</label>
+              <div class="col-6 col-md-3 col-xl-2">
+                <label class="form-label" for="library_sort_by">排序字段</label>
+                <select id="library_sort_by" class="form-select">
+                  <option value="default">默认顺序</option>
+                  <option value="internal">是否有内嵌字幕</option>
+                  <option value="external">是否有外挂字幕</option>
+                  <option value="audit">字幕检测准确性</option>
+                </select>
+              </div>
+              <div class="col-6 col-md-3 col-xl-1">
+                <label class="form-label" for="library_sort_order">方向</label>
+                <select id="library_sort_order" class="form-select">
+                  <option value="desc">降序</option>
+                  <option value="asc">升序</option>
+                </select>
+              </div>
+              <div class="col-12 col-md-6 col-xl-2">
+                <label class="form-label" for="library_filter_keyword">搜索</label>
                 <input id="library_filter_keyword" type="text" class="form-control" placeholder="标题、原名、年份">
               </div>
-              <div class="col-12 col-xl-2">
-                <button class="btn btn-primary w-100" type="button" onclick="load_library_items(1)">筛选</button>
+              <div class="col-12 col-md-6 col-xl-1">
+                <button class="btn btn-primary w-100" id="library_filter_btn" type="button" onclick="load_library_items(1)">筛选</button>
               </div>
             </div>
-            <div id="library_items_summary" class="text-muted mt-3"></div>
+            <div id="library_items_summary" class="text-muted mt-3" aria-live="polite"></div>
           </div>
           <div id="library_items_grid" class="lit-library-grid"></div>
           <div class="card-footer d-flex align-items-center">
@@ -124,10 +140,10 @@
             </div>
           </div>
           <div class="py-3">
-            <div class="fw-bold mb-1">按字幕状态筛选为什么和单集弹窗结果不同？</div>
+            <div class="fw-bold mb-1">按字幕状态筛选/排序为什么和单集弹窗结果不同？</div>
             <div class="text-muted">
               为避免大媒体库请求卡住，列表筛选阶段不会对全库逐项运行 ffprobe，只使用已有流信息和外挂字幕快速检测。
-              打开电视剧/番剧的“选择剧集”弹窗可以查看更细的单集检测结果。
+              外挂字幕排序首次会读取相关目录，结果会短时缓存 30 秒；打开电视剧/番剧的“选择剧集”弹窗可以查看更细的单集检测结果。
             </div>
           </div>
           <div class="py-3">

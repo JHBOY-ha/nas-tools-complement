@@ -1917,6 +1917,15 @@ def upload_subtitle():
                                                            rmt_mode=rmt_mode,
                                                            server_type=server_type,
                                                            align_mode=align_mode)
+        if success:
+            for cache_path in [
+                data.get("source_subtitle"),
+                data.get("target_subtitle"),
+                target_file,
+                media_file
+            ]:
+                if cache_path:
+                    MediaLibrary.invalidate_subtitle_directory_cache(cache_path)
         refresh_msg = ""
         # 同步成功后刷新媒体服务器库，使新字幕被媒体服务器识别
         if success and data.get("synced"):
