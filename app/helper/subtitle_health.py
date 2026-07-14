@@ -52,7 +52,10 @@ class SubtitleHealth:
         "ty", "ug", "uk", "ur", "uz", "ve", "vi", "vo", "wa", "wo", "xh", "yi",
         "yo", "za", "zh", "zu"
     }
-    _charset_candidates = ["utf_8", "utf_16", "utf_16_le", "utf_16_be", "gb18030", "big5"]
+    _charset_candidates = [
+        "utf_8", "utf_16", "utf_16_le", "utf_16_be",
+        "gb18030", "big5", "cp1252"
+    ]
 
     @classmethod
     def normalize_uploaded_subtitle(cls, subtitle_file):

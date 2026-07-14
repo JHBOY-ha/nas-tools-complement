@@ -38,6 +38,14 @@ class Subtitle:
         "ru": "rus", "es": "spa", "sv": "swe", "th": "tha", "tr": "tur", "uk": "ukr",
         "vi": "vie"
     }
+    _traditional_chinese_chars = set(
+        "體臺萬與為這個們來時會說後裡麼還點從對開關讓過發現長門間見當無於學國華"
+        "電車書風區東氣應實種樣頭總經業數據網絡軟雲檔檢測識別聲愛寫讀買賣請問謝歡樂"
+    )
+    _simplified_chinese_chars = set(
+        "体台万与为这个们来时会说后里面么还点从对开关让过发现长门间见当无于学国华"
+        "电车书风区东气应实种样头总经业数据网络软云档检测识别声爱写读买卖请问谢欢乐"
+    )
 
     def __init__(self):
         self.init_config()
@@ -261,8 +269,10 @@ class Subtitle:
                         default_language=""
                     )
                     if not subtitle_profile.get("language"):
-                        failures.append({"path": subtitle_file, "reason": "无法从文件名判断字幕语言，已保留原文件"})
-                        continue
+                        subtitle_profile["language"] = self.__infer_subtitle_language(
+                            work_file,
+                            validation
+                        ) or "zh-CN"
                     subtitle_profile["source"] = self.__guess_subtitle_source(
                         os.path.basename(subtitle_file),
                         media_file
@@ -424,6 +434,55 @@ class Subtitle:
             region = region.upper() if len(region) == 2 and region.isalpha() else region
             return f"{primary}-{region}"
         return token
+
+    @classmethod
+    def __infer_subtitle_language(cls, subtitle_file, validation=None):
+        """在文件名没有语言标记时，从规范化后的字幕正文推断常见语言。"""
+        encoding = str((validation or {}).get("encoding") or "").lower().replace("-", "")
+        if "big5" in encoding:
+            return "zh-TW"
+        try:
+            with open(subtitle_file, "r", encoding="utf-8-sig", errors="ignore") as file_obj:
+                text = file_obj.read(512 * 1024)
+        except OSError:
+            return ""
+        if not text:
+            return ""
+
+        ext = os.path.splitext(subtitle_file)[-1].lower()
+        if ext in [".ass", ".ssa"]:
+            dialogue = []
+            for line in text.splitlines():
+                if line.lstrip().lower().startswith("dialogue:"):
+                    dialogue.append(line.split(",", 9)[-1])
+            if dialogue:
+                text = "\n".join(dialogue)
+        text = re.sub(r"\{[^}]*}|<[^>]*>|\\[NnH]", " ", text)
+
+        if len(re.findall(r"[\u3040-\u30ff]", text)) >= 3:
+            return "jpn"
+        if len(re.findall(r"[\uac00-\ud7af]", text)) >= 3:
+            return "kor"
+
+        chinese_chars = re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", text)
+        if len(chinese_chars) >= 3:
+            traditional_hits = sum(char in cls._traditional_chinese_chars for char in chinese_chars)
+            simplified_hits = sum(char in cls._simplified_chinese_chars for char in chinese_chars)
+            return "zh-TW" if traditional_hits > simplified_hits else "zh-CN"
+
+        if len(re.findall(r"[\u0400-\u04ff]", text)) >= 3:
+            return "rus"
+        if len(re.findall(r"[\u0370-\u03ff]", text)) >= 3:
+            return "gre"
+        if len(re.findall(r"[\u0590-\u05ff]", text)) >= 3:
+            return "heb"
+        if len(re.findall(r"[\u0600-\u06ff]", text)) >= 3:
+            return "ara"
+        if len(re.findall(r"[\u0e00-\u0e7f]", text)) >= 3:
+            return "tha"
+        if len(re.findall(r"[a-zA-Z]", text)) >= 20:
+            return "eng"
+        return ""
 
     @classmethod
     def __build_subtitle_path(cls, media_file, subtitle_profile, sub_ext, server_type=None):

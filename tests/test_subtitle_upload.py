@@ -264,6 +264,46 @@ class SubtitleUploadTest(TestCase):
             with open(subtitle_file, "r", encoding="utf-8") as file_obj:
                 self.assertIn("繁體中文字幕測試", file_obj.read())
 
+    def test_repair_infers_language_when_filename_has_no_language_tag(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            movie = os.path.join(tmpdir, "Movie.mkv")
+            subtitle_file = os.path.join(tmpdir, "Movie.srt")
+            open(movie, "wb").close()
+            with open(subtitle_file, "w", encoding="utf-8") as file_obj:
+                file_obj.write(
+                    "1\n00:00:01,000 --> 00:00:02,000\n"
+                    "这是没有语言标签的简体中文字幕。\n"
+                )
+
+            valid = {"valid": True, "probe_available": True, "message": "ok", "encoding": "utf-8"}
+            with patch.object(SubtitleHealth, "validate_subtitle", return_value=valid):
+                success, msg, data = Subtitle().repair_external_subtitles(movie, "jellyfin")
+
+            self.assertTrue(success, msg)
+            self.assertEqual(data["processed"][0]["language"], "zh-CN")
+            self.assertFalse(os.path.exists(subtitle_file))
+            self.assertTrue(os.path.exists(os.path.join(tmpdir, "Movie.chi.zh-cn.srt")))
+
+    def test_repair_infers_english_when_filename_has_no_language_tag(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            movie = os.path.join(tmpdir, "Movie.mkv")
+            subtitle_file = os.path.join(tmpdir, "Movie.srt")
+            open(movie, "wb").close()
+            with open(subtitle_file, "w", encoding="utf-8") as file_obj:
+                file_obj.write(
+                    "1\n00:00:01,000 --> 00:00:02,000\n"
+                    "This subtitle has no language tag in its filename.\n"
+                )
+
+            valid = {"valid": True, "probe_available": True, "message": "ok", "encoding": "utf-8"}
+            with patch.object(SubtitleHealth, "validate_subtitle", return_value=valid):
+                success, msg, data = Subtitle().repair_external_subtitles(movie, "jellyfin")
+
+            self.assertTrue(success, msg)
+            self.assertEqual(data["processed"][0]["language"], "eng")
+            self.assertFalse(os.path.exists(subtitle_file))
+            self.assertTrue(os.path.exists(os.path.join(tmpdir, "Movie.eng.srt")))
+
     def test_big5_normalization_preserves_traditional_chinese_text(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             subtitle_file = os.path.join(tmpdir, "Movie.chi.srt")
@@ -282,6 +322,25 @@ class SubtitleUploadTest(TestCase):
             self.assertEqual(result["encoding"].lower(), "big5")
             with open(subtitle_file, "r", encoding="utf-8") as file_obj:
                 self.assertIn("繁體中文字幕測試", file_obj.read())
+
+    def test_cp1252_normalization_preserves_western_punctuation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            subtitle_file = os.path.join(tmpdir, "Movie.eng.srt")
+            text = (
+                "1\n00:00:01,000 --> 00:00:02,000\n"
+                "It’s déjà vu — don’t worry.\n"
+            )
+            with open(subtitle_file, "wb") as file_obj:
+                file_obj.write(text.encode("cp1252"))
+
+            valid = {"valid": True, "probe_available": True, "message": "ok"}
+            with patch.object(SubtitleHealth, "validate_subtitle", return_value=valid):
+                result = SubtitleHealth.normalize_uploaded_subtitle(subtitle_file)
+
+            self.assertTrue(result["valid"])
+            self.assertEqual(result["encoding"].lower(), "cp1252")
+            with open(subtitle_file, "r", encoding="utf-8") as file_obj:
+                self.assertIn("It’s déjà vu — don’t worry.", file_obj.read())
 
     def test_upload_repairs_blank_line_between_srt_index_and_timing(self):
         with tempfile.TemporaryDirectory() as tmpdir:
