@@ -59,12 +59,13 @@ class SubtitleHealth:
 
     @classmethod
     def normalize_uploaded_subtitle(cls, subtitle_file):
-        """将文本字幕规范化为 UTF-8，并修复可安全确认的 SRT 结构问题。"""
+        """将文本字幕规范化为 UTF-8，并修复可安全确认的字幕结构问题。"""
         result = {
             "normalized": False,
             "repaired": False,
             "encoding": "",
             "removed_blank_lines": 0,
+            "ass_repairs": [],
             "probe_available": bool(shutil.which("ffprobe")),
             "valid": False,
             "message": ""
@@ -87,6 +88,10 @@ class SubtitleHealth:
                 normalized_text, removed = cls.__repair_srt_blank_lines(normalized_text)
                 result["removed_blank_lines"] = removed
                 result["repaired"] = removed > 0
+            elif ext in [".ass", ".ssa"]:
+                normalized_text, repairs = cls.__repair_ass_structure(normalized_text)
+                result["ass_repairs"] = repairs
+                result["repaired"] = bool(repairs)
             normalized_bytes = normalized_text.encode("utf-8")
             if raw != normalized_bytes:
                 cls.__atomic_write(subtitle_file, normalized_bytes)
@@ -351,6 +356,58 @@ class SubtitleHealth:
                     continue
             index += 1
         return "\n".join(output), removed
+
+    @staticmethod
+    def __repair_ass_structure(text):
+        """修复可以无歧义确认的 ASS/SSA 段头截断与 Dialogue 时间分隔符。"""
+        lines = text.split("\n")
+        repairs = []
+        partial_script_headers = {
+            "Script Info]", "cript Info]", "ript Info]", "ipt Info]"
+        }
+
+        for index, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped in partial_script_headers:
+                lines[index] = "[Script Info]"
+                repairs.append("恢复缺失的 [Script Info] 段头")
+            break
+
+        in_events = False
+        repaired_timestamps = 0
+        timestamp_pattern = re.compile(r"^(\d+:\d{2}:\d{2}):(\d{2})$")
+        for index, line in enumerate(lines):
+            stripped = line.strip()
+            if re.fullmatch(r"\[[^\]]+\]", stripped):
+                in_events = stripped.casefold() == "[events]"
+                continue
+            if not in_events or not re.match(r"^\s*dialogue\s*:", line, re.I):
+                continue
+
+            prefix, payload = line.split(":", 1)
+            leading = payload[:len(payload) - len(payload.lstrip())]
+            fields = payload.lstrip().split(",", 9)
+            if len(fields) != 10:
+                continue
+            changed = False
+            for field_index in [1, 2]:
+                value = fields[field_index].strip()
+                match = timestamp_pattern.fullmatch(value)
+                if not match:
+                    continue
+                left_space = fields[field_index][:len(fields[field_index]) - len(fields[field_index].lstrip())]
+                right_space = fields[field_index][len(fields[field_index].rstrip()):]
+                fields[field_index] = f"{left_space}{match.group(1)}.{match.group(2)}{right_space}"
+                repaired_timestamps += 1
+                changed = True
+            if changed:
+                lines[index] = f"{prefix}:{leading}{','.join(fields)}"
+
+        if repaired_timestamps:
+            repairs.append(f"规范化 {repaired_timestamps} 个 Dialogue 时间分隔符")
+        return "\n".join(lines), repairs
 
     @staticmethod
     def __atomic_write(file_path, content):

@@ -158,7 +158,9 @@ class Subtitle:
         normalize_messages = []
         if validation.get("normalized"):
             normalize_messages.append("已转换为 UTF-8")
-        if validation.get("repaired"):
+        if validation.get("ass_repairs"):
+            normalize_messages.extend(validation.get("ass_repairs"))
+        elif validation.get("repaired"):
             normalize_messages.append(f"已修复 {validation.get('removed_blank_lines') or 0} 处 SRT 异常空行")
         normalize_msg = f"，{'，'.join(normalize_messages)}" if normalize_messages else ""
 

@@ -342,6 +342,62 @@ class SubtitleUploadTest(TestCase):
             with open(subtitle_file, "r", encoding="utf-8") as file_obj:
                 self.assertIn("It’s déjà vu — don’t worry.", file_obj.read())
 
+    def test_ass_normalization_repairs_truncated_header_and_timestamp_separator(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            subtitle_file = os.path.join(tmpdir, "Movie.zh.ass")
+            content = (
+                "ipt Info]\r\n"
+                "ScriptType: v4.00+\r\n\r\n"
+                "[V4+ Styles]\r\n"
+                "Format: Name, Fontname, Fontsize\r\n"
+                "Style: Default,Arial,20\r\n\r\n"
+                "[Events]\r\n"
+                "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\r\n"
+                "Dialogue: 0,0:00:00.45,0:00:05:45,Default,,0,0,0,,测试字幕\r\n"
+            )
+            with open(subtitle_file, "wb") as file_obj:
+                file_obj.write(content.encode("utf-8"))
+
+            valid = {"valid": True, "probe_available": True, "message": "ok"}
+            with patch.object(SubtitleHealth, "validate_subtitle", return_value=valid):
+                result = SubtitleHealth.normalize_uploaded_subtitle(subtitle_file)
+
+            self.assertTrue(result["valid"])
+            self.assertTrue(result["repaired"])
+            self.assertEqual(
+                result["ass_repairs"],
+                ["恢复缺失的 [Script Info] 段头", "规范化 1 个 Dialogue 时间分隔符"]
+            )
+            with open(subtitle_file, "r", encoding="utf-8") as file_obj:
+                repaired = file_obj.read()
+            self.assertTrue(repaired.startswith("[Script Info]\n"))
+            self.assertIn("0:00:00.45,0:00:05.45", repaired)
+
+    def test_upload_reports_ass_repairs_without_srt_message(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            movie = os.path.join(tmpdir, "Movie.mkv")
+            open(movie, "wb").close()
+            content = (
+                "ipt Info]\nScriptType: v4.00+\n\n"
+                "[Events]\n"
+                "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+                "Dialogue: 0,0:00:00.45,0:00:05:45,Default,,0,0,0,,测试字幕\n"
+            ).encode("utf-8")
+
+            valid = {"valid": True, "probe_available": True, "message": "ok"}
+            with patch.object(SubtitleHealth, "validate_subtitle", return_value=valid):
+                success, msg, data = Subtitle().upload_subtitle(
+                    _UploadFile("Movie.zh-cn.ass", content),
+                    movie,
+                    server_type="jellyfin"
+                )
+
+            self.assertTrue(success, msg)
+            self.assertIn("恢复缺失的 [Script Info] 段头", msg)
+            self.assertIn("规范化 1 个 Dialogue 时间分隔符", msg)
+            self.assertNotIn("SRT 异常空行", msg)
+            self.assertEqual(len(data["validation"]["ass_repairs"]), 2)
+
     def test_upload_repairs_blank_line_between_srt_index_and_timing(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             movie = os.path.join(tmpdir, "Movie.mkv")
