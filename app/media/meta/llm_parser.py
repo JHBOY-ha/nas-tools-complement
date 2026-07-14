@@ -48,6 +48,7 @@ class LLMMetaParser(object):
         self._model = ""
         self._timeout = 20
         self._max_tokens = 1024
+        self._thinking = ""
         self._confidence_threshold = 0.75
         self._search_context_enable = False
         self._search_max_results = 3
@@ -70,6 +71,7 @@ class LLMMetaParser(object):
         self._model = str(config.get("model") or "").strip()
         self._timeout = self.__parse_int(config.get("timeout"), min_val=1, default=20)
         self._max_tokens = self.__parse_int(config.get("max_tokens"), min_val=1, default=1024)
+        self._thinking = config.get("thinking") or ""
         self._confidence_threshold = self.__parse_float(
             config.get("confidence_threshold"), min_val=0, max_val=1, default=0.75
         )
@@ -85,12 +87,13 @@ class LLMMetaParser(object):
         self._parse_cache = {}
         self._client = None
 
-    def get_status(self):
+    def get_status(self, config=None):
         """
-        测试连通性（用于设置页测试按钮）
+        测试连通性（用于设置页测试按钮）。传入 config 时仅使用表单中的临时配置，
+        不读取或修改已保存配置。
         """
         try:
-            client = self.__get_client()
+            client = LLMClient(config) if config is not None else self.__get_client()
             if not client:
                 return False
             return client.get_status()
@@ -843,6 +846,7 @@ class LLMMetaParser(object):
                 "model": self._model,
                 "timeout": self._timeout,
                 "max_tokens": self._max_tokens,
+                "thinking": self._thinking,
                 "enable": self._enabled
             })
         return self._client

@@ -147,3 +147,76 @@ class LLMClientTest(TestCase):
                 "model": "gpt-test"
             })
             self.assertIsNone(client.complete_json("system", "user"))
+
+    def test_status_succeeds_when_choices_only_contain_reasoning(self):
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "reasoning_content": "Okay, the user"
+                },
+                "finish_reason": "length"
+            }]
+        }
+        with patch("app.utils.llm_client.requests.post", return_value=response) as post, \
+                patch("app.utils.llm_client.log.info") as info:
+            client = LLMClient({
+                "base_url": "https://api.deepseek.com/",
+                "api_key": "key",
+                "model": "deepseek-v4-flash"
+            })
+            self.assertTrue(client.get_status())
+
+        self.assertEqual(4, post.call_args.kwargs["json"]["max_tokens"])
+        self.assertNotIn("thinking", post.call_args.kwargs["json"])
+        message = info.call_args.args[0]
+        self.assertIn("reasoning_content_len=14", message)
+        self.assertIn("finish_reason=length", message)
+
+    def test_configured_thinking_mode_is_sent_explicitly(self):
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {
+            "choices": [{"message": {"content": "OK"}}]
+        }
+        with patch("app.utils.llm_client.requests.post", return_value=response) as post:
+            client = LLMClient({
+                "base_url": "https://api.deepseek.com/",
+                "api_key": "key",
+                "model": "deepseek-v4-flash",
+                "thinking": "disabled"
+            })
+            self.assertTrue(client.get_status())
+
+        self.assertEqual(
+            {"type": "disabled"},
+            post.call_args.kwargs["json"]["thinking"]
+        )
+
+    def test_completion_does_not_treat_reasoning_as_final_content(self):
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "reasoning_content": "private reasoning"
+                },
+                "finish_reason": "length"
+            }]
+        }
+        with patch("app.utils.llm_client.requests.post", return_value=response), \
+                patch("app.utils.llm_client.log.info") as info:
+            client = LLMClient({
+                "base_url": "https://api.example/v1",
+                "api_key": "key",
+                "model": "reasoning-model"
+            })
+            self.assertEqual("", client.complete_text("system", "user"))
+
+        message = info.call_args.args[0]
+        self.assertIn("补全请求最终内容为空", message)
+        self.assertIn("reasoning_content_len=17", message)
+        self.assertNotIn("private reasoning", message)

@@ -25,6 +25,7 @@ class LLMClient:
         self._model = str(self._config.get("model") or "").strip()
         self._timeout = self.__parse_int(self._config.get("timeout"), min_val=1, default=20)
         self._max_tokens = self.__parse_int(self._config.get("max_tokens"), min_val=1, default=1024)
+        self._thinking = self.__parse_thinking(self._config.get("thinking"))
         self._enabled = StringUtils.to_bool(
             self._config.get("enable", self._config.get("enabled")), False
         )
@@ -36,12 +37,24 @@ class LLMClient:
 
     def get_status(self):
         if not self.is_ready(require_enable=False):
+            log.warn("【LLM】连接测试配置不完整，请检查 Base URL、API Key 和 Model")
             return False
-        return bool(self.complete_text(
-            system_prompt="You are a health-check assistant.",
-            user_prompt="OK",
-            max_tokens=4
-        ))
+        try:
+            data = self.__request_openai(
+                system_prompt="You are a health-check assistant.",
+                user_prompt="OK",
+                max_tokens=4
+            )
+            choices = (data.get("choices") or []) if data else []
+            if not choices:
+                log.warn("【LLM】连接测试响应成功，但响应中不含 choices")
+                return False
+            self.__log_empty_content(choices[0], context="连接测试")
+            return True
+        except Exception as err:
+            ExceptionUtils.exception_traceback(err)
+            log.error("【LLM】连接测试失败：error=%s" % str(err))
+            return False
 
     def complete_json(self, system_prompt, user_prompt, max_tokens=None):
         content = self.complete_text(
@@ -62,6 +75,21 @@ class LLMClient:
             return ""
 
     def __complete_openai(self, system_prompt, user_prompt, max_tokens=None):
+        data = self.__request_openai(system_prompt, user_prompt, max_tokens)
+        if not data:
+            return ""
+        choices = data.get("choices") or []
+        if not choices:
+            log.warn("【LLM】OpenAI兼容接口响应成功，但响应中不含 choices")
+            return ""
+        choice = choices[0] or {}
+        message = choice.get("message") or {}
+        content = self.extract_text_content(message.get("content"))
+        if not content:
+            self.__log_empty_content(choice, context="补全请求")
+        return content
+
+    def __request_openai(self, system_prompt, user_prompt, max_tokens=None):
         payload = {
             "model": self._model,
             "messages": [
@@ -71,6 +99,9 @@ class LLMClient:
             "max_tokens": max_tokens or self._max_tokens,
             "temperature": 0
         }
+        # thinking 并非 OpenAI Chat Completions 标准字段，仅在用户明确配置时发送。
+        if self._thinking:
+            payload["thinking"] = {"type": self._thinking}
         response = requests.post(
             self._chat_completion_url,
             headers={
@@ -84,13 +115,21 @@ class LLMClient:
         if response is None or response.status_code >= 400:
             status, detail = self.__http_error_detail(response)
             log.warn("【LLM】OpenAI兼容接口请求失败：status=%s%s" % (status, detail))
-            return ""
-        data = response.json()
-        choices = data.get("choices") or []
-        if not choices:
-            return ""
-        message = choices[0].get("message") or {}
-        return self.extract_text_content(message.get("content"))
+            return None
+        return response.json()
+
+    @classmethod
+    def __log_empty_content(cls, choice, context):
+        message = (choice.get("message") or {}) if isinstance(choice, dict) else {}
+        content = cls.extract_text_content(message.get("content"))
+        if content:
+            return
+        reasoning_content = cls.extract_text_content(message.get("reasoning_content"))
+        finish_reason = (choice.get("finish_reason") or "") if isinstance(choice, dict) else ""
+        log.info(
+            "【LLM】%s最终内容为空：reasoning_content_len=%s, finish_reason=%s"
+            % (context, len(reasoning_content), finish_reason)
+        )
 
     @staticmethod
     def __build_chat_completion_url(base_url):
@@ -189,3 +228,16 @@ class LLMClient:
         if min_val is not None and number < min_val:
             return default
         return number
+
+    @staticmethod
+    def __parse_thinking(value):
+        if isinstance(value, dict):
+            value = value.get("type")
+        if isinstance(value, bool):
+            return "enabled" if value else "disabled"
+        value = str(value or "").strip().lower()
+        if value in ["enabled", "enable", "on", "true", "1"]:
+            return "enabled"
+        if value in ["disabled", "disable", "off", "false", "0"]:
+            return "disabled"
+        return ""

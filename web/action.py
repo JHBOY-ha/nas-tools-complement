@@ -1634,7 +1634,11 @@ class WebAction:
                             importlib.import_module(module), class_name)()
                         if hasattr(module_obj, "init_config"):
                             module_obj.init_config()
-                        ret = module_obj.get_status()
+                        temporary_config = data.get("config")
+                        if isinstance(temporary_config, dict):
+                            ret = module_obj.get_status(config=temporary_config)
+                        else:
+                            ret = module_obj.get_status()
                     else:
                         ret = eval(command)
                 # 重载配置

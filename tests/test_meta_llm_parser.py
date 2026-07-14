@@ -239,6 +239,24 @@ class LLMMetaParserTest(TestCase):
 
         self.assertFalse(status)
 
+    def test_get_status_uses_temporary_form_config(self):
+        temporary_config = {
+            "base_url": "https://api.deepseek.com/",
+            "api_key": "new-key",
+            "model": "deepseek-v4-flash",
+            "thinking": "disabled"
+        }
+        mock_client = Mock()
+        mock_client.get_status.return_value = True
+
+        with patch("app.media.meta.llm_parser.LLMClient", return_value=mock_client) as client_cls, \
+                patch.object(self.parser, "_LLMMetaParser__get_client") as get_saved_client:
+            status = self.parser.get_status(config=temporary_config)
+
+        self.assertTrue(status)
+        client_cls.assert_called_once_with(temporary_config)
+        get_saved_client.assert_not_called()
+
     def test_parse_with_search_context_should_attach_external_candidates(self):
         self.parser._search_context_enable = True
         mock_client = Mock()
