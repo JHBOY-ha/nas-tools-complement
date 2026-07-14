@@ -22,7 +22,7 @@ from app.downloader.client import Qbittorrent, Transmission
 from app.filetransfer import FileTransfer
 from app.filter import Filter
 from app.helper import DbHelper, ProgressHelper, ThreadHelper, \
-    MetaHelper, DisplayHelper, WordsHelper, CookieCloudHelper
+    MetaHelper, DisplayHelper, WordsHelper, CookieCloudHelper, OpenSubtitles
 from app.indexer import Indexer
 from app.media import Category, Media, Bangumi, DouBan
 from app.media.meta import MetaInfo, MetaBase
@@ -176,6 +176,7 @@ class WebAction:
             "rename_file": self.__rename_file,
             "delete_files": self.__delete_files,
             "download_subtitle": self.__download_subtitle,
+            "test_opensubtitles": self.__test_opensubtitles,
             "get_download_setting": self.__get_download_setting,
             "update_download_setting": self.__update_download_setting,
             "delete_download_setting": self.__delete_download_setting,
@@ -1236,6 +1237,8 @@ class WebAction:
         # 保存配置
         if not config_test:
             Config().save_config(cfg)
+            if any(str(key).startswith("subtitle.") for key, _ in cfgs):
+                Subtitle().init_config()
 
         return {"code": 0}
 
@@ -2184,7 +2187,8 @@ class WebAction:
         if target.find("themoviedb") != -1 \
                 or target.find("telegram") != -1 \
                 or target.find("fanart") != -1 \
-                or target.find("tmdb") != -1:
+                or target.find("tmdb") != -1 \
+                or target.find("opensubtitles") != -1:
             res = RequestUtils(proxies=Config().get_proxies(),
                                timeout=5).get_res(target)
         else:
@@ -4181,11 +4185,46 @@ class WebAction:
                           "episode": media.begin_episode,
                           "bluray": False,
                           "imdbid": media.imdb_id}]
-        success, retmsg = Subtitle().download_subtitle(items=subtitle_item)
+        success, retmsg = Subtitle().download_subtitle(
+            items=subtitle_item,
+            selected_file_id=data.get("file_id")
+        )
         if success:
             return {"code": 0, "msg": retmsg}
+        elif isinstance(retmsg, dict):
+            return {
+                "code": 1,
+                "msg": retmsg.get("msg"),
+                "candidates": retmsg.get("candidates") or []
+            }
         else:
             return {"code": -1, "msg": retmsg}
+
+    @staticmethod
+    def __test_opensubtitles(data):
+        """Validate OpenSubtitles credentials without consuming download quota."""
+        current = ((Config().get_config("subtitle") or {}).get("opensubtitles") or {}).copy()
+        for key in ("api_key", "username", "password", "languages"):
+            value = data.get(key)
+            if value not in (None, ""):
+                current[key] = value
+        client = OpenSubtitles(current)
+        info, error = client.get_user_info()
+        if error:
+            return {"code": -1, "msg": error}
+        return {
+            "code": 0,
+            "msg": "OpenSubtitles账户验证成功",
+            "data": {
+                "level": info.get("level"),
+                "vip": bool(info.get("vip")),
+                "allowed_downloads": info.get("allowed_downloads"),
+                "downloads_count": info.get("downloads_count"),
+                "remaining_downloads": info.get("remaining_downloads"),
+                "reset_time": info.get("reset_time"),
+                "reset_time_utc": info.get("reset_time_utc")
+            }
+        }
 
     @staticmethod
     def __get_download_setting(data):

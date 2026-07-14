@@ -14,7 +14,6 @@
 <div class="page-body">
   <div class="container-xl">
     <div class="d-grid gap-3 grid-normal-card">
-      {% if ChromeOk %}
       <a class="card card-link-pop p-0" href="#" data-bs-toggle="modal" data-bs-target="#modal-opensubtitles">
         <div class="card-cover card-cover-blurred text-center">
           <span class="avatar avatar-xl avatar-thumb avatar-rounded"
@@ -27,7 +26,6 @@
                   class="badge bg-green" title="已开启"></span> 正在使用{% endif %}{% endif %}</div>
         </div>
       </a>
-      {% endif %}
       <a class="card card-link-pop p-0" href="#" data-bs-toggle="modal"
          data-bs-target="#modal-chinesesubfinder">
         <div class="card-cover card-cover-blurred text-center bg-lime">
@@ -46,7 +44,7 @@
 </div>
 <div class="modal modal-blur fade" id="modal-opensubtitles" tabindex="-1" role="dialog" aria-hidden="true"
      data-bs-backdrop="static" data-bs-keyboard="false">
-  <div class="modal-dialog modal-md modal-dialog-centered" role="document">
+  <div class="modal-dialog modal-lg modal-dialog-centered" role="document">
     <div class="modal-content">
       <div class="modal-header">
         <h5 class="modal-title">OpenSubtitles</h5>
@@ -59,16 +57,62 @@
               <label class="form-check form-switch">
                 <input class="form-check-input" type="checkbox" id="subtitle.opensubtitles.enable" {% if
                   Config.subtitle.opensubtitles and Config.subtitle.opensubtitles.enable %}checked{% endif %}>
-                <span class="form-check-label">开启opensubtitles.org字幕下载 <span class="form-help"
-                                                                                   title="需要确保网络能正常连通www.opensubtitles.org"
+                <span class="form-check-label">开启OpenSubtitles.com API字幕下载 <span class="form-help"
+                                                                                   title="使用官方REST API，不再依赖opensubtitles.org网页抓取"
                                                                                    data-bs-toggle="tooltip">?</span></span>
               </label>
             </div>
           </div>
         </div>
+        <div class="row">
+          <div class="col-lg-6">
+            <div class="mb-3">
+              <label class="form-label required">用户名</label>
+              <input type="text" id="subtitle.opensubtitles.username" class="form-control"
+                     autocomplete="username"
+                     value="{% if Config.subtitle and Config.subtitle.opensubtitles %}{{ Config.subtitle.opensubtitles.username or '' }}{% endif %}"
+                     placeholder="OpenSubtitles.com用户名（不是邮箱）">
+            </div>
+          </div>
+          <div class="col-lg-6">
+            <div class="mb-3">
+              <label class="form-label required">API Key <span class="form-help"
+                title="登录OpenSubtitles.com后，在API Consumers中创建Consumer获取"
+                data-bs-toggle="tooltip">?</span></label>
+              <input type="password" id="subtitle.opensubtitles.api_key" class="form-control"
+                     autocomplete="new-password"
+                     placeholder="{% if Config.subtitle and Config.subtitle.opensubtitles and Config.subtitle.opensubtitles.api_key %}已配置，留空保持不变{% else %}API Consumer Key{% endif %}">
+            </div>
+          </div>
+        </div>
+        <div class="row">
+          <div class="col-lg-6">
+            <div class="mb-3">
+              <label class="form-label required">密码</label>
+              <input type="password" id="subtitle.opensubtitles.password" class="form-control"
+                     autocomplete="new-password"
+                     placeholder="{% if Config.subtitle and Config.subtitle.opensubtitles and Config.subtitle.opensubtitles.password %}已配置，留空保持不变{% else %}OpenSubtitles.com密码{% endif %}">
+            </div>
+          </div>
+          <div class="col-lg-6">
+            <div class="mb-3">
+              <label class="form-label required">语言优先级 <span class="form-help"
+                title="按顺序优先选择；zh-cn=简中，ze=中英双语，zh-tw=繁中"
+                data-bs-toggle="tooltip">?</span></label>
+              <input type="text" id="subtitle.opensubtitles.languages" class="form-control"
+                     value="{% if Config.subtitle and Config.subtitle.opensubtitles %}{{ Config.subtitle.opensubtitles.languages or 'zh-cn,ze,zh-tw' }}{% else %}zh-cn,ze,zh-tw{% endif %}">
+            </div>
+          </div>
+        </div>
+        <div class="alert alert-info mb-0">
+          API Key需在 <a href="https://www.opensubtitles.com/consumers" target="_blank" rel="noopener">OpenSubtitles API Consumers</a>
+          创建。测试账户和搜索不会消耗下载次数，生成字幕临时链接时才消耗配额。
+        </div>
       </div>
       <div class="modal-footer">
         <button type="button" class="btn btn-link me-auto" data-bs-dismiss="modal">取消</button>
+        <a href="javascript:test_opensubtitles_config()" id="opensubtitles_test_btn"
+           class="btn btn-outline-primary">测试账户</a>
         <a href="javascript:save_subtitle_config('opensubtitles')" id="opensubtitles_save_btn"
            class="btn btn-primary">确定</a>
       </div>
@@ -147,9 +191,34 @@
   function save_config(type, func, test) {
     currType = type;
     const params = input_select_GetVal(`modal-${type}`);
+    if (type === 'opensubtitles') {
+      if (!params['subtitle.opensubtitles.api_key']) delete params['subtitle.opensubtitles.api_key'];
+      if (!params['subtitle.opensubtitles.password']) delete params['subtitle.opensubtitles.password'];
+    }
     params['test'] = test || false;
     params['subtitle.server'] = type;
     ajax_post("update_config", params, func);
+  }
+
+  function test_opensubtitles_config() {
+    const params = input_select_GetVal('modal-opensubtitles');
+    const data = {
+      username: params['subtitle.opensubtitles.username'],
+      api_key: params['subtitle.opensubtitles.api_key'],
+      password: params['subtitle.opensubtitles.password'],
+      languages: params['subtitle.opensubtitles.languages']
+    };
+    ajax_post("test_opensubtitles", data, function (ret) {
+      if (ret.code !== 0) {
+        show_fail_modal(ret.msg);
+        return;
+      }
+      const info = ret.data || {};
+      const reset = info.reset_time_utc || info.reset_time || '账户接口未提供（下载成功后显示）';
+      show_success_modal(`${ret.msg}<br>等级：${info.level || '-'}，VIP：${info.vip ? '是' : '否'}，` +
+        `今日已用：${info.downloads_count ?? '-'}，剩余：${info.remaining_downloads ?? '-'} / ${info.allowed_downloads ?? '-'}，` +
+        `重置：${reset}`);
+    });
   }
 
   //保存配置、关闭和刷新页面

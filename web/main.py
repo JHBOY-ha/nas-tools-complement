@@ -1256,10 +1256,8 @@ def notification():
 @App.route('/subtitle', methods=['POST', 'GET'])
 @login_required
 def subtitle():
-    ChromeOk = ChromeHelper().get_status()
     return render_template("setting/subtitle.html",
-                           Config=Config().get_config(),
-                           ChromeOk=ChromeOk)
+                           Config=Config().get_config())
 
 
 # 用户管理页面

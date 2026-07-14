@@ -320,13 +320,24 @@
   }
 
   // 下载字幕
+  let subtitle_candidate_context = null;
+
   function mediafile_subtitle(name, id) {
     let path = $(`#mediafilepath_${id}`).val();
-    ajax_post("download_subtitle", {path: path, name: name}, function (ret) {
+    request_mediafile_subtitle(path, name, null);
+  }
+
+  function request_mediafile_subtitle(path, name, file_id) {
+    const data = {path: path, name: name};
+    if (file_id) data.file_id = file_id;
+    ajax_post("download_subtitle", data, function (ret) {
       if (ret.code == 0) {
+        $("#modal-subtitle-candidates").modal("hide");
         show_success_modal(ret.msg, function () {
           refresh_files();
         });
+      } else if (ret.code == 1 && ret.candidates && ret.candidates.length) {
+        show_subtitle_candidates(path, name, ret.candidates);
       } else {
         show_fail_modal(`${ret.msg}！`);
       }
@@ -385,6 +396,37 @@
       }
     });
   });
+  function subtitle_escape(value) {
+    return $("<div>").text(value === null || value === undefined ? "" : String(value)).html();
+  }
+
+  function show_subtitle_candidates(path, name, candidates) {
+    subtitle_candidate_context = {path: path, name: name};
+    let rows = "";
+    candidates.forEach(function (candidate) {
+      const match = candidate.match_type === "moviehash" ? "文件Hash" :
+        (candidate.match_type === "metadata" ? "高置信元数据" : "需人工确认");
+      const source = candidate.from_trusted ? "可信来源" : (candidate.ai_translated ? "AI翻译" : "普通来源");
+      rows += `<tr>
+        <td>${subtitle_escape(candidate.language)}</td>
+        <td class="text-wrap">${subtitle_escape(candidate.release)}</td>
+        <td>${subtitle_escape(match)}<br><small class="text-muted">相似度 ${Math.round((candidate.similarity || 0) * 100)}%</small></td>
+        <td>${subtitle_escape(source)}</td>
+        <td>${subtitle_escape(candidate.ratings || 0)} / ${subtitle_escape(candidate.download_count || 0)}</td>
+        <td><button type="button" class="btn btn-sm btn-primary" onclick="confirm_subtitle_candidate(${Number(candidate.file_id)})">选择</button></td>
+      </tr>`;
+    });
+    $("#subtitle_candidates_body").html(rows);
+    $("#modal-subtitle-candidates").modal("show");
+  }
+
+  function confirm_subtitle_candidate(file_id) {
+    if (!subtitle_candidate_context) return;
+    $("#modal-subtitle-candidates").modal("hide");
+    show_confirm_modal("确认下载该字幕？生成临时链接将消耗OpenSubtitles一次下载配额。", function () {
+      request_mediafile_subtitle(subtitle_candidate_context.path, subtitle_candidate_context.name, file_id);
+    });
+  }
 
   // 查询硬链接
   function find_hardlinks(files, dir) {
@@ -463,6 +505,30 @@
   init_mediafile_tree();
 
 </script>
+<div class="modal modal-blur fade" id="modal-subtitle-candidates" tabindex="-1" role="dialog" aria-hidden="true"
+     data-bs-backdrop="static" data-bs-keyboard="false">
+  <div class="modal-dialog modal-xl modal-dialog-centered modal-dialog-scrollable" role="document">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">选择OpenSubtitles候选</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div class="alert alert-warning">以下候选未达到自动下载置信度。搜索不消耗配额，点击“选择”并确认后才会消耗一次。</div>
+        <div class="table-responsive">
+          <table class="table table-vcenter">
+            <thead><tr><th>语言</th><th>发布版本</th><th>匹配</th><th>来源</th><th>评分/下载</th><th></th></tr></thead>
+            <tbody id="subtitle_candidates_body"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-link ms-auto" data-bs-dismiss="modal">取消</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script id="mediafile_item_template" type="text/html">
   <div class="card">
     <div class="row">

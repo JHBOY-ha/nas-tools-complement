@@ -4,6 +4,7 @@ from tests.test_metainfo import MetaInfoTest
 from tests.test_media_cn_fallback import MediaCnFallbackTest
 from tests.test_meta_llm_parser import LLMMetaParserTest
 from tests.test_meta_helper import MetaHelperRandomSampleTest
+from tests.test_opensubtitles_api import OpenSubtitlesApiTest
 
 if __name__ == '__main__':
     suite = unittest.TestSuite()
@@ -15,6 +16,8 @@ if __name__ == '__main__':
     suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(LLMMetaParserTest))
     # 测试TMDB缓存随机采样兼容性
     suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(MetaHelperRandomSampleTest))
+    # OpenSubtitles.com REST API与免费配额保护
+    suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(OpenSubtitlesApiTest))
 
     # 运行测试
     runner = unittest.TextTestRunner()
