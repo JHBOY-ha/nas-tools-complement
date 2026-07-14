@@ -23,20 +23,22 @@ from app.brushtask import BrushTask
 from app.conf import ModuleConf, SystemConfig
 from app.downloader import Downloader
 from app.filter import Filter
-from app.helper import SecurityHelper, MetaHelper, ChromeHelper, ThreadHelper
+from app.helper import SecurityHelper, MetaHelper, ChromeHelper, ThreadHelper, DbHelper
 from app.indexer import Indexer
+from app.library import MediaLibrary
 from app.media.meta import MetaInfo
-from app.mediaserver import WebhookEvent
+from app.mediaserver import WebhookEvent, MediaServer
 from app.message import Message
 from app.rsschecker import RssChecker
 from app.sites import Sites
 from app.speedlimiter import SpeedLimiter
 from app.subscribe import Subscribe
 from app.sync import Sync
+from app.subtitle import Subtitle
 from app.torrentremover import TorrentRemover
-from app.utils import DomUtils, SystemUtils, ExceptionUtils, StringUtils
+from app.utils import DomUtils, SystemUtils, ExceptionUtils, StringUtils, PathUtils
 from app.utils.types import *
-from config import PT_TRANSFER_INTERVAL, Config
+from config import PT_TRANSFER_INTERVAL, Config, RMT_MEDIAEXT
 from web.action import WebAction
 from web.apiv1 import apiv1_bp
 from web.backend.WXBizMsgCrypt3 import WXBizMsgCrypt
@@ -995,7 +997,16 @@ def mediafile():
         DirD = "/"
     DirR = request.args.get("dir")
     return render_template("rename/mediafile.html",
-                           Dir=DirR or DirD)
+                           Dir=DirR or DirD,
+                           MediaServerType=Config().get_config('media').get('media_server') or "emby")
+
+
+# 媒体库字幕管理页面
+@App.route('/medialibrary', methods=['POST', 'GET'])
+@login_required
+def medialibrary():
+    return render_template("rename/medialibrary.html",
+                           MediaServerType=Config().get_config('media').get('media_server') or "emby")
 
 
 # 基础设置页面
@@ -1091,6 +1102,131 @@ def indexer():
 @login_required
 def library():
     return render_template("setting/library.html", Config=Config().get_config())
+
+
+@App.route('/library/items', methods=['POST'])
+@login_required
+def library_items():
+    """
+    媒体库项目列表
+    """
+    try:
+        data = request.get_json(silent=True) or request.form.to_dict() or {}
+        return MediaLibrary().list_items(data)
+    except Exception as e:
+        ExceptionUtils.exception_traceback(e)
+        return {"code": -1, "msg": str(e)}
+
+
+@App.route('/library/episodes', methods=['POST'])
+@login_required
+def library_episodes():
+    """
+    媒体库剧集列表
+    """
+    try:
+        data = request.get_json(silent=True) or request.form.to_dict() or {}
+        return MediaLibrary().get_episodes(data)
+    except Exception as e:
+        ExceptionUtils.exception_traceback(e)
+        return {"code": -1, "msg": str(e)}
+
+
+@App.route('/library/subtitle/audit', methods=['POST'])
+@login_required
+def library_subtitle_audit():
+    """按全局影视服务器规则检测指定分类的外挂字幕。"""
+    try:
+        data = request.get_json(silent=True) or request.form.to_dict() or {}
+        return MediaLibrary().audit_external_subtitles(
+            data.get("category"),
+            data.get("subcategory")
+        )
+    except Exception as e:
+        ExceptionUtils.exception_traceback(e)
+        return {"code": -1, "msg": str(e)}
+
+
+@App.route('/library/subtitle/audit/history', methods=['GET'])
+@login_required
+def library_subtitle_audit_history():
+    """读取最近 3 次外挂字幕检测记录。"""
+    try:
+        return MediaLibrary().get_external_subtitle_audit_history()
+    except Exception as e:
+        ExceptionUtils.exception_traceback(e)
+        return {"code": -1, "msg": str(e)}
+
+
+@App.route('/library/subtitle/audit/categories', methods=['GET'])
+@login_required
+def library_subtitle_audit_categories():
+    """读取字幕检测可用的媒体小分类。"""
+    try:
+        return MediaLibrary().get_external_subtitle_audit_categories()
+    except Exception as e:
+        ExceptionUtils.exception_traceback(e)
+        return {"code": -1, "msg": str(e)}
+
+
+@App.route('/library/subtitle/repair', methods=['POST'])
+@login_required
+def library_subtitle_repair():
+    """按全局影视服务器规则二次处理单个电影的现有外挂字幕。"""
+    try:
+        data = request.get_json(silent=True) or request.form.to_dict() or {}
+        media_file = os.path.normpath(str(data.get("media_path") or ""))
+        media_config = Config().get_config('media') or {}
+        server_type = str(media_config.get('media_server') or "emby").lower()
+        if not media_file or not os.path.isfile(media_file):
+            return {"code": -1, "msg": "媒体文件不存在"}
+        if os.path.splitext(media_file)[-1].lower() not in RMT_MEDIAEXT:
+            return {"code": -1, "msg": "请选择有效的媒体文件"}
+        if not _is_within_media_library(media_file):
+            return {"code": -1, "msg": "媒体文件不在媒体库目录范围内"}
+        if server_type not in ["emby", "jellyfin", "plex"]:
+            return {"code": -1, "msg": "全局影视服务器配置无效"}
+
+        success, message, result = Subtitle().repair_external_subtitles(media_file, server_type)
+        if not success:
+            return {"code": -1, "msg": message, "data": result}
+        MediaLibrary.invalidate_subtitle_directory_cache(media_file)
+        result["audit_status"] = MediaLibrary.update_external_subtitle_audit_status(media_file, server_type)
+        refresh_msg = ""
+        try:
+            refreshed = MediaServer().refresh_root_library_by_type(server_type)
+            if refreshed is False:
+                refresh_msg = "，但刷新媒体服务器失败"
+        except Exception as e:
+            ExceptionUtils.exception_traceback(e)
+            refresh_msg = f"，但刷新媒体服务器失败：{str(e)}"
+        return {"code": 0, "msg": f"{message}{refresh_msg}", "data": result}
+    except Exception as e:
+        ExceptionUtils.exception_traceback(e)
+        return {"code": -1, "msg": str(e)}
+
+
+@App.route('/library/image/<itemid>', methods=['GET'])
+@login_required
+def library_image(itemid):
+    """
+    代理媒体服务器封面，避免前端暴露媒体服务器API Key
+    """
+    try:
+        image_type = request.args.get("type") or "Primary"
+        res = MediaServer().get_item_image(itemid, image_type)
+        if not res or res.status_code != 200:
+            poster_file = MediaLibrary().get_local_poster_file(itemid)
+            if poster_file:
+                return send_file(poster_file)
+            return "", 404
+        response = make_response(res.content)
+        response.headers["Content-Type"] = res.headers.get("Content-Type") or "image/jpeg"
+        response.headers["Cache-Control"] = "private, max-age=3600"
+        return response
+    except Exception as e:
+        ExceptionUtils.exception_traceback(e)
+        return "", 404
 
 
 # 媒体服务器页面
@@ -1750,6 +1886,137 @@ def upload():
     except Exception as e:
         ExceptionUtils.exception_traceback(e)
         return {"code": 1, "msg": str(e), "filepath": ""}
+
+
+def _get_all_media_library_root_paths():
+    """汇总所有已配置的媒体库根路径（电影/电视剧/动漫）"""
+    media = Config().get_config('media') or {}
+    roots = []
+    for key in ("movie_path", "tv_path", "anime_path"):
+        val = media.get(key)
+        if val:
+            roots.extend(val if isinstance(val, list) else [val])
+    return [p for p in roots if p]
+
+
+def _is_within_media_library(path):
+    """判断路径是否在任一媒体库根目录范围内"""
+    if not path:
+        return False
+    for root in _get_all_media_library_root_paths():
+        if PathUtils.is_path_in_path(root, path):
+            return True
+    return False
+
+
+# 手动上传字幕
+# 流程：校验参数 → 查找转移历史 → 校验 target_file 安全性 → 调用 Subtitle.upload_subtitle() → 刷新媒体服务器
+@App.route('/subtitle/upload', methods=['POST'])
+@login_required
+def upload_subtitle():
+    try:
+        media_file = request.form.get("path")
+        target_file = request.form.get("target_path") or ""
+        server_type = str(request.form.get("server") or Config().get_config('media').get('media_server') or "emby").lower()
+        align_mode = str(request.form.get("align") or "none").lower()
+        upload_files = request.files.getlist("file")
+        if not media_file:
+            return {"code": -1, "msg": "媒体文件不能为空"}
+        media_file = os.path.normpath(media_file)
+        if not os.path.exists(media_file) or not os.path.isfile(media_file):
+            return {"code": -1, "msg": "媒体文件不存在"}
+        if os.path.splitext(media_file)[-1].lower() not in RMT_MEDIAEXT:
+            return {"code": -1, "msg": "请选择有效的媒体文件"}
+        if server_type not in ["emby", "jellyfin", "plex"]:
+            return {"code": -1, "msg": "请选择目标影视服务器"}
+        if align_mode not in ["auto", "offset", "segmented", "llm", "none"]:
+            return {"code": -1, "msg": "请选择有效的字幕对齐模式"}
+        if not upload_files:
+            return {"code": -1, "msg": "请选择字幕文件"}
+        if len(upload_files) > 20:
+            return {"code": -1, "msg": "单次最多上传 20 个字幕文件"}
+
+        # 查找该媒体文件的转移历史，获取整理模式和目标路径
+        history = DbHelper().get_latest_transfer_history_by_source_full_path(media_file)
+        rmt_mode = ModuleConf.get_enum_item(RmtMode, history.MODE) if history and history.MODE else None
+        if not rmt_mode:
+            rmt_mode = ModuleConf.RMT_MODES.get(Config().get_config('pt').get('rmt_mode') or "link")
+        if target_file:
+            target_file = os.path.normpath(target_file)
+        elif history and history.DEST_PATH and history.DEST_FILENAME:
+            target_file = os.path.normpath(os.path.join(history.DEST_PATH, history.DEST_FILENAME))
+        # 校验目标路径必须在已配置的媒体库根目录内，防止路径穿越攻击
+        if target_file and not _is_within_media_library(target_file):
+            return {"code": -1, "msg": "目标文件不在媒体库目录范围内"}
+
+        # 调用核心逻辑保存并同步字幕；多文件共用一次路径校验和媒体服务器刷新
+        service = Subtitle()
+        upload_results = []
+        successful_data = []
+        for upload_file in upload_files:
+            item_success, item_message, item_data = service.upload_subtitle(
+                upload_file=upload_file,
+                media_file=media_file,
+                target_media_file=target_file,
+                rmt_mode=rmt_mode,
+                server_type=server_type,
+                align_mode=align_mode
+            )
+            upload_results.append({
+                "filename": os.path.basename(upload_file.filename or ""),
+                "success": item_success,
+                "message": item_message,
+                "data": item_data
+            })
+            if item_success:
+                successful_data.append(item_data)
+
+        if len(upload_results) == 1:
+            success = upload_results[0]["success"]
+            message = upload_results[0]["message"]
+            data = upload_results[0]["data"]
+        else:
+            success_count = len(successful_data)
+            failure_count = len(upload_results) - success_count
+            success = success_count > 0
+            message = f"已处理 {len(upload_results)} 个字幕：成功 {success_count} 个"
+            if failure_count:
+                message += f"，失败 {failure_count} 个"
+                first_failure = next((item for item in upload_results if not item.get("success")), {})
+                if first_failure:
+                    message += f"（{first_failure.get('filename') or '字幕'}：{first_failure.get('message') or '处理失败'}）"
+            data = {
+                "results": upload_results,
+                "success_count": success_count,
+                "failure_count": failure_count,
+                "synced": any(item.get("synced") for item in successful_data)
+            }
+
+        for item_data in successful_data:
+            for cache_path in [
+                item_data.get("source_subtitle"),
+                item_data.get("target_subtitle"),
+                target_file,
+                media_file
+            ]:
+                if cache_path:
+                    MediaLibrary.invalidate_subtitle_directory_cache(cache_path)
+        refresh_msg = ""
+        # 同步成功后刷新媒体服务器库，使新字幕被媒体服务器识别
+        if success and data.get("synced"):
+            try:
+                refreshed = MediaServer().refresh_root_library_by_type(server_type)
+                if refreshed is False:
+                    refresh_msg = "，但刷新媒体服务器失败"
+            except Exception as e:
+                ExceptionUtils.exception_traceback(e)
+                refresh_msg = f"，但刷新媒体服务器失败：{str(e)}"
+        return {"code": 0 if success else -1,
+                "msg": f"{message}{refresh_msg}",
+                "data": data}
+    except Exception as e:
+        ExceptionUtils.exception_traceback(e)
+        return {"code": -1, "msg": str(e)}
 
 
 # base64模板过滤器

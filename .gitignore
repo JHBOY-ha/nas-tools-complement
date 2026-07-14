@@ -21,7 +21,16 @@ nas-tool-sandbox
 config
 
 config/user.db
+
 config/config.yaml
+
 CLAUDE.md
+
 .qoder
+
 .vscode
+
+
+
+docker/compose.local.yml
+docker/pm2.local.config.js

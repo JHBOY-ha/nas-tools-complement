@@ -7,16 +7,10 @@ from urllib.parse import quote
 import log
 from app.media.tmdbv3api import TMDb, Search, TMDbException
 from app.utils import ExceptionUtils, RequestUtils, StringUtils
+from app.utils.llm_client import LLMClient
 from app.utils.commons import singleton
 from app.utils.types import MediaType
 from config import Config, DEFAULT_TMDB_PROXY
-
-try:
-    from openai import OpenAI
-    OPENAI_IMPORT_ERROR = None
-except Exception as e:
-    OpenAI = None
-    OPENAI_IMPORT_ERROR = e
 
 
 @singleton
@@ -47,12 +41,15 @@ class LLMMetaParser(object):
 
     def __init__(self):
         self._client = None
+        self._client_config = {}
         self._enabled = False
         self._mode = "rule_first"
         self._base_url = ""
         self._api_key = ""
         self._model = ""
         self._timeout = 20
+        self._max_tokens = 1024
+        self._thinking = ""
         self._confidence_threshold = 0.75
         self._search_context_enable = False
         self._search_max_results = 3
@@ -63,6 +60,7 @@ class LLMMetaParser(object):
 
     def init_config(self):
         config = Config().get_config("llm") or {}
+        self._client_config = deepcopy(config)
         self._enabled = StringUtils.to_bool(
             config.get("enable", config.get("enabled")), False
         )
@@ -74,6 +72,8 @@ class LLMMetaParser(object):
         self._api_key = str(config.get("api_key") or "").strip()
         self._model = str(config.get("model") or "").strip()
         self._timeout = self.__parse_int(config.get("timeout"), min_val=1, default=20)
+        self._max_tokens = self.__parse_int(config.get("max_tokens"), min_val=1, default=1024)
+        self._thinking = config.get("thinking") or ""
         self._confidence_threshold = self.__parse_float(
             config.get("confidence_threshold"), min_val=0, max_val=1, default=0.75
         )
@@ -89,27 +89,16 @@ class LLMMetaParser(object):
         self._parse_cache = {}
         self._client = None
 
-    def get_status(self):
+    def get_status(self, config=None):
         """
-        测试连通性（用于设置页测试按钮）
+        测试连通性（用于设置页测试按钮）。传入 config 时仅使用表单中的临时配置，
+        不读取或修改已保存配置。
         """
-        if not self.__is_client_ready(require_enable=False):
-            return False
         try:
-            client = self.__get_client()
+            client = LLMClient(config) if config is not None else self.__get_client()
             if not client:
                 return False
-            response = client.chat.completions.create(
-                model=self._model,
-                messages=[
-                    {"role": "system", "content": "You are a health-check assistant."},
-                    {"role": "user", "content": "OK"}
-                ],
-                max_tokens=1,
-                temperature=0,
-                extra_body={"thinking": {"type": "disabled"}}
-            )
-            return True if response and getattr(response, "choices", None) else False
+            return client.get_status()
         except Exception as err:
             ExceptionUtils.exception_traceback(err)
             log.error("【Meta】LLM 连接测试失败：%s" % str(err))
@@ -180,31 +169,15 @@ class LLMMetaParser(object):
             if external_candidates:
                 user_prompt += f"external_candidates: {external_candidates}\n"
             user_prompt += "若字段无法判断请省略该字段。"
-            response = client.chat.completions.create(
-                model=self._model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0,
-                max_tokens=512,
-                extra_body={"thinking": {"type": "disabled"}}
+            content = client.complete_text(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                max_tokens=512
             )
-            content = self.__extract_content(response)
             if content:
                 log.info("【Meta】LLM原始返回：%s" % self.__shorten_text(content, 2000))
             else:
-                reasoning_content = self.__extract_reasoning_content(response)
-                if reasoning_content:
-                    log.info(
-                        "【Meta】LLM原始返回为空，检测到思考内容：reasoning_content_len=%s, finish_reason=%s"
-                        % (
-                            len(reasoning_content),
-                            self.__extract_finish_reason(response)
-                        )
-                    )
-                else:
-                    log.info("【Meta】LLM原始返回为空")
+                log.info("【Meta】LLM原始返回为空")
             parsed = self.__parse_json(content)
             if not parsed:
                 self.__set_cached_parse_result(cache_key, {})
@@ -482,6 +455,9 @@ class LLMMetaParser(object):
         text = re.sub(r"\[[^\]]*]", " ", raw_title)
         text = re.sub(r"[【】\[\]\(\)\{\}]+", " ", text)
         text = text.replace("+", " ")
+        slash_parts = [part.strip() for part in re.split(r"\s*[／/|]\s*", text) if part.strip()]
+        if len(slash_parts) > 1 and StringUtils.is_chinese(slash_parts[0]):
+            text = slash_parts[0]
         tokens = re.split(r"[.\s/_\-]+", text)
         title_tokens = []
         for token in tokens:
@@ -860,23 +836,23 @@ class LLMMetaParser(object):
             return False
         if not self._base_url or not self._api_key or not self._model:
             return False
-        if OpenAI is None:
-            if OPENAI_IMPORT_ERROR:
-                log.error("【Meta】openai 导入失败，无法启用 LLM 识别：%s" % str(OPENAI_IMPORT_ERROR))
-            else:
-                log.error("【Meta】openai 依赖未安装，无法启用 LLM 识别")
-            return False
         return True
 
     def __get_client(self):
         if not self.__is_client_ready(require_enable=False):
             return None
         if not self._client:
-            self._client = OpenAI(
-                base_url=self._base_url,
-                api_key=self._api_key,
-                timeout=self._timeout
-            )
+            client_config = deepcopy(self._client_config)
+            client_config.update({
+                "base_url": self._base_url,
+                "api_key": self._api_key,
+                "model": self._model,
+                "timeout": self._timeout,
+                "max_tokens": self._max_tokens,
+                "thinking": self._thinking,
+                "enable": self._enabled
+            })
+            self._client = LLMClient(client_config)
         return self._client
 
     @staticmethod

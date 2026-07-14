@@ -241,6 +241,10 @@ def update_config():
         overwrite_cofig = True
     else:
         # 兼容旧配置字段
+        for obsolete_key in ["provider", "anthropic_version"]:
+            if obsolete_key in llm_config:
+                llm_config.pop(obsolete_key, None)
+                overwrite_cofig = True
         if ("enable" not in llm_config or llm_config.get("enable") is None) and llm_config.get("enabled") is not None:
             llm_config["enable"] = llm_config.get("enabled")
             overwrite_cofig = True

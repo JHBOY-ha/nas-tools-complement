@@ -2,6 +2,7 @@ from app.utils import ExceptionUtils
 from app.utils.types import MediaServerType
 
 import log
+import json
 from config import Config
 from app.mediaserver.client._base import _IMediaClient
 from plexapi.myplex import MyPlexAccount
@@ -199,15 +200,80 @@ class Plex(_IMediaClient):
                 for item in section.all():
                     if not item:
                         continue
+                    item_path = self.__item_path(item)
+                    provider_ids = self.__provider_ids(item)
                     yield {"id": item.key,
                            "library": item.librarySectionID,
                            "type": item.type,
                            "title": item.title,
                            "year": item.year,
-                           "json": str(item.__dict__)}
+                           "tmdbid": provider_ids.get("tmdbid"),
+                           "imdbid": provider_ids.get("imdbid"),
+                           "path": item_path,
+                           "json": json.dumps({
+                               "Path": item_path,
+                               "ProviderIds": provider_ids,
+                               "MediaStreams": []
+                           }, ensure_ascii=False)}
         except Exception as err:
             ExceptionUtils.exception_traceback(err)
         yield {}
+
+    @staticmethod
+    def __item_path(item):
+        """
+        获取Plex媒体项目的本地文件或目录路径
+        """
+        try:
+            locations = getattr(item, "locations", None) or []
+            if locations:
+                return locations[0]
+        except Exception:
+            pass
+        try:
+            for media in getattr(item, "media", None) or []:
+                for part in getattr(media, "parts", None) or []:
+                    file_path = getattr(part, "file", None)
+                    if file_path:
+                        return file_path
+        except Exception:
+            pass
+        return ""
+
+    @staticmethod
+    def __provider_ids(item):
+        """
+        从Plex guid/guids 中提取常见ProviderId
+        """
+        guid_values = []
+        try:
+            if getattr(item, "guid", None):
+                guid_values.append(item.guid)
+        except Exception:
+            pass
+        provider_ids = Plex.__parse_provider_ids(guid_values)
+        if provider_ids.get("tmdbid"):
+            return provider_ids
+
+        try:
+            for guid in getattr(item, "guids", None) or []:
+                guid_id = getattr(guid, "id", None)
+                if guid_id:
+                    guid_values.append(guid_id)
+        except Exception:
+            pass
+        return Plex.__parse_provider_ids(guid_values)
+
+    @staticmethod
+    def __parse_provider_ids(guid_values):
+        provider_ids = {}
+        for guid_value in guid_values:
+            guid_value = str(guid_value or "")
+            if guid_value.startswith("tmdb://"):
+                provider_ids["tmdbid"] = guid_value.replace("tmdb://", "").split("?")[0]
+            elif guid_value.startswith("imdb://"):
+                provider_ids["imdbid"] = guid_value.replace("imdb://", "").split("?")[0]
+        return provider_ids
 
     def get_playing_sessions(self):
         """

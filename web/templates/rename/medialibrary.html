@@ -1,0 +1,351 @@
+{% import 'macro/svg.html' as SVG %}
+<div class="container-xl">
+  <div class="page-header d-print-none">
+    <div class="row align-items-center">
+      <div class="col">
+        <h2 class="page-title">字幕库</h2>
+        <div class="text-muted mt-1">集中查看中文字幕覆盖情况、外挂字幕识别结果与最近检测状态</div>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="page-body">
+  <div class="container-xl">
+    <div class="row row-cards">
+      <div class="col-12 lit-library-section">
+        <div class="card lit-library-panel">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title d-flex align-items-center gap-2">
+                <span>字幕状态总览</span>
+                <button class="btn btn-icon btn-sm btn-ghost-secondary" type="button"
+                        data-bs-toggle="modal" data-bs-target="#index-library-help-modal"
+                        aria-label="查看字幕库状态说明" title="查看说明">
+                  {{ SVG.circle_question() }}
+                </button>
+              </h3>
+              <div class="card-subtitle mt-1">筛选媒体后，可上传字幕或按分类检测影视服务器识别情况</div>
+            </div>
+            <div class="card-actions">
+              <button class="btn btn-outline-primary" type="button" onclick="run_library_subtitle_audit()">
+                {{ SVG.check() }}
+                检测外挂字幕
+              </button>
+              <button class="btn" id="library_refresh_btn" type="button" onclick="load_library_items(1)">
+                {{ SVG.refresh() }}
+                刷新
+              </button>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="lit-library-toolbar">
+              <div class="dropdown">
+                <button class="btn btn-outline-primary lit-library-filter-trigger" id="library_filter_trigger"
+                        type="button" data-bs-toggle="dropdown" data-bs-auto-close="outside"
+                        aria-expanded="false" aria-controls="library_filter_menu">
+                  {{ SVG.filter() }}
+                  <span>筛选与排序</span>
+                  <span id="library_filter_count" class="badge bg-primary text-white d-none" aria-label="已启用筛选数量">0</span>
+                </button>
+                <div class="dropdown-menu lit-library-filter-menu p-0" id="library_filter_menu"
+                     aria-labelledby="library_filter_trigger">
+                  <div class="lit-library-filter-menu-header">
+                    <div>
+                      <div class="fw-bold">筛选与排序</div>
+                      <div class="text-muted small">设置完成后统一应用，避免短时间内重复读取 NAS 目录</div>
+                    </div>
+                  </div>
+                  <div class="p-3">
+                    <div class="row g-3 align-items-end">
+                      <div class="col-12 col-sm-6 col-lg-4">
+                        <label class="form-label" for="library_filter_type">类型</label>
+                        <select id="library_filter_type" class="form-select">
+                          <option value="all">全部</option>
+                          <option value="movie">电影</option>
+                          <option value="tv">电视剧</option>
+                          <option value="anime">动漫</option>
+                        </select>
+                      </div>
+                      <div class="col-12 col-sm-6 col-lg-4">
+                        <label class="form-label" for="library_filter_category">小分类</label>
+                        <select id="library_filter_category" class="form-select">
+                          <option value="">全部</option>
+                        </select>
+                      </div>
+                      <div class="col-12 col-sm-6 col-lg-4">
+                        <label class="form-label" for="library_filter_subtitle">字幕状态</label>
+                        <select id="library_filter_subtitle" class="form-select">
+                          <option value="all">全部</option>
+                          <option value="missing">缺中文字幕</option>
+                          <option value="ok">已有中文字幕</option>
+                        </select>
+                      </div>
+                      <div class="col-12 col-sm-6 col-lg-4">
+                        <label class="form-label" for="library_sort_by">排序字段</label>
+                        <select id="library_sort_by" class="form-select">
+                          <option value="default">默认顺序</option>
+                          <option value="internal">是否有内嵌字幕</option>
+                          <option value="external">是否有外挂字幕</option>
+                          <option value="audit">字幕检测问题程度</option>
+                        </select>
+                      </div>
+                      <div class="col-12 col-sm-6 col-lg-4">
+                        <label class="form-label" for="library_sort_order">排序方向</label>
+                        <select id="library_sort_order" class="form-select">
+                          <option value="desc">降序</option>
+                          <option value="asc">升序</option>
+                        </select>
+                      </div>
+                      <div class="col-12 col-sm-6 col-lg-4">
+                        <label class="form-label" for="library_filter_keyword">搜索</label>
+                        <input id="library_filter_keyword" type="search" class="form-control" placeholder="标题、原名、年份">
+                      </div>
+                    </div>
+                  </div>
+                  <div class="lit-library-filter-menu-footer">
+                    <button class="btn" type="button" onclick="reset_library_filters()">重置</button>
+                    <button class="btn btn-primary" id="library_filter_btn" type="button" onclick="apply_library_filters()">应用筛选</button>
+                  </div>
+                </div>
+              </div>
+              <div class="lit-library-result-bar">
+              <div id="library_items_summary" class="text-muted" aria-live="polite"></div>
+              </div>
+            </div>
+          </div>
+          <div class="lit-library-legend" aria-label="字幕状态图例">
+            <span class="lit-library-legend-title">卡片状态</span>
+            <span class="lit-library-legend-item"><span class="lit-library-legend-dot external"></span>外挂中文</span>
+            <span class="lit-library-legend-item"><span class="lit-library-legend-dot internal"></span>内嵌中文</span>
+            <span class="lit-library-legend-item"><span class="lit-library-legend-dot missing"></span>缺中文字幕</span>
+            <span class="lit-library-legend-item"><span class="lit-library-legend-dot unknown"></span>未检测</span>
+            <span class="lit-library-legend-divider" aria-hidden="true"></span>
+            <span class="lit-library-legend-note">电影卡片的文字标签表示最近一次外挂字幕检测结果</span>
+          </div>
+          <div id="library_items_grid" class="lit-library-grid"></div>
+          <div class="card-footer d-flex align-items-center">
+            <button id="library_prev_btn" class="btn" type="button" onclick="load_library_items(library_page - 1)">
+              {{ SVG.chevron_left() }}
+              上一页
+            </button>
+            <div id="library_page_text" class="text-muted mx-auto"></div>
+            <button id="library_next_btn" class="btn" type="button" onclick="load_library_items(library_page + 1)">
+              下一页
+              {{ SVG.chevron_right() }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="modal modal-blur fade" id="index-library-help-modal" tabindex="-1" role="dialog" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable" role="document">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">字幕库状态说明</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
+      </div>
+      <div class="modal-body">
+        <div class="alert alert-info d-flex gap-2 align-items-start">
+          <span class="flex-shrink-0">{{ SVG.info_circle() }}</span>
+          <div>
+            <div class="fw-bold mb-1">页面同时展示两套独立状态</div>
+            <div>
+              <strong>中文字幕状态</strong>用于判断媒体是否已有可用的外挂或内嵌中文字幕；
+              <strong>外挂检测状态</strong>用于判断最近一次分类检测时，影视服务器能否正确识别外挂字幕。
+            </div>
+          </div>
+        </div>
+
+        <section class="lit-library-help-section">
+          <h6 class="lit-library-help-title">中文字幕状态</h6>
+          <div class="lit-library-help-status-grid">
+            <div class="lit-library-help-status-item">
+              <span class="badge bg-green text-white">已有外挂中文字幕</span>
+              <span class="text-muted">目标视频同目录中存在同名前缀、带中文语言标记的字幕文件。</span>
+            </div>
+            <div class="lit-library-help-status-item">
+              <span class="badge bg-azure text-white">已有内嵌中文字幕</span>
+              <span class="text-muted">媒体服务器流信息中存在中文内嵌字幕。</span>
+            </div>
+            <div class="lit-library-help-status-item">
+              <span class="badge bg-orange text-white">缺中文字幕</span>
+              <span class="text-muted">已检查到媒体文件，但未找到可识别的中文外挂或内嵌字幕。</span>
+            </div>
+            <div class="lit-library-help-status-item">
+              <span class="badge bg-secondary text-white">未检测</span>
+              <span class="text-muted">通常表示缺少整理/链接记录、本地路径不可用，或剧集尚未展开到单集。</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="lit-library-help-section">
+          <h6 class="lit-library-help-title">外挂字幕检测状态</h6>
+          <div class="lit-library-help-status-grid">
+            <div class="lit-library-help-status-item">
+              <span class="badge bg-red-lt text-red">外挂字幕无法识别</span>
+              <span class="text-muted">文件关联、格式或解析存在错误，需要优先处理。</span>
+            </div>
+            <div class="lit-library-help-status-item">
+              <span class="badge bg-yellow-lt text-yellow">外挂字幕语言需规范</span>
+              <span class="text-muted">字幕可读取，但语言标签或命名可能显示为“未定义”；电影卡片会提供“二次处理”。</span>
+            </div>
+            <div class="lit-library-help-status-item">
+              <span class="badge bg-green-lt text-green">外挂字幕检测通过</span>
+              <span class="text-muted">最近一次分类检测中，字幕关联、语言和格式均通过检查。</span>
+            </div>
+          </div>
+          <div class="text-muted small mt-2">
+            电影卡片保留最近一次检测状态；检测窗口中保留最近 3 次分类检测记录。
+          </div>
+        </section>
+
+        <section class="lit-library-help-section">
+          <h6 class="lit-library-help-title">排序规则</h6>
+          <ul class="text-muted mb-0 ps-3">
+            <li>按“内嵌字幕”或“外挂字幕”降序时，已有对应字幕的媒体排在前面。</li>
+            <li>按“字幕检测问题程度”降序时，依次为：无法识别 → 语言需规范 → 未检测 → 检测通过。</li>
+            <li>选择升序会反转上述顺序，使正常项目优先。</li>
+          </ul>
+        </section>
+
+        <section class="lit-library-help-section">
+          <h6 class="lit-library-help-title">命名与识别建议</h6>
+          <div class="text-muted">
+            字幕必须位于媒体链接后的目标视频同目录，且文件名前缀与视频一致。
+            Jellyfin 简体中文字幕建议使用 <code>Movie.chi.zh-cn.srt</code>；
+            Plex 建议使用 <code>Movie.zh-CN.srt</code> 或 <code>Movie.zh-TW.srt</code>。
+            同语种多来源字幕在 Jellyfin 下会保留独立标题，例如
+            <code>Movie.YYeTs.chi.zh-cn.srt</code>、<code>Movie.source-2.chi.zh-cn.srt</code>。
+            上传后会按所选影视服务器规范化文件名并触发刷新。
+          </div>
+        </section>
+
+        <section class="lit-library-help-section">
+          <h6 class="lit-library-help-title">性能与排查</h6>
+          <div class="text-muted mb-2">
+            列表使用媒体服务器已有流信息和外挂字幕目录缓存，不会为全库逐项运行 ffprobe；目录结果短时缓存 30 秒，上传成功后立即失效。
+            “检测外挂字幕”会执行更完整的解析，因此建议每次只选择一个分类或小分类。
+          </div>
+          <ol class="text-muted mb-0 ps-3">
+            <li>确认媒体已完成整理/链接，且目标媒体文件存在。</li>
+            <li>确认字幕位于目标视频同目录，文件名前缀与视频一致。</li>
+            <li>执行“媒体库同步”，再回到字幕库点击“刷新”。</li>
+            <li>电视剧或番剧点击“选择剧集”，逐集确认实际状态。</li>
+          </ol>
+        </section>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-primary" data-bs-dismiss="modal">知道了</button>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="modal modal-blur fade" id="index-library-subtitle-audit-modal" tabindex="-1" role="dialog" aria-hidden="true"
+     data-bs-backdrop="static" data-bs-keyboard="false">
+  <div class="modal-dialog modal-xl modal-dialog-centered modal-dialog-scrollable" role="document">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">外挂字幕分类检测</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div class="text-muted mb-3">
+          按全局设置的影视服务器检查字幕与视频文件名关联、语言标签、格式支持及 ffprobe 解析结果。
+          每次仅扫描一个媒体分类，减少 NAS 磁盘与 CPU 压力。
+        </div>
+        <div class="mb-3">
+          <label class="form-label" for="index_library_subtitle_audit_category">检测分类</label>
+          <select class="form-select" id="index_library_subtitle_audit_category"
+                  onchange="update_library_subtitle_audit_subcategories()">
+            <option value="movie" selected>电影</option>
+            <option value="tv">电视剧</option>
+            <option value="anime">动漫</option>
+          </select>
+        </div>
+        <div class="mb-3">
+          <label class="form-label" for="index_library_subtitle_audit_subcategory">详细小分类</label>
+          <select class="form-select" id="index_library_subtitle_audit_subcategory">
+            <option value="">全部电影</option>
+          </select>
+          <div class="form-hint">小分类来自当前分类 YAML，例如华语电影、外语电影、动画电影。</div>
+        </div>
+        <div id="index_library_subtitle_audit_summary"></div>
+        <div id="index_library_subtitle_audit_issues" class="divide-y mt-3"></div>
+        <div class="hr-text mt-4">最近 3 次检测记录</div>
+        <div id="index_library_subtitle_audit_history"></div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn me-auto" data-bs-dismiss="modal">关闭</button>
+        <button type="button" id="index_library_subtitle_audit_retry" class="btn btn-primary"
+                onclick="run_library_subtitle_audit(true)">开始/重新检测</button>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="modal modal-blur fade" id="index-library-episodes-modal" tabindex="-1" role="dialog" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable" role="document">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="index_library_episodes_title">选择剧集</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div id="index_library_episodes_body" class="divide-y"></div>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="modal modal-blur fade" id="index-upload-subtitle-modal" tabindex="-1" role="dialog" aria-hidden="true"
+     data-bs-backdrop="static" data-bs-keyboard="false">
+  <div class="modal-dialog modal-md modal-dialog-centered" role="document">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">上传字幕</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="index_upload_subtitle_path">
+        <input type="hidden" id="index_upload_subtitle_target_path">
+        <div class="mb-3">
+          <label class="form-label">媒体文件</label>
+          <input type="text" id="index_upload_subtitle_name" class="form-control" readonly>
+        </div>
+        <div class="mb-3">
+          <label class="form-label required">字幕文件</label>
+          <input type="file" id="index_upload_subtitle_file" class="form-control"
+                 accept=".srt,.ass,.ssa,.smi,.vtt,.sub" multiple>
+          <div class="form-hint">单次最多选择 20 个字幕；同电影、同语种的不同来源会保留为独立轨道，不会相互覆盖。</div>
+        </div>
+        <div class="mb-3">
+          <label class="form-label required">目标影视服务器</label>
+          <select id="index_upload_subtitle_server" class="form-select">
+            <option value="jellyfin" {% if MediaServerType|lower == "jellyfin" %}selected{% endif %}>Jellyfin</option>
+            <option value="emby" {% if MediaServerType|lower == "emby" %}selected{% endif %}>Emby</option>
+            <option value="plex" {% if MediaServerType|lower == "plex" %}selected{% endif %}>Plex</option>
+          </select>
+        </div>
+        <div class="mb-3">
+          <label class="form-label">字幕对齐模式</label>
+          <select id="index_upload_subtitle_align" class="form-select">
+            <option value="none" selected>不对齐</option>
+            <option value="auto">自动选择</option>
+            <option value="offset">仅整体偏移</option>
+            <option value="segmented">多锚点分段</option>
+            <option value="llm">LLM跨语言对齐</option>
+          </select>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn me-auto" data-bs-dismiss="modal">取消</button>
+        <button type="button" id="index_upload_subtitle_btn" class="btn btn-primary">上传</button>
+      </div>
+    </div>
+  </div>
+</div>
+<script type="text/javascript" src="../static/js/media-library.js"></script>
+<script type="text/javascript">
+  window.CURRENT_MEDIA_SERVER_TYPE = "{{ MediaServerType or 'emby' }}";
+  init_media_library_page({page_size: 18, default_server: window.CURRENT_MEDIA_SERVER_TYPE});
+</script>

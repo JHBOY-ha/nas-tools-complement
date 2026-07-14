@@ -1,3 +1,4 @@
+import json
 import re
 
 import log
@@ -322,6 +323,22 @@ class Jellyfin(_IMediaClient):
             return None
         return None
 
+    def get_item_image(self, item_id, image_type="Primary"):
+        """
+        获取Jellyfin当前项目图片响应
+        """
+        if not item_id:
+            return None
+        if not self._host or not self._apikey:
+            return None
+        req_url = "%sItems/%s/Images/%s?api_key=%s" % (self._host, item_id, image_type, self._apikey)
+        try:
+            return RequestUtils().get_res(req_url)
+        except Exception as e:
+            ExceptionUtils.exception_traceback(e)
+            log.error(f"【{self.server_type}】连接Items/Id/Images出错：" + str(e))
+            return None
+
     def refresh_root_library(self):
         """
         通知Jellyfin刷新整个媒体库
@@ -408,7 +425,7 @@ class Jellyfin(_IMediaClient):
                                "tmdbid": item_info.get("ProviderIds", {}).get("Tmdb"),
                                "imdbid": item_info.get("ProviderIds", {}).get("Imdb"),
                                "path": item_info.get("Path"),
-                               "json": str(item_info)}
+                               "json": json.dumps(item_info, ensure_ascii=False)}
                     elif "Folder" in result.get("Type"):
                         for item in self.get_items(result.get("Id")):
                             yield item
@@ -416,6 +433,38 @@ class Jellyfin(_IMediaClient):
             ExceptionUtils.exception_traceback(e)
             log.error(f"【{self.server_type}】连接Users/Items出错：" + str(e))
         yield {}
+
+    def get_episodes(self, series_id):
+        """
+        获取电视剧/动漫下所有剧集
+        """
+        if not series_id:
+            return []
+        if not self._host or not self._apikey or not self._user:
+            return []
+        req_url = "%sUsers/%s/Items?parentId=%s&Recursive=true&IncludeItemTypes=Episode&Fields=Path,MediaStreams,ProviderIds&api_key=%s" % (
+            self._host, self._user, series_id, self._apikey)
+        episodes = []
+        try:
+            res = RequestUtils().get_res(req_url)
+            if res and res.status_code == 200:
+                results = res.json().get("Items") or []
+                for item_info in results:
+                    if not item_info:
+                        continue
+                    episodes.append({"id": item_info.get("Id"),
+                                     "series_id": series_id,
+                                     "type": item_info.get("Type"),
+                                     "title": item_info.get("Name"),
+                                     "season": item_info.get("ParentIndexNumber"),
+                                     "episode": item_info.get("IndexNumber"),
+                                     "path": item_info.get("Path"),
+                                     "media_streams": item_info.get("MediaStreams") or [],
+                                     "json": json.dumps(item_info, ensure_ascii=False)})
+        except Exception as e:
+            ExceptionUtils.exception_traceback(e)
+            log.error(f"【{self.server_type}】连接Users/Items获取剧集出错：" + str(e))
+        return episodes
 
     def get_playing_sessions(self):
         """

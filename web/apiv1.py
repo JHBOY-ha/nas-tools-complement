@@ -953,6 +953,7 @@ class ConfigUpdate(ClientResource):
 class ConfigTest(ClientResource):
     parser = reqparse.RequestParser()
     parser.add_argument('command', type=str, help='测试命令', location='form', required=True)
+    parser.add_argument('config', type=dict, help='仅用于本次测试的临时配置', location='form', required=False)
 
     @config.doc(parser=parser)
     def post(self):

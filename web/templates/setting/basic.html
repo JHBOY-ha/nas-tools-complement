@@ -722,18 +722,38 @@
                          class="form-control" id="llm.search_timeout" placeholder="8" autocomplete="off">
                 </div>
               </div>
+              <div class="col-12 col-xl-3">
+                <div class="mb-3">
+                  <label class="form-label">Max Tokens</label>
+                  <input type="text" value="{% if Config.llm %}{{ Config.llm.max_tokens or 1024 }}{% else %}1024{% endif %}"
+                         class="form-control" id="llm.max_tokens" placeholder="1024" autocomplete="off">
+                </div>
+              </div>
             </div>
             <div class="row">
-              <div class="col-12 col-xl-6">
+              <div class="col-12 col-xl-3">
                 <div class="mb-3">
-                  <label class="form-label required">Base URL（OpenAI协议 API URL） <span class="form-help"
-                    title="填写OpenAI兼容协议接口地址，例如 https://api.openai.com/v1 或第三方兼容服务的 /v1 地址"
+                  <label class="form-label">思考模式 <span class="form-help"
+                    title="跟随服务默认时不发送非标准字段；仅在服务支持 thinking 参数时选择启用或禁用"
+                    data-bs-toggle="tooltip">?</span></label>
+                  <select class="form-select" id="llm.thinking">
+                    <option value="" {% if not Config.llm or not Config.llm.thinking %}selected{% endif %}>跟随服务默认</option>
+                    <option value="disabled" {% if Config.llm and Config.llm.thinking=='disabled' %}selected{% endif %}>禁用思考</option>
+                    <option value="enabled" {% if Config.llm and Config.llm.thinking=='enabled' %}selected{% endif %}>启用思考</option>
+                  </select>
+                </div>
+              </div>
+              <div class="col-12 col-xl-4">
+                <div class="mb-3">
+                  <label class="form-label required">Base URL（优先填写根地址） <span class="form-help"
+                    id="llm_base_url_help"
+                    title="仅支持 OpenAI Chat Completions 兼容协议。推荐填写 API 根地址，例如 https://openrouter.ai/api/v1；也容忍填写完整的 /chat/completions 地址"
                     data-bs-toggle="tooltip">?</span></label>
                   <input type="text" value="{% if Config.llm %}{{ Config.llm.base_url or Config.llm.api_base or '' }}{% endif %}"
                          class="form-control" id="llm.base_url" placeholder="https://api.openai.com/v1" autocomplete="off">
                 </div>
               </div>
-              <div class="col-12 col-xl-3">
+              <div class="col-12 col-xl-2">
                 <div class="mb-3">
                   <label class="form-label required">Model</label>
                   <input type="text" value="{% if Config.llm %}{{ Config.llm.model or '' }}{% endif %}"
@@ -1223,16 +1243,22 @@
   // 测试LLM配置
   function test_llm_connection() {
     let params = input_select_GetVal("llm");
-    params["test"] = true;
+    let config = {};
+    Object.keys(params).forEach(function (key) {
+      if (key.indexOf("llm.") === 0) {
+        config[key.substring(4)] = params[key];
+      }
+    });
     $("#llm_test_btn").text("测试中...").attr("disabled", true);
-    ajax_post("update_config", params, function () {
-      ajax_post("test_connection", {"command": "app.media.meta.llm_parser|LLMMetaParser"}, function (ret) {
-        if (ret.code === 0) {
-          $("#llm_test_btn").text("测试成功").attr("disabled", false);
-        } else {
-          $("#llm_test_btn").text("测试失败！").attr("disabled", false);
-        }
-      });
+    ajax_post("test_connection", {
+      "command": "app.media.meta.llm_parser|LLMMetaParser",
+      "config": config
+    }, function (ret) {
+      if (ret.code === 0) {
+        $("#llm_test_btn").text("测试成功").attr("disabled", false);
+      } else {
+        $("#llm_test_btn").text("测试失败！").attr("disabled", false);
+      }
     });
   }
 
