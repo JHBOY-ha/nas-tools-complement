@@ -3,10 +3,12 @@
 import os
 import sys
 import types
+from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
-import requests
+import httpx
+from openai import APIStatusError
 
 if not os.environ.get("NASTOOL_CONFIG"):
     _ROOT_PATH = os.path.dirname(os.path.dirname(__file__))
@@ -61,41 +63,46 @@ from app.utils.llm_client import LLMClient
 
 
 class LLMClientTest(TestCase):
-    def test_api_root_builds_chat_completion_request(self):
-        response = Mock()
-        response.status_code = 200
-        response.json.return_value = {
-            "choices": [
-                {"message": {"content": "{\"ok\": true}"}}
-            ]
-        }
-        with patch("app.utils.llm_client.requests.post", return_value=response) as post:
+    @staticmethod
+    def make_sdk(response=None, error=None):
+        sdk = Mock()
+        if error:
+            sdk.chat.completions.create.side_effect = error
+        else:
+            sdk.chat.completions.create.return_value = response
+        return sdk
+
+    def test_api_root_builds_sdk_chat_completion_request(self):
+        sdk = self.make_sdk({
+            "choices": [{"message": {"content": "{\"ok\": true}"}}]
+        })
+        with patch("app.utils.llm_client.OpenAI", return_value=sdk) as openai_cls:
             client = LLMClient({
                 "base_url": "https://api.example/v1",
                 "api_key": "key",
                 "model": "gpt-test",
-                "timeout": 9
+                "timeout": 9,
+                "max_retries": 1
             })
             result = client.complete_json("system", "user", max_tokens=128)
 
         self.assertEqual({"ok": True}, result)
-        args, kwargs = post.call_args
-        self.assertEqual("https://api.example/v1/chat/completions", args[0])
-        self.assertEqual("Bearer key", kwargs["headers"]["Authorization"])
-        self.assertEqual("gpt-test", kwargs["json"]["model"])
-        self.assertEqual(128, kwargs["json"]["max_tokens"])
-        self.assertEqual("system", kwargs["json"]["messages"][0]["content"])
-        self.assertIs(kwargs["verify"], True)
+        openai_cls.assert_called_once_with(
+            api_key="key",
+            base_url="https://api.example/v1/",
+            timeout=9,
+            max_retries=1
+        )
+        kwargs = sdk.chat.completions.create.call_args.kwargs
+        self.assertEqual("gpt-test", kwargs["model"])
+        self.assertEqual(128, kwargs["max_tokens"])
+        self.assertEqual("system", kwargs["messages"][0]["content"])
 
-    def test_full_chat_completion_url_is_used_without_duplicate_path(self):
-        response = Mock()
-        response.status_code = 200
-        response.json.return_value = {
-            "choices": [
-                {"message": {"content": "{\"ok\": true}"}}
-            ]
-        }
-        with patch("app.utils.llm_client.requests.post", return_value=response) as post:
+    def test_full_chat_completion_url_is_converted_for_sdk(self):
+        sdk = self.make_sdk({
+            "choices": [{"message": {"content": "{\"ok\": true}"}}]
+        })
+        with patch("app.utils.llm_client.OpenAI", return_value=sdk) as openai_cls:
             client = LLMClient({
                 "base_url": "https://openrouter.ai/api/v1/chat/completions?trace=1",
                 "api_key": "key",
@@ -104,43 +111,43 @@ class LLMClientTest(TestCase):
             result = client.complete_json("system", "user", max_tokens=256)
 
         self.assertEqual({"ok": True}, result)
-        args, kwargs = post.call_args
-        self.assertEqual("https://openrouter.ai/api/v1/chat/completions?trace=1", args[0])
-        self.assertEqual("Bearer key", kwargs["headers"]["Authorization"])
-        self.assertEqual("system", kwargs["json"]["messages"][0]["content"])
-        self.assertIs(kwargs["verify"], True)
+        self.assertEqual(
+            "https://openrouter.ai/api/v1/",
+            openai_cls.call_args.kwargs["base_url"]
+        )
+        kwargs = sdk.chat.completions.create.call_args.kwargs
+        self.assertEqual("system", kwargs["messages"][0]["content"])
+        self.assertEqual({"trace": "1"}, kwargs["extra_query"])
 
     def test_missing_config_is_not_ready(self):
         client = LLMClient({"base_url": "", "api_key": "", "model": ""})
         self.assertFalse(client.is_ready())
         self.assertEqual("", client.complete_text("system", "user"))
 
-    def test_http_error_returns_empty_text(self):
-        response = requests.Response()
-        response.status_code = 401
-        response._content = b'{"error":{"message":"invalid api key"}}'
-        with patch("app.utils.llm_client.requests.post", return_value=response), \
-                patch("app.utils.llm_client.log.warn") as warn:
+    def test_sdk_http_error_is_classified_and_returns_empty_text(self):
+        request = httpx.Request("POST", "https://api.example/v1/chat/completions")
+        response = httpx.Response(401, request=request)
+        error = APIStatusError("invalid api key", response=response, body={"error": "invalid api key"})
+        sdk = self.make_sdk(error=error)
+        with patch("app.utils.llm_client.OpenAI", return_value=sdk), \
+                patch("app.utils.llm_client.log.error") as log_error:
             client = LLMClient({
                 "base_url": "https://api.example/v1",
                 "api_key": "key",
                 "model": "gpt-test"
             })
             self.assertEqual("", client.complete_text("system", "user"))
-        warning = warn.call_args.args[0]
-        self.assertIn("status=401", warning)
-        self.assertNotIn("status=none", warning)
-        self.assertIn("invalid api key", warning)
+
+        message = log_error.call_args.args[0]
+        self.assertIn("category=http_status", message)
+        self.assertIn("status=401", message)
+        self.assertIn("invalid api key", message)
 
     def test_invalid_json_returns_none(self):
-        response = Mock()
-        response.status_code = 200
-        response.json.return_value = {
-            "choices": [
-                {"message": {"content": "not json"}}
-            ]
-        }
-        with patch("app.utils.llm_client.requests.post", return_value=response):
+        sdk = self.make_sdk({
+            "choices": [{"message": {"content": "not json"}}]
+        })
+        with patch("app.utils.llm_client.OpenAI", return_value=sdk):
             client = LLMClient({
                 "base_url": "https://api.example/v1",
                 "api_key": "key",
@@ -148,19 +155,12 @@ class LLMClientTest(TestCase):
             })
             self.assertIsNone(client.complete_json("system", "user"))
 
-    def test_status_succeeds_when_choices_only_contain_reasoning(self):
-        response = Mock()
-        response.status_code = 200
-        response.json.return_value = {
-            "choices": [{
-                "message": {
-                    "content": "",
-                    "reasoning_content": "Okay, the user"
-                },
-                "finish_reason": "length"
-            }]
-        }
-        with patch("app.utils.llm_client.requests.post", return_value=response) as post, \
+    def test_status_succeeds_when_sdk_choices_only_contain_reasoning(self):
+        sdk = self.make_sdk(SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content="", reasoning_content="Okay, the user"),
+            finish_reason="length"
+        )]))
+        with patch("app.utils.llm_client.OpenAI", return_value=sdk), \
                 patch("app.utils.llm_client.log.info") as info:
             client = LLMClient({
                 "base_url": "https://api.deepseek.com/",
@@ -169,19 +169,18 @@ class LLMClientTest(TestCase):
             })
             self.assertTrue(client.get_status())
 
-        self.assertEqual(4, post.call_args.kwargs["json"]["max_tokens"])
-        self.assertNotIn("thinking", post.call_args.kwargs["json"])
+        kwargs = sdk.chat.completions.create.call_args.kwargs
+        self.assertEqual(4, kwargs["max_tokens"])
+        self.assertNotIn("extra_body", kwargs)
         message = info.call_args.args[0]
         self.assertIn("reasoning_content_len=14", message)
         self.assertIn("finish_reason=length", message)
 
-    def test_configured_thinking_mode_is_sent_explicitly(self):
-        response = Mock()
-        response.status_code = 200
-        response.json.return_value = {
+    def test_configured_thinking_mode_uses_sdk_extra_body(self):
+        sdk = self.make_sdk({
             "choices": [{"message": {"content": "OK"}}]
-        }
-        with patch("app.utils.llm_client.requests.post", return_value=response) as post:
+        })
+        with patch("app.utils.llm_client.OpenAI", return_value=sdk):
             client = LLMClient({
                 "base_url": "https://api.deepseek.com/",
                 "api_key": "key",
@@ -191,14 +190,32 @@ class LLMClientTest(TestCase):
             self.assertTrue(client.get_status())
 
         self.assertEqual(
-            {"type": "disabled"},
-            post.call_args.kwargs["json"]["thinking"]
+            {"thinking": {"type": "disabled"}},
+            sdk.chat.completions.create.call_args.kwargs["extra_body"]
         )
 
+    def test_sdk_extension_parameters_are_forwarded(self):
+        sdk = self.make_sdk({
+            "choices": [{"message": {"content": "OK"}}]
+        })
+        with patch("app.utils.llm_client.OpenAI", return_value=sdk):
+            client = LLMClient({
+                "base_url": "https://api.example/v1",
+                "api_key": "key",
+                "model": "gpt-test",
+                "extra_body": {"vendor_option": True},
+                "extra_headers": {"X-App": "nas-tools"},
+                "extra_query": {"region": "cn"}
+            })
+            self.assertTrue(client.get_status())
+
+        kwargs = sdk.chat.completions.create.call_args.kwargs
+        self.assertEqual({"vendor_option": True}, kwargs["extra_body"])
+        self.assertEqual({"X-App": "nas-tools"}, kwargs["extra_headers"])
+        self.assertEqual({"region": "cn"}, kwargs["extra_query"])
+
     def test_completion_does_not_treat_reasoning_as_final_content(self):
-        response = Mock()
-        response.status_code = 200
-        response.json.return_value = {
+        sdk = self.make_sdk({
             "choices": [{
                 "message": {
                     "content": "",
@@ -206,8 +223,8 @@ class LLMClientTest(TestCase):
                 },
                 "finish_reason": "length"
             }]
-        }
-        with patch("app.utils.llm_client.requests.post", return_value=response), \
+        })
+        with patch("app.utils.llm_client.OpenAI", return_value=sdk), \
                 patch("app.utils.llm_client.log.info") as info:
             client = LLMClient({
                 "base_url": "https://api.example/v1",

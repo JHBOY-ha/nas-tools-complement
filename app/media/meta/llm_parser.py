@@ -41,6 +41,7 @@ class LLMMetaParser(object):
 
     def __init__(self):
         self._client = None
+        self._client_config = {}
         self._enabled = False
         self._mode = "rule_first"
         self._base_url = ""
@@ -59,6 +60,7 @@ class LLMMetaParser(object):
 
     def init_config(self):
         config = Config().get_config("llm") or {}
+        self._client_config = deepcopy(config)
         self._enabled = StringUtils.to_bool(
             config.get("enable", config.get("enabled")), False
         )
@@ -840,7 +842,8 @@ class LLMMetaParser(object):
         if not self.__is_client_ready(require_enable=False):
             return None
         if not self._client:
-            self._client = LLMClient({
+            client_config = deepcopy(self._client_config)
+            client_config.update({
                 "base_url": self._base_url,
                 "api_key": self._api_key,
                 "model": self._model,
@@ -849,6 +852,7 @@ class LLMMetaParser(object):
                 "thinking": self._thinking,
                 "enable": self._enabled
             })
+            self._client = LLMClient(client_config)
         return self._client
 
     @staticmethod

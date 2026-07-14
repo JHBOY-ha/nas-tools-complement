@@ -122,6 +122,8 @@ class LLMMetaParserTest(TestCase):
         self.parser._model = "gpt-4o-mini"
         self.parser._timeout = 20
         self.parser._max_tokens = 1024
+        self.parser._thinking = ""
+        self.parser._client_config = {}
         self.parser._confidence_threshold = 0.75
         self.parser._client = None
         self.parser._parse_cache = {}
@@ -256,6 +258,20 @@ class LLMMetaParserTest(TestCase):
         self.assertTrue(status)
         client_cls.assert_called_once_with(temporary_config)
         get_saved_client.assert_not_called()
+
+    def test_saved_extension_config_reaches_shared_client(self):
+        self.parser._client_config = {
+            "max_retries": 1,
+            "extra_headers": {"X-App": "nas-tools"}
+        }
+
+        with patch("app.media.meta.llm_parser.LLMClient") as client_cls:
+            self.parser._LLMMetaParser__get_client()
+
+        config = client_cls.call_args.args[0]
+        self.assertEqual(1, config["max_retries"])
+        self.assertEqual({"X-App": "nas-tools"}, config["extra_headers"])
+        self.assertEqual("https://api.openai.com/v1", config["base_url"])
 
     def test_parse_with_search_context_should_attach_external_candidates(self):
         self.parser._search_context_enable = True
