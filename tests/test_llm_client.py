@@ -61,7 +61,7 @@ from app.utils.llm_client import LLMClient
 
 
 class LLMClientTest(TestCase):
-    def test_openai_provider_builds_chat_completion_request(self):
+    def test_api_root_builds_chat_completion_request(self):
         response = Mock()
         response.status_code = 200
         response.json.return_value = {
@@ -71,7 +71,6 @@ class LLMClientTest(TestCase):
         }
         with patch("app.utils.llm_client.requests.post", return_value=response) as post:
             client = LLMClient({
-                "provider": "openai",
                 "base_url": "https://api.example/v1",
                 "api_key": "key",
                 "model": "gpt-test",
@@ -88,36 +87,31 @@ class LLMClientTest(TestCase):
         self.assertEqual("system", kwargs["json"]["messages"][0]["content"])
         self.assertIs(kwargs["verify"], True)
 
-    def test_anthropic_provider_builds_messages_request(self):
+    def test_full_chat_completion_url_is_used_without_duplicate_path(self):
         response = Mock()
         response.status_code = 200
         response.json.return_value = {
-            "content": [
-                {"type": "text", "text": "[{\"id\": 1, \"text\": \"你好\"}]"}
+            "choices": [
+                {"message": {"content": "{\"ok\": true}"}}
             ]
         }
         with patch("app.utils.llm_client.requests.post", return_value=response) as post:
             client = LLMClient({
-                "provider": "anthropic",
-                "base_url": "https://api.anthropic.com/v1",
+                "base_url": "https://openrouter.ai/api/v1/chat/completions?trace=1",
                 "api_key": "key",
-                "model": "claude-test",
-                "anthropic_version": "2023-06-01"
+                "model": "openai/gpt-test"
             })
             result = client.complete_json("system", "user", max_tokens=256)
 
-        self.assertEqual([{"id": 1, "text": "你好"}], result)
+        self.assertEqual({"ok": True}, result)
         args, kwargs = post.call_args
-        self.assertEqual("https://api.anthropic.com/v1/messages", args[0])
-        self.assertEqual("key", kwargs["headers"]["x-api-key"])
-        self.assertEqual("2023-06-01", kwargs["headers"]["anthropic-version"])
-        self.assertEqual("system", kwargs["json"]["system"])
-        self.assertEqual("user", kwargs["json"]["messages"][0]["content"])
-        self.assertNotIn("temperature", kwargs["json"])
+        self.assertEqual("https://openrouter.ai/api/v1/chat/completions?trace=1", args[0])
+        self.assertEqual("Bearer key", kwargs["headers"]["Authorization"])
+        self.assertEqual("system", kwargs["json"]["messages"][0]["content"])
         self.assertIs(kwargs["verify"], True)
 
     def test_missing_config_is_not_ready(self):
-        client = LLMClient({"provider": "openai", "base_url": "", "api_key": "", "model": ""})
+        client = LLMClient({"base_url": "", "api_key": "", "model": ""})
         self.assertFalse(client.is_ready())
         self.assertEqual("", client.complete_text("system", "user"))
 
@@ -128,7 +122,6 @@ class LLMClientTest(TestCase):
         with patch("app.utils.llm_client.requests.post", return_value=response), \
                 patch("app.utils.llm_client.log.warn") as warn:
             client = LLMClient({
-                "provider": "openai",
                 "base_url": "https://api.example/v1",
                 "api_key": "key",
                 "model": "gpt-test"
@@ -138,23 +131,6 @@ class LLMClientTest(TestCase):
         self.assertIn("status=401", warning)
         self.assertNotIn("status=none", warning)
         self.assertIn("invalid api key", warning)
-
-    def test_anthropic_http_error_keeps_real_status(self):
-        response = requests.Response()
-        response.status_code = 429
-        response._content = b'{"error":{"message":"rate limited"}}'
-        with patch("app.utils.llm_client.requests.post", return_value=response), \
-                patch("app.utils.llm_client.log.warn") as warn:
-            client = LLMClient({
-                "provider": "anthropic",
-                "base_url": "https://api.anthropic.com/v1",
-                "api_key": "key",
-                "model": "claude-test"
-            })
-            self.assertEqual("", client.complete_text("system", "user"))
-        warning = warn.call_args.args[0]
-        self.assertIn("status=429", warning)
-        self.assertNotIn("status=none", warning)
 
     def test_invalid_json_returns_none(self):
         response = Mock()
@@ -166,7 +142,6 @@ class LLMClientTest(TestCase):
         }
         with patch("app.utils.llm_client.requests.post", return_value=response):
             client = LLMClient({
-                "provider": "openai",
                 "base_url": "https://api.example/v1",
                 "api_key": "key",
                 "model": "gpt-test"

@@ -371,7 +371,6 @@ class SubtitleAlignTest(TestCase):
                 ("00:00:11,000", "00:00:12,000", "fifth line"),
             ]))
             mock_client = Mock()
-            mock_client.provider = "openai"
             mock_client.is_ready.return_value = True
             mock_client.complete_json.return_value = [
                 {"id": 0, "text": "第一句对白"},
@@ -416,7 +415,6 @@ class SubtitleAlignTest(TestCase):
                 ("00:00:11,000", "00:00:12,000", "fifth line"),
             ]))
             mock_client = Mock()
-            mock_client.provider = "anthropic"
             mock_client.is_ready.return_value = True
             mock_client.complete_json.return_value = [{"id": 0, "text": "第一句对白"}]
 

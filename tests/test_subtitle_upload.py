@@ -373,12 +373,40 @@ class SubtitleUploadTest(TestCase):
             self.assertTrue(repaired.startswith("[Script Info]\n"))
             self.assertIn("0:00:00.45,0:00:05.45", repaired)
 
+    def test_ass_normalization_repairs_deeply_truncated_script_header(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            subtitle_file = os.path.join(tmpdir, "Movie.zh.ass")
+            content = (
+                " Info]\r\n"
+                "ScriptType: v4.00\r\n\r\n"
+                "[V4 Styles]\r\n"
+                "Format: Name, Fontname, Fontsize\r\n"
+                "Style: Default,Arial,20\r\n\r\n"
+                "[Events]\r\n"
+                "Format: Marked, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\r\n"
+                "Dialogue: Marked=0,0:00:00.45,0:00:05.45,Default,,0,0,0,,测试字幕\r\n"
+            )
+            with open(subtitle_file, "wb") as file_obj:
+                file_obj.write(content.encode("utf-8"))
+
+            valid = {"valid": True, "probe_available": True, "message": "ok"}
+            with patch.object(SubtitleHealth, "validate_subtitle", return_value=valid):
+                result = SubtitleHealth.normalize_uploaded_subtitle(subtitle_file)
+
+            self.assertTrue(result["valid"])
+            self.assertEqual(result["ass_repairs"], ["恢复缺失的 [Script Info] 段头"])
+            with open(subtitle_file, "r", encoding="utf-8") as file_obj:
+                self.assertTrue(file_obj.read().startswith("[Script Info]\n"))
+
     def test_upload_reports_ass_repairs_without_srt_message(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             movie = os.path.join(tmpdir, "Movie.mkv")
             open(movie, "wb").close()
             content = (
                 "ipt Info]\nScriptType: v4.00+\n\n"
+                "[V4+ Styles]\n"
+                "Format: Name, Fontname, Fontsize\n"
+                "Style: Default,Arial,20\n\n"
                 "[Events]\n"
                 "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
                 "Dialogue: 0,0:00:00.45,0:00:05:45,Default,,0,0,0,,测试字幕\n"

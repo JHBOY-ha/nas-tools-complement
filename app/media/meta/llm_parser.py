@@ -43,13 +43,11 @@ class LLMMetaParser(object):
         self._client = None
         self._enabled = False
         self._mode = "rule_first"
-        self._provider = "openai"
         self._base_url = ""
         self._api_key = ""
         self._model = ""
         self._timeout = 20
         self._max_tokens = 1024
-        self._anthropic_version = "2023-06-01"
         self._confidence_threshold = 0.75
         self._search_context_enable = False
         self._search_max_results = 3
@@ -67,13 +65,11 @@ class LLMMetaParser(object):
         if mode not in self._allowed_modes:
             mode = "rule_first"
         self._mode = mode
-        self._provider = str(config.get("provider") or "openai").strip().lower()
         self._base_url = str(config.get("base_url") or config.get("api_base") or "").strip()
         self._api_key = str(config.get("api_key") or "").strip()
         self._model = str(config.get("model") or "").strip()
         self._timeout = self.__parse_int(config.get("timeout"), min_val=1, default=20)
         self._max_tokens = self.__parse_int(config.get("max_tokens"), min_val=1, default=1024)
-        self._anthropic_version = str(config.get("anthropic_version") or "2023-06-01").strip()
         self._confidence_threshold = self.__parse_float(
             config.get("confidence_threshold"), min_val=0, max_val=1, default=0.75
         )
@@ -842,13 +838,11 @@ class LLMMetaParser(object):
             return None
         if not self._client:
             self._client = LLMClient({
-                "provider": self._provider,
                 "base_url": self._base_url,
                 "api_key": self._api_key,
                 "model": self._model,
                 "timeout": self._timeout,
                 "max_tokens": self._max_tokens,
-                "anthropic_version": self._anthropic_version,
                 "enable": self._enabled
             })
         return self._client

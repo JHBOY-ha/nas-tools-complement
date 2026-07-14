@@ -122,7 +122,6 @@ class LLMMetaParserTest(TestCase):
         self.parser._model = "gpt-4o-mini"
         self.parser._timeout = 20
         self.parser._max_tokens = 1024
-        self.parser._provider = "openai"
         self.parser._confidence_threshold = 0.75
         self.parser._client = None
         self.parser._parse_cache = {}
@@ -257,19 +256,6 @@ class LLMMetaParserTest(TestCase):
         call_kwargs = mock_client.complete_text.call_args.kwargs
         user_prompt = call_kwargs.get("user_prompt", "")
         self.assertIn("external_candidates", user_prompt)
-
-    def test_parse_with_anthropic_provider_uses_common_client(self):
-        self.parser._provider = "anthropic"
-        self.parser._parse_cache = {}
-        mock_client = Mock()
-        mock_client.complete_text.return_value = "{\"type\":\"movie\",\"en_name\":\"Dune\"}"
-
-        with patch.object(self.parser, "_LLMMetaParser__is_client_ready", return_value=True), \
-                patch.object(self.parser, "_LLMMetaParser__get_client", return_value=mock_client):
-            result = self.parser.parse(title="Dune 2021")
-
-        self.assertEqual(MediaType.MOVIE, result.get("type"))
-        self.assertEqual("Dune", result.get("en_name"))
 
     def test_parse_should_extract_tmdb_id(self):
         result = self.parser._LLMMetaParser__normalize_result({

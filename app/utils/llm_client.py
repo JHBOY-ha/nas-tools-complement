@@ -1,5 +1,6 @@
 import json
 import re
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
@@ -10,35 +11,28 @@ from config import Config
 
 class LLMClient:
     """
-    统一封装 OpenAI 兼容协议和 Anthropic Messages API。
+    统一封装 OpenAI Chat Completions 兼容协议。
+
+    Base URL 优先填写 API 根地址，也容忍直接填写完整的
+    /chat/completions 请求地址。
     """
-    _providers = {"openai", "anthropic"}
 
     def __init__(self, config=None):
         self._config = config if config is not None else (Config().get_config("llm") or {})
-        self._provider = str(self._config.get("provider") or "openai").strip().lower()
-        if self._provider not in self._providers:
-            self._provider = "openai"
-        self._base_url = str(self._config.get("base_url") or self._config.get("api_base") or "").strip().rstrip("/")
+        self._base_url = str(self._config.get("base_url") or self._config.get("api_base") or "").strip()
+        self._chat_completion_url = self.__build_chat_completion_url(self._base_url)
         self._api_key = str(self._config.get("api_key") or "").strip()
         self._model = str(self._config.get("model") or "").strip()
         self._timeout = self.__parse_int(self._config.get("timeout"), min_val=1, default=20)
         self._max_tokens = self.__parse_int(self._config.get("max_tokens"), min_val=1, default=1024)
-        self._anthropic_version = str(
-            self._config.get("anthropic_version") or "2023-06-01"
-        ).strip()
         self._enabled = StringUtils.to_bool(
             self._config.get("enable", self._config.get("enabled")), False
         )
 
-    @property
-    def provider(self):
-        return self._provider
-
     def is_ready(self, require_enable=False):
         if require_enable and not self._enabled:
             return False
-        return bool(self._base_url and self._api_key and self._model)
+        return bool(self._chat_completion_url and self._api_key and self._model)
 
     def get_status(self):
         if not self.is_ready(require_enable=False):
@@ -61,16 +55,13 @@ class LLMClient:
         if not self.is_ready(require_enable=False):
             return ""
         try:
-            if self._provider == "anthropic":
-                return self.__complete_anthropic(system_prompt, user_prompt, max_tokens)
             return self.__complete_openai(system_prompt, user_prompt, max_tokens)
         except Exception as err:
             ExceptionUtils.exception_traceback(err)
-            log.error("【LLM】请求失败：provider=%s, error=%s" % (self._provider, str(err)))
+            log.error("【LLM】OpenAI兼容接口请求失败：error=%s" % str(err))
             return ""
 
     def __complete_openai(self, system_prompt, user_prompt, max_tokens=None):
-        url = "%s/chat/completions" % self._base_url
         payload = {
             "model": self._model,
             "messages": [
@@ -81,7 +72,7 @@ class LLMClient:
             "temperature": 0
         }
         response = requests.post(
-            url,
+            self._chat_completion_url,
             headers={
                 "Authorization": "Bearer %s" % self._api_key,
                 "Content-Type": "application/json"
@@ -101,33 +92,22 @@ class LLMClient:
         message = choices[0].get("message") or {}
         return self.extract_text_content(message.get("content"))
 
-    def __complete_anthropic(self, system_prompt, user_prompt, max_tokens=None):
-        url = "%s/messages" % self._base_url
-        payload = {
-            "model": self._model,
-            "max_tokens": max_tokens or self._max_tokens,
-            "system": system_prompt or "",
-            "messages": [
-                {"role": "user", "content": user_prompt or ""}
-            ]
-        }
-        response = requests.post(
-            url,
-            headers={
-                "x-api-key": self._api_key,
-                "anthropic-version": self._anthropic_version,
-                "Content-Type": "application/json"
-            },
-            json=payload,
-            timeout=self._timeout,
-            verify=True
-        )
-        if response is None or response.status_code >= 400:
-            status, detail = self.__http_error_detail(response)
-            log.warn("【LLM】Anthropic接口请求失败：status=%s%s" % (status, detail))
+    @staticmethod
+    def __build_chat_completion_url(base_url):
+        """
+        优先将输入视为 API 根地址；若已是 OpenAI Chat Completions
+        完整地址则直接使用。路径始终在查询参数之前完成拼接。
+        """
+        value = str(base_url or "").strip()
+        if not value:
             return ""
-        data = response.json()
-        return self.extract_text_content(data.get("content"))
+        parsed = urlsplit(value)
+        if parsed.scheme.lower() not in ["http", "https"] or not parsed.netloc:
+            return ""
+        path = (parsed.path or "").rstrip("/")
+        if not path.lower().endswith("/chat/completions"):
+            path = "%s/chat/completions" % path if path else "/chat/completions"
+        return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, ""))
 
     @classmethod
     def parse_json(cls, content):

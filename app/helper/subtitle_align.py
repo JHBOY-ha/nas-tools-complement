@@ -511,7 +511,7 @@ class SubtitleAligner:
         batch_count = 0
         for batch in cls.__iter_translation_batches(reference_cues):
             batch_count += 1
-            cache_key = cls.__translation_cache_key(client, target_language, batch)
+            cache_key = cls.__translation_cache_key(target_language, batch)
             cached = cls.__get_translation_cache(cache_key)
             if cached is None:
                 translated, msg = cls.__request_translation_batch(client, target_name, batch)
@@ -524,7 +524,7 @@ class SubtitleAligner:
                 if cue_id < 0 or cue_id >= len(translated_cues):
                     return None, "LLM 翻译结果索引异常"
                 translated_cues[cue_id]["text"] = text
-        log.info("【Subtitle】LLM参考字幕翻译完成：provider=%s, batches=%s" % (client.provider, batch_count))
+        log.info("【Subtitle】LLM参考字幕翻译完成：protocol=openai, batches=%s" % batch_count)
         return translated_cues, ""
 
     @classmethod
@@ -602,9 +602,9 @@ class SubtitleAligner:
         return translated, ""
 
     @classmethod
-    def __translation_cache_key(cls, client, target_language, batch):
+    def __translation_cache_key(cls, target_language, batch):
         payload = json.dumps({
-            "provider": client.provider,
+            "protocol": "openai",
             "target_language": cls.__normalize_language(target_language),
             "items": batch
         }, ensure_ascii=False, sort_keys=True)

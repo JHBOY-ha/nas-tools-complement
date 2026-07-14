@@ -362,16 +362,25 @@ class SubtitleHealth:
         """修复可以无歧义确认的 ASS/SSA 段头截断与 Dialogue 时间分隔符。"""
         lines = text.split("\n")
         repairs = []
-        partial_script_headers = {
-            "Script Info]", "cript Info]", "ript Info]", "ipt Info]"
+        canonical_script_header = "[Script Info]"
+        section_names = {
+            line.strip().casefold()
+            for line in lines
+            if re.fullmatch(r"\[[^\]]+\]", line.strip())
         }
+        has_ass_sections = "[events]" in section_names and any(
+            section in section_names for section in ["[v4 styles]", "[v4+ styles]"]
+        )
 
         for index, line in enumerate(lines):
             stripped = line.strip()
             if not stripped:
                 continue
-            if stripped in partial_script_headers:
-                lines[index] = "[Script Info]"
+            is_script_header_suffix = len(stripped) >= len("Info]") \
+                and canonical_script_header.casefold().endswith(stripped.casefold()) \
+                and stripped.casefold().endswith("info]")
+            if has_ass_sections and is_script_header_suffix:
+                lines[index] = canonical_script_header
                 repairs.append("恢复缺失的 [Script Info] 段头")
             break
 
