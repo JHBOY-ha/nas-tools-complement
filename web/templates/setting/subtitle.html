@@ -216,7 +216,7 @@
       const info = ret.data || {};
       const reset = info.reset_time_utc || info.reset_time || '账户接口未提供（下载成功后显示）';
       show_success_modal(`${ret.msg}<br>等级：${info.level || '-'}，VIP：${info.vip ? '是' : '否'}，` +
-        `今日已用：${info.downloads_count ?? '-'}，剩余：${info.remaining_downloads ?? '-'} / ${info.allowed_downloads ?? '-'}，` +
+        `登录账户今日已用：${info.downloads_count ?? '-'}，剩余：${info.remaining_downloads ?? '-'} / ${info.allowed_downloads ?? '-'}，` +
         `重置：${reset}`);
     });
   }

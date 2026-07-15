@@ -2181,6 +2181,8 @@ class WebAction:
                 target = target + "/t/p/w500/wwemzKWzjKYJFfCeiB57q3r4Bcm.png"
             if target == "qyapi.weixin.qq.com":
                 target = target + "/cgi-bin/message/send"
+            if target == "api.opensubtitles.com":
+                target = target + "/api/v1/infos/languages"
             target = "https://" + target
 
         start_time = datetime.datetime.now()
