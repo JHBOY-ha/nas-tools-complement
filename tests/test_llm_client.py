@@ -98,6 +98,32 @@ class LLMClientTest(TestCase):
         self.assertEqual(128, kwargs["max_tokens"])
         self.assertEqual("system", kwargs["messages"][0]["content"])
 
+    def test_per_request_timeout_and_retry_override_use_sdk_options(self):
+        sdk = self.make_sdk()
+        request_sdk = self.make_sdk({
+            "choices": [{"message": {"content": "{\"ok\": true}"}}]
+        })
+        sdk.with_options.return_value = request_sdk
+        with patch("app.utils.llm_client.OpenAI", return_value=sdk):
+            client = LLMClient({
+                "base_url": "https://api.example/v1",
+                "api_key": "key",
+                "model": "gpt-test",
+                "timeout": 20,
+                "max_retries": 2
+            })
+            result = client.complete_json(
+                "system",
+                "user",
+                timeout=1.25,
+                max_retries=0
+            )
+
+        self.assertEqual({"ok": True}, result)
+        sdk.with_options.assert_called_once_with(timeout=1.25, max_retries=0)
+        request_sdk.chat.completions.create.assert_called_once()
+        sdk.chat.completions.create.assert_not_called()
+
     def test_full_chat_completion_url_is_converted_for_sdk(self):
         sdk = self.make_sdk({
             "choices": [{"message": {"content": "{\"ok\": true}"}}]

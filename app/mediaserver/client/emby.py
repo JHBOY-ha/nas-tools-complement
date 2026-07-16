@@ -336,6 +336,32 @@ class Emby(_IMediaClient):
             return False
         return False
 
+    def refresh_subtitle_target(self, server_item_id=None,
+                                parent_server_item_id=None,
+                                library_id=None, media_path=None):
+        """只刷新精确项目，剧集失败时最多降级到父剧集。"""
+        candidates = []
+        if server_item_id:
+            candidates.append((server_item_id, "item"))
+        if parent_server_item_id and str(parent_server_item_id) != str(server_item_id or ""):
+            candidates.append((parent_server_item_id, "parent"))
+        if not candidates:
+            return {
+                "status": "skipped", "scope": "none",
+                "message": "缺少经过校验的 Emby 项目 ID"
+            }
+        for item_id, scope in candidates:
+            if self.__refresh_emby_library_by_id(item_id):
+                return {
+                    "status": "refreshed", "scope": scope,
+                    "item_id": item_id,
+                    "message": "已刷新 Emby 项目" if scope == "item" else "已降级刷新父剧集"
+                }
+        return {
+            "status": "failed", "scope": candidates[-1][1],
+            "item_id": candidates[-1][0], "message": "Emby 局部刷新失败"
+        }
+
     def refresh_root_library(self):
         """
         通知Emby刷新整个媒体库
@@ -507,7 +533,10 @@ class Emby(_IMediaClient):
                     if not item_info:
                         continue
                     episodes.append({"id": item_info.get("Id"),
+                                     "server_item_id": item_info.get("Id"),
                                      "series_id": series_id,
+                                     "parent_server_item_id": item_info.get("SeriesId") or series_id,
+                                     "library_id": "",
                                      "type": item_info.get("Type"),
                                      "title": item_info.get("Name"),
                                      "season": item_info.get("ParentIndexNumber"),

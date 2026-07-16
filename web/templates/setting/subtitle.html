@@ -42,6 +42,127 @@
         </div>
       </a>
     </div>
+    <div class="card mt-3" id="subtitle-task-settings-card">
+      <div class="card-header">
+        <div>
+          <h3 class="card-title">手动上传与检测任务</h3>
+          <div class="card-subtitle mt-1">限制后台队列、暂存空间和深度检测上限，降低服务器与 NAS 的持续磁盘压力。</div>
+        </div>
+        <div class="card-actions">
+          <button type="button" class="btn" data-subtitle-task-center aria-label="打开字幕任务中心">
+            任务中心
+            <span class="badge bg-primary text-white d-none" data-subtitle-task-count>0</span>
+          </button>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="alert alert-info">
+          配置只影响新任务。上传 worker 和检测并发固定为 1；上传、修复、检测共享重型进程闸门，默认同时只执行 1 个 ffprobe、ffmpeg 或 LLM 操作。
+        </div>
+        <div id="subtitle_task_settings_message" class="d-none" role="alert" aria-live="polite"></div>
+        <form id="subtitle_task_settings_form">
+          <fieldset>
+            <legend class="h4 mb-3">上传队列与空间</legend>
+            <div class="row g-3">
+              <div class="col-12 col-md-6 col-xl-3">
+                <label class="form-label" for="subtitle_task_max_upload_queue">等待批次数</label>
+                <input class="form-control" type="number" id="subtitle_task_max_upload_queue" data-policy-key="max_upload_queue" min="1" max="32" required>
+                <div class="form-hint">默认 10；超过后新任务返回队列已满。</div>
+              </div>
+              <div class="col-12 col-md-6 col-xl-3">
+                <label class="form-label" for="subtitle_task_text_file_limit_mb">文本单文件（MiB）</label>
+                <input class="form-control" type="number" id="subtitle_task_text_file_limit_mb" data-policy-key="text_file_limit_mb" min="1" max="100" required>
+              </div>
+              <div class="col-12 col-md-6 col-xl-3">
+                <label class="form-label" for="subtitle_task_vobsub_limit_mb">VobSub 组合（MiB）</label>
+                <input class="form-control" type="number" id="subtitle_task_vobsub_limit_mb" data-policy-key="vobsub_limit_mb" min="10" max="250" required>
+              </div>
+              <div class="col-12 col-md-6 col-xl-3">
+                <label class="form-label" for="subtitle_task_batch_limit_mb">单批总量（MiB）</label>
+                <input class="form-control" type="number" id="subtitle_task_batch_limit_mb" data-policy-key="batch_limit_mb" min="20" max="250" required>
+              </div>
+              <div class="col-12 col-md-6 col-xl-3">
+                <label class="form-label" for="subtitle_task_staging_quota_mb">暂存总额度（MiB）</label>
+                <input class="form-control" type="number" id="subtitle_task_staging_quota_mb" data-policy-key="staging_quota_mb" min="256" max="4096" required>
+              </div>
+              <div class="col-12 col-md-6 col-xl-3">
+                <label class="form-label" for="subtitle_task_reserve_free_mb">最少保留空间（MiB）</label>
+                <input class="form-control" type="number" id="subtitle_task_reserve_free_mb" data-policy-key="reserve_free_mb" min="256" max="51200" required>
+              </div>
+              <div class="col-12 col-md-6 col-xl-3">
+                <label class="form-label" for="subtitle_task_max_batch_items">单批逻辑字幕</label>
+                <input class="form-control" type="number" id="subtitle_task_max_batch_items" data-policy-key="max_batch_items" min="1" max="20" required>
+              </div>
+              <div class="col-12 col-md-6 col-xl-3">
+                <label class="form-label" for="subtitle_task_llm_max_batch_items">LLM 对齐单批</label>
+                <input class="form-control" type="number" id="subtitle_task_llm_max_batch_items" data-policy-key="llm_max_batch_items" min="1" max="5" required>
+              </div>
+            </div>
+          </fieldset>
+
+          <fieldset class="mt-4">
+            <legend class="h4 mb-3">进程与任务预算</legend>
+            <div class="row g-3">
+              <div class="col-12 col-md-6 col-xl-3">
+                <label class="form-label" for="subtitle_task_heavy_process_concurrency">重型进程并发</label>
+                <input class="form-control" type="number" id="subtitle_task_heavy_process_concurrency" data-policy-key="heavy_process_concurrency" min="1" max="2" required>
+                <div class="form-hint">NAS 建议保持 1。</div>
+              </div>
+              <div class="col-12 col-md-6 col-xl-3">
+                <label class="form-label" for="subtitle_task_ffprobe_timeout_seconds">ffprobe 超时（秒）</label>
+                <input class="form-control" type="number" id="subtitle_task_ffprobe_timeout_seconds" data-policy-key="ffprobe_timeout_seconds" min="3" max="60" required>
+              </div>
+              <div class="col-12 col-md-6 col-xl-3">
+                <label class="form-label" for="subtitle_task_ffmpeg_timeout_seconds">ffmpeg 超时（秒）</label>
+                <input class="form-control" type="number" id="subtitle_task_ffmpeg_timeout_seconds" data-policy-key="ffmpeg_timeout_seconds" min="10" max="600" required>
+              </div>
+              <div class="col-12 col-md-6 col-xl-3">
+                <label class="form-label" for="subtitle_task_llm_timeout_seconds">LLM 单字幕超时（秒）</label>
+                <input class="form-control" type="number" id="subtitle_task_llm_timeout_seconds" data-policy-key="llm_timeout_seconds" min="30" max="900" required>
+              </div>
+              <div class="col-12 col-md-6 col-xl-3">
+                <label class="form-label" for="subtitle_task_upload_budget_minutes">上传/修复任务预算（分钟）</label>
+                <input class="form-control" type="number" id="subtitle_task_upload_budget_minutes" data-policy-key="upload_budget_minutes" min="1" max="360" required>
+              </div>
+            </div>
+          </fieldset>
+
+          <fieldset class="mt-4">
+            <legend class="h4 mb-3">检测与记录</legend>
+            <div class="row g-3">
+              <div class="col-12 col-md-6 col-xl-3">
+                <label class="form-label" for="subtitle_task_audit_max_changed">新增/变化字幕上限</label>
+                <input class="form-control" type="number" id="subtitle_task_audit_max_changed" data-policy-key="audit_max_changed" min="100" max="50000" required>
+              </div>
+              <div class="col-12 col-md-6 col-xl-3">
+                <label class="form-label" for="subtitle_task_audit_max_minutes">单次检测上限（分钟）</label>
+                <input class="form-control" type="number" id="subtitle_task_audit_max_minutes" data-policy-key="audit_max_minutes" min="5" max="240" required>
+              </div>
+              <div class="col-12 col-md-6 col-xl-3">
+                <label class="form-label" for="subtitle_task_audit_max_directories">深扫目录上限</label>
+                <input class="form-control" type="number" id="subtitle_task_audit_max_directories" data-policy-key="audit_max_directories" min="1000" max="200000" required>
+              </div>
+              <div class="col-12 col-md-6 col-xl-3">
+                <label class="form-label" for="subtitle_task_audit_max_issues">问题明细上限</label>
+                <input class="form-control" type="number" id="subtitle_task_audit_max_issues" data-policy-key="audit_max_issues" min="20" max="1000" required>
+              </div>
+              <div class="col-12 col-md-6 col-xl-3">
+                <label class="form-label" for="subtitle_task_task_retention_days">任务保留（天）</label>
+                <input class="form-control" type="number" id="subtitle_task_task_retention_days" data-policy-key="task_retention_days" min="1" max="90" required>
+              </div>
+              <div class="col-12 col-md-6 col-xl-3">
+                <label class="form-label" for="subtitle_task_task_retention_count">任务记录上限</label>
+                <input class="form-control" type="number" id="subtitle_task_task_retention_count" data-policy-key="task_retention_count" min="20" max="2000" required>
+              </div>
+            </div>
+          </fieldset>
+        </form>
+      </div>
+      <div class="card-footer d-flex flex-wrap gap-2 justify-content-end">
+        <button type="button" class="btn" id="subtitle_task_settings_reload">重新读取</button>
+        <button type="button" class="btn btn-primary" id="subtitle_task_settings_save">保存任务限制</button>
+      </div>
+    </div>
   </div>
 </div>
 <div class="modal modal-blur fade" id="modal-opensubtitles" tabindex="-1" role="dialog" aria-hidden="true"
@@ -139,6 +260,7 @@
     </div>
   </div>
 </div>
+<script type="text/javascript" src="../static/js/subtitle-tasks.js"></script>
 <script type="text/javascript">
   // 当前处理的类型
   var currType = "";
@@ -159,5 +281,95 @@
       window_history_refresh();
     });
   }
+
+  function subtitle_task_settings_policy(response) {
+    let payload = SubtitleTasks.payloadOf(response) || {};
+    if (payload.settings && typeof payload.settings === "object") {
+      payload = payload.settings;
+    }
+    if (payload.policy && typeof payload.policy === "object") {
+      payload = payload.policy;
+    }
+    return payload;
+  }
+
+  function show_subtitle_task_settings_message(message, danger) {
+    const node = $("#subtitle_task_settings_message");
+    node.removeClass("d-none alert-success alert-danger")
+        .addClass(danger ? "alert alert-danger" : "alert alert-success")
+        .text(message || "");
+  }
+
+  function apply_subtitle_task_settings(policy) {
+    $("#subtitle_task_settings_form [data-policy-key]").each(function () {
+      const key = $(this).data("policy-key");
+      if (policy[key] !== undefined && policy[key] !== null) {
+        $(this).val(policy[key]);
+      }
+    });
+  }
+
+  function load_subtitle_task_settings() {
+    const buttons = $("#subtitle_task_settings_reload,#subtitle_task_settings_save");
+    buttons.prop("disabled", true);
+    $("#subtitle_task_settings_message").addClass("d-none");
+    SubtitleTasks.request("GET", "/subtitle/tasks/settings").then(function (response) {
+      apply_subtitle_task_settings(subtitle_task_settings_policy(response));
+    }).catch(function (error) {
+      show_subtitle_task_settings_message((error && error.message) || "读取任务限制失败", true);
+    }).finally(function () {
+      buttons.prop("disabled", false);
+    });
+  }
+
+  function collect_subtitle_task_settings() {
+    const policy = {};
+    $("#subtitle_task_settings_form [data-policy-key]").each(function () {
+      policy[$(this).data("policy-key")] = parseInt($(this).val(), 10);
+    });
+    return policy;
+  }
+
+  function validate_subtitle_task_settings(policy) {
+    const form = document.getElementById("subtitle_task_settings_form");
+    if (form && !form.reportValidity()) {
+      return "请检查超出安全范围的设置";
+    }
+    if (policy.batch_limit_mb < policy.text_file_limit_mb || policy.batch_limit_mb < policy.vobsub_limit_mb) {
+      return "单批总量不能小于文本单文件或 VobSub 组合上限";
+    }
+    if (policy.staging_quota_mb < policy.batch_limit_mb * 6) {
+      return "暂存总额度不能小于单批总量的 6 倍（含编码转换、原子临时文件和对齐参考）";
+    }
+    if (policy.llm_max_batch_items > policy.max_batch_items) {
+      return "LLM 对齐单批数量不能大于普通单批数量";
+    }
+    return "";
+  }
+
+  function save_subtitle_task_settings() {
+    const policy = collect_subtitle_task_settings();
+    const validation_error = validate_subtitle_task_settings(policy);
+    if (validation_error) {
+      show_subtitle_task_settings_message(validation_error, true);
+      return;
+    }
+    const buttons = $("#subtitle_task_settings_reload,#subtitle_task_settings_save");
+    buttons.prop("disabled", true);
+    $("#subtitle_task_settings_message").addClass("d-none");
+    SubtitleTasks.request("POST", "/subtitle/tasks/settings", policy).then(function (response) {
+      apply_subtitle_task_settings(subtitle_task_settings_policy(response));
+      show_subtitle_task_settings_message("任务限制已保存；正在运行和已排队任务仍使用入队时的配置快照。", false);
+    }).catch(function (error) {
+      show_subtitle_task_settings_message((error && error.message) || "保存任务限制失败", true);
+    }).finally(function () {
+      buttons.prop("disabled", false);
+    });
+  }
+
+  SubtitleTasks.init();
+  $("#subtitle_task_settings_reload").unbind("click").click(load_subtitle_task_settings);
+  $("#subtitle_task_settings_save").unbind("click").click(save_subtitle_task_settings);
+  load_subtitle_task_settings();
 
 </script>

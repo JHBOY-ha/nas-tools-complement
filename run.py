@@ -1,6 +1,7 @@
 import os
 import signal
 import sys
+import threading
 import time
 import warnings
 
@@ -13,7 +14,6 @@ warnings.filterwarnings('ignore')
 is_windows_exe = getattr(sys, 'frozen', False) and (os.name == "nt")
 if is_windows_exe:
     # 托盘相关库
-    import threading
     from windows.trayicon import TrayIcon, NullWriter
 
     # 初始化环境变量
@@ -54,6 +54,11 @@ def sigal_handler(num, stack):
     """
     if SystemUtils.is_docker():
         log.warn('捕捉到退出信号：%s，开始退出...' % num)
+        try:
+            from app.helper.subtitle_tasks import get_subtitle_task_manager
+            get_subtitle_task_manager().shutdown(wait=False)
+        except Exception:
+            pass
         # 停止虚拟显示
         DisplayHelper().quit()
         # 退出主进程
@@ -108,6 +113,30 @@ def init_system():
 
 def start_service():
     log.console("开始启动服务...")
+    # 先注册处理器，再恢复 SQLite 中的上传任务。检测和二次处理在
+    # 重启后只标记 interrupted，避免 NAS 启动时突然恢复扫描。
+    from app.helper.subtitle_tasks import get_subtitle_task_manager
+    from app.helper.subtitle_task_processors import register_subtitle_task_processors
+    subtitle_task_manager = get_subtitle_task_manager()
+    register_subtitle_task_processors(subtitle_task_manager)
+
+    def start_subtitle_tasks():
+        try:
+            subtitle_task_manager.start()
+        except Exception as error:
+            # The web process must still become reachable so an administrator
+            # can inspect logs/settings when recovery hits a slow or faulty NAS
+            # volume.  API access will retry the same guarded start path.
+            log.error("字幕任务中心启动失败：%s" % str(error))
+
+    # Upload recovery can hash existing checkpoints.  Keep that bounded work
+    # off the web-server startup critical path; the manager lock still prevents
+    # a concurrent API request from running ahead of recovery.
+    threading.Thread(
+        target=start_subtitle_tasks,
+        name="subtitle-task-startup",
+        daemon=True
+    ).start()
     # 启动虚拟显示
     DisplayHelper()
     # 启动定时服务

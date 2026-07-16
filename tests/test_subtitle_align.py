@@ -432,6 +432,88 @@ class SubtitleAlignTest(TestCase):
             with open(source, "r", encoding="utf-8") as file_obj:
                 self.assertEqual(original, file_obj.read())
 
+    def test_llm_translation_uses_decreasing_remaining_timeout_without_retries(self):
+        cues = [
+            {"start": 0, "end": 1000, "text": "first line"},
+            {"start": 1000, "end": 2000, "text": "second line"}
+        ]
+        batches = [
+            [{"id": 0, "text": "first line"}],
+            [{"id": 1, "text": "second line"}]
+        ]
+        mock_client = Mock()
+        mock_client.is_ready.return_value = True
+        mock_client.complete_json.side_effect = [
+            [{"id": 0, "text": "第一句"}],
+            [{"id": 1, "text": "第二句"}]
+        ]
+        SubtitleAligner._llm_translation_cache.clear()
+
+        with patch("app.helper.subtitle_align.LLMClient", return_value=mock_client), \
+                patch.object(
+                    SubtitleAligner,
+                    "_SubtitleAligner__is_llm_alignment_enabled",
+                    return_value=True
+                ), \
+                patch.object(
+                    SubtitleAligner,
+                    "_SubtitleAligner__iter_translation_batches",
+                    return_value=batches
+                ), \
+                patch(
+                    "app.helper.subtitle_align.time.monotonic",
+                    side_effect=[100, 101, 102, 103, 104, 105, 106]
+                ):
+            translated, message = SubtitleAligner._SubtitleAligner__translate_reference_cues(
+                cues,
+                target_language="zh-CN",
+                timeout=10,
+                max_batches=2
+            )
+
+        self.assertEqual("", message)
+        self.assertEqual(["第一句", "第二句"], [cue["text"] for cue in translated])
+        self.assertEqual(2, mock_client.complete_json.call_count)
+        first_kwargs = mock_client.complete_json.call_args_list[0].kwargs
+        second_kwargs = mock_client.complete_json.call_args_list[1].kwargs
+        self.assertEqual(9, first_kwargs["timeout"])
+        self.assertEqual(6, second_kwargs["timeout"])
+        self.assertEqual(0, first_kwargs["max_retries"])
+        self.assertEqual(0, second_kwargs["max_retries"])
+
+    def test_llm_translation_checks_cancel_after_request(self):
+        cues = [{"start": 0, "end": 1000, "text": "first line"}]
+        batch = [{"id": 0, "text": "first line"}]
+        mock_client = Mock()
+        mock_client.is_ready.return_value = True
+        mock_client.complete_json.return_value = [{"id": 0, "text": "第一句"}]
+        cancel_check = Mock(side_effect=[False, True])
+        SubtitleAligner._llm_translation_cache.clear()
+
+        with patch("app.helper.subtitle_align.LLMClient", return_value=mock_client), \
+                patch.object(
+                    SubtitleAligner,
+                    "_SubtitleAligner__is_llm_alignment_enabled",
+                    return_value=True
+                ), \
+                patch.object(
+                    SubtitleAligner,
+                    "_SubtitleAligner__iter_translation_batches",
+                    return_value=[batch]
+                ), \
+                patch("app.helper.subtitle_align.time.monotonic", side_effect=[100, 101]):
+            translated, message = SubtitleAligner._SubtitleAligner__translate_reference_cues(
+                cues,
+                target_language="zh-CN",
+                cancel_check=cancel_check,
+                timeout=10
+            )
+
+        self.assertIsNone(translated)
+        self.assertEqual("任务已取消", message)
+        self.assertEqual(2, cancel_check.call_count)
+        self.assertEqual(0, mock_client.complete_json.call_args.kwargs["max_retries"])
+
     def test_align_subtitle_skips_when_ffmpeg_missing(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             source = os.path.join(tmpdir, "source.srt")
@@ -457,3 +539,67 @@ class SubtitleAlignTest(TestCase):
 
             self.assertFalse(ret["applied"])
             self.assertIn("ffmpeg/ffprobe", ret["message"])
+
+    def test_align_subtitle_caps_each_blocking_step_to_upload_remaining_budget(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = os.path.join(tmpdir, "source.srt")
+            media = os.path.join(tmpdir, "Movie.mkv")
+            _write(source, _srt([
+                ("00:00:01,000", "00:00:02,000", "A sufficiently long subtitle line")
+            ]))
+            open(media, "wb").close()
+            task_work = os.path.join(tmpdir, "task-work")
+            remaining = Mock(side_effect=[5.0, 4.0, 3.0])
+            with patch.object(SubtitleAligner, "_SubtitleAligner__is_enabled", return_value=True), \
+                    patch("app.helper.subtitle_align.shutil.which", return_value="tool"), \
+                    patch.object(SubtitleAligner, "_SubtitleAligner__detect_subtitle_language", return_value="eng"), \
+                    patch.object(
+                        SubtitleAligner, "_SubtitleAligner__select_reference_stream",
+                        return_value={"index": 0, "_language": "eng"}
+                    ) as select_stream, \
+                    patch.object(
+                        SubtitleAligner, "_SubtitleAligner__extract_reference_subtitle",
+                        return_value=(True, "")
+                    ) as extract_reference, \
+                    patch.object(
+                        SubtitleAligner, "align_with_reference_file",
+                        return_value={"applied": True, "skipped": False, "message": "ok"}
+                    ) as align_reference:
+                result = SubtitleAligner.align_subtitle(
+                    source, media, align_mode="llm",
+                    ffprobe_timeout=10, ffmpeg_timeout=60, llm_timeout=180,
+                    remaining_budget=remaining,
+                    temporary_dir=task_work,
+                    reference_max_bytes=12345
+                )
+
+            self.assertTrue(result["applied"])
+            self.assertEqual(select_stream.call_args.kwargs["timeout"], 5.0)
+            self.assertEqual(extract_reference.call_args.kwargs["timeout"], 4.0)
+            self.assertEqual(extract_reference.call_args.kwargs["max_bytes"], 12345)
+            reference_path = extract_reference.call_args.args[2]
+            self.assertEqual(
+                os.path.commonpath([task_work, reference_path]),
+                task_work
+            )
+            self.assertEqual(align_reference.call_args.kwargs["llm_timeout"], 3.0)
+
+    def test_reference_extraction_has_ffmpeg_file_size_cap(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            media = os.path.join(tmpdir, "Movie.mkv")
+            output = os.path.join(tmpdir, "reference.srt")
+            open(media, "wb").close()
+            with open(output, "wb") as file_obj:
+                file_obj.write(b"x" * 11)
+            completed = Mock(returncode=0, stderr="")
+            with patch.object(
+                    SubtitleAligner, "_SubtitleAligner__run_process",
+                    return_value=completed) as run_process:
+                ok, message = SubtitleAligner._SubtitleAligner__extract_reference_subtitle(
+                    media, 0, output, max_bytes=10
+                )
+
+        self.assertFalse(ok)
+        self.assertIn("大小限制", message)
+        command = run_process.call_args.args[0]
+        self.assertEqual(command[command.index("-fs") + 1], "11")

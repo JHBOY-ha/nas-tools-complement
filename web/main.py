@@ -4,6 +4,7 @@ import os.path
 import re
 import shutil
 import sqlite3
+import tempfile
 import time
 import traceback
 import urllib
@@ -15,8 +16,11 @@ from threading import Lock
 from urllib import parse
 
 from flask import Flask, request, json, render_template, make_response, session, send_from_directory, send_file
+from flask.wrappers import Request as FlaskRequest
 from flask_compress import Compress
 from flask_login import LoginManager, login_user, login_required, current_user
+from werkzeug.exceptions import RequestEntityTooLarge
+from werkzeug.http import parse_options_header
 
 import log
 from app.brushtask import BrushTask
@@ -50,8 +54,256 @@ from web.security import require_auth
 # 配置文件锁
 ConfigLock = Lock()
 
+_SUBTITLE_UPLOAD_HTTP_LIMIT = 260 * 1024 * 1024
+_SUBTITLE_UPLOAD_MAX_FORM_MEMORY = 64 * 1024
+_SUBTITLE_UPLOAD_MAX_PARTS = 64
+_SUBTITLE_UPLOAD_MAX_FILE_PARTS = 40
+
+
+class _MultipartPartLimitStream:
+    """Count multipart boundaries before Werkzeug allocates every part.
+
+    Werkzeug 2.1 does not provide a parser-level part limit.  The wrapper is
+    intentionally scoped to the subtitle upload endpoint and remains useful
+    with newer Werkzeug versions as a defense-in-depth streaming limit.
+    """
+
+    _max_boundary_padding = 1024
+
+    def __init__(self, stream, boundary, max_parts, max_bytes=None):
+        self._stream = stream
+        self._marker = b"--" + boundary if boundary else b""
+        self._max_parts = max(int(max_parts or 0), 1)
+        self._max_bytes = max(int(max_bytes or 0), 1) if max_bytes else None
+        self._bytes_read = 0
+        self._tail = b""
+        self._boundaries = 0
+        self._overlong_padding_closing = None
+
+    def _checked(self, data, eof=False):
+        data = data or b""
+        self._bytes_read += len(data)
+        if self._max_bytes is not None and self._bytes_read > self._max_bytes:
+            raise RequestEntityTooLarge("字幕上传请求超过当前批次字节限制")
+        if self._marker:
+            scan_data = bytes(data)
+            if self._overlong_padding_closing is not None:
+                index = 0
+                while index < len(scan_data) and scan_data[index] in (9, 32):
+                    index += 1
+                if index >= len(scan_data):
+                    if eof:
+                        closing = self._overlong_padding_closing
+                        self._overlong_padding_closing = None
+                        if closing:
+                            raise RequestEntityTooLarge(
+                                "字幕上传 multipart 边界空白过长"
+                            )
+                    return data
+                closing = self._overlong_padding_closing
+                self._overlong_padding_closing = None
+                if scan_data[index] in (10, 13):
+                    raise RequestEntityTooLarge(
+                        "字幕上传 multipart 边界空白过长"
+                    )
+                # The overlong whitespace was followed by ordinary content,
+                # so the candidate was not a delimiter.  Continue scanning
+                # after that whitespace for later real boundary lines.
+                scan_data = scan_data[index:]
+            combined = self._tail + scan_data
+            offset = 0
+            processed_through = 0
+            while True:
+                marker_at = combined.find(self._marker, offset)
+                if marker_at < 0:
+                    break
+                if marker_at <= 0 or combined[marker_at - 1] not in (10, 13):
+                    # The initial delimiter is not part of the N subsequent
+                    # boundaries used for the part count.  Any other token
+                    # without a line-break prefix is ordinary file content;
+                    # do not apply delimiter padding rules to it.
+                    processed_through = marker_at + 1
+                    offset = marker_at + 1
+                    continue
+                suffix_at = marker_at + len(self._marker)
+                if suffix_at >= len(combined):
+                    break
+                suffix_byte = combined[suffix_at]
+                closing = False
+                if suffix_byte == 45:
+                    if suffix_at + 1 >= len(combined):
+                        break
+                    if combined[suffix_at:suffix_at + 2] == b"--":
+                        closing = True
+                        suffix_at += 2
+                padding_start = suffix_at
+                while suffix_at < len(combined) and combined[suffix_at] in (9, 32):
+                    suffix_at += 1
+                padding_length = suffix_at - padding_start
+                if padding_length > self._max_boundary_padding:
+                    if suffix_at >= len(combined) and not eof:
+                        self._overlong_padding_closing = closing
+                        processed_through = len(combined)
+                        break
+                    if (suffix_at >= len(combined) and closing) \
+                            or (suffix_at < len(combined)
+                                and combined[suffix_at] in (10, 13)):
+                        raise RequestEntityTooLarge(
+                            "字幕上传 multipart 边界空白过长"
+                        )
+                    valid_suffix = False
+                elif suffix_at >= len(combined):
+                    if not eof:
+                        break
+                    valid_suffix = closing
+                else:
+                    valid_suffix = combined[suffix_at] in (10, 13)
+                # Werkzeug 2.1 accepts CRLF, bare LF and bare CR multipart line
+                # endings.  A token is a delimiter only when it also has the
+                # RFC boundary suffix; subtitle text containing
+                # ``\n--boundary-anything`` or ``\n--boundary--anything`` must
+                # not consume the part budget.
+                if valid_suffix:
+                    self._boundaries += 1
+                processed_through = marker_at + 1
+                offset = marker_at + 1
+            # For N parts there are N CRLF-prefixed boundaries after the
+            # initial boundary, including the closing boundary.
+            if self._boundaries > self._max_parts:
+                raise RequestEntityTooLarge("字幕上传 multipart 组件过多")
+            tail_size = len(self._marker) + self._max_boundary_padding + 5
+            discard = max(len(combined) - tail_size, processed_through, 0)
+            self._tail = combined[discard:]
+        return data
+
+    def read(self, size=-1):
+        data = self._stream.read(size)
+        return self._checked(data, eof=not data and size != 0)
+
+    def readinto(self, buffer):
+        readinto = getattr(self._stream, "readinto", None)
+        if callable(readinto):
+            size = readinto(buffer)
+            if size:
+                self._checked(memoryview(buffer)[:size])
+            elif len(buffer):
+                self._checked(b"", eof=True)
+            return size
+        data = self._stream.read(len(buffer))
+        size = len(data or b"")
+        if size:
+            buffer[:size] = data
+            self._checked(data)
+        elif len(buffer):
+            self._checked(b"", eof=True)
+        return size
+
+    def readline(self, size=-1):
+        data = self._stream.readline(size)
+        return self._checked(data, eof=not data and size != 0)
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+class _NasToolsRequest(FlaskRequest):
+    """Spool subtitle multipart parts on the task staging volume.
+
+    This avoids Werkzeug first filling an unrelated system temporary volume.
+    The task manager validates/hash-checks these files and atomically adopts
+    them, so the normal path does not write a second full copy.
+    """
+
+    def _is_subtitle_upload(self):
+        return self.path.rstrip("/") == "/subtitle/upload"
+
+    def _load_form_data(self):
+        if self._is_subtitle_upload():
+            # These assignments work with the Flask 3 properties and with the
+            # plain Request attributes used by the pinned Flask/Werkzeug 2.1.
+            self.max_form_memory_size = _SUBTITLE_UPLOAD_MAX_FORM_MEMORY
+            try:
+                self.max_form_parts = _SUBTITLE_UPLOAD_MAX_PARTS
+            except (AttributeError, TypeError):
+                pass
+            content_type, options = parse_options_header(
+                self.environ.get("CONTENT_TYPE", "")
+            )
+            boundary = options.get("boundary") if content_type == "multipart/form-data" else None
+            raw_stream = self.environ.get("wsgi.input")
+            if raw_stream and not isinstance(raw_stream, _MultipartPartLimitStream):
+                try:
+                    boundary = boundary.encode("ascii", "strict") \
+                        if isinstance(boundary, str) else bytes(boundary or b"")
+                except (UnicodeEncodeError, TypeError, ValueError):
+                    boundary = b""
+                self.environ["wsgi.input"] = _MultipartPartLimitStream(
+                    raw_stream, boundary, _SUBTITLE_UPLOAD_MAX_PARTS,
+                    max_bytes=getattr(
+                        self, "_subtitle_upload_body_limit",
+                        _SUBTITLE_UPLOAD_HTTP_LIMIT
+                    )
+                )
+        return super()._load_form_data()
+
+    def make_form_data_parser(self):
+        parser = super().make_form_data_parser()
+        if self._is_subtitle_upload():
+            parser.max_form_memory_size = _SUBTITLE_UPLOAD_MAX_FORM_MEMORY
+            if hasattr(parser, "max_form_parts"):
+                parser.max_form_parts = _SUBTITLE_UPLOAD_MAX_PARTS
+        return parser
+
+    def _get_file_stream(self, total_content_length, content_type,
+                         filename=None, content_length=None):
+        if self._is_subtitle_upload():
+            part_count = int(getattr(self, "_subtitle_upload_file_parts", 0)) + 1
+            self._subtitle_upload_file_parts = part_count
+            if part_count > _SUBTITLE_UPLOAD_MAX_FILE_PARTS:
+                raise RequestEntityTooLarge("字幕上传文件组件超过 40 个")
+            incoming_root = os.path.join(Config().get_temp_path(), "subtitle-upload-incoming")
+            os.makedirs(incoming_root, exist_ok=True)
+            stream = tempfile.NamedTemporaryFile(
+                mode="w+b", prefix="subtitle-http-", suffix=".upload",
+                dir=incoming_root, delete=False
+            )
+            paths = getattr(self, "_subtitle_upload_temp_paths", None)
+            if paths is None:
+                paths = []
+                self._subtitle_upload_temp_paths = paths
+            paths.append(stream.name)
+            streams = getattr(self, "_subtitle_upload_temp_streams", None)
+            if streams is None:
+                streams = []
+                self._subtitle_upload_temp_streams = streams
+            streams.append(stream)
+            return stream
+        return super()._get_file_stream(
+            total_content_length, content_type, filename, content_length
+        )
+
+    def close(self):
+        try:
+            super().close()
+        finally:
+            # A multipart parse error can leave streams outside request.files.
+            # Close every stream we created before unlinking it (required on
+            # Windows and also prevents descriptor leaks on Linux).
+            for stream in getattr(self, "_subtitle_upload_temp_streams", []):
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+            for path in getattr(self, "_subtitle_upload_temp_paths", []):
+                try:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                except OSError:
+                    pass
+
 # Flask App
 App = Flask(__name__)
+App.request_class = _NasToolsRequest
 App.config['JSON_AS_ASCII'] = False
 App.secret_key = os.urandom(24)
 App.permanent_session_lifetime = datetime.timedelta(days=30)
@@ -1135,24 +1387,72 @@ def library_episodes():
 @App.route('/library/subtitle/audit', methods=['POST'])
 @login_required
 def library_subtitle_audit():
-    """按全局影视服务器规则检测指定分类的外挂字幕。"""
+    """创建一个有界的后台外挂字幕检测任务。"""
     try:
         data = request.get_json(silent=True) or request.form.to_dict() or {}
-        return MediaLibrary().audit_external_subtitles(
-            data.get("category"),
-            data.get("subcategory")
+        category = str(data.get("category") or "").strip().lower()
+        subcategory = str(data.get("subcategory") or "").strip()
+        mode = str(data.get("mode") or "linked").strip().lower()
+        server_type = str(
+            data.get("server") or Config().get_config('media').get('media_server') or "emby"
+        ).lower()
+        if category not in ["movie", "tv", "anime"]:
+            return {"code": -1, "msg": "请选择要检测的媒体分类"}, 400
+        if server_type not in ["emby", "jellyfin", "plex"]:
+            return {"code": -1, "msg": "请选择目标影视服务器"}, 400
+        if mode not in ["linked", "deep"]:
+            return {"code": -1, "msg": "字幕检测范围无效"}, 400
+        deep_confirmed = _request_bool(data.get("deep_confirmed")) \
+            or _request_bool(data.get("confirmed"))
+        if mode == "deep" and not deep_confirmed:
+            return {
+                "code": -1,
+                "msg": "深度目录扫描需要明确确认",
+                "confirmation_required": True
+            }, 400
+        payload = {
+            "category": category,
+            "subcategory": subcategory,
+            "mode": mode,
+            "server": server_type,
+            "deep_confirmed": deep_confirmed
+        }
+        scope_key = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        task, reused = _subtitle_tasks().submit_task(
+            "audit",
+            owner=_subtitle_task_owner(),
+            payload=payload,
+            request_id=data.get("request_id"),
+            server=server_type,
+            scope_key=scope_key,
+            dedupe_key=scope_key
         )
+        return _subtitle_task_response(task, reused, "已启动字幕检测任务")
     except Exception as e:
         ExceptionUtils.exception_traceback(e)
-        return {"code": -1, "msg": str(e)}
+        return _subtitle_task_error(e)
 
 
 @App.route('/library/subtitle/audit/history', methods=['GET'])
 @login_required
 def library_subtitle_audit_history():
-    """读取最近 3 次外挂字幕检测记录。"""
+    """从 SQLite 任务记录读取最近 3 次完整或部分检测。"""
     try:
-        return MediaLibrary().get_external_subtitle_audit_history()
+        manager = _subtitle_tasks()
+        server_type = str(request.args.get("server") or "").strip().lower()
+        if server_type and server_type not in ["emby", "jellyfin", "plex"]:
+            return {"code": -1, "msg": "影视服务器配置无效"}, 400
+        history = manager.recent_audit_results(server=server_type, limit=3)
+        if not history:
+            # Before the one-time migration has run, retain read compatibility.
+            legacy = MediaLibrary().get_external_subtitle_audit_history()
+            if server_type:
+                legacy["history"] = [
+                    item for item in (legacy.get("history") or [])
+                    if str(item.get("server") or "").lower() == server_type
+                ][:3]
+            return legacy
+        return {"code": 0, "history": history[:3]}
     except Exception as e:
         ExceptionUtils.exception_traceback(e)
         return {"code": -1, "msg": str(e)}
@@ -1172,38 +1472,46 @@ def library_subtitle_audit_categories():
 @App.route('/library/subtitle/repair', methods=['POST'])
 @login_required
 def library_subtitle_repair():
-    """按全局影视服务器规则二次处理单个电影的现有外挂字幕。"""
+    """创建单个媒体的外挂字幕二次处理任务。"""
     try:
         data = request.get_json(silent=True) or request.form.to_dict() or {}
         media_file = os.path.normpath(str(data.get("media_path") or ""))
         media_config = Config().get_config('media') or {}
-        server_type = str(media_config.get('media_server') or "emby").lower()
+        server_type = str(data.get("server") or media_config.get('media_server') or "emby").lower()
         if not media_file or not os.path.isfile(media_file):
-            return {"code": -1, "msg": "媒体文件不存在"}
+            return {"code": -1, "msg": "媒体文件不存在"}, 400
         if os.path.splitext(media_file)[-1].lower() not in RMT_MEDIAEXT:
-            return {"code": -1, "msg": "请选择有效的媒体文件"}
+            return {"code": -1, "msg": "请选择有效的媒体文件"}, 400
         if not _is_within_media_library(media_file):
-            return {"code": -1, "msg": "媒体文件不在媒体库目录范围内"}
+            return {"code": -1, "msg": "媒体文件不在媒体库目录范围内"}, 400
         if server_type not in ["emby", "jellyfin", "plex"]:
-            return {"code": -1, "msg": "全局影视服务器配置无效"}
-
-        success, message, result = Subtitle().repair_external_subtitles(media_file, server_type)
-        if not success:
-            return {"code": -1, "msg": message, "data": result}
-        MediaLibrary.invalidate_subtitle_directory_cache(media_file)
-        result["audit_status"] = MediaLibrary.update_external_subtitle_audit_status(media_file, server_type)
-        refresh_msg = ""
-        try:
-            refreshed = MediaServer().refresh_root_library_by_type(server_type)
-            if refreshed is False:
-                refresh_msg = "，但刷新媒体服务器失败"
-        except Exception as e:
-            ExceptionUtils.exception_traceback(e)
-            refresh_msg = f"，但刷新媒体服务器失败：{str(e)}"
-        return {"code": 0, "msg": f"{message}{refresh_msg}", "data": result}
+            return {"code": -1, "msg": "影视服务器配置无效"}, 400
+        path_authorization = _path_authorization_snapshot(
+            media_file, _get_all_media_library_root_paths()
+        )
+        if not path_authorization:
+            return {"code": -1, "msg": "媒体文件路径在入队前发生变化，请重试"}, 409
+        payload = {
+            "media_path": media_file,
+            "server": server_type,
+            "server_item_id": data.get("server_item_id") or "",
+            "parent_server_item_id": data.get("parent_server_item_id") or "",
+            "library_id": data.get("library_id") or "",
+            "path_authorization": {"repair": path_authorization}
+        }
+        dedupe_key = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        task, reused = _subtitle_tasks().submit_task(
+            "repair",
+            owner=_subtitle_task_owner(),
+            payload=payload,
+            request_id=data.get("request_id"),
+            server=server_type,
+            dedupe_key=dedupe_key
+        )
+        return _subtitle_task_response(task, reused, "已加入字幕二次处理队列")
     except Exception as e:
         ExceptionUtils.exception_traceback(e)
-        return {"code": -1, "msg": str(e)}
+        return _subtitle_task_error(e)
 
 
 @App.route('/library/image/<itemid>', methods=['GET'])
@@ -1899,124 +2207,350 @@ def _get_all_media_library_root_paths():
     return [p for p in roots if p]
 
 
-def _is_within_media_library(path):
-    """判断路径是否在任一媒体库根目录范围内"""
+def _is_within_roots(path, roots):
+    """Require the lexical media file's parent directory inside a trusted root.
+
+    Media-link layouts intentionally use a symlink file in the library that
+    points back to a download volume.  Subtitles belong beside that lexical
+    link, so authorization follows parent directories but not the final file
+    symlink.
+    """
     if not path:
         return False
-    for root in _get_all_media_library_root_paths():
-        if PathUtils.is_path_in_path(root, path):
-            return True
+    try:
+        lexical_path = os.path.abspath(os.path.normpath(path))
+        candidate = os.path.normcase(os.path.realpath(os.path.dirname(lexical_path)))
+    except (OSError, ValueError, TypeError):
+        return False
+    for root in roots or []:
+        try:
+            real_root = os.path.normcase(os.path.realpath(os.path.abspath(root)))
+            if os.path.commonpath([real_root, candidate]) == real_root:
+                return True
+        except (OSError, ValueError, TypeError):
+            continue
     return False
 
 
-# 手动上传字幕
-# 流程：校验参数 → 查找转移历史 → 校验 target_file 安全性 → 调用 Subtitle.upload_subtitle() → 刷新媒体服务器
+def _is_within_media_library(path):
+    """判断路径是否在任一媒体库根目录范围内"""
+    return _is_within_roots(path, _get_all_media_library_root_paths())
+
+
+def _get_subtitle_upload_source_roots():
+    roots = list(_get_all_media_library_root_paths())
+    try:
+        roots.extend(Downloader().get_download_visit_dirs() or [])
+    except Exception as error:
+        log.warn("【SubtitleTask】读取下载访问目录失败：%s" % str(error))
+    return roots
+
+
+def _is_allowed_subtitle_upload_source(path):
+    """Allow only configured download-visible paths or media-library roots."""
+    return _is_within_roots(path, _get_subtitle_upload_source_roots())
+
+
+def _path_authorization_snapshot(path, roots):
+    """Persist lexical placement plus link/referent identities for TOCTOU checks."""
+    if not path:
+        return None
+    try:
+        lexical_path = os.path.abspath(os.path.normpath(path))
+        parent_real = os.path.normcase(os.path.realpath(os.path.dirname(lexical_path)))
+        referent_real = os.path.normcase(os.path.realpath(lexical_path))
+        matched_roots = []
+        for root in roots or []:
+            if not root:
+                continue
+            try:
+                real_root = os.path.normcase(os.path.realpath(os.path.abspath(root)))
+                if os.path.commonpath([real_root, parent_real]) == real_root:
+                    matched_roots.append(real_root)
+            except (OSError, ValueError, TypeError):
+                # Different Windows drive letters are expected when media and
+                # download libraries span several volumes; keep checking the
+                # remaining trusted roots.
+                continue
+        if not matched_roots or not os.path.isfile(lexical_path):
+            return None
+        link_stat = os.lstat(lexical_path)
+        referent_stat = os.stat(lexical_path)
+
+        def identity(stat_result):
+            return {
+                "device": int(getattr(stat_result, "st_dev", 0) or 0),
+                "inode": int(getattr(stat_result, "st_ino", 0) or 0),
+                "size": int(getattr(stat_result, "st_size", 0) or 0),
+                "mtime_ns": int(getattr(stat_result, "st_mtime_ns", 0) or 0)
+            }
+
+        return {
+            "path": lexical_path,
+            # Compatibility fields remain readable by pre-upgrade workers.
+            "real_path": referent_real,
+            "directory": parent_real,
+            "parent_real": parent_real,
+            "referent_real": referent_real,
+            "is_link": bool(os.path.islink(lexical_path)),
+            "trusted_roots": sorted(set(matched_roots)),
+            "identity": identity(referent_stat),
+            "link_identity": identity(link_stat),
+            "referent_identity": identity(referent_stat)
+        }
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _subtitle_task_owner():
+    return str(current_user.get_id() if current_user.is_authenticated else "")
+
+
+def _subtitle_task_admin():
+    return current_user.is_authenticated and str(current_user.get_id()) == "0"
+
+
+def _request_bool(value):
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in ["1", "true", "yes", "on", "y"]
+
+
+def _subtitle_tasks():
+    """Lazily register task processors after the application DB is available."""
+    from app.helper.subtitle_tasks import get_subtitle_task_manager
+    from app.helper.subtitle_task_processors import register_subtitle_task_processors
+    manager = get_subtitle_task_manager()
+    register_subtitle_task_processors(manager)
+    manager.start()
+    return manager
+
+
+def _subtitle_task_error(error):
+    status = int(getattr(error, "status_code", getattr(error, "code", 500)) or 500)
+    if status < 400 or status > 599:
+        status = 500
+    return {"code": -1, "msg": str(error), "error": str(error)}, status
+
+
+def _subtitle_task_response(task, reused=False, created_message="已加入字幕任务队列"):
+    task = dict(task or {})
+    task["reused"] = bool(reused)
+    task["deduplicated"] = bool(reused)
+    return {
+        "code": 0,
+        "msg": "已连接到现有字幕任务" if reused else created_message,
+        "task_id": task.get("task_id") or task.get("id"),
+        "status": task.get("status"),
+        "reused": bool(reused),
+        "data": task
+    }, 200 if reused else 202
+
+
+# 手动上传字幕：HTTP 只负责流式暂存和入队，规范化/对齐/发布/刷新均在后台执行。
 @App.route('/subtitle/upload', methods=['POST'])
 @login_required
 def upload_subtitle():
+    manager = None
+    admission_acquired = False
     try:
+        upload_type, upload_options = parse_options_header(
+            request.environ.get("CONTENT_TYPE", "")
+        )
+        upload_boundary = upload_options.get("boundary") \
+            if upload_type == "multipart/form-data" else None
+        try:
+            boundary_valid = bool(upload_boundary) \
+                and len(str(upload_boundary).encode("ascii", "strict")) <= 70
+        except (UnicodeEncodeError, TypeError, ValueError):
+            boundary_valid = False
+        if upload_type != "multipart/form-data" or not boundary_valid:
+            return {"code": -1, "msg": "字幕上传仅接受合法的 multipart/form-data 请求"}, 415
+        if request.content_length is not None \
+                and int(request.content_length) > _SUBTITLE_UPLOAD_HTTP_LIMIT:
+            return {"code": -1, "msg": "上传请求超过 260 MiB 硬限制"}, 413
+        # Check the persistent queue and staging-volume safety margin before
+        # touching request.form/request.files (which triggers multipart I/O).
+        manager = _subtitle_tasks()
+        manager.acquire_upload_admission(request.content_length)
+        admission_acquired = True
+        policy = manager.get_settings()
+        batch_body_limit = (
+            max(int(policy.get("batch_limit_mb") or 250), 1) * 1024 * 1024
+            + 1024 * 1024
+        )
+        request._subtitle_upload_body_limit = min(
+            _SUBTITLE_UPLOAD_HTTP_LIMIT, batch_body_limit
+        )
+        if request.content_length is not None \
+                and int(request.content_length) > request._subtitle_upload_body_limit:
+            return {"code": -1, "msg": "上传请求超过当前批次字节限制"}, 413
         media_file = request.form.get("path")
         target_file = request.form.get("target_path") or ""
         server_type = str(request.form.get("server") or Config().get_config('media').get('media_server') or "emby").lower()
         align_mode = str(request.form.get("align") or "none").lower()
         upload_files = request.files.getlist("file")
         if not media_file:
-            return {"code": -1, "msg": "媒体文件不能为空"}
+            return {"code": -1, "msg": "媒体文件不能为空"}, 400
         media_file = os.path.normpath(media_file)
         if not os.path.exists(media_file) or not os.path.isfile(media_file):
-            return {"code": -1, "msg": "媒体文件不存在"}
+            return {"code": -1, "msg": "媒体文件不存在"}, 400
         if os.path.splitext(media_file)[-1].lower() not in RMT_MEDIAEXT:
-            return {"code": -1, "msg": "请选择有效的媒体文件"}
+            return {"code": -1, "msg": "请选择有效的媒体文件"}, 400
+        if not _is_allowed_subtitle_upload_source(media_file):
+            return {"code": -1, "msg": "媒体文件不在已配置的下载访问目录或媒体库范围内"}, 400
         if server_type not in ["emby", "jellyfin", "plex"]:
-            return {"code": -1, "msg": "请选择目标影视服务器"}
+            return {"code": -1, "msg": "请选择目标影视服务器"}, 400
         if align_mode not in ["auto", "offset", "segmented", "llm", "none"]:
-            return {"code": -1, "msg": "请选择有效的字幕对齐模式"}
+            return {"code": -1, "msg": "请选择有效的字幕对齐模式"}, 400
         if not upload_files:
-            return {"code": -1, "msg": "请选择字幕文件"}
-        if len(upload_files) > 20:
-            return {"code": -1, "msg": "单次最多上传 20 个字幕文件"}
+            return {"code": -1, "msg": "请选择字幕文件"}, 400
+        if len(upload_files) > 40:
+            return {"code": -1, "msg": "上传文件组件过多"}, 413
 
         # 查找该媒体文件的转移历史，获取整理模式和目标路径
         history = DbHelper().get_latest_transfer_history_by_source_full_path(media_file)
         rmt_mode = ModuleConf.get_enum_item(RmtMode, history.MODE) if history and history.MODE else None
         if not rmt_mode:
             rmt_mode = ModuleConf.RMT_MODES.get(Config().get_config('pt').get('rmt_mode') or "link")
-        if target_file:
-            target_file = os.path.normpath(target_file)
-        elif history and history.DEST_PATH and history.DEST_FILENAME:
-            target_file = os.path.normpath(os.path.join(history.DEST_PATH, history.DEST_FILENAME))
-        # 校验目标路径必须在已配置的媒体库根目录内，防止路径穿越攻击
+        requested_target = os.path.normpath(target_file) if target_file else ""
+        history_target = ""
+        if history and history.DEST_PATH and history.DEST_FILENAME:
+            history_target = os.path.normpath(os.path.join(history.DEST_PATH, history.DEST_FILENAME))
+        if history_target:
+            if requested_target and os.path.normcase(os.path.realpath(requested_target)) \
+                    != os.path.normcase(os.path.realpath(history_target)):
+                return {"code": -1, "msg": "上传目标与媒体链接历史不匹配"}, 400
+            target_file = history_target
+        elif requested_target:
+            # 没有可信转移历史时，客户端不能把字幕写到库内另一部影片旁边。
+            if os.path.normcase(os.path.realpath(requested_target)) \
+                    != os.path.normcase(os.path.realpath(media_file)):
+                return {"code": -1, "msg": "无法验证字幕目标与当前媒体的关联"}, 400
+            target_file = ""
+        # 已链接目标是字幕唯一主副本；无链接目标时才落到当前媒体目录。
         if target_file and not _is_within_media_library(target_file):
-            return {"code": -1, "msg": "目标文件不在媒体库目录范围内"}
-
-        # 调用核心逻辑保存并同步字幕；多文件共用一次路径校验和媒体服务器刷新
-        service = Subtitle()
-        upload_results = []
-        successful_data = []
-        for upload_file in upload_files:
-            item_success, item_message, item_data = service.upload_subtitle(
-                upload_file=upload_file,
-                media_file=media_file,
-                target_media_file=target_file,
-                rmt_mode=rmt_mode,
-                server_type=server_type,
-                align_mode=align_mode
-            )
-            upload_results.append({
-                "filename": os.path.basename(upload_file.filename or ""),
-                "success": item_success,
-                "message": item_message,
-                "data": item_data
-            })
-            if item_success:
-                successful_data.append(item_data)
-
-        if len(upload_results) == 1:
-            success = upload_results[0]["success"]
-            message = upload_results[0]["message"]
-            data = upload_results[0]["data"]
-        else:
-            success_count = len(successful_data)
-            failure_count = len(upload_results) - success_count
-            success = success_count > 0
-            message = f"已处理 {len(upload_results)} 个字幕：成功 {success_count} 个"
-            if failure_count:
-                message += f"，失败 {failure_count} 个"
-                first_failure = next((item for item in upload_results if not item.get("success")), {})
-                if first_failure:
-                    message += f"（{first_failure.get('filename') or '字幕'}：{first_failure.get('message') or '处理失败'}）"
-            data = {
-                "results": upload_results,
-                "success_count": success_count,
-                "failure_count": failure_count,
-                "synced": any(item.get("synced") for item in successful_data)
+            return {"code": -1, "msg": "目标文件不在媒体库目录范围内"}, 400
+        if target_file and (not os.path.isfile(target_file)
+                            or os.path.splitext(target_file)[-1].lower() not in RMT_MEDIAEXT):
+            return {"code": -1, "msg": "媒体链接目标文件不存在或无效"}, 400
+        canonical_media = target_file or media_file
+        source_roots = _get_subtitle_upload_source_roots()
+        target_roots = _get_all_media_library_root_paths() if target_file else source_roots
+        source_authorization = _path_authorization_snapshot(media_file, source_roots)
+        target_authorization = _path_authorization_snapshot(canonical_media, target_roots)
+        if not source_authorization or not target_authorization:
+            return {"code": -1, "msg": "字幕任务路径在入队前发生变化，请重新提交"}, 409
+        payload = {
+            "media_file": media_file,
+            "target_media_file": target_file,
+            "canonical_media_file": canonical_media,
+            "linked_target": bool(target_file),
+            "rmt_mode": getattr(rmt_mode, "value", rmt_mode) if rmt_mode else "",
+            "server": server_type,
+            "align_mode": align_mode,
+            "server_item_id": request.form.get("server_item_id") or "",
+            "parent_server_item_id": request.form.get("parent_server_item_id") or "",
+            "library_id": request.form.get("library_id") or "",
+            "path_authorization": {
+                "source": source_authorization,
+                "target": target_authorization
             }
-
-        for item_data in successful_data:
-            for cache_path in [
-                item_data.get("source_subtitle"),
-                item_data.get("target_subtitle"),
-                target_file,
-                media_file
-            ]:
-                if cache_path:
-                    MediaLibrary.invalidate_subtitle_directory_cache(cache_path)
-        refresh_msg = ""
-        # 同步成功后刷新媒体服务器库，使新字幕被媒体服务器识别
-        if success and data.get("synced"):
-            try:
-                refreshed = MediaServer().refresh_root_library_by_type(server_type)
-                if refreshed is False:
-                    refresh_msg = "，但刷新媒体服务器失败"
-            except Exception as e:
-                ExceptionUtils.exception_traceback(e)
-                refresh_msg = f"，但刷新媒体服务器失败：{str(e)}"
-        return {"code": 0 if success else -1,
-                "msg": f"{message}{refresh_msg}",
-                "data": data}
+        }
+        task, reused = manager.submit_upload(
+            owner=_subtitle_task_owner(),
+            files=upload_files,
+            payload=payload,
+            request_id=request.form.get("request_id"),
+            server=server_type
+        )
+        return _subtitle_task_response(task, reused, "字幕已上传并加入处理队列")
     except Exception as e:
         ExceptionUtils.exception_traceback(e)
-        return {"code": -1, "msg": str(e)}
+        return _subtitle_task_error(e)
+    finally:
+        if admission_acquired and manager is not None:
+            manager.release_upload_admission()
+
+
+@App.route('/subtitle/tasks/settings', methods=['GET', 'POST'])
+@login_required
+def subtitle_task_settings():
+    """读取或由管理员更新只影响新任务的资源策略。"""
+    try:
+        manager = _subtitle_tasks()
+        if request.method == 'GET':
+            return {"code": 0, "data": manager.get_settings()}
+        if not _subtitle_task_admin():
+            return {"code": -1, "msg": "只有管理员可以修改字幕任务限制"}, 403
+        data = request.get_json(silent=True) or request.form.to_dict() or {}
+        settings = data.get("policy") if isinstance(data.get("policy"), dict) else data
+        saved = manager.update_settings(settings, updated_by=_subtitle_task_owner())
+        return {"code": 0, "msg": "字幕任务限制已保存，仅影响新任务", "data": saved}
+    except Exception as e:
+        ExceptionUtils.exception_traceback(e)
+        return _subtitle_task_error(e)
+
+
+@App.route('/subtitle/tasks', methods=['GET'])
+@login_required
+def subtitle_task_list():
+    try:
+        task_types = [value for value in str(request.args.get("type") or "").split(",") if value]
+        statuses = [value for value in str(request.args.get("status") or "").split(",") if value]
+        page = max(int(request.args.get("page") or 1), 1)
+        page_size = max(1, min(int(request.args.get("page_size") or request.args.get("limit") or 20), 100))
+        offset = request.args.get("offset")
+        offset = max(int(offset), 0) if offset is not None else (page - 1) * page_size
+        result = _subtitle_tasks().list_tasks(
+            owner=_subtitle_task_owner(),
+            task_types=task_types or None,
+            statuses=statuses or None,
+            limit=page_size,
+            offset=offset
+        )
+        if isinstance(result, list):
+            result = {"items": result, "total": len(result), "limit": page_size, "offset": offset}
+        return {"code": 0, "data": result}
+    except (TypeError, ValueError):
+        return {"code": -1, "msg": "任务分页参数无效"}, 400
+    except Exception as e:
+        ExceptionUtils.exception_traceback(e)
+        return _subtitle_task_error(e)
+
+
+@App.route('/subtitle/tasks/<task_id>', methods=['GET'])
+@login_required
+def subtitle_task_detail(task_id):
+    try:
+        task = _subtitle_tasks().get_task(
+            task_id,
+            owner=_subtitle_task_owner(),
+            admin=False
+        )
+        if not task:
+            return {"code": -1, "msg": "字幕任务不存在"}, 404
+        return {"code": 0, "data": task}
+    except Exception as e:
+        ExceptionUtils.exception_traceback(e)
+        return _subtitle_task_error(e)
+
+
+@App.route('/subtitle/tasks/<task_id>/cancel', methods=['POST'])
+@login_required
+def subtitle_task_cancel(task_id):
+    try:
+        task = _subtitle_tasks().cancel_task(
+            task_id,
+            owner=_subtitle_task_owner(),
+            admin=False
+        )
+        if not task:
+            return {"code": -1, "msg": "字幕任务不存在"}, 404
+        return {"code": 0, "msg": "已请求取消字幕任务", "data": task}
+    except Exception as e:
+        ExceptionUtils.exception_traceback(e)
+        return _subtitle_task_error(e)
 
 
 # base64模板过滤器

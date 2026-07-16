@@ -356,6 +356,50 @@ class Jellyfin(_IMediaClient):
             ExceptionUtils.exception_traceback(e)
             log.error(f"【{self.server_type}】连接Library/Refresh出错：" + str(e))
             return False
+        return False
+
+    def __refresh_jellyfin_item_by_id(self, item_id):
+        """调用 Jellyfin 单项目 Refresh API，绝不回退全库。"""
+        if not item_id or not self._host or not self._apikey:
+            return False
+        req_url = (
+            "%sItems/%s/Refresh?Recursive=true&MetadataRefreshMode=Default"
+            "&ImageRefreshMode=Default&ReplaceAllMetadata=false"
+            "&ReplaceAllImages=false&api_key=%s"
+        ) % (self._host, item_id, self._apikey)
+        try:
+            res = RequestUtils().post_res(req_url)
+            return bool(res)
+        except Exception as e:
+            ExceptionUtils.exception_traceback(e)
+            log.error(f"【{self.server_type}】连接Items/Id/Refresh出错：" + str(e))
+            return False
+
+    def refresh_subtitle_target(self, server_item_id=None,
+                                parent_server_item_id=None,
+                                library_id=None, media_path=None):
+        """只刷新精确项目，剧集失败时最多降级到父剧集。"""
+        candidates = []
+        if server_item_id:
+            candidates.append((server_item_id, "item"))
+        if parent_server_item_id and str(parent_server_item_id) != str(server_item_id or ""):
+            candidates.append((parent_server_item_id, "parent"))
+        if not candidates:
+            return {
+                "status": "skipped", "scope": "none",
+                "message": "缺少经过校验的 Jellyfin 项目 ID"
+            }
+        for item_id, scope in candidates:
+            if self.__refresh_jellyfin_item_by_id(item_id):
+                return {
+                    "status": "refreshed", "scope": scope,
+                    "item_id": item_id,
+                    "message": "已刷新 Jellyfin 项目" if scope == "item" else "已降级刷新父剧集"
+                }
+        return {
+            "status": "failed", "scope": candidates[-1][1],
+            "item_id": candidates[-1][0], "message": "Jellyfin 局部刷新失败"
+        }
 
     def refresh_library_by_items(self, items):
         """
@@ -453,7 +497,10 @@ class Jellyfin(_IMediaClient):
                     if not item_info:
                         continue
                     episodes.append({"id": item_info.get("Id"),
+                                     "server_item_id": item_info.get("Id"),
                                      "series_id": series_id,
+                                     "parent_server_item_id": item_info.get("SeriesId") or series_id,
+                                     "library_id": "",
                                      "type": item_info.get("Type"),
                                      "title": item_info.get("Name"),
                                      "season": item_info.get("ParentIndexNumber"),

@@ -15,6 +15,10 @@ from app.utils.llm_client import LLMClient
 from config import Config
 
 
+class _SubtitleProcessCanceled(Exception):
+    """Raised internally when a task asks a child process to stop."""
+
+
 class SubtitleAligner:
     """
     使用目标视频内嵌文本字幕作为参考，对上传外挂字幕做整体或多锚点分段时间轴修正。
@@ -49,7 +53,10 @@ class SubtitleAligner:
     _llm_translation_cache_ttl = 60 * 60
 
     @classmethod
-    def align_subtitle(cls, subtitle_file, media_file, align_mode="auto"):
+    def align_subtitle(cls, subtitle_file, media_file, align_mode="auto", cancel_check=None,
+                       ffprobe_timeout=None, ffmpeg_timeout=None, llm_timeout=180,
+                       llm_max_batches=8, remaining_budget=None,
+                       temporary_dir=None, reference_max_bytes=20 * 1024 * 1024):
         """
         返回 {"applied": bool, "skipped": bool, "message": str, "mode": str, ...}
         低置信度或环境不可用时只跳过，不抛出业务异常。
@@ -73,19 +80,45 @@ class SubtitleAligner:
         if not cls._lock.acquire(blocking=False):
             return cls.__skip("已有字幕自动对齐任务正在运行")
         try:
+            def bounded_timeout(configured, fallback):
+                timeout = float(fallback if configured is None else configured)
+                if callable(remaining_budget):
+                    remaining = float(remaining_budget())
+                    if remaining <= 0:
+                        raise _SubtitleProcessCanceled()
+                    timeout = min(timeout, remaining)
+                return max(timeout, 0.1)
+
             source_language = cls.__detect_subtitle_language(subtitle_file)
             stream = cls.__select_reference_stream(
                 media_file,
                 preferred_language=source_language,
-                allow_cross_language=align_mode == "llm"
+                allow_cross_language=align_mode == "llm",
+                cancel_check=cancel_check,
+                timeout=bounded_timeout(ffprobe_timeout, cls._ffprobe_timeout)
             )
             if not stream:
                 if align_mode == "llm":
                     return cls.__skip("未找到可用的文本字幕参考轨")
                 return cls.__skip("未找到同语种文本字幕参考轨")
-            with tempfile.TemporaryDirectory() as tmpdir:
+            # Task callers place this directory under their persisted staging
+            # tree so extracted references share the same quota and crash
+            # cleanup boundary instead of leaking onto the system temp volume.
+            temporary_parent = os.path.abspath(
+                temporary_dir or os.path.dirname(os.path.abspath(subtitle_file))
+            )
+            os.makedirs(temporary_parent, exist_ok=True)
+            with tempfile.TemporaryDirectory(
+                    prefix=".subtitle-reference-", dir=temporary_parent) as tmpdir:
                 reference_file = os.path.join(tmpdir, "reference.srt")
-                ok, msg = cls.__extract_reference_subtitle(media_file, stream.get("index"), reference_file)
+                ok, msg = cls.__extract_reference_subtitle(
+                    media_file,
+                    stream.get("index"),
+                    reference_file,
+                    cancel_check=cancel_check,
+                    timeout=bounded_timeout(ffmpeg_timeout, cls._ffmpeg_timeout),
+                    max_bytes=reference_max_bytes
+                )
                 if not ok:
                     return cls.__skip(msg)
                 reference_language = stream.get("_language") or "unknown"
@@ -95,12 +128,17 @@ class SubtitleAligner:
                     align_mode="auto" if align_mode == "llm" else align_mode,
                     source_language=source_language,
                     reference_language=reference_language,
-                    allow_llm=align_mode == "llm"
+                    allow_llm=align_mode == "llm",
+                    cancel_check=cancel_check,
+                    llm_timeout=bounded_timeout(llm_timeout, 180),
+                    llm_max_batches=llm_max_batches
                 )
                 ret["stream_index"] = stream.get("index")
                 ret["source_language"] = source_language
                 ret["reference_language"] = reference_language
                 return ret
+        except _SubtitleProcessCanceled:
+            return cls.__skip("任务已取消")
         except Exception as e:
             ExceptionUtils.exception_traceback(e)
             return cls.__skip(f"自动对齐失败：{str(e)}")
@@ -109,7 +147,8 @@ class SubtitleAligner:
 
     @classmethod
     def align_with_reference_file(cls, subtitle_file, reference_file, align_mode="auto",
-                                  source_language=None, reference_language=None, allow_llm=False):
+                                  source_language=None, reference_language=None, allow_llm=False,
+                                  cancel_check=None, llm_timeout=180, llm_max_batches=8):
         """
         纯文件对齐入口，便于单元测试；成功时原地重写 subtitle_file。
         """
@@ -134,7 +173,10 @@ class SubtitleAligner:
                 return cls.__skip("参考字幕与上传字幕语言不同，未启用 LLM 跨语言对齐")
             translated_cues, translate_msg = cls.__translate_reference_cues(
                 reference.get("cues"),
-                target_language=source_language
+                target_language=source_language,
+                cancel_check=cancel_check,
+                timeout=llm_timeout,
+                max_batches=llm_max_batches
             )
             if not translated_cues:
                 return cls.__skip(translate_msg or "LLM 翻译参考字幕失败")
@@ -198,14 +240,13 @@ class SubtitleAligner:
         return {"applied": False, "skipped": True, "message": message, "mode": "skip", "anchors": 0}
 
     @classmethod
-    def __select_reference_stream(cls, media_file, preferred_language="zh-CN", allow_cross_language=False):
+    def __select_reference_stream(cls, media_file, preferred_language="zh-CN", allow_cross_language=False,
+                                  cancel_check=None, timeout=None):
         try:
-            ret = subprocess.run(
+            ret = cls.__run_process(
                 ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", media_file],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=cls._ffprobe_timeout,
-                text=True
+                timeout=timeout or cls._ffprobe_timeout,
+                cancel_check=cancel_check
             )
             if ret.returncode != 0 or not ret.stdout:
                 return None
@@ -346,21 +387,25 @@ class SubtitleAligner:
         return left == right
 
     @classmethod
-    def __extract_reference_subtitle(cls, media_file, stream_index, output_file):
+    def __extract_reference_subtitle(cls, media_file, stream_index, output_file,
+                                     cancel_check=None, timeout=None, max_bytes=None):
         if stream_index is None:
             return False, "参考字幕轨索引无效"
         try:
-            ret = subprocess.run(
+            max_bytes = max(int(max_bytes or 20 * 1024 * 1024), 1)
+            ret = cls.__run_process(
                 [
-                    "ffmpeg", "-y", "-v", "error", "-i", media_file,
-                    "-map", f"0:{stream_index}", "-c:s", "srt", output_file
+                    "ffmpeg", "-nostdin", "-threads", "1", "-y", "-v", "error", "-i", media_file,
+                    "-map", f"0:{stream_index}", "-c:s", "srt",
+                    "-fs", str(max_bytes + 1), output_file
                 ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=cls._ffmpeg_timeout,
-                text=True
+                timeout=timeout or cls._ffmpeg_timeout,
+                cancel_check=cancel_check
             )
-            if ret.returncode != 0 or not os.path.exists(output_file) or os.path.getsize(output_file) <= 0:
+            output_size = os.path.getsize(output_file) if os.path.exists(output_file) else 0
+            if output_size > max_bytes:
+                return False, "参考字幕轨超过大小限制"
+            if ret.returncode != 0 or output_size <= 0:
                 err = (ret.stderr or "").strip()
                 if err:
                     log.warn(f"【Subtitle】抽取参考字幕失败：{err}")
@@ -368,9 +413,56 @@ class SubtitleAligner:
             return True, ""
         except subprocess.TimeoutExpired:
             return False, "抽取参考字幕超时"
+        except _SubtitleProcessCanceled:
+            return False, "任务已取消"
         except Exception as e:
             ExceptionUtils.exception_traceback(e)
             return False, f"抽取参考字幕失败：{str(e)}"
+
+    @staticmethod
+    def __stop_process(process):
+        """Terminate a child and escalate to kill without blocking indefinitely."""
+        if process.poll() is not None:
+            return
+        try:
+            process.terminate()
+            process.wait(timeout=2)
+            return
+        except Exception:
+            pass
+        try:
+            process.kill()
+            process.wait(timeout=2)
+        except Exception:
+            pass
+
+    @classmethod
+    def __run_process(cls, command, timeout, cancel_check=None):
+        """Run ffmpeg/ffprobe with cooperative cancellation and a hard deadline."""
+        started = time.monotonic()
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        try:
+            while True:
+                if cancel_check and cancel_check():
+                    cls.__stop_process(process)
+                    raise _SubtitleProcessCanceled()
+                elapsed = time.monotonic() - started
+                if elapsed >= float(timeout):
+                    cls.__stop_process(process)
+                    raise subprocess.TimeoutExpired(command, timeout)
+                try:
+                    stdout, stderr = process.communicate(timeout=min(0.25, max(0.05, float(timeout) - elapsed)))
+                    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+                except subprocess.TimeoutExpired:
+                    continue
+        except Exception:
+            cls.__stop_process(process)
+            raise
 
     @classmethod
     def __parse_srt(cls, text):
@@ -500,7 +592,8 @@ class SubtitleAligner:
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}{separator}{millis:03d}"
 
     @classmethod
-    def __translate_reference_cues(cls, reference_cues, target_language):
+    def __translate_reference_cues(cls, reference_cues, target_language, cancel_check=None,
+                                   timeout=180, max_batches=8):
         if not cls.__is_llm_alignment_enabled():
             return None, "LLM 跨语言对齐未启用"
         client = LLMClient()
@@ -509,12 +602,37 @@ class SubtitleAligner:
         translated_cues = [dict(cue) for cue in reference_cues]
         target_name = cls.__language_display_name(target_language)
         batch_count = 0
+        started = time.monotonic()
+        try:
+            total_timeout = float(180 if timeout is None else timeout)
+        except (TypeError, ValueError):
+            total_timeout = 180.0
+        if total_timeout <= 0:
+            return None, "LLM 字幕对齐超时"
+        deadline = started + total_timeout
+        max_batches = max(1, min(int(max_batches or 8), 20))
         for batch in cls.__iter_translation_batches(reference_cues):
+            if cancel_check and cancel_check():
+                return None, "任务已取消"
+            if batch_count >= max_batches:
+                return None, f"LLM 翻译批次数超过限制（{max_batches}）"
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None, "LLM 字幕对齐超时"
             batch_count += 1
             cache_key = cls.__translation_cache_key(target_language, batch)
             cached = cls.__get_translation_cache(cache_key)
             if cached is None:
-                translated, msg = cls.__request_translation_batch(client, target_name, batch)
+                translated, msg = cls.__request_translation_batch(
+                    client,
+                    target_name,
+                    batch,
+                    timeout=remaining
+                )
+                if cancel_check and cancel_check():
+                    return None, "任务已取消"
+                if time.monotonic() >= deadline:
+                    return None, "LLM 字幕对齐超时"
                 if not translated:
                     return None, msg
                 cls.__set_translation_cache(cache_key, translated)
@@ -524,6 +642,8 @@ class SubtitleAligner:
                 if cue_id < 0 or cue_id >= len(translated_cues):
                     return None, "LLM 翻译结果索引异常"
                 translated_cues[cue_id]["text"] = text
+            if time.monotonic() >= deadline:
+                return None, "LLM 字幕对齐超时"
         log.info("【Subtitle】LLM参考字幕翻译完成：protocol=openai, batches=%s" % batch_count)
         return translated_cues, ""
 
@@ -565,7 +685,7 @@ class SubtitleAligner:
         return max(1, min(value, 40))
 
     @classmethod
-    def __request_translation_batch(cls, client, target_language_name, batch):
+    def __request_translation_batch(cls, client, target_language_name, batch, timeout=None):
         system_prompt = (
             "You translate subtitle cues for timestamp alignment. "
             "Return strict JSON only. Do not add explanations. "
@@ -579,7 +699,9 @@ class SubtitleAligner:
         result = client.complete_json(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            max_tokens=2048
+            max_tokens=2048,
+            timeout=timeout,
+            max_retries=0
         )
         if isinstance(result, dict):
             result = result.get("items") or result.get("results") or result.get("translations")

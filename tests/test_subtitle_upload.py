@@ -212,6 +212,143 @@ class SubtitleUploadTest(TestCase):
             self.assertTrue(os.path.exists(os.path.join(tmpdir, "Movie.chi.zh-cn.srt")))
             self.assertTrue(os.path.exists(os.path.join(tmpdir, "Movie.YYeTs.chi.zh-cn.srt")))
 
+    def test_repair_gate_cancel_preserves_already_processed_items_as_partial_data(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            movie = os.path.join(tmpdir, "Movie.mkv")
+            first = os.path.join(tmpdir, "Movie.first.eng.srt")
+            second = os.path.join(tmpdir, "Movie.second.eng.srt")
+            open(movie, "wb").close()
+            for subtitle_file in [first, second]:
+                with open(subtitle_file, "wb") as file_obj:
+                    file_obj.write(b"1\n00:00:01,000 --> 00:00:02,000\nEnglish\n")
+
+            gate_calls = [0]
+
+            class _Gate:
+                def __enter__(self):
+                    gate_calls[0] += 1
+                    if gate_calls[0] == 2:
+                        raise InterruptedError("task canceled while waiting for heavy gate")
+
+                @staticmethod
+                def __exit__(_exc_type, _exc, _traceback):
+                    return False
+
+            warning = {"status": "warning", "reason": "needs normalization"}
+            valid = {"valid": True, "probe_available": True, "message": "ok"}
+            with patch.object(SubtitleHealth, "requires_external_probe", return_value=True), \
+                    patch.object(SubtitleHealth, "inspect_external_subtitle", return_value=warning), \
+                    patch.object(SubtitleHealth, "normalize_uploaded_subtitle", return_value=valid), \
+                    patch.object(SubtitleHealth, "language_defined", return_value=True):
+                success, msg, data = Subtitle().repair_external_subtitles(
+                    movie, "jellyfin", heavy_operation=lambda _kind: _Gate()
+                )
+
+            self.assertTrue(success, msg)
+            self.assertTrue(data["canceled"])
+            self.assertEqual(len(data["processed"]), 1)
+            self.assertEqual(data["processed"][0]["source"], first)
+
+    def test_repair_processes_vobsub_sub_and_idx_as_one_logical_item(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            movie = os.path.join(tmpdir, "Movie.mkv")
+            source_sub = os.path.join(tmpdir, "Movie.sub")
+            source_idx = os.path.join(tmpdir, "Movie.idx")
+            open(movie, "wb").close()
+            with open(source_sub, "wb") as file_obj:
+                file_obj.write(b"\x00binary-vobsub-payload")
+            with open(source_idx, "wb") as file_obj:
+                file_obj.write(b"VobSub index file, v7")
+
+            def normalize_pair(work_sub, **_kwargs):
+                self.assertTrue(os.path.isfile(os.path.splitext(work_sub)[0] + ".idx"))
+                return {"valid": True, "probe_available": True, "message": "ok"}
+
+            def inspect(path, _media, _server, **_kwargs):
+                return {
+                    "path": path,
+                    "status": "warning" if os.path.normcase(path) == os.path.normcase(source_sub) else "ok",
+                    "reason": "missing language" if path == source_sub else "ok"
+                }
+
+            with patch.object(SubtitleHealth, "normalize_uploaded_subtitle",
+                              side_effect=normalize_pair), \
+                    patch.object(SubtitleHealth, "inspect_external_subtitle", side_effect=inspect), \
+                    patch.object(SubtitleHealth, "language_defined", return_value=False):
+                success, msg, data = Subtitle().repair_external_subtitles(
+                    movie, "jellyfin",
+                    policy={"vobsub_limit_mb": 200, "ffprobe_timeout_seconds": 10}
+                )
+
+            target_sub = os.path.join(tmpdir, "Movie.chi.zh-cn.sub")
+            target_idx = os.path.join(tmpdir, "Movie.chi.zh-cn.idx")
+            self.assertTrue(success, msg)
+            self.assertFalse(os.path.exists(source_sub))
+            self.assertFalse(os.path.exists(source_idx))
+            self.assertTrue(os.path.isfile(target_sub))
+            self.assertTrue(os.path.isfile(target_idx))
+            self.assertEqual(data["processed"][0]["target_companion"], target_idx)
+
+    def test_repair_keeps_new_vobsub_pair_when_old_pair_restore_fails(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            movie = os.path.join(tmpdir, "Movie.mkv")
+            source_sub = os.path.join(tmpdir, "Movie.sub")
+            source_idx = os.path.join(tmpdir, "Movie.idx")
+            open(movie, "wb").close()
+            with open(source_sub, "wb") as file_obj:
+                file_obj.write(b"\x00binary-vobsub-payload")
+            with open(source_idx, "wb") as file_obj:
+                file_obj.write(b"VobSub index file, v7")
+
+            def inspect(path, _media, _server, **_kwargs):
+                return {
+                    "path": path,
+                    "status": "warning" if os.path.normcase(path) == os.path.normcase(source_sub) else "ok",
+                    "reason": "missing language" if path == source_sub else "ok"
+                }
+
+            real_replace = os.replace
+            subtitle_class = type(Subtitle())
+            real_rename_no_replace = subtitle_class._Subtitle__rename_no_replace
+
+            def fail_old_primary_retirement(source, target):
+                target_name = os.path.basename(target)
+                retiring_old_primary = os.path.normcase(source) == os.path.normcase(source_sub) \
+                    and ".subtitle-repair-old-" in target_name
+                if retiring_old_primary:
+                    raise PermissionError("simulated VobSub retirement failure")
+                return real_replace(source, target)
+
+            def fail_old_companion_restore(source, target):
+                restoring_old_companion = ".subtitle-repair-old-" in os.path.basename(source) \
+                    and os.path.normcase(target) == os.path.normcase(source_idx)
+                if restoring_old_companion:
+                    raise PermissionError("simulated VobSub restore failure")
+                return real_rename_no_replace(source, target)
+
+            valid = {"valid": True, "probe_available": True, "message": "ok"}
+            with patch.object(SubtitleHealth, "normalize_uploaded_subtitle", return_value=valid), \
+                    patch.object(SubtitleHealth, "inspect_external_subtitle", side_effect=inspect), \
+                    patch.object(SubtitleHealth, "language_defined", return_value=False), \
+                    patch("app.subtitle.os.replace", side_effect=fail_old_primary_retirement), \
+                    patch.object(subtitle_class, "_Subtitle__rename_no_replace",
+                                 side_effect=fail_old_companion_restore):
+                success, msg, data = Subtitle().repair_external_subtitles(
+                    movie, "jellyfin",
+                    policy={"vobsub_limit_mb": 200, "ffprobe_timeout_seconds": 10}
+                )
+
+            target_sub = os.path.join(tmpdir, "Movie.chi.zh-cn.sub")
+            target_idx = os.path.join(tmpdir, "Movie.chi.zh-cn.idx")
+            self.assertTrue(success, msg)
+            self.assertTrue(os.path.isfile(target_sub))
+            self.assertTrue(os.path.isfile(target_idx))
+            self.assertTrue(os.path.isfile(source_sub))
+            self.assertFalse(os.path.exists(source_idx))
+            self.assertEqual(len(data["processed"]), 1)
+            self.assertEqual(len(data["failures"]), 1)
+            self.assertIn("已保留新的完整字幕对", data["failures"][0]["reason"])
+
     def test_jellyfin_region_language_tags_are_not_relabelled_as_chinese(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             movie = os.path.join(tmpdir, "Movie.mkv")

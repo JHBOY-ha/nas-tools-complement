@@ -135,9 +135,15 @@ class MediaLibraryTest(TestCase):
                 "media_server": "jellyfin",
                 "movie_path": ["/media/movies"]
             }
-            ret = library.audit_external_subtitles("movie", "动画电影")
+            ret = library.audit_external_subtitles(
+                "movie", "动画电影", mode="deep", deep_confirmed=True
+            )
 
-        audit_roots.assert_called_once_with([os.path.join("/media/movies", "动画电影")], "jellyfin")
+        audit_roots.assert_called_once()
+        self.assertEqual(
+            audit_roots.call_args.args[:2],
+            ([os.path.join("/media/movies", "动画电影")], "jellyfin")
+        )
         self.assertEqual(ret["subcategory"], "动画电影")
         self.assertEqual(ret["scope_name"], "电影 / 动画电影")
 
@@ -176,7 +182,7 @@ class MediaLibraryTest(TestCase):
             library = MediaLibrary.__new__(MediaLibrary)
             library.category = self._AuditCategory()
 
-            def audit_result(roots, server):
+            def audit_result(roots, server, **_kwargs):
                 media_path = domestic_movie if roots[0] == domestic_root else foreign_movie
                 key = os.path.normcase(os.path.normpath(media_path))
                 return {
@@ -198,8 +204,12 @@ class MediaLibraryTest(TestCase):
                     "movie_path": [tmpdir]
                 }
                 config_cls.return_value.get_config_path.return_value = tmpdir
-                library.audit_external_subtitles("movie", "国产电影")
-                library.audit_external_subtitles("movie", "外国电影")
+                library.audit_external_subtitles(
+                    "movie", "国产电影", mode="deep", deep_confirmed=True
+                )
+                library.audit_external_subtitles(
+                    "movie", "外国电影", mode="deep", deep_confirmed=True
+                )
                 snapshot = library._MediaLibrary__latest_audit_snapshot("movie", "jellyfin")
 
             self.assertEqual(len(snapshot["media_statuses"]), 2)
@@ -272,9 +282,10 @@ class MediaLibraryTest(TestCase):
                 patch.object(SubtitleHealth, "audit_roots", return_value=audit_result) as audit_roots, \
                 patch.object(MediaLibrary, "_MediaLibrary__save_subtitle_audit", return_value=[]):
             config_cls.return_value.get_config.return_value = media_config
-            ret = library.audit_external_subtitles("tv")
+            ret = library.audit_external_subtitles("tv", mode="deep", deep_confirmed=True)
 
-        audit_roots.assert_called_once_with(["/media/tv"], "jellyfin")
+        audit_roots.assert_called_once()
+        self.assertEqual(audit_roots.call_args.args[:2], (["/media/tv"], "jellyfin"))
         self.assertEqual(ret["category"], "tv")
         self.assertEqual(ret["category_name"], "电视剧")
 
@@ -299,9 +310,10 @@ class MediaLibraryTest(TestCase):
                 "tv_path": ["/media/tv"],
                 "anime_path": []
             }
-            ret = library.audit_external_subtitles("anime")
+            ret = library.audit_external_subtitles("anime", mode="deep", deep_confirmed=True)
 
-        audit_roots.assert_called_once_with(["/media/tv"], "emby")
+        audit_roots.assert_called_once()
+        self.assertEqual(audit_roots.call_args.args[:2], (["/media/tv"], "emby"))
         self.assertEqual(ret["category"], "anime")
 
     def test_full_library_subtitle_audit_reports_server_recognition_states(self):
@@ -343,7 +355,7 @@ class MediaLibraryTest(TestCase):
             library = MediaLibrary.__new__(MediaLibrary)
             counter = {"value": 0}
 
-            def audit_result(*_):
+            def audit_result(*_, **__):
                 counter["value"] += 1
                 value = counter["value"]
                 return {
@@ -365,7 +377,9 @@ class MediaLibraryTest(TestCase):
                 }
                 config_cls.return_value.get_config_path.return_value = tmpdir
                 for _ in range(4):
-                    library.audit_external_subtitles("movie")
+                    library.audit_external_subtitles(
+                        "movie", mode="deep", deep_confirmed=True
+                    )
                 history = library.get_external_subtitle_audit_history()["history"]
 
             self.assertEqual(len(history), 3)
@@ -515,6 +529,53 @@ class MediaLibraryTest(TestCase):
 
         self.assertEqual(ret["code"], 0)
         self.assertEqual(library.mediadb.queried_server, "Jellyfin")
+
+    def test_get_episodes_uses_explicit_request_server_not_global_server(self):
+        class _ServerType:
+            value = "Jellyfin"
+
+        class _MediaServer:
+            requested = None
+
+            @staticmethod
+            def get_type():
+                return _ServerType()
+
+            def get_episodes_by_type(self, server_type, series_id):
+                self.requested = (server_type, series_id)
+                return [{
+                    "id": "plex-episode", "series_id": series_id,
+                    "season": 1, "episode": 1, "path": ""
+                }]
+
+            @staticmethod
+            def get_episodes(_series_id):
+                raise AssertionError("must not query the globally selected server")
+
+        row = types.SimpleNamespace(
+            ITEM_ID="plex-series", LIBRARY="plex-library", ITEM_TYPE="Series",
+            TITLE="Show", YEAR="2024", TMDBID="123", PATH="/media/Show"
+        )
+
+        class _MediaDb:
+            queried_server = None
+
+            def list_items(self, server_type=None):
+                self.queried_server = server_type
+                return [row]
+
+        library = MediaLibrary.__new__(MediaLibrary)
+        library.mediadb = _MediaDb()
+        library.dbhelper = types.SimpleNamespace(get_transfer_histories_with_dest=lambda: [])
+        library.media_server = _MediaServer()
+        library.category = self._AuditCategory()
+
+        ret = library.get_episodes({"item_id": "plex-series", "server": "plex"})
+
+        self.assertEqual(ret["code"], 0)
+        self.assertEqual(library.mediadb.queried_server, "plex")
+        self.assertEqual(library.media_server.requested, ("plex", "plex-series"))
+        self.assertEqual(ret["items"][0]["server_item_id"], "plex-episode")
 
     def test_list_items_prefers_linked_transfer_history_but_keeps_synced_items(self):
         class _ServerType:
@@ -936,3 +997,264 @@ class MediaLibraryTest(TestCase):
             open(poster, "wb").close()
 
             self.assertEqual(MediaLibrary._MediaLibrary__find_local_poster(media_dir), poster)
+
+
+class SubtitleLowIoTest(TestCase):
+    def test_external_subtitle_listing_is_streamed_and_bounded(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            movie = os.path.join(tmpdir, "Movie.mkv")
+            open(movie, "wb").close()
+            for index in range(6):
+                open(os.path.join(tmpdir, "Movie.%02d.srt" % index), "wb").close()
+
+            with patch(
+                    "app.helper.subtitle_health.os.listdir",
+                    side_effect=AssertionError("bounded listing must use streaming scandir")
+            ):
+                subtitles = SubtitleHealth.list_external_subtitles(
+                    movie, max_results=2
+                )
+                canceled = SubtitleHealth.list_external_subtitles(
+                    movie, max_results=2, cancel_check=lambda: True
+                )
+
+        self.assertEqual(len(subtitles), 2)
+        self.assertEqual(canceled, [])
+
+    def test_text_validation_never_starts_ffprobe(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            subtitle = os.path.join(tmpdir, "Movie.zh-CN.srt")
+            with open(subtitle, "w", encoding="utf-8") as file_obj:
+                file_obj.write("1\n00:00:01,000 --> 00:00:02,000\nHello\n")
+            with patch("app.helper.subtitle_health.shutil.which", return_value="ffprobe"), \
+                    patch("app.helper.subtitle_health.subprocess.Popen",
+                          side_effect=AssertionError("text validation must stay local")):
+                result = SubtitleHealth.validate_subtitle(subtitle)
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["message"], "本地字幕结构检查通过")
+
+    def test_linked_audit_enumerates_shared_directory_once_without_walk(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            media_files = []
+            for name in ["One", "Two"]:
+                media_file = os.path.join(tmpdir, "%s.mkv" % name)
+                subtitle = os.path.join(tmpdir, "%s.zh-CN.srt" % name)
+                open(media_file, "wb").close()
+                with open(subtitle, "w", encoding="utf-8") as file_obj:
+                    file_obj.write("1\n00:00:01,000 --> 00:00:02,000\nHello\n")
+                media_files.append(media_file)
+            real_scandir = os.scandir
+            with patch("app.helper.subtitle_health.os.walk",
+                       side_effect=AssertionError("linked audit must not walk")), \
+                    patch("app.helper.subtitle_health.os.listdir",
+                          side_effect=AssertionError("linked audit must stream scandir")), \
+                    patch("app.helper.subtitle_health.os.scandir", wraps=real_scandir) as scandir, \
+                    patch.object(SubtitleHealth, "_ffprobe_version", "test"):
+                result = SubtitleHealth.audit_linked_media(media_files, "jellyfin")
+        self.assertEqual(scandir.call_count, 1)
+        self.assertEqual(result["summary"]["total"], 2)
+        self.assertEqual(result["metrics"]["directories"], 1)
+
+    def test_linked_audit_keeps_explicit_media_symlink_lexical_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            media_file = os.path.join(tmpdir, "Movie.mkv")
+            subtitle = os.path.join(tmpdir, "Movie.zh-CN.srt")
+            open(media_file, "wb").close()
+            with open(subtitle, "w", encoding="utf-8") as file_obj:
+                file_obj.write("1\n00:00:01,000 --> 00:00:02,000\nHello\n")
+
+            def is_link(path):
+                return os.path.normcase(os.path.abspath(path)) \
+                    == os.path.normcase(os.path.abspath(media_file))
+
+            with patch(
+                    "app.helper.subtitle_health.os.path.islink",
+                    side_effect=is_link), patch.object(
+                        SubtitleHealth, "_ffprobe_version", "test"):
+                result = SubtitleHealth.audit_linked_media(
+                    [media_file], "jellyfin"
+                )
+
+        self.assertEqual(result["summary"]["total"], 1)
+        self.assertEqual(result["metrics"]["directories"], 1)
+
+    def test_linked_audit_keeps_only_a_bounded_root_sample(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            media_files = []
+            for index in range(SubtitleHealth._audit_root_sample_limit + 5):
+                media_dir = os.path.join(tmpdir, "dir-%02d" % index)
+                os.makedirs(media_dir)
+                media_file = os.path.join(media_dir, "Movie.mkv")
+                open(media_file, "wb").close()
+                media_files.append(media_file)
+
+            result = SubtitleHealth.audit_linked_media(media_files, "jellyfin")
+
+        self.assertEqual(result["root_count"], len(media_files))
+        self.assertEqual(
+            len(result["root_sample"]),
+            SubtitleHealth._audit_root_sample_limit
+        )
+        self.assertEqual(result["roots"], result["root_sample"])
+
+    def test_deep_audit_prunes_nas_system_directories(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            movie = os.path.join(tmpdir, "Movie.mkv")
+            subtitle = os.path.join(tmpdir, "Movie.zh-CN.srt")
+            system_dir = os.path.join(tmpdir, "@eaDir")
+            os.makedirs(system_dir)
+            open(movie, "wb").close()
+            with open(subtitle, "w", encoding="utf-8") as file_obj:
+                file_obj.write("1\n00:00:01,000 --> 00:00:02,000\nHello\n")
+            with open(os.path.join(system_dir, "Hidden.srt"), "w", encoding="utf-8") as file_obj:
+                file_obj.write("invalid")
+            with patch.object(SubtitleHealth, "_ffprobe_version", "test"):
+                result = SubtitleHealth.audit_roots([tmpdir], "emby")
+        self.assertEqual(result["summary"]["total"], 1)
+        self.assertEqual(result["metrics"]["directories"], 1)
+        self.assertEqual(result["roots"], [tmpdir])
+        self.assertEqual(result["root_count"], 1)
+
+    def test_audit_ui_prioritizes_all_incomplete_coverage_reasons(self):
+        root_path = os.path.dirname(os.path.dirname(__file__))
+        javascript_path = os.path.join(
+            root_path, "web", "static", "js", "media-library.js"
+        )
+        with open(javascript_path, "r", encoding="utf-8") as file_obj:
+            source = file_obj.read()
+
+        self.assertIn("function library_subtitle_audit_incomplete_reason", source)
+        self.assertIn('task.status === "partial"', source)
+        self.assertIn("record.partial === true", source)
+        self.assertIn("record.coverage_complete === false", source)
+        for stop_reason in [
+                "time_limit", "subtitle_limit", "candidate_limit",
+                "directory_limit", "media_limit", "scan_error",
+                "inaccessible", "canceled", "interrupted"]:
+            self.assertIn("%s:" % stop_reason, source)
+        self.assertIn("本次检测未完整覆盖全部目标", source)
+        self.assertIn("已检测范围内未发现问题", source)
+
+    def test_transfer_history_id_is_not_exposed_as_episode_server_id(self):
+        history = types.SimpleNamespace(
+            ID=999, DEST_PATH="/media/show", DEST_FILENAME="Show.S01E01.mkv",
+            SEASON_EPISODE="S01E01", TITLE="Show"
+        )
+        server_episode = {
+            "id": "episode-real", "series_id": "series-real",
+            "season": 1, "episode": 1, "path": "/media/show/Show.S01E01.mkv"
+        }
+        library = MediaLibrary.__new__(MediaLibrary)
+        items = library._MediaLibrary__series_history_items(
+            [history], [server_episode], "series-real", "library-real"
+        )
+        self.assertEqual(items[0]["id"], "episode-real")
+        self.assertEqual(items[0]["server_item_id"], "episode-real")
+        self.assertEqual(items[0]["history_id"], 999)
+
+    def test_refresh_context_rejects_spoofed_movie_id(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = os.path.join(tmpdir, "Movie.mkv")
+            open(target, "wb").close()
+            row = types.SimpleNamespace(
+                ITEM_ID="movie-real", LIBRARY="library-real", ITEM_TYPE="Movie",
+                TITLE="Movie", YEAR="2024", TMDBID="123", PATH="/source/Movie.mkv"
+            )
+            history = types.SimpleNamespace(
+                ID=1, TYPE="电影", TMDBID=123, TITLE="Movie", YEAR="2024",
+                DEST_PATH=tmpdir, DEST_FILENAME="Movie.mkv"
+            )
+            library = MediaLibrary.__new__(MediaLibrary)
+            library.mediadb = types.SimpleNamespace(list_items=lambda server_type=None: [row])
+            library.dbhelper = types.SimpleNamespace(
+                get_transfer_histories_with_dest=lambda: [history]
+            )
+            library.media_server = types.SimpleNamespace(get_episodes=lambda _item_id: [])
+            result = library.validate_subtitle_refresh_context(
+                target, "jellyfin", server_item_id="spoofed"
+            )
+        self.assertFalse(result["valid"])
+        self.assertIn("不匹配", result["reason"])
+
+    def test_emby_item_refresh_falls_back_only_to_parent(self):
+        from app.mediaserver.client.emby import Emby
+
+        client = Emby.__new__(Emby)
+        with patch.object(
+                Emby, "_Emby__refresh_emby_library_by_id", side_effect=[False, True]
+        ) as refresh_item, patch.object(
+                Emby, "refresh_root_library",
+                side_effect=AssertionError("target refresh must not refresh root")
+        ):
+            result = client.refresh_subtitle_target(
+                server_item_id="episode", parent_server_item_id="series"
+            )
+        self.assertEqual(result["status"], "refreshed")
+        self.assertEqual(result["scope"], "parent")
+        self.assertEqual(refresh_item.call_count, 2)
+
+    def test_jellyfin_item_refresh_falls_back_only_to_parent(self):
+        from app.mediaserver.client.jellyfin import Jellyfin
+
+        client = Jellyfin.__new__(Jellyfin)
+        with patch.object(
+                Jellyfin, "_Jellyfin__refresh_jellyfin_item_by_id",
+                side_effect=[False, True]
+        ) as refresh_item, patch.object(
+                Jellyfin, "refresh_root_library",
+                side_effect=AssertionError("target refresh must not refresh root")
+        ):
+            result = client.refresh_subtitle_target(
+                server_item_id="episode", parent_server_item_id="series"
+            )
+        self.assertEqual(result["status"], "refreshed")
+        self.assertEqual(result["scope"], "parent")
+        self.assertEqual(refresh_item.call_count, 2)
+
+    def test_plex_refresh_uses_validated_section_parent_path(self):
+        if "plexapi" not in sys.modules:
+            plexapi_stub = types.ModuleType("plexapi")
+            myplex_stub = types.ModuleType("plexapi.myplex")
+            server_stub = types.ModuleType("plexapi.server")
+            myplex_stub.MyPlexAccount = object
+            server_stub.PlexServer = object
+            sys.modules["plexapi"] = plexapi_stub
+            sys.modules["plexapi.myplex"] = myplex_stub
+            sys.modules["plexapi.server"] = server_stub
+        from app.mediaserver.client.plex import Plex
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            media_dir = os.path.join(tmpdir, "Movie")
+            os.makedirs(media_dir)
+            media_file = os.path.join(media_dir, "Movie.mkv")
+            open(media_file, "wb").close()
+            updates = []
+            section = types.SimpleNamespace(
+                locations=[os.path.join(tmpdir, "incompatible"), tmpdir],
+                update=lambda path=None: updates.append(path)
+            )
+            plex_library = types.SimpleNamespace(
+                sectionByID=lambda section_id: section if section_id == "7" else None
+            )
+            client = Plex.__new__(Plex)
+            client._plex = types.SimpleNamespace(library=plex_library)
+
+            real_commonpath = os.path.commonpath
+            calls = [0]
+
+            def cross_volume_once(paths):
+                calls[0] += 1
+                if calls[0] == 1:
+                    raise ValueError("Paths don't have the same drive")
+                return real_commonpath(paths)
+
+            with patch(
+                    "app.mediaserver.client.plex.os.path.commonpath",
+                    side_effect=cross_volume_once):
+                result = client.refresh_subtitle_target(
+                    library_id="7", media_path=media_file
+                )
+
+        self.assertEqual(result["status"], "refreshed")
+        self.assertEqual(result["scope"], "path")
+        self.assertEqual(updates, [media_dir])

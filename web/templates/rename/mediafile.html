@@ -32,6 +32,11 @@
                 共 <span id="mediafile_num">0</span> 个文件
               </div>
               <div class="align-self-center">
+                <button type="button" class="btn" data-subtitle-task-center aria-label="打开字幕任务中心">
+                  {{ SVG.check() }}
+                  字幕任务
+                  <span class="badge bg-primary text-white d-none" data-subtitle-task-count>0</span>
+                </button>
                 <a href="javascript:mediafile_transfer_all()" class="btn" title="转移当前目录">
                   {{ SVG.transform() }}
                   转移目录
@@ -60,7 +65,7 @@
     <div class="modal-content">
       <div class="modal-header">
         <h5 class="modal-title">文件重命名</h5>
-        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
       </div>
       <div class="modal-body">
         <div class="row">
@@ -107,20 +112,22 @@
     <div class="modal-content">
       <div class="modal-header">
         <h5 class="modal-title">上传字幕</h5>
-        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
       </div>
       <div class="modal-body">
         <input type="hidden" id="upload_subtitle_media_path">
+        <input type="hidden" id="upload_subtitle_request_id">
         <div class="mb-3">
-          <label class="form-label">媒体文件</label>
+          <label class="form-label" for="upload_subtitle_media_name">媒体文件</label>
           <input type="text" id="upload_subtitle_media_name" class="form-control" readonly>
         </div>
         <div class="mb-3">
-          <label class="form-label required">字幕文件</label>
-          <input type="file" id="upload_subtitle_file" class="form-control" accept=".srt,.ass,.ssa,.smi,.vtt,.sub">
+          <label class="form-label required" for="upload_subtitle_file">字幕文件</label>
+          <input type="file" id="upload_subtitle_file" class="form-control" accept=".srt,.ass,.ssa,.smi,.vtt,.sub,.idx" multiple>
+          <div class="form-hint">单批最多 20 个逻辑字幕；VobSub 请同时选择同名 .sub 与 .idx，两者计为一个。</div>
         </div>
         <div class="mb-3">
-          <label class="form-label required">目标影视服务器</label>
+          <label class="form-label required" for="upload_subtitle_server">目标影视服务器</label>
           <select id="upload_subtitle_server" class="form-select">
             <option value="jellyfin" {% if MediaServerType|lower == "jellyfin" %}selected{% endif %}>Jellyfin</option>
             <option value="emby" {% if MediaServerType|lower == "emby" %}selected{% endif %}>Emby</option>
@@ -128,12 +135,12 @@
           </select>
         </div>
         <div class="mb-3">
-          <label class="form-label">目标电影文件</label>
+          <label class="form-label" for="upload_subtitle_target_path">目标媒体文件</label>
           <input type="text" id="upload_subtitle_target_path" class="form-control filetree-files-only"
                  placeholder="可选；为空时使用最新整理历史">
         </div>
         <div class="mb-3">
-          <label class="form-label">字幕对齐模式</label>
+          <label class="form-label" for="upload_subtitle_align">字幕对齐模式</label>
           <select id="upload_subtitle_align" class="form-select">
             <option value="none" selected>不对齐</option>
             <option value="auto">自动选择</option>
@@ -142,9 +149,18 @@
             <option value="llm">LLM跨语言对齐</option>
           </select>
         </div>
+        <div id="upload_subtitle_progress" class="subtitle-upload-progress d-none" aria-live="polite">
+          <div class="fw-bold mb-1" data-subtitle-progress-title>准备上传</div>
+          <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100">
+            <div class="progress-bar" data-subtitle-progress-bar style="width:0">0%</div>
+          </div>
+          <div class="small mt-2" data-subtitle-progress-message></div>
+          <div class="text-muted small text-break mt-1" data-subtitle-progress-current hidden></div>
+        </div>
       </div>
       <div class="modal-footer">
-        <button type="button" class="btn btn-link me-auto" data-bs-dismiss="modal">取消</button>
+        <button type="button" class="btn btn-link me-auto" data-bs-dismiss="modal">关闭（后台继续）</button>
+        <button type="button" id="upload_subtitle_cancel" class="btn btn-outline-danger subtitle-task-cancel-action d-none">取消任务</button>
         <button type="button" id="upload_subtitle_btn" class="btn btn-primary">上传</button>
       </div>
     </div>
@@ -173,11 +189,16 @@
     </div>
   </div>
 </div>
+<script type="text/javascript" src="../static/js/subtitle-tasks.js"></script>
 <script type="text/javascript">
   const mediafile_config_media_server = "{{ MediaServerType or 'emby' }}".toLowerCase();
   const mediafile_default_media_server = ["emby", "jellyfin", "plex"].includes(mediafile_config_media_server)
       ? mediafile_config_media_server
       : "emby";
+  let mediafile_subtitle_upload_task_id = "";
+  let mediafile_subtitle_upload_request = null;
+
+  SubtitleTasks.init();
 
   function js_change_card() {
     const card_a = document.querySelector(".js-change-card-a");
@@ -335,6 +356,10 @@
 
   // 显示上传字幕
   function show_upload_subtitle_modal(name, id) {
+    if (mediafile_subtitle_upload_request) {
+      $("#modal-upload-subtitle").modal("show");
+      return;
+    }
     let path = $(`#mediafilepath_${id}`).val();
     $("#upload_subtitle_media_path").val(path);
     $("#upload_subtitle_media_name").val(name);
@@ -342,48 +367,162 @@
     $("#upload_subtitle_file").val("");
     $("#upload_subtitle_align").val("none");
     $("#upload_subtitle_server").val(mediafile_default_media_server);
+    $("#upload_subtitle_request_id").val(SubtitleTasks.randomRequestId());
+    $("#upload_subtitle_progress").addClass("d-none");
+    $("#upload_subtitle_cancel").addClass("d-none").removeData("task-id");
+    $("#upload_subtitle_btn").prop("disabled", false).text("上传");
+    mediafile_subtitle_upload_task_id = "";
     $("#modal-upload-subtitle").modal("show");
+  }
+
+  function render_mediafile_subtitle_task(task) {
+    mediafile_subtitle_upload_task_id = task.task_id || task.id || mediafile_subtitle_upload_task_id;
+    $("#upload_subtitle_progress").removeClass("d-none");
+    SubtitleTasks.renderTaskProgress("#upload_subtitle_progress", task);
+    const active = SubtitleTasks.isActive(task);
+    $("#upload_subtitle_cancel")
+        .toggleClass("d-none", !active || task.status === "canceling")
+        .text("取消任务")
+        .data("task-id", mediafile_subtitle_upload_task_id);
+    $("#upload_subtitle_btn").prop("disabled", active).text(active ? "后台处理中" : "再次上传");
+  }
+
+  function finish_mediafile_subtitle_task(task) {
+    render_mediafile_subtitle_task(task);
+    $("#upload_subtitle_cancel").addClass("d-none");
+    $("#upload_subtitle_btn").prop("disabled", false).text("再次上传");
+    $("#upload_subtitle_request_id").val(SubtitleTasks.randomRequestId());
+    if (["succeeded", "partial"].indexOf(task.status) !== -1) {
+      refresh_files();
+    }
   }
 
   // 上传字幕
   $("#upload_subtitle_btn").unbind("click").click(function () {
-    let file = $("#upload_subtitle_file")[0].files[0];
-    if (!file) {
+    const files = Array.from($("#upload_subtitle_file")[0].files || []);
+    if (!files.length) {
       show_fail_modal("请选择字幕文件！");
+      return;
+    }
+    const align_mode = $("#upload_subtitle_align").val() || "none";
+    const validation = SubtitleTasks.validateFiles(files, align_mode);
+    if (!validation.ok) {
+      show_fail_modal(validation.message);
       return;
     }
     let form_data = new FormData();
     form_data.append("path", $("#upload_subtitle_media_path").val());
     form_data.append("target_path", $("#upload_subtitle_target_path").val());
     form_data.append("server", $("#upload_subtitle_server").val());
-    form_data.append("align", $("#upload_subtitle_align").val() || "none");
-    form_data.append("file", file);
+    form_data.append("align", align_mode);
+    form_data.append("request_id", $("#upload_subtitle_request_id").val() || SubtitleTasks.randomRequestId());
+    files.forEach(function (file) {
+      form_data.append("file", file);
+    });
+    $("#upload_subtitle_btn").prop("disabled", true).text("上传中");
+    $("#upload_subtitle_cancel").removeClass("d-none").removeData("task-id").text("停止上传");
+    $("#upload_subtitle_progress").removeClass("d-none");
+    SubtitleTasks.renderProgress("#upload_subtitle_progress", {
+      title: "正在上传到暂存区",
+      message: `${validation.logicalCount} 个逻辑字幕，共 ${SubtitleTasks.formatBytes(validation.totalBytes)}`,
+      percent: 0
+    });
     NProgress.start();
-    $.ajax({
-      type: "POST",
-      url: "/subtitle/upload?random=" + Math.random(),
-      dataType: "json",
-      data: form_data,
-      cache: false,
-      processData: false,
-      contentType: false,
-      timeout: 0,
-      success: function (ret) {
-        NProgress.done();
-        $("#modal-upload-subtitle").modal("hide");
-        if (ret.code === 0) {
-          show_success_modal(ret.msg, function () {
-            refresh_files();
-          });
-        } else {
-          show_fail_modal(`${ret.msg}！`);
+    const submission_request_id = $("#upload_subtitle_request_id").val();
+    const upload_request = SubtitleTasks.upload(form_data, {
+      onUploadProgress: function (progress) {
+        if ($("#upload_subtitle_request_id").val() !== submission_request_id) {
+          return;
+        }
+        SubtitleTasks.renderProgress("#upload_subtitle_progress", {
+          title: "正在上传到暂存区",
+          message: `${SubtitleTasks.formatBytes(progress.loaded)} / ${SubtitleTasks.formatBytes(progress.total)}`,
+          percent: progress.percent
+        });
+      },
+      onUpdate: function (task) {
+        if ($("#upload_subtitle_request_id").val() === submission_request_id) {
+          render_mediafile_subtitle_task(task);
         }
       },
-      error: function () {
-        NProgress.done();
-        show_fail_modal("网络错误！");
+      onDone: function (task) {
+        if ($("#upload_subtitle_request_id").val() === submission_request_id) {
+          finish_mediafile_subtitle_task(task);
+        } else if (["succeeded", "partial"].indexOf(task.status) !== -1) {
+          refresh_files();
+        }
+      },
+      onConnectionError: function () {
+        if ($("#upload_subtitle_request_id").val() !== submission_request_id) {
+          return;
+        }
+        SubtitleTasks.renderProgress("#upload_subtitle_progress", {
+          title: "任务连接暂时中断",
+          message: "后台处理不会因此停止，正在自动重连。",
+          percent: null
+        });
       }
     });
+    mediafile_subtitle_upload_request = upload_request;
+    upload_request.then(function (created) {
+      NProgress.done();
+      if (mediafile_subtitle_upload_request === upload_request) {
+        mediafile_subtitle_upload_request = null;
+      }
+      if ($("#upload_subtitle_request_id").val() !== submission_request_id) {
+        return;
+      }
+      if (created.legacy) {
+        SubtitleTasks.renderProgress("#upload_subtitle_progress", {
+          title: "字幕处理完成",
+          message: SubtitleTasks.responseMessage(created.response, "字幕上传成功"),
+          percent: 100
+        });
+        $("#upload_subtitle_btn").prop("disabled", false).text("再次上传");
+        $("#upload_subtitle_cancel").addClass("d-none");
+        $("#upload_subtitle_request_id").val(SubtitleTasks.randomRequestId());
+        refresh_files();
+        return;
+      }
+      mediafile_subtitle_upload_task_id = created.task_id;
+      $("#upload_subtitle_cancel").text("取消任务").data("task-id", created.task_id);
+      render_mediafile_subtitle_task(created.task || {
+        task_id: created.task_id,
+        type: "upload",
+        status: "queued",
+        progress: {phase: "queued", percent: 0, message: created.reused ? "已连接到现有上传任务" : "上传完成，已进入后台队列"}
+      });
+    }).catch(function (error) {
+      NProgress.done();
+      if (mediafile_subtitle_upload_request === upload_request) {
+        mediafile_subtitle_upload_request = null;
+      }
+      if ($("#upload_subtitle_request_id").val() !== submission_request_id) {
+        return;
+      }
+      $("#upload_subtitle_cancel").addClass("d-none");
+      $("#upload_subtitle_btn").prop("disabled", false).text("重试上传");
+      if (error && error.status) {
+        $("#upload_subtitle_request_id").val(SubtitleTasks.randomRequestId());
+      }
+      SubtitleTasks.renderProgress("#upload_subtitle_progress", {
+        title: error && error.aborted ? "浏览器上传已停止" : "上传请求未完成",
+        message: (error && error.message) || "连接中断，请在任务中心确认后重试。",
+        percent: null
+      });
+      if (!error || !error.aborted) {
+        show_fail_modal((error && error.message) || "字幕上传请求失败");
+      }
+    });
+  });
+
+  $("#upload_subtitle_cancel").unbind("click").click(function () {
+    const task_id = $(this).data("task-id") || mediafile_subtitle_upload_task_id;
+    if (task_id) {
+      SubtitleTasks.confirmCancel(task_id);
+    } else if (mediafile_subtitle_upload_request && typeof mediafile_subtitle_upload_request.abort === "function") {
+      mediafile_subtitle_upload_request.abort();
+    }
   });
 
   // 查询硬链接

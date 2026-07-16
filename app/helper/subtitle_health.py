@@ -3,7 +3,8 @@ import os
 import re
 import shutil
 import subprocess
-from concurrent.futures import ThreadPoolExecutor
+import time
+from contextlib import nullcontext
 
 from charset_normalizer import from_bytes
 
@@ -15,6 +16,9 @@ class SubtitleHealth:
     """外挂字幕规范化、媒体服务器兼容性检查及全库审计。"""
 
     _text_extensions = {".srt", ".ass", ".ssa", ".smi", ".vtt"}
+    _audit_candidate_limit = 100000
+    _audit_media_limit = 100000
+    _audit_root_sample_limit = 20
     _server_extensions = {
         "jellyfin": {".srt", ".ass", ".ssa", ".vtt", ".sub"},
         "emby": {".srt", ".ass", ".ssa", ".smi", ".vtt", ".sub"},
@@ -56,9 +60,18 @@ class SubtitleHealth:
         "utf_8", "utf_16", "utf_16_le", "utf_16_be",
         "gb18030", "big5", "cp1252"
     ]
+    _validator_version = "subtitle-health-v2"
+    _max_local_text_bytes = 20 * 1024 * 1024
+    _ffprobe_version = None
+    _nas_skip_directories = {
+        "@eadir", "@recycle", "@sharesnap", "@snapshot", "#recycle",
+        "$recycle.bin", ".snapshot", ".snapshots", ".recycle",
+        ".appledouble", "lost+found"
+    }
 
     @classmethod
-    def normalize_uploaded_subtitle(cls, subtitle_file):
+    def normalize_uploaded_subtitle(cls, subtitle_file, timeout_seconds=10,
+                                    cancel_check=None):
         """将文本字幕规范化为 UTF-8，并修复可安全确认的字幕结构问题。"""
         result = {
             "normalized": False,
@@ -72,12 +85,23 @@ class SubtitleHealth:
         }
         ext = os.path.splitext(subtitle_file)[-1].lower()
         if ext not in cls._text_extensions:
-            validation = cls.validate_subtitle(subtitle_file)
+            if cancel_check is None and timeout_seconds == 10:
+                validation = cls.validate_subtitle(subtitle_file)
+            else:
+                validation = cls.validate_subtitle(
+                    subtitle_file,
+                    timeout_seconds=timeout_seconds,
+                    cancel_check=cancel_check
+                )
             result.update(validation)
             return result
         try:
-            with open(subtitle_file, "rb") as file_obj:
-                raw = file_obj.read()
+            if os.path.getsize(subtitle_file) > cls._max_local_text_bytes:
+                result["message"] = "文本字幕超过 20 MiB 本地处理上限"
+                return result
+            raw = cls.__read_file_cooperative(
+                subtitle_file, cls._max_local_text_bytes, cancel_check
+            )
             encoding, text = cls.__decode_text(raw)
             if text is None:
                 result["message"] = "无法识别字幕字符编码"
@@ -96,8 +120,19 @@ class SubtitleHealth:
             if raw != normalized_bytes:
                 cls.__atomic_write(subtitle_file, normalized_bytes)
                 result["normalized"] = True
-            validation = cls.validate_subtitle(subtitle_file)
+            if cancel_check is None and timeout_seconds == 10:
+                validation = cls.validate_subtitle(subtitle_file)
+            else:
+                validation = cls.validate_subtitle(
+                    subtitle_file,
+                    timeout_seconds=timeout_seconds,
+                    cancel_check=cancel_check
+                )
             result.update(validation)
+            return result
+        except InterruptedError:
+            result["canceled"] = True
+            result["message"] = "字幕规范化已取消"
             return result
         except Exception as e:
             ExceptionUtils.exception_traceback(e)
@@ -105,47 +140,180 @@ class SubtitleHealth:
             return result
 
     @classmethod
-    def validate_subtitle(cls, subtitle_file):
+    def validate_subtitle(cls, subtitle_file, timeout_seconds=10, cancel_check=None):
         ext = os.path.splitext(subtitle_file)[-1].lower()
         probe_available = bool(shutil.which("ffprobe"))
         if not os.path.isfile(subtitle_file):
             return {"valid": False, "probe_available": probe_available, "message": "字幕文件不存在"}
-        if os.path.getsize(subtitle_file) <= 0:
+        file_size = os.path.getsize(subtitle_file)
+        if file_size <= 0:
             return {"valid": False, "probe_available": probe_available, "message": "字幕文件为空"}
+        # 文本字幕有明确且便宜的结构校验，不应为每次上传/审计都启动 ffprobe。
+        # ffprobe 仅保留给 VobSub 等二进制或无法本地确认的格式。
+        if ext in cls._text_extensions:
+            if file_size > cls._max_local_text_bytes:
+                return {
+                    "valid": False, "probe_available": probe_available,
+                    "message": "文本字幕超过 20 MiB 本地结构检查上限"
+                }
+            validation = cls.__fallback_validate(
+                subtitle_file, ext, cancel_check=cancel_check
+            )
+            validation["probe_available"] = probe_available
+            if validation.get("valid"):
+                validation["message"] = "本地字幕结构检查通过"
+            return validation
+        if ext == ".sub" and not os.path.isfile(os.path.splitext(subtitle_file)[0] + ".idx"):
+            try:
+                microdvd = cls.__validate_microdvd_sub(
+                    subtitle_file, cancel_check=cancel_check
+                )
+            except InterruptedError:
+                return {
+                    "valid": False, "probe_available": probe_available,
+                    "canceled": True, "message": "字幕结构检查已取消"
+                }
+            if microdvd is True:
+                return {
+                    "valid": True, "probe_available": probe_available,
+                    "message": "本地 MicroDVD 字幕结构检查通过"
+                }
+            if microdvd is False:
+                return {
+                    "valid": False, "probe_available": probe_available,
+                    "message": "二进制 SUB 缺少同名 .idx 文件"
+                }
         if probe_available:
             try:
                 probe_file = subtitle_file
                 if ext == ".sub" and os.path.exists(os.path.splitext(subtitle_file)[0] + ".idx"):
                     probe_file = os.path.splitext(subtitle_file)[0] + ".idx"
-                ret = subprocess.run(
+                returncode, stdout, stderr, stop_reason = cls.__run_popen(
                     [
                         "ffprobe", "-v", "error", "-print_format", "json",
                         "-show_streams", "-show_format", probe_file
                     ],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=20,
-                    text=True
+                    timeout_seconds=timeout_seconds,
+                    cancel_check=cancel_check
                 )
-                payload = json.loads(ret.stdout or "{}") if ret.stdout else {}
+                if stop_reason == "canceled":
+                    return {
+                        "valid": False, "probe_available": True,
+                        "canceled": True, "message": "ffprobe 检测已取消"
+                    }
+                if stop_reason == "timeout":
+                    return {"valid": False, "probe_available": True, "message": "ffprobe 检测超时"}
+                payload = json.loads(stdout or "{}") if stdout else {}
                 streams = payload.get("streams") or []
                 is_subtitle = any(str(stream.get("codec_type") or "").lower() == "subtitle" for stream in streams)
-                if ret.returncode == 0 and is_subtitle:
+                if returncode == 0 and is_subtitle:
                     return {"valid": True, "probe_available": True, "message": "ffprobe 解析通过"}
                 if ext == ".sub" and not os.path.exists(os.path.splitext(subtitle_file)[0] + ".idx"):
                     return {"valid": False, "probe_available": True, "message": "SUB 无法独立解析，可能缺少同名 .idx 文件"}
-                error = str(ret.stderr or "").strip().splitlines()
+                error = str(stderr or "").strip().splitlines()
                 detail = error[-1] if error else "ffprobe 未返回字幕流"
                 return {"valid": False, "probe_available": True, "message": detail}
-            except subprocess.TimeoutExpired:
-                return {"valid": False, "probe_available": True, "message": "ffprobe 检测超时"}
             except Exception as e:
                 ExceptionUtils.exception_traceback(e)
                 return {"valid": False, "probe_available": True, "message": f"ffprobe 检测失败：{str(e)}"}
+        if ext not in cls._text_extensions:
+            return {
+                "valid": False, "probe_available": False,
+                "message": "未安装 ffprobe，无法验证二进制或未知字幕格式"
+            }
         return cls.__fallback_validate(subtitle_file, ext)
 
     @classmethod
-    def inspect_external_subtitle(cls, subtitle_file, media_file, server_type):
+    def __run_popen(cls, command, timeout_seconds, cancel_check=None):
+        """可轮询、可终止的受限子进程执行器。"""
+        if cls.__cancel_requested(cancel_check):
+            return None, "", "", "canceled"
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True
+        )
+        started = time.monotonic()
+        stop_reason = ""
+        while process.poll() is None:
+            if cls.__cancel_requested(cancel_check):
+                stop_reason = "canceled"
+                break
+            if time.monotonic() - started >= max(float(timeout_seconds or 0), 0.001):
+                stop_reason = "timeout"
+                break
+            time.sleep(0.05)
+        if stop_reason:
+            cls.__terminate_popen(process)
+        try:
+            stdout, stderr = process.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
+        return process.returncode, stdout, stderr, stop_reason
+
+    @staticmethod
+    def __terminate_popen(process):
+        try:
+            process.terminate()
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+
+    @classmethod
+    def __validate_microdvd_sub(cls, subtitle_file, cancel_check=None):
+        """识别确定的文本 MicroDVD；False 表示明显二进制，None 表示未知。"""
+        try:
+            sample = cls.__read_file_cooperative(
+                subtitle_file,
+                min(cls._max_local_text_bytes, 1024 * 1024),
+                cancel_check,
+                reject_oversize=False
+            )
+            if b"\x00" in sample:
+                return False
+            _, text = cls.__decode_text(sample)
+            if text is None:
+                return False
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            if lines and all(
+                    re.match(r"^\{\d+\}\{\d+\}", line) for line in lines[:20]):
+                return True
+            return None
+        except InterruptedError:
+            raise
+        except OSError:
+            return None
+
+    @classmethod
+    def __read_file_cooperative(cls, file_path, max_bytes, cancel_check=None,
+                                reject_oversize=True):
+        chunks = []
+        total = 0
+        with open(file_path, "rb") as file_obj:
+            while True:
+                if cls.__cancel_requested(cancel_check):
+                    raise InterruptedError("任务已取消")
+                if not reject_oversize and total >= max_bytes:
+                    break
+                allowance = max_bytes - total + (1 if reject_oversize else 0)
+                chunk = file_obj.read(min(1024 * 1024, allowance))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ValueError("字幕超过本地处理上限")
+        return b"".join(chunks)
+
+    @classmethod
+    def inspect_external_subtitle(cls, subtitle_file, media_file, server_type,
+                                  cancel_check=None, probe_timeout_seconds=10):
         server_type = str(server_type or "emby").lower()
         ext = os.path.splitext(subtitle_file)[-1].lower()
         result = {
@@ -164,8 +332,17 @@ class SubtitleHealth:
         if ext not in supported:
             result["reason"] = f"{server_type} 不支持或不建议使用 {ext} 外挂字幕"
             return result
-        validation = cls.validate_subtitle(subtitle_file)
+        if cancel_check is None and probe_timeout_seconds == 10:
+            validation = cls.validate_subtitle(subtitle_file)
+        else:
+            validation = cls.validate_subtitle(
+                subtitle_file,
+                timeout_seconds=probe_timeout_seconds,
+                cancel_check=cancel_check
+            )
         result["probe_available"] = validation.get("probe_available", False)
+        if validation.get("canceled"):
+            result["canceled"] = True
         if not validation.get("valid"):
             result["reason"] = validation.get("message") or "字幕内容无法解析"
             return result
@@ -180,32 +357,74 @@ class SubtitleHealth:
         return result
 
     @classmethod
-    def list_external_subtitles(cls, media_file):
-        """返回与指定媒体文件同目录、同名前缀的全部外挂字幕。"""
+    def iter_external_subtitles(cls, media_file, max_results=None, cancel_check=None):
+        """流式返回与媒体文件关联的外挂字幕，可限制最多产出数量。"""
         if not media_file or not os.path.isfile(media_file):
-            return []
+            return
         media_dir = os.path.dirname(media_file)
         media_base = os.path.splitext(os.path.basename(media_file))[0]
         media_bases = [(media_base, media_file)]
+        if max_results is not None:
+            max_results = max(int(max_results or 0), 0)
+            if max_results == 0:
+                return
+        yielded = 0
         try:
-            file_names = sorted(os.listdir(media_dir))
+            entries = os.scandir(media_dir)
         except OSError:
-            return []
-        subtitles = []
-        for file_name in file_names:
-            if os.path.splitext(file_name)[-1].lower() not in RMT_SUBEXT:
-                continue
-            if cls.__match_media_file(file_name, media_bases) == media_file:
-                subtitles.append(os.path.join(media_dir, file_name))
-        return subtitles
+            return
+        try:
+            with entries:
+                for entry in entries:
+                    if cls.__cancel_requested(cancel_check):
+                        return
+                    file_name = entry.name
+                    if os.path.splitext(file_name)[-1].lower() not in RMT_SUBEXT:
+                        continue
+                    if cls.__match_media_file(file_name, media_bases) != media_file:
+                        continue
+                    yield entry.path
+                    yielded += 1
+                    if max_results is not None and yielded >= max_results:
+                        return
+        except OSError:
+            return
 
     @classmethod
-    def inspect_media_subtitles(cls, media_file, server_type):
+    def list_external_subtitles(cls, media_file, max_results=None, cancel_check=None):
+        """返回关联外挂字幕；调用方可用 ``max_results`` 建立任务硬上限。"""
+        return list(cls.iter_external_subtitles(
+            media_file,
+            max_results=max_results,
+            cancel_check=cancel_check
+        ))
+
+    @classmethod
+    def inspect_media_subtitles(cls, media_file, server_type, cancel_check=None,
+                                probe_timeout_seconds=10, heavy_operation=None):
         """检查单个媒体文件关联的全部外挂字幕。"""
-        return [
-            cls.inspect_external_subtitle(subtitle_file, media_file, server_type)
-            for subtitle_file in cls.list_external_subtitles(media_file)
-        ]
+        results = []
+        for subtitle_file in cls.list_external_subtitles(media_file):
+            if cls.__cancel_requested(cancel_check):
+                break
+            operation = nullcontext()
+            if cls.requires_external_probe(subtitle_file) and heavy_operation:
+                operation = heavy_operation("interactive")
+            with operation:
+                if cancel_check is None and probe_timeout_seconds == 10:
+                    result = cls.inspect_external_subtitle(
+                        subtitle_file, media_file, server_type
+                    )
+                else:
+                    result = cls.inspect_external_subtitle(
+                        subtitle_file, media_file, server_type,
+                        cancel_check=cancel_check,
+                        probe_timeout_seconds=probe_timeout_seconds
+                    )
+            results.append(result)
+            if result.get("canceled"):
+                break
+        return results
 
     @classmethod
     def aggregate_media_subtitles(cls, results):
@@ -226,67 +445,512 @@ class SubtitleHealth:
         return os.path.splitext(subtitle_file or "")[-1].lower() in supported
 
     @classmethod
-    def audit_roots(cls, roots, server_type, issue_limit=1000):
+    def requires_external_probe(cls, subtitle_file):
+        """Whether validation may need ffprobe instead of the local parser."""
+        return os.path.splitext(subtitle_file or "")[-1].lower() not in cls._text_extensions
+
+    @classmethod
+    def audit_linked_media(cls, media_files, server_type, issue_limit=200,
+                           directory_limit=50000, subtitle_limit=10000,
+                           time_limit_seconds=3600, probe_timeout_seconds=10,
+                           cancel_check=None, progress_callback=None,
+                           cache_get=None, cache_put=None,
+                           heavy_operation=None):
+        """只检测已链接媒体；每个目标目录恰好枚举一次且不调用 ``os.walk``。"""
+        accumulator = cls.__new_audit_accumulator(
+            server_type=server_type,
+            roots=[],
+            issue_limit=issue_limit,
+            subtitle_limit=subtitle_limit,
+            time_limit_seconds=time_limit_seconds,
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
+            cache_get=cache_get,
+            cache_put=cache_put,
+            heavy_operation=heavy_operation,
+            mode="linked",
+            probe_timeout_seconds=probe_timeout_seconds
+        )
+        accumulator["directory_limit"] = max(int(directory_limit or 0), 1)
+        groups = {}
+        seen_media = set()
+        groups_truncated = False
+        truncation_reason = ""
+        for media_file in media_files or []:
+            if cls.__should_stop_audit(accumulator):
+                break
+            media_file = os.path.normpath(str(media_file or "").strip())
+            media_key = os.path.normcase(os.path.abspath(media_file)) if media_file else ""
+            if not media_key or media_key in seen_media:
+                continue
+            if len(seen_media) >= cls._audit_media_limit:
+                groups_truncated = True
+                truncation_reason = "media_limit"
+                accumulator["partial"] = True
+                break
+            seen_media.add(media_key)
+            directory = os.path.dirname(media_file)
+            if not directory:
+                continue
+            directory_key = os.path.normcase(os.path.abspath(directory))
+            if directory_key not in groups \
+                    and len(groups) >= accumulator["directory_limit"]:
+                groups_truncated = True
+                truncation_reason = "directory_limit"
+                accumulator["partial"] = True
+                break
+            group = groups.setdefault(directory_key, {"directory": directory, "media": {}})
+            cls.__emit_audit_progress(accumulator, media_file)
+            # linked mode receives explicit, trusted TRANSFER_HISTORY targets.
+            # A library media entry may itself be a symlink to the download
+            # volume; keep its lexical path so subtitles beside the link are
+            # still audited.  Subtitle symlinks remain rejected below.
+            if os.path.isfile(media_file):
+                group["media"][os.path.normcase(os.path.abspath(media_file))] = media_file
+        accumulator["root_count"] = len(groups)
+        accumulator["root_sample"] = []
+        for group in groups.values():
+            accumulator["root_sample"].append(group["directory"])
+            if len(accumulator["root_sample"]) >= cls._audit_root_sample_limit:
+                break
+        # ``roots`` is retained as a bounded compatibility sample.  Persisting
+        # every linked directory would turn a 50,000-directory audit into a
+        # multi-megabyte task/history record.  Deep mode still returns exactly
+        # its explicitly configured roots.
+        accumulator["roots"] = list(accumulator["root_sample"])
+        for group in groups.values():
+            directory = group["directory"]
+            selected = group["media"]
+            if cls.__should_stop_audit(accumulator):
+                break
+            if accumulator["directories"] >= accumulator["directory_limit"]:
+                accumulator["partial"] = True
+                accumulator["stop_reason"] = "directory_limit"
+                break
+            if not os.path.isdir(directory):
+                cls.__record_inaccessible(accumulator, directory)
+                continue
+            selected_paths = list(selected.values())
+            media_bases = sorted(
+                [(os.path.splitext(os.path.basename(path))[0], path) for path in selected_paths],
+                key=lambda item: len(item[0]), reverse=True
+            )
+            try:
+                with os.scandir(directory) as entries:
+                    accumulator["directories"] += 1
+                    cls.__emit_audit_progress(accumulator, directory)
+                    for entry in entries:
+                        if cls.__should_stop_audit(accumulator):
+                            break
+                        try:
+                            if entry.is_symlink() \
+                                    or not entry.is_file(follow_symlinks=False):
+                                continue
+                        except OSError as error:
+                            cls.__record_scan_error(accumulator, error, entry.path)
+                            continue
+                        sub_name = entry.name
+                        if os.path.splitext(sub_name)[-1].lower() not in RMT_SUBEXT:
+                            continue
+                        media_file = cls.__match_media_file(sub_name, media_bases)
+                        if not media_file:
+                            continue
+                        if not cls.__audit_pair(
+                                accumulator, entry.path, media_file):
+                            break
+            except OSError as error:
+                cls.__record_scan_error(accumulator, error, directory)
+                continue
+        if groups_truncated and not accumulator.get("stop_reason"):
+            accumulator["stop_reason"] = truncation_reason or "directory_limit"
+        return cls.__finish_audit(accumulator)
+
+    @classmethod
+    def audit_roots(cls, roots, server_type, issue_limit=1000,
+                    directory_limit=50000, subtitle_limit=10000,
+                    time_limit_seconds=3600, probe_timeout_seconds=10, cancel_check=None,
+                    progress_callback=None, cache_get=None, cache_put=None,
+                    heavy_operation=None):
+        """受限的深度扫描。
+
+        目录和字幕逐个处理，不保存完整路径/Future/结果列表；不跟随软链接，
+        并主动剪枝 NAS 快照、回收站及系统目录。
+        """
         roots = cls.__normalize_roots(roots)
-        subtitle_pairs = []
-        inaccessible_roots = []
-        scan_errors = []
-        scan_error_paths = []
+        accumulator = cls.__new_audit_accumulator(
+            server_type=server_type,
+            roots=roots,
+            issue_limit=issue_limit,
+            subtitle_limit=subtitle_limit,
+            time_limit_seconds=time_limit_seconds,
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
+            cache_get=cache_get,
+            cache_put=cache_put,
+            heavy_operation=heavy_operation,
+            mode="deep",
+            probe_timeout_seconds=probe_timeout_seconds
+        )
+        accumulator["directory_limit"] = max(int(directory_limit or 0), 1)
 
         def _onerror(error):
-            scan_errors.append(str(error))
-            error_path = os.path.normpath(str(getattr(error, "filename", "") or "").strip())
-            if error_path and error_path not in scan_error_paths:
-                scan_error_paths.append(error_path)
+            cls.__record_scan_error(
+                accumulator,
+                error,
+                str(getattr(error, "filename", "") or "")
+            )
 
         for root in roots:
-            if not os.path.isdir(root):
-                inaccessible_roots.append(root)
+            if cls.__should_stop_audit(accumulator):
+                break
+            if not os.path.isdir(root) or os.path.islink(root):
+                cls.__record_inaccessible(accumulator, root)
                 continue
-            for current_dir, _, file_names in os.walk(root, onerror=_onerror):
-                media_files = [name for name in file_names if os.path.splitext(name)[-1].lower() in RMT_MEDIAEXT]
-                subtitle_files = [name for name in file_names if os.path.splitext(name)[-1].lower() in RMT_SUBEXT]
-                if not subtitle_files:
-                    continue
+            for current_dir, dir_names, file_names in os.walk(
+                    root, topdown=True, onerror=_onerror, followlinks=False):
+                # os.walk 在网络文件系统上可能阻塞于一次目录调用；返回后立即合作式取消。
+                if cls.__should_stop_audit(accumulator):
+                    dir_names[:] = []
+                    break
+                dir_names[:] = [
+                    name for name in dir_names
+                    if name.casefold() not in cls._nas_skip_directories
+                    and not os.path.islink(os.path.join(current_dir, name))
+                ]
+                if accumulator["directories"] >= accumulator["directory_limit"]:
+                    accumulator["partial"] = True
+                    accumulator["stop_reason"] = "directory_limit"
+                    dir_names[:] = []
+                    break
+                accumulator["directories"] += 1
+                cls.__emit_audit_progress(accumulator, current_dir)
+                media_files = [
+                    name for name in file_names
+                    if os.path.splitext(name)[-1].lower() in RMT_MEDIAEXT
+                    and not os.path.islink(os.path.join(current_dir, name))
+                ]
                 media_bases = sorted(
                     [(os.path.splitext(name)[0], os.path.join(current_dir, name)) for name in media_files],
-                    key=lambda item: len(item[0]),
-                    reverse=True
+                    key=lambda item: len(item[0]), reverse=True
                 )
-                for sub_name in subtitle_files:
-                    sub_file = os.path.join(current_dir, sub_name)
+                for sub_name in file_names:
+                    if os.path.splitext(sub_name)[-1].lower() not in RMT_SUBEXT:
+                        continue
+                    subtitle_file = os.path.join(current_dir, sub_name)
+                    if os.path.islink(subtitle_file):
+                        continue
                     media_file = cls.__match_media_file(sub_name, media_bases)
-                    subtitle_pairs.append((sub_file, media_file))
+                    if not cls.__audit_pair(
+                            accumulator, subtitle_file, media_file):
+                        dir_names[:] = []
+                        break
+                if accumulator.get("stop_reason"):
+                    break
+            if accumulator.get("stop_reason"):
+                break
+        return cls.__finish_audit(accumulator)
 
-        def _inspect(pair):
-            return cls.inspect_external_subtitle(pair[0], pair[1], server_type)
-
-        results = []
-        if subtitle_pairs:
-            workers = min(4, len(subtitle_pairs))
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                results = list(executor.map(_inspect, subtitle_pairs))
-        summary = {
-            "total": len(results),
-            "ok": len([item for item in results if item.get("status") == "ok"]),
-            "warning": len([item for item in results if item.get("status") == "warning"]),
-            "error": len([item for item in results if item.get("status") == "error"])
+    @classmethod
+    def subtitle_fingerprint(cls, subtitle_file, cancel_check=None):
+        """生成可持久化探测缓存指纹；VobSub 同时纳入配对 IDX 元数据。"""
+        subtitle_file = os.path.abspath(os.path.normpath(subtitle_file or ""))
+        stat = os.stat(subtitle_file)
+        fingerprint = {
+            "path": os.path.normcase(subtitle_file),
+            "size": stat.st_size,
+            "mtime_ns": getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1000000000)),
+            "validator_version": cls._validator_version,
+            "ffprobe_version": cls.__get_ffprobe_version(cancel_check=cancel_check)
         }
-        media_statuses = cls.__aggregate_media_statuses(results)
-        issues = [item for item in results if item.get("status") != "ok"]
+        if os.path.splitext(subtitle_file)[-1].lower() == ".sub":
+            idx_file = os.path.splitext(subtitle_file)[0] + ".idx"
+            if os.path.isfile(idx_file):
+                idx_stat = os.stat(idx_file)
+                fingerprint.update({
+                    "pair_path": os.path.normcase(os.path.abspath(idx_file)),
+                    "pair_size": idx_stat.st_size,
+                    "pair_mtime_ns": getattr(
+                        idx_stat, "st_mtime_ns", int(idx_stat.st_mtime * 1000000000)
+                    )
+                })
+            else:
+                fingerprint["pair_missing"] = True
+        return fingerprint
+
+    @classmethod
+    def __new_audit_accumulator(cls, server_type, roots, issue_limit,
+                                subtitle_limit, time_limit_seconds,
+                                cancel_check, progress_callback,
+                                cache_get, cache_put, heavy_operation, mode,
+                                probe_timeout_seconds=10):
+        roots = list(roots or [])
         return {
-            "code": 0,
             "server": str(server_type or "emby").lower(),
             "roots": roots,
-            "inaccessible_roots": inaccessible_roots,
-            "scan_errors": scan_errors[:100],
-            "scan_error_paths": scan_error_paths,
-            "summary": summary,
-            "media_statuses": media_statuses,
-            "issues": issues[:issue_limit],
-            "issues_truncated": max(len(issues) - issue_limit, 0),
-            "probe_available": bool(shutil.which("ffprobe"))
+            "root_count": len(roots),
+            "root_sample": roots[:cls._audit_root_sample_limit],
+            "mode": mode,
+            "started": time.monotonic(),
+            "time_limit_seconds": max(float(time_limit_seconds or 0), 0.001),
+            "subtitle_limit": max(int(subtitle_limit or 0), 1),
+            "candidate_limit": cls._audit_candidate_limit,
+            "probe_timeout_seconds": max(float(probe_timeout_seconds or 10), 0.1),
+            "issue_limit": max(int(issue_limit or 0), 0),
+            "cancel_check": cancel_check,
+            "progress_callback": progress_callback,
+            "last_progress_at": 0,
+            "cache_get": cache_get,
+            "cache_put": cache_put,
+            "heavy_operation": heavy_operation,
+            "directories": 0,
+            "candidates": 0,
+            "inspected": 0,
+            "cache_hits": 0,
+            "summary": {"total": 0, "ok": 0, "warning": 0, "error": 0},
+            "media_statuses": {},
+            "issues": [],
+            "issue_count": 0,
+            "inaccessible_roots": [],
+            "inaccessible_count": 0,
+            "scan_errors": [],
+            "scan_error_paths": [],
+            "scan_error_path_set": set(),
+            "partial": False,
+            "canceled": False,
+            "stop_reason": ""
         }
+
+    @classmethod
+    def __audit_pair(cls, accumulator, subtitle_file, media_file):
+        if cls.__should_stop_audit(accumulator):
+            return False
+        if accumulator["candidates"] >= accumulator["candidate_limit"]:
+            accumulator["partial"] = True
+            accumulator["stop_reason"] = "candidate_limit"
+            return False
+        accumulator["candidates"] += 1
+        fingerprint = None
+        cached = None
+        if accumulator.get("cache_get") or accumulator.get("cache_put"):
+            try:
+                fingerprint_operation = nullcontext()
+                if cls._ffprobe_version is None and accumulator.get("heavy_operation"):
+                    fingerprint_operation = accumulator["heavy_operation"]("audit")
+                with fingerprint_operation:
+                    fingerprint = cls.subtitle_fingerprint(
+                        subtitle_file,
+                        cancel_check=accumulator.get("cancel_check")
+                    )
+                if accumulator.get("cache_get"):
+                    cached = accumulator["cache_get"](fingerprint)
+            except TimeoutError:
+                accumulator["partial"] = True
+                accumulator["stop_reason"] = "time_limit"
+                return False
+            except InterruptedError:
+                accumulator["canceled"] = True
+                accumulator["partial"] = True
+                accumulator["stop_reason"] = "canceled"
+                return False
+            except (OSError, ValueError):
+                cached = None
+            except Exception as error:
+                ExceptionUtils.exception_traceback(error)
+                cached = None
+        if isinstance(cached, dict):
+            result = dict(cached)
+            result.update({
+                "path": subtitle_file,
+                "media_path": media_file or "",
+                "server": accumulator["server"]
+            })
+            accumulator["cache_hits"] += 1
+        else:
+            if accumulator["inspected"] >= accumulator["subtitle_limit"]:
+                accumulator["partial"] = True
+                accumulator["stop_reason"] = "subtitle_limit"
+                return False
+            probe_operation = nullcontext()
+            if os.path.splitext(subtitle_file)[-1].lower() not in cls._text_extensions \
+                    and accumulator.get("heavy_operation"):
+                probe_operation = accumulator["heavy_operation"]("audit")
+            try:
+                with probe_operation:
+                    result = cls.inspect_external_subtitle(
+                        subtitle_file, media_file, accumulator["server"],
+                        cancel_check=accumulator.get("cancel_check"),
+                        probe_timeout_seconds=accumulator["probe_timeout_seconds"]
+                    )
+            except TimeoutError:
+                accumulator["partial"] = True
+                accumulator["stop_reason"] = "time_limit"
+                return False
+            except InterruptedError:
+                accumulator["canceled"] = True
+                accumulator["partial"] = True
+                accumulator["stop_reason"] = "canceled"
+                return False
+            accumulator["inspected"] += 1
+            if fingerprint and accumulator.get("cache_put") and not result.get("canceled"):
+                try:
+                    accumulator["cache_put"](fingerprint, dict(result))
+                except Exception as error:
+                    ExceptionUtils.exception_traceback(error)
+        cls.__accumulate_audit_result(accumulator, result)
+        cls.__emit_audit_progress(accumulator, subtitle_file)
+        return not cls.__should_stop_audit(accumulator)
+
+    @staticmethod
+    def __emit_audit_progress(accumulator, current_item, force=False):
+        callback = accumulator.get("progress_callback")
+        if not callback:
+            return
+        now = time.monotonic()
+        if not force and now - accumulator.get("last_progress_at", 0) < 0.5:
+            return
+        accumulator["last_progress_at"] = now
+        try:
+            callback({
+                "directories": accumulator["directories"],
+                "candidates": accumulator["candidates"],
+                "inspected": accumulator["inspected"],
+                "cache_hits": accumulator["cache_hits"],
+                "current_item": current_item
+            })
+        except Exception as error:
+            ExceptionUtils.exception_traceback(error)
+
+    @staticmethod
+    def __accumulate_audit_result(accumulator, result):
+        status = result.get("status") or "error"
+        accumulator["summary"]["total"] += 1
+        accumulator["summary"][status if status in {"ok", "warning", "error"} else "error"] += 1
+        media_path = str(result.get("media_path") or "").strip()
+        if media_path:
+            key = os.path.normcase(os.path.normpath(media_path))
+            priorities = {"ok": 0, "warning": 1, "error": 2}
+            current = accumulator["media_statuses"].get(key)
+            subtitle_count = int((current or {}).get("subtitle_count") or 0) + 1
+            if not current or priorities.get(status, 2) > priorities.get(current.get("status"), 2):
+                accumulator["media_statuses"][key] = {
+                    "media_path": media_path,
+                    "status": status,
+                    "reason": result.get("reason") or "",
+                    "subtitle_count": subtitle_count
+                }
+            else:
+                current["subtitle_count"] = subtitle_count
+        if status != "ok":
+            accumulator["issue_count"] += 1
+            if len(accumulator["issues"]) < accumulator["issue_limit"]:
+                accumulator["issues"].append(result)
+
+    @classmethod
+    def __should_stop_audit(cls, accumulator):
+        if accumulator.get("stop_reason"):
+            return True
+        if cls.__cancel_requested(accumulator.get("cancel_check")):
+            accumulator["canceled"] = True
+            accumulator["partial"] = True
+            accumulator["stop_reason"] = "canceled"
+            return True
+        if time.monotonic() - accumulator["started"] >= accumulator["time_limit_seconds"]:
+            accumulator["partial"] = True
+            accumulator["stop_reason"] = "time_limit"
+            return True
+        return False
+
+    @staticmethod
+    def __cancel_requested(cancel_check):
+        try:
+            if callable(cancel_check):
+                return bool(cancel_check())
+            if hasattr(cancel_check, "is_set"):
+                return bool(cancel_check.is_set())
+            return bool(cancel_check)
+        except Exception as error:
+            ExceptionUtils.exception_traceback(error)
+            return False
+
+    @staticmethod
+    def __record_scan_error(accumulator, error, path):
+        accumulator["partial"] = True
+        if len(accumulator["scan_errors"]) < 100:
+            accumulator["scan_errors"].append(str(error))
+        path = os.path.normpath(str(path or "").strip())
+        path_key = os.path.normcase(path) if path else ""
+        if path_key and path_key not in accumulator["scan_error_path_set"] \
+                and len(accumulator["scan_error_path_set"]) < 100:
+            accumulator["scan_error_path_set"].add(path_key)
+            accumulator["scan_error_paths"].append(path)
+
+    @staticmethod
+    def __record_inaccessible(accumulator, path):
+        accumulator["partial"] = True
+        accumulator["inaccessible_count"] += 1
+        if len(accumulator["inaccessible_roots"]) < 100:
+            accumulator["inaccessible_roots"].append(path)
+
+    @classmethod
+    def __finish_audit(cls, accumulator):
+        elapsed = max(time.monotonic() - accumulator["started"], 0)
+        partial = bool(accumulator["partial"] or accumulator["scan_errors"])
+        cls.__emit_audit_progress(accumulator, "", force=True)
+        return {
+            "code": 0,
+            "server": accumulator["server"],
+            "mode": accumulator["mode"],
+            "roots": accumulator["roots"],
+            "root_count": accumulator["root_count"],
+            "root_sample": accumulator["root_sample"],
+            "inaccessible_roots": accumulator["inaccessible_roots"],
+            "scan_errors": accumulator["scan_errors"],
+            "scan_error_paths": accumulator["scan_error_paths"],
+            "summary": accumulator["summary"],
+            "media_statuses": accumulator["media_statuses"],
+            "issues": accumulator["issues"],
+            "issues_truncated": max(
+                accumulator["issue_count"] - len(accumulator["issues"]), 0
+            ),
+            "probe_available": bool(shutil.which("ffprobe")),
+            "coverage_complete": not partial,
+            "partial": partial,
+            "canceled": accumulator["canceled"],
+            "stop_reason": accumulator["stop_reason"] or (
+                "scan_error" if accumulator["scan_errors"] else (
+                    "inaccessible" if accumulator["inaccessible_count"] else ""
+                )
+            ),
+            "metrics": {
+                "directories": accumulator["directories"],
+                "candidates": accumulator["candidates"],
+                "inspected": accumulator["inspected"],
+                "cache_hits": accumulator["cache_hits"],
+                "candidate_limit": accumulator["candidate_limit"],
+                "elapsed_seconds": round(elapsed, 3),
+                "inaccessible": accumulator["inaccessible_count"]
+            }
+        }
+
+    @classmethod
+    def __get_ffprobe_version(cls, cancel_check=None):
+        if cls._ffprobe_version is not None:
+            return cls._ffprobe_version
+        executable = shutil.which("ffprobe")
+        if not executable:
+            cls._ffprobe_version = "unavailable"
+            return cls._ffprobe_version
+        try:
+            _, stdout, _, stop_reason = cls.__run_popen(
+                [executable, "-version"], timeout_seconds=3,
+                cancel_check=cancel_check
+            )
+            if stop_reason:
+                return "unknown"
+            cls._ffprobe_version = (stdout or "").splitlines()[0].strip() or "unknown"
+        except Exception:
+            cls._ffprobe_version = "unknown"
+        return cls._ffprobe_version
 
     @staticmethod
     def __aggregate_media_statuses(results):
@@ -434,12 +1098,17 @@ class SubtitleHealth:
                 os.remove(temp_file)
 
     @classmethod
-    def __fallback_validate(cls, subtitle_file, ext):
+    def __fallback_validate(cls, subtitle_file, ext, cancel_check=None):
         if ext not in cls._text_extensions:
-            return {"valid": True, "probe_available": False, "message": "未安装 ffprobe，仅完成基础检查"}
+            return {
+                "valid": False, "probe_available": False,
+                "message": "未安装 ffprobe，无法验证二进制或未知字幕格式"
+            }
         try:
-            with open(subtitle_file, "rb") as file_obj:
-                _, text = cls.__decode_text(file_obj.read())
+            raw = cls.__read_file_cooperative(
+                subtitle_file, cls._max_local_text_bytes, cancel_check
+            )
+            _, text = cls.__decode_text(raw)
             if text is None:
                 return {"valid": False, "probe_available": False, "message": "无法识别字幕字符编码"}
             stripped = text.lstrip("\ufeff\r\n ")
@@ -458,6 +1127,11 @@ class SubtitleHealth:
                 "valid": valid,
                 "probe_available": False,
                 "message": "基础格式检查通过" if valid else "字幕基础格式检查失败"
+            }
+        except InterruptedError:
+            return {
+                "valid": False, "probe_available": False,
+                "canceled": True, "message": "字幕结构检查已取消"
             }
         except Exception as e:
             ExceptionUtils.exception_traceback(e)
@@ -501,8 +1175,11 @@ class SubtitleHealth:
     @staticmethod
     def __normalize_roots(roots):
         result = []
+        seen = set()
         for root in roots or []:
             root = os.path.normpath(str(root or "").strip())
-            if root and root not in result:
+            key = os.path.normcase(os.path.abspath(root)) if root else ""
+            if root and key not in seen:
+                seen.add(key)
                 result.append(root)
         return result

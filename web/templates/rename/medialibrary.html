@@ -27,6 +27,11 @@
               <div class="card-subtitle mt-1">筛选媒体后，可上传字幕或按分类检测影视服务器识别情况</div>
             </div>
             <div class="card-actions">
+              <button class="btn" type="button" data-subtitle-task-center aria-label="打开字幕任务中心">
+                {{ SVG.check() }}
+                任务中心
+                <span class="badge bg-primary text-white d-none" data-subtitle-task-count>0</span>
+              </button>
               <button class="btn btn-outline-primary" type="button" onclick="run_library_subtitle_audit()">
                 {{ SVG.check() }}
                 检测外挂字幕
@@ -218,15 +223,16 @@
             Plex 建议使用 <code>Movie.zh-CN.srt</code> 或 <code>Movie.zh-TW.srt</code>。
             同语种多来源字幕在 Jellyfin 下会保留独立标题，例如
             <code>Movie.YYeTs.chi.zh-cn.srt</code>、<code>Movie.source-2.chi.zh-cn.srt</code>。
-            上传后会按所选影视服务器规范化文件名并触发刷新。
+            上传后会按所选影视服务器规范化文件名，并只刷新当前电影、剧集或对应 Plex 路径；
+            无法可靠定位媒体服务器项目时会跳过刷新，不会退回全库刷新。
           </div>
         </section>
 
         <section class="lit-library-help-section">
           <h6 class="lit-library-help-title">性能与排查</h6>
           <div class="text-muted mb-2">
-            列表使用媒体服务器已有流信息和外挂字幕目录缓存，不会为全库逐项运行 ffprobe；目录结果短时缓存 30 秒，上传成功后立即失效。
-            “检测外挂字幕”会执行更完整的解析，因此建议每次只选择一个分类或小分类。
+            默认检测只读取已链接媒体的目标目录，同一目录只枚举一次，并复用未变化字幕的探测缓存。
+            深度目录扫描仅在高级选项中提供，受目录、字幕数量和时间上限保护；建议只在排查遗漏时使用。
           </div>
           <ol class="text-muted mb-0 ps-3">
             <li>确认媒体已完成整理/链接，且目标媒体文件存在。</li>
@@ -248,12 +254,21 @@
     <div class="modal-content">
       <div class="modal-header">
         <h5 class="modal-title">外挂字幕分类检测</h5>
-        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
       </div>
       <div class="modal-body">
         <div class="text-muted mb-3">
-          按全局设置的影视服务器检查字幕与视频文件名关联、语言标签、格式支持及 ffprobe 解析结果。
-          每次仅扫描一个媒体分类，减少 NAS 磁盘与 CPU 压力。
+          按所选影视服务器检查字幕与视频文件名关联、语言标签、格式支持及解析结果。
+          默认只检测转移历史中的已链接媒体，并按目标目录去重，减少 NAS 磁盘与 CPU 压力。
+        </div>
+        <div class="mb-3">
+          <label class="form-label required" for="index_library_subtitle_audit_server">目标影视服务器</label>
+          <select class="form-select" id="index_library_subtitle_audit_server"
+                  onchange="load_library_subtitle_audit_history()">
+            <option value="jellyfin" {% if MediaServerType|lower == "jellyfin" %}selected{% endif %}>Jellyfin</option>
+            <option value="emby" {% if MediaServerType|lower == "emby" %}selected{% endif %}>Emby</option>
+            <option value="plex" {% if MediaServerType|lower == "plex" %}selected{% endif %}>Plex</option>
+          </select>
         </div>
         <div class="mb-3">
           <label class="form-label" for="index_library_subtitle_audit_category">检测分类</label>
@@ -266,18 +281,41 @@
         </div>
         <div class="mb-3">
           <label class="form-label" for="index_library_subtitle_audit_subcategory">详细小分类</label>
-          <select class="form-select" id="index_library_subtitle_audit_subcategory">
+          <select class="form-select" id="index_library_subtitle_audit_subcategory" onchange="update_library_subtitle_audit_mode()">
             <option value="">全部电影</option>
           </select>
           <div class="form-hint">小分类来自当前分类 YAML，例如华语电影、外语电影、动画电影。</div>
         </div>
-        <div id="index_library_subtitle_audit_summary"></div>
+        <div class="mb-3">
+          <label class="form-label" for="index_library_subtitle_audit_mode">检测范围</label>
+          <select class="form-select" id="index_library_subtitle_audit_mode" onchange="update_library_subtitle_audit_mode()">
+            <option value="linked" selected>已链接媒体（推荐，低 IO）</option>
+            <option value="deep">深度目录扫描（高级）</option>
+          </select>
+          <div class="form-hint">已链接模式不会遍历媒体库根目录；缓存命中的字幕不会重复执行深度探测。</div>
+        </div>
+        <div id="index_library_subtitle_audit_deep_warning" class="alert alert-warning d-none" role="alert">
+          <div class="fw-bold mb-1">深度扫描可能持续占用 NAS 磁盘 IO</div>
+          <div class="small mb-1 text-break">目标目录范围：<strong id="index_library_subtitle_audit_deep_scope">所选媒体分类</strong></div>
+          <div class="small mb-2">仅在需要查找未链接字幕时使用。任务会跳过回收站、快照及 NAS 系统目录，并受
+            <span id="index_library_subtitle_audit_limit_minutes">60</span> 分钟、
+            <span id="index_library_subtitle_audit_limit_directories">50,000</span> 个目录、
+            <span id="index_library_subtitle_audit_limit_changed">10,000</span> 个新增/变化字幕和
+            <span id="index_library_subtitle_audit_limit_issues">200</span> 条问题明细限制。
+          </div>
+          <label class="form-check mb-0">
+            <input class="form-check-input" type="checkbox" id="index_library_subtitle_audit_deep_confirm">
+            <span class="form-check-label">我已了解高 IO 风险，并确认开始本次深度扫描</span>
+          </label>
+        </div>
+        <div id="index_library_subtitle_audit_summary" aria-live="polite"></div>
         <div id="index_library_subtitle_audit_issues" class="divide-y mt-3"></div>
         <div class="hr-text mt-4">最近 3 次检测记录</div>
         <div id="index_library_subtitle_audit_history"></div>
       </div>
       <div class="modal-footer">
         <button type="button" class="btn me-auto" data-bs-dismiss="modal">关闭</button>
+        <button type="button" id="index_library_subtitle_audit_cancel" class="btn btn-outline-danger subtitle-task-cancel-action d-none">取消任务</button>
         <button type="button" id="index_library_subtitle_audit_retry" class="btn btn-primary"
                 onclick="run_library_subtitle_audit(true)">开始/重新检测</button>
       </div>
@@ -289,7 +327,7 @@
     <div class="modal-content">
       <div class="modal-header">
         <h5 class="modal-title" id="index_library_episodes_title">选择剧集</h5>
-        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
       </div>
       <div class="modal-body">
         <div id="index_library_episodes_body" class="divide-y"></div>
@@ -303,23 +341,27 @@
     <div class="modal-content">
       <div class="modal-header">
         <h5 class="modal-title">上传字幕</h5>
-        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
       </div>
       <div class="modal-body">
         <input type="hidden" id="index_upload_subtitle_path">
         <input type="hidden" id="index_upload_subtitle_target_path">
+        <input type="hidden" id="index_upload_subtitle_request_id">
+        <input type="hidden" id="index_upload_subtitle_server_item_id">
+        <input type="hidden" id="index_upload_subtitle_parent_server_item_id">
+        <input type="hidden" id="index_upload_subtitle_library_id">
         <div class="mb-3">
-          <label class="form-label">媒体文件</label>
+          <label class="form-label" for="index_upload_subtitle_name">媒体文件</label>
           <input type="text" id="index_upload_subtitle_name" class="form-control" readonly>
         </div>
         <div class="mb-3">
-          <label class="form-label required">字幕文件</label>
+          <label class="form-label required" for="index_upload_subtitle_file">字幕文件</label>
           <input type="file" id="index_upload_subtitle_file" class="form-control"
-                 accept=".srt,.ass,.ssa,.smi,.vtt,.sub" multiple>
-          <div class="form-hint">单次最多选择 20 个字幕；同电影、同语种的不同来源会保留为独立轨道，不会相互覆盖。</div>
+                 accept=".srt,.ass,.ssa,.smi,.vtt,.sub,.idx" multiple>
+          <div class="form-hint">单批最多 20 个逻辑字幕；VobSub 请同时选择同名 .sub 与 .idx，两者计为一个。不会覆盖现有字幕。</div>
         </div>
         <div class="mb-3">
-          <label class="form-label required">目标影视服务器</label>
+          <label class="form-label required" for="index_upload_subtitle_server">目标影视服务器</label>
           <select id="index_upload_subtitle_server" class="form-select">
             <option value="jellyfin" {% if MediaServerType|lower == "jellyfin" %}selected{% endif %}>Jellyfin</option>
             <option value="emby" {% if MediaServerType|lower == "emby" %}selected{% endif %}>Emby</option>
@@ -327,7 +369,7 @@
           </select>
         </div>
         <div class="mb-3">
-          <label class="form-label">字幕对齐模式</label>
+          <label class="form-label" for="index_upload_subtitle_align">字幕对齐模式</label>
           <select id="index_upload_subtitle_align" class="form-select">
             <option value="none" selected>不对齐</option>
             <option value="auto">自动选择</option>
@@ -336,14 +378,26 @@
             <option value="llm">LLM跨语言对齐</option>
           </select>
         </div>
+        <div id="index_upload_subtitle_progress" class="subtitle-upload-progress d-none" aria-live="polite">
+          <div class="d-flex justify-content-between gap-2 mb-1">
+            <span class="fw-bold" data-subtitle-progress-title>准备上传</span>
+          </div>
+          <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100">
+            <div class="progress-bar" data-subtitle-progress-bar style="width:0">0%</div>
+          </div>
+          <div class="small mt-2" data-subtitle-progress-message></div>
+          <div class="text-muted small text-break mt-1" data-subtitle-progress-current hidden></div>
+        </div>
       </div>
       <div class="modal-footer">
-        <button type="button" class="btn me-auto" data-bs-dismiss="modal">取消</button>
+        <button type="button" class="btn me-auto" data-bs-dismiss="modal">关闭（后台继续）</button>
+        <button type="button" id="index_upload_subtitle_cancel" class="btn btn-outline-danger subtitle-task-cancel-action d-none">取消任务</button>
         <button type="button" id="index_upload_subtitle_btn" class="btn btn-primary">上传</button>
       </div>
     </div>
   </div>
 </div>
+<script type="text/javascript" src="../static/js/subtitle-tasks.js"></script>
 <script type="text/javascript" src="../static/js/media-library.js"></script>
 <script type="text/javascript">
   window.CURRENT_MEDIA_SERVER_TYPE = "{{ MediaServerType or 'emby' }}";

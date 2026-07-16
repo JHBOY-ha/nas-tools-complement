@@ -140,3 +140,22 @@ class MediaDb:
         except Exception as e:
             ExceptionUtils.exception_traceback(e)
             return []
+
+    def find_items(self, server_type=None, item_ids=None, library=None, path=None):
+        """Narrow media-sync lookup used by targeted subtitle refresh validation."""
+        try:
+            query = self.session.query(MEDIASYNCITEMS)
+            if server_type:
+                names = {str(server_type), str(server_type).lower(), str(server_type).capitalize()}
+                query = query.filter(MEDIASYNCITEMS.SERVER.in_(list(names)))
+            ids = [str(value) for value in (item_ids or []) if str(value or "").strip()]
+            if ids:
+                query = query.filter(MEDIASYNCITEMS.ITEM_ID.in_(ids))
+            if library:
+                query = query.filter(MEDIASYNCITEMS.LIBRARY == str(library))
+            if path:
+                query = query.filter(MEDIASYNCITEMS.PATH == os.path.normpath(str(path)))
+            return query.order_by(MEDIASYNCITEMS.TITLE.asc()).all()
+        except Exception as e:
+            ExceptionUtils.exception_traceback(e)
+            return []

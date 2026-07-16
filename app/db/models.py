@@ -1,5 +1,5 @@
 # coding: utf-8
-from sqlalchemy import Column, Float, Index, Integer, Text, text, Sequence
+from sqlalchemy import Column, Float, ForeignKey, Index, Integer, Text, text, Sequence, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
 
 Base = declarative_base()
@@ -565,6 +565,148 @@ class MEDIASYNCITEMS(BaseMedia):
     PATH = Column(Text)
     NOTE = Column(Text)
     JSON = Column(Text)
+
+
+class SUBTITLETASK(Base):
+    """Persistent queue record for manual subtitle work.
+
+    JSON values deliberately use ``Text`` instead of SQLAlchemy's JSON type.  The
+    application has to keep working with user databases created by older SQLite
+    versions and the task manager already owns validation/serialization.
+    """
+
+    __tablename__ = 'SUBTITLE_TASK'
+    __table_args__ = (
+        Index('INDX_SUBTITLE_TASK_OWNER_TYPE', 'OWNER', 'TYPE'),
+        Index('INDX_SUBTITLE_TASK_STATUS_CREATED', 'STATUS', 'CREATED_AT'),
+        Index('INDX_SUBTITLE_TASK_DEDUPE', 'OWNER', 'TYPE', 'DEDUPE_KEY'),
+        Index('INDX_SUBTITLE_TASK_SCOPE', 'TYPE', 'SCOPE_KEY', 'STATUS'),
+    )
+
+    ID = Column(Text, primary_key=True)
+    TYPE = Column(Text, nullable=False)
+    OWNER = Column(Text, nullable=False, server_default=text("''"))
+    STATUS = Column(Text, nullable=False, index=True)
+    PRIORITY = Column(Integer, nullable=False, server_default=text("0"))
+    SERVER = Column(Text)
+    REQUEST_ID = Column(Text)
+    DEDUPE_KEY = Column(Text)
+    SCOPE_KEY = Column(Text)
+    PAYLOAD = Column(Text, nullable=False, server_default=text("'{}'"))
+    POLICY = Column(Text, nullable=False, server_default=text("'{}'"))
+    PHASE = Column(Text)
+    COMPLETED = Column(Integer, nullable=False, server_default=text("0"))
+    TOTAL = Column(Integer)
+    PERCENT = Column(Float)
+    CURRENT_ITEM = Column(Text)
+    MESSAGE = Column(Text)
+    METRICS = Column(Text, nullable=False, server_default=text("'{}'"))
+    RESULT = Column(Text)
+    ERROR = Column(Text)
+    CANCEL_REQUESTED = Column(Integer, nullable=False, server_default=text("0"))
+    ACTIVE_SECONDS = Column(Float, nullable=False, server_default=text("0"))
+    RUN_STARTED_AT = Column(Float)
+    CREATED_AT = Column(Float, nullable=False)
+    QUEUED_AT = Column(Float)
+    STARTED_AT = Column(Float)
+    FINISHED_AT = Column(Float)
+    UPDATED_AT = Column(Float, nullable=False)
+
+
+class SUBTITLETASKITEM(Base):
+    """Checkpoint for one logical upload item (a VobSub pair counts as one)."""
+
+    __tablename__ = 'SUBTITLE_TASK_ITEM'
+    __table_args__ = (
+        UniqueConstraint('TASK_ID', 'ITEM_KEY', name='UN_SUBTITLE_TASK_ITEM_KEY'),
+        Index('INDX_SUBTITLE_TASK_ITEM_ORDER', 'TASK_ID', 'LOGICAL_INDEX'),
+        Index('INDX_SUBTITLE_TASK_ITEM_STATUS', 'TASK_ID', 'STATUS'),
+    )
+
+    ID = Column(Integer, Sequence('ID'), primary_key=True)
+    TASK_ID = Column(Text, ForeignKey('SUBTITLE_TASK.ID', ondelete='CASCADE'), nullable=False)
+    ITEM_KEY = Column(Text, nullable=False)
+    LOGICAL_INDEX = Column(Integer, nullable=False)
+    KIND = Column(Text, nullable=False)
+    SOURCE_NAME = Column(Text, nullable=False)
+    COMPANION_NAME = Column(Text)
+    STAGED_PATH = Column(Text, nullable=False)
+    COMPANION_PATH = Column(Text)
+    CONTENT_HASH = Column(Text, nullable=False)
+    COMPANION_HASH = Column(Text)
+    SIZE = Column(Integer, nullable=False, server_default=text("0"))
+    COMPANION_SIZE = Column(Integer, nullable=False, server_default=text("0"))
+    LANGUAGE = Column(Text)
+    STATUS = Column(Text, nullable=False, server_default=text("'queued'"))
+    STAGE = Column(Text, nullable=False, server_default=text("'staged'"))
+    OUTPUT_PATH = Column(Text)
+    OUTPUT_COMPANION_PATH = Column(Text)
+    OUTPUT_HASH = Column(Text)
+    RESULT = Column(Text)
+    ERROR = Column(Text)
+    CREATED_AT = Column(Float, nullable=False)
+    UPDATED_AT = Column(Float, nullable=False)
+
+
+class SUBTITLEPROBECACHE(Base):
+    """Persistent ffprobe/local-validator result keyed by server and path."""
+
+    __tablename__ = 'SUBTITLE_PROBE_CACHE'
+    __table_args__ = (
+        UniqueConstraint('SERVER', 'PATH', name='UN_SUBTITLE_PROBE_CACHE_PATH'),
+        Index('INDX_SUBTITLE_PROBE_CACHE_UPDATED', 'UPDATED_AT'),
+    )
+
+    ID = Column(Integer, Sequence('ID'), primary_key=True)
+    SERVER = Column(Text, nullable=False)
+    PATH = Column(Text, nullable=False)
+    FINGERPRINT = Column(Text, nullable=False)
+    SIZE = Column(Integer, nullable=False, server_default=text("0"))
+    MTIME_NS = Column(Text)
+    PAIR_PATH = Column(Text)
+    PAIR_SIZE = Column(Integer)
+    PAIR_MTIME_NS = Column(Text)
+    VALIDATOR_VERSION = Column(Text)
+    PROBE_VERSION = Column(Text)
+    RESULT = Column(Text, nullable=False, server_default=text("'{}'"))
+    CREATED_AT = Column(Float, nullable=False)
+    UPDATED_AT = Column(Float, nullable=False)
+
+
+class SUBTITLEAUDITSTATE(Base):
+    """Latest confirmed state for one subtitle inside a stable audit scope."""
+
+    __tablename__ = 'SUBTITLE_AUDIT_STATE'
+    __table_args__ = (
+        UniqueConstraint('SCOPE_KEY', 'SERVER', 'SUBTITLE_PATH', name='UN_SUBTITLE_AUDIT_STATE_PATH'),
+        Index('INDX_SUBTITLE_AUDIT_STATE_SCOPE', 'SCOPE_KEY', 'SERVER'),
+        Index('INDX_SUBTITLE_AUDIT_STATE_STATUS', 'STATUS'),
+        Index('INDX_SUBTITLE_AUDIT_STATE_UPDATED', 'UPDATED_AT'),
+        Index('INDX_SUBTITLE_AUDIT_STATE_SERVER_UPDATED', 'SERVER', 'UPDATED_AT'),
+    )
+
+    ID = Column(Integer, Sequence('ID'), primary_key=True)
+    SCOPE_KEY = Column(Text, nullable=False)
+    SERVER = Column(Text, nullable=False)
+    SUBTITLE_PATH = Column(Text, nullable=False)
+    MEDIA_PATH = Column(Text)
+    STATUS = Column(Text, nullable=False)
+    REASON = Column(Text)
+    RESULT = Column(Text, nullable=False, server_default=text("'{}'"))
+    TASK_ID = Column(Text)
+    CONFIRMED_AT = Column(Float, nullable=False)
+    UPDATED_AT = Column(Float, nullable=False)
+
+
+class SUBTITLETASKSETTING(Base):
+    """Single-row policy override used when new tasks take their snapshot."""
+
+    __tablename__ = 'SUBTITLE_TASK_SETTING'
+
+    ID = Column(Integer, primary_key=True)
+    POLICY = Column(Text, nullable=False, server_default=text("'{}'"))
+    UPDATED_BY = Column(Text)
+    UPDATED_AT = Column(Float, nullable=False)
 
 
 class MEDIASYNCSTATISTIC(BaseMedia):

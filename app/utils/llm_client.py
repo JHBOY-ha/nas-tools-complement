@@ -73,26 +73,43 @@ class LLMClient:
             self.__log_request_error(err, context="连接测试")
             return False
 
-    def complete_json(self, system_prompt, user_prompt, max_tokens=None):
+    def complete_json(self, system_prompt, user_prompt, max_tokens=None,
+                      timeout=None, max_retries=None):
         content = self.complete_text(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            max_tokens=max_tokens
+            max_tokens=max_tokens,
+            timeout=timeout,
+            max_retries=max_retries
         )
         return self.parse_json(content)
 
-    def complete_text(self, system_prompt, user_prompt, max_tokens=None):
+    def complete_text(self, system_prompt, user_prompt, max_tokens=None,
+                      timeout=None, max_retries=None):
         if not self.is_ready(require_enable=False):
             return ""
         try:
-            return self.__complete_openai(system_prompt, user_prompt, max_tokens)
+            return self.__complete_openai(
+                system_prompt,
+                user_prompt,
+                max_tokens,
+                timeout=timeout,
+                max_retries=max_retries
+            )
         except Exception as err:
             ExceptionUtils.exception_traceback(err)
             self.__log_request_error(err, context="补全请求")
             return ""
 
-    def __complete_openai(self, system_prompt, user_prompt, max_tokens=None):
-        response = self.__request_openai(system_prompt, user_prompt, max_tokens)
+    def __complete_openai(self, system_prompt, user_prompt, max_tokens=None,
+                          timeout=None, max_retries=None):
+        response = self.__request_openai(
+            system_prompt,
+            user_prompt,
+            max_tokens,
+            timeout=timeout,
+            max_retries=max_retries
+        )
         if not response:
             return ""
         choices = self.__get_value(response, "choices", []) or []
@@ -106,7 +123,8 @@ class LLMClient:
             self.__log_empty_content(choice, context="补全请求")
         return content
 
-    def __request_openai(self, system_prompt, user_prompt, max_tokens=None):
+    def __request_openai(self, system_prompt, user_prompt, max_tokens=None,
+                         timeout=None, max_retries=None):
         kwargs = {
             "model": self._model,
             "messages": [
@@ -128,7 +146,13 @@ class LLMClient:
         extra_query.update(self._extra_query)
         if extra_query:
             kwargs["extra_query"] = extra_query
-        return self.__get_client().chat.completions.create(**kwargs)
+        client = self.__get_client()
+        if timeout is not None or max_retries is not None:
+            client = client.with_options(
+                timeout=self._timeout if timeout is None else timeout,
+                max_retries=self._max_retries if max_retries is None else max_retries
+            )
+        return client.chat.completions.create(**kwargs)
 
     def __get_client(self):
         if not self._client:
