@@ -777,7 +777,12 @@ class Media:
         """
         if not meta_info:
             return {}
-        return self.meta.get_meta_data_by_key(self.__make_cache_key(meta_info))
+        cached = self.meta.get_meta_data_by_key(self.__make_cache_key(meta_info))
+        if (cached.get("id") and self.__resolve_tmdb_mtype(meta_type=cached.get("type"))
+                != self.__resolve_tmdb_mtype(meta_type=meta_info.type)):
+            log.warn("【Meta】忽略与作品类型冲突的历史识别缓存")
+            return {}
+        return cached
 
     @staticmethod
     def __is_same_search_name(name1, name2):
@@ -953,6 +958,13 @@ class Media:
             mtype = MediaType.TV
         else:
             mtype = self.__resolve_tmdb_mtype(meta_type=meta_info.type, hint_type=mtype_hint)
+        expected_type = self.__resolve_tmdb_mtype(meta_type=meta_info.type, hint_type=mtype_hint)
+        if expected_type and mtype != expected_type:
+            log.warn("【Meta】LLM候选类型与作品类型冲突，回退名称检索")
+            return None, None
+        # 仅接受经外部候选列表验证的ID，不能凭LLM生成的数字直接绑定作品。
+        if not llm_note.get("candidate_verified"):
+            return None, None
         return tmdb_id, mtype
 
     def __search_media_with_name(self, meta_info, query_name, strict=None):
@@ -962,18 +974,18 @@ class Media:
         if not meta_info or not query_name:
             return {}
 
-        if meta_info.type != MediaType.TV and not meta_info.year:
+        if meta_info.type not in [MediaType.TV, MediaType.ANIME] and not meta_info.year:
             file_media_info = self.__search_multi_tmdb(file_media_name=query_name)
         else:
-            if meta_info.type == MediaType.TV:
+            if meta_info.type in [MediaType.TV, MediaType.ANIME]:
                 file_media_info = self.__search_tmdb(file_media_name=query_name,
                                                      first_media_year=meta_info.year,
-                                                     search_type=meta_info.type,
+                                                     search_type=MediaType.TV,
                                                      media_year=meta_info.year,
                                                      season_number=meta_info.begin_season)
                 if not file_media_info and meta_info.year and self._rmt_match_mode == MatchMode.NORMAL and not strict:
                     file_media_info = self.__search_tmdb(file_media_name=query_name,
-                                                         search_type=meta_info.type)
+                                                         search_type=MediaType.TV)
             else:
                 file_media_info = self.__search_tmdb(file_media_name=query_name,
                                                      first_media_year=meta_info.year,
@@ -1026,14 +1038,14 @@ class Media:
         if not title:
             return None
         # 识别
-        meta_info = MetaInfo(title, subtitle=subtitle)
+        meta_info = MetaInfo(title, subtitle=subtitle, mtype=mtype)
         if not meta_info.get_name() or not meta_info.type:
             log.warn("【Rmt】%s 未识别出有效信息！" % meta_info.org_string)
             return None
         if mtype:
             meta_info.type = mtype
         media_key = self.__make_cache_key(meta_info)
-        if not cache or not self.meta.get_meta_data_by_key(media_key):
+        if not cache or not self.get_cache_info(meta_info).get("id"):
             file_media_info = None
             llm_tmdb_id, llm_tmdb_type = self.__extract_llm_tmdb_target(meta_info=meta_info, mtype_hint=mtype)
             if llm_tmdb_id:
@@ -1071,12 +1083,12 @@ class Media:
                                                      chinese=chinese,
                                                      append_to_response=append_to_response)
             # 保存到缓存
-            if file_media_info is not None:
+            if file_media_info:
                 self.__insert_media_cache(media_key=media_key,
                                           file_media_info=file_media_info)
         else:
             # 使用缓存信息
-            cache_info = self.meta.get_meta_data_by_key(media_key)
+            cache_info = self.get_cache_info(meta_info)
             if cache_info.get("id"):
                 file_media_info = self.get_tmdb_info(mtype=cache_info.get("type"),
                                                      tmdbid=cache_info.get("id"),
@@ -1139,7 +1151,8 @@ class Media:
                                 media_type=None,
                                 season=None,
                                 episode_format: EpisodeFormat = None,
-                                chinese=True):
+                                chinese=True,
+                                download_context=None):
         """
         根据文件清单，搜刮TMDB信息，用于文件名称的识别
         :param file_list: 文件清单，如果是列表也可以是单个文件，也可以是一个目录
@@ -1206,7 +1219,7 @@ class Media:
                         continue
                     # 区配缓存及TMDB
                     media_key = self.__make_cache_key(meta_info)
-                    if not self.meta.get_meta_data_by_key(media_key):
+                    if not self.get_cache_info(meta_info).get("id"):
                         # 没有缓存数据
                         file_media_info = None
                         llm_tmdb_id, llm_tmdb_type = self.__extract_llm_tmdb_target(meta_info=meta_info)
@@ -1241,12 +1254,12 @@ class Media:
                                                                  tmdbid=file_media_info.get("id"),
                                                                  chinese=chinese)
                         # 保存到缓存
-                        if file_media_info is not None:
+                        if file_media_info:
                             self.__insert_media_cache(media_key=media_key,
                                                       file_media_info=file_media_info)
                     else:
                         # 使用缓存信息
-                        cache_info = self.meta.get_meta_data_by_key(media_key)
+                        cache_info = self.get_cache_info(meta_info)
                         if cache_info.get("id"):
                             file_media_info = self.get_tmdb_info(mtype=cache_info.get("type"),
                                                                  tmdbid=cache_info.get("id"),
@@ -1262,7 +1275,36 @@ class Media:
                     meta_info.set_tmdb_info(file_media_info)
                 # 自带TMDB信息
                 else:
-                    meta_info = MetaInfo(title=file_name, mtype=media_type)
+                    # 已绑定作品身份时不再让LLM根据缩写文件名改写类型和季集。
+                    meta_info = MetaInfo(title=file_name, mtype=media_type,
+                                         use_llm=not bool(download_context))
+                    if download_context and media_type != MediaType.MOVIE:
+                        seasons = download_context.get("seasons") or []
+                        episodes = download_context.get("episodes") or []
+                        explicit_season = re.search(r"(?i)(?:S|Season[ ._-]*)(\d{1,2})(?=[E ._\-]|$)", file_name)
+                        if explicit_season and seasons and int(explicit_season.group(1)) not in seasons:
+                            raise ValueError("文件季号与RSS下载任务冲突：%s" % file_name)
+                        if len(seasons) == 1 and not explicit_season:
+                            meta_info.begin_season = seasons[0]
+                        file_episodes = meta_info.get_episode_list()
+                        if file_episodes and episodes and not set(file_episodes).issubset(set(episodes)):
+                            # 仅在TMDB完整给出之前各季集数、且映射后命中RSS集号时转换绝对集号。
+                            counts = {entry.get("season_number"): entry.get("episode_count")
+                                      for entry in (tmdb_info.get("seasons") or [])}
+                            prior = list(range(1, seasons[0])) if len(seasons) == 1 else []
+                            can_map = (not explicit_season and prior
+                                       and all(isinstance(counts.get(s), int) and counts[s] > 0 for s in prior))
+                            offset = sum(counts[s] for s in prior) if can_map else 0
+                            mapped = [ep - offset for ep in file_episodes]
+                            if not offset or not set(mapped).issubset(set(episodes)):
+                                raise ValueError("文件集号与RSS下载任务冲突，需确认绝对集数映射：%s" % file_name)
+                            meta_info.begin_episode = mapped[0]
+                            meta_info.end_episode = mapped[-1] if len(mapped) > 1 else None
+                            log.info("【Meta】按已验证的前季集数转换绝对集号：%s -> %s" % (file_episodes, mapped))
+                        if not file_episodes and len(file_list) == 1 and len(episodes) == 1:
+                            meta_info.begin_episode = episodes[0]
+                        if not meta_info.get_episode_list():
+                            raise ValueError("下载文件缺少可验证集号：%s" % file_name)
                     meta_info.set_tmdb_info(tmdb_info)
                     if season and meta_info.type != MediaType.MOVIE:
                         meta_info.begin_season = int(season)
@@ -1273,7 +1315,8 @@ class Media:
                         if end_ep is not None:
                             meta_info.end_episode = end_ep
                     # 加入缓存
-                    self.save_rename_cache(file_name, tmdb_info)
+                    if not download_context:
+                        self.save_rename_cache(file_name, tmdb_info)
                 # 按文件路程存储
                 return_media_infos[file_path] = meta_info
             except Exception as err:

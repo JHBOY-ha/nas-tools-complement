@@ -1,4 +1,6 @@
 import os
+import time
+import uuid
 from threading import Lock
 
 import log
@@ -116,6 +118,39 @@ class Downloader:
                 self.clients[ctype.value] = self.__build_class(ctype.value, conf)
             return self.clients.get(ctype.value)
 
+    def _create_download_context(self, media_info, dl_type):
+        info = getattr(media_info, "tmdb_info", None)
+        if not info or not info.get("id"):
+            return None
+        tmdb_type = info.get("media_type")
+        if tmdb_type not in [MediaType.MOVIE, MediaType.TV]:
+            return None
+        payload = {
+            "tmdb_info": dict(info, media_type=tmdb_type.name),
+            "source_title": media_info.org_string,
+            "seasons": media_info.get_season_list(),
+            "episodes": media_info.get_episode_list()
+        }
+        context_id = uuid.uuid4().hex
+        if not self.dbhelper.save_download_context(context_id, dl_type.value, payload):
+            raise RuntimeError("保存下载识别信息失败，未添加下载任务")
+        return "NASTOOL_CTX_" + context_id
+
+    def _get_download_context(self, task, dl_type):
+        tags = task.get("tags") or []
+        if isinstance(tags, str):
+            tags = [tag.strip() for tag in tags.split(",")]
+        context_tags = [tag for tag in tags if tag.startswith("NASTOOL_CTX_")]
+        if not context_tags:
+            return None
+        if len(context_tags) != 1:
+            raise ValueError("下载任务有多个作品身份标记，需手动核对")
+        payload = self.dbhelper.get_download_context(context_tags[0][12:], dl_type.value)
+        if not payload:
+            raise ValueError("下载任务的作品身份记录缺失，需手动核对")
+        payload["tmdb_info"]["media_type"] = MediaType[payload["tmdb_info"]["media_type"]]
+        return payload
+
     def download(self,
                  media_info,
                  is_paused=None,
@@ -219,6 +254,11 @@ class Downloader:
             else:
                 if tag:
                     tags = [tag]
+            # 通过持久化任务标签传递作品身份；标签由下载器保存，重启后仍可恢复。
+            if dl_type in [DownloaderType.QB, DownloaderType.TR]:
+                context_tag = self._create_download_context(media_info, dl_type)
+                if context_tag:
+                    tags = list(tags or []) + [context_tag]
             # 布局
             content_layout = download_attr.get("content_layout")
             if content_layout == 1:
@@ -330,21 +370,35 @@ class Downloader:
                     log.info("【Downloader】开始转移下载文件...")
                 else:
                     return
+                if not hasattr(self, "_transfer_retries"):
+                    self._transfer_retries = {}
                 for task in trans_tasks:
-                    done_flag, done_msg = self.filetransfer.transfer_media(in_from=self._default_client_type,
-                                                                           in_path=task.get("path"),
-                                                                           rmt_mode=self._pt_rmt_mode)
+                    retry_key = (self._default_client_type.value, str(task.get("id")))
+                    attempts, retry_at = self._transfer_retries.get(retry_key, (0, 0))
+                    if time.monotonic() < retry_at:
+                        continue
+                    try:
+                        context = self._get_download_context(task, self._default_client_type)
+                        done_flag, done_msg = self.filetransfer.transfer_media(
+                            in_from=self._default_client_type,
+                            in_path=task.get("path"), rmt_mode=self._pt_rmt_mode,
+                            download_context=context)
+                    except Exception as err:
+                        ExceptionUtils.exception_traceback(err)
+                        done_flag, done_msg = False, str(err)
                     if not done_flag:
-                        log.warn("【Downloader】%s 转移失败：%s" % (task.get("path"), done_msg))
-                        self.default_client.set_torrents_status(ids=task.get("id"),
-                                                                tags=task.get("tags"))
+                        attempts += 1
+                        delay = min(3600, 60 * 2 ** min(attempts - 1, 6))
+                        self._transfer_retries[retry_key] = (attempts, time.monotonic() + delay)
+                        log.warn("【Downloader】%s 整理失败：%s，%s秒后重试" %
+                                 (task.get("path"), done_msg, delay))
+                        continue
+                    self._transfer_retries.pop(retry_key, None)
+                    if self._pt_rmt_mode in [RmtMode.MOVE, RmtMode.RCLONE, RmtMode.MINIO]:
+                        log.warn("【Downloader】移动模式下删除种子文件：%s" % task.get("id"))
+                        self.default_client.delete_torrents(delete_file=True, ids=task.get("id"))
                     else:
-                        if self._pt_rmt_mode in [RmtMode.MOVE, RmtMode.RCLONE, RmtMode.MINIO]:
-                            log.warn("【Downloader】移动模式下删除种子文件：%s" % task.get("id"))
-                            self.default_client.delete_torrents(delete_file=True, ids=task.get("id"))
-                        else:
-                            self.default_client.set_torrents_status(ids=task.get("id"),
-                                                                    tags=task.get("tags"))
+                        self.default_client.set_torrents_status(ids=task.get("id"), tags=task.get("tags"))
                 log.info("【Downloader】下载文件转移结束")
             finally:
                 lock.release()
@@ -761,11 +815,13 @@ class Downloader:
                         no_exists_episodes = self.mediaserver.get_no_exists_episodes(meta_info,
                                                                                      season_number,
                                                                                      episode_count)
-                        # 没有配置Emby
+                        # 任一来源已有该集即可证明存在；空结果不等于无需检查其它盘。
+                        local_missing = self.filetransfer.get_no_exists_medias(
+                            meta_info, season_number, episode_count)
                         if no_exists_episodes is None:
-                            no_exists_episodes = self.filetransfer.get_no_exists_medias(meta_info,
-                                                                                        season_number,
-                                                                                        episode_count)
+                            no_exists_episodes = local_missing
+                        else:
+                            no_exists_episodes = sorted(set(no_exists_episodes).intersection(local_missing))
                         if no_exists_episodes:
                             # 排序
                             no_exists_episodes.sort()
@@ -830,7 +886,7 @@ class Downloader:
         # 检查电影
         else:
             exists_movies = self.mediaserver.get_movies(meta_info.title, meta_info.year)
-            if exists_movies is None:
+            if not exists_movies:
                 exists_movies = self.filetransfer.get_no_exists_medias(meta_info)
             if exists_movies:
                 movies_str = "\n • ".join(["%s (%s)" % (m.get('title'), m.get('year')) for m in exists_movies])

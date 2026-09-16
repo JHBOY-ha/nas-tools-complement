@@ -183,6 +183,16 @@ class LLMMetaParser(object):
                 self.__set_cached_parse_result(cache_key, {})
                 return {}
             result = self.__normalize_result(parsed)
+            # ID必须实际出现在此次提供的TMDB候选中，且作品类型一致。
+            try:
+                candidates = json.loads(external_candidates) if external_candidates else {}
+                result["candidate_verified"] = any(
+                    str(item.get("id")) == str(result.get("tmdb_id"))
+                    and item.get("type", item.get("media_type")) == result.get("tmdb_type")
+                    for item in candidates.get("tmdb", [])
+                )
+            except (ValueError, TypeError, AttributeError):
+                result["candidate_verified"] = False
             self.__set_cached_parse_result(cache_key, result)
             return result
         except Exception as err:
@@ -217,7 +227,8 @@ class LLMMetaParser(object):
             if llm_result.get("tmdb_id"):
                 note["llm"].update({
                     "tmdb_id": llm_result.get("tmdb_id"),
-                    "tmdb_type": llm_result.get("tmdb_type")
+                    "tmdb_type": llm_result.get("tmdb_type"),
+                    "candidate_verified": llm_result.get("candidate_verified", False)
                 })
                 log.info(
                     "【Meta】LLM直出TMDB候选：id=%s, type=%s"

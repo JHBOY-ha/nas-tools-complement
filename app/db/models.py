@@ -151,6 +151,14 @@ class DOUBANMEDIAS(Base):
         return {c.name: getattr(self, c.name) for c in self.__table__.columns}
 
 
+class DOWNLOADCONTEXT(Base):
+    __tablename__ = 'DOWNLOAD_CONTEXT'
+
+    ID = Column(Text, primary_key=True)
+    DOWNLOADER = Column(Text)
+    PAYLOAD = Column(Text)
+
+
 class DOWNLOADHISTORY(Base):
     __tablename__ = 'DOWNLOAD_HISTORY'
 

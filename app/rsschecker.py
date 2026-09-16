@@ -197,7 +197,8 @@ class RssChecker(object):
                 # 类型
                 mediatype = res.get('type')
                 if mediatype:
-                    mediatype = MediaType.MOVIE if mediatype == "movie" else MediaType.TV
+                    mediatype = {"movie": MediaType.MOVIE, "tv": MediaType.TV,
+                                 "anime": MediaType.ANIME}.get(str(mediatype).lower())
 
                 log.info("【RssChecker】开始处理：%s" % title)
 

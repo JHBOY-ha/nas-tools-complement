@@ -1,5 +1,6 @@
 import json
 import re
+from urllib.parse import urlencode
 
 import log
 from config import Config
@@ -257,42 +258,68 @@ class Jellyfin(_IMediaClient):
         return []
 
     def __get_jellyfin_tv_episodes(self, title, year=None, tmdb_id=None, season=None):
-        """
-        根据标题和年份和季，返回Jellyfin中的剧集列表
-        :param title: 标题
-        :param year: 年份，可以为空，为空时不按年份过滤
-        :param tmdb_id: TMDBID
-        :param season: 季
-        :return: 集号的列表
-        """
+        """合并同一作品所有媒体库条目的季集；任何请求失败返回未知。"""
         if not self._host or not self._apikey or not self._user:
             return None
-        # 电视剧
-        series_id, season_id = self.__get_jellyfin_season_id_by_name(title, year, season)
-        if series_id is None or season_id is None:
-            return None
-        if not series_id or not season_id:
-            return []
-        # 验证tmdbid是否相同
-        item_tmdbid = self.get_iteminfo(series_id).get("ProviderIds", {}).get("Tmdb")
-        if tmdb_id and item_tmdbid:
-            if str(tmdb_id) != str(item_tmdbid):
-                return []
-        req_url = "%sShows/%s/Episodes?seasonId=%s&&userId=%s&isMissing=false&api_key=%s" % (
-            self._host, series_id, season_id, self._user, self._apikey)
         try:
-            res_json = self.__request_utils().get_res(req_url)
-            if res_json:
-                res_items = res_json.json().get("Items")
-                exists_episodes = []
-                for res_item in res_items:
-                    exists_episodes.append(int(res_item.get("IndexNumber")))
-                return exists_episodes
-        except Exception as e:
-            ExceptionUtils.exception_traceback(e)
-            log.error(f"【{self.server_type}】连接Shows/Id/Episodes出错：" + str(e))
+            def request(path, params):
+                params = dict(params, api_key=self._apikey)
+                response = self.__request_utils().get_res(
+                    "%s%s?%s" % (self._host, path, urlencode(params)))
+                if not response:
+                    raise ValueError("Jellyfin查询失败")
+                data = response.json()
+                if not isinstance(data.get("Items"), list):
+                    raise ValueError("Jellyfin返回了无效项目列表")
+                return data
+
+            def pages(path, params):
+                start = 0
+                while True:
+                    data = request(path, dict(params, StartIndex=start, Limit=200))
+                    items = data["Items"]
+                    yield from items
+                    start += len(items)
+                    total = data.get("TotalRecordCount")
+                    if not items or (total is not None and start >= total) or (total is None and len(items) < 200):
+                        break
+
+            # 按ID检索而非只取第一个同名条目，覆盖分盘、分库、不同译名。
+            params = {"IncludeItemTypes": "Series", "Recursive": "true", "Fields": "ProviderIds"}
+            if tmdb_id:
+                params["AnyProviderIdEquals"] = "tmdb.%s" % tmdb_id
+            else:
+                params["SearchTerm"] = title
+            series = pages("Users/%s/Items" % self._user, params)
+            exists = set()
+            wanted_season = 1 if season is None else int(season)
+            for item in series:
+                if tmdb_id:
+                    provider = item.get("ProviderIds", {}).get("Tmdb")
+                    if str(provider) != str(tmdb_id):
+                        continue
+                elif item.get("Name") != title or (year and str(item.get("ProductionYear")) != str(year)):
+                    continue
+                series_id = item["Id"]
+                for entry in pages("Shows/%s/Seasons" % series_id, {"userId": self._user}):
+                    if entry.get("IndexNumber") is None or int(entry["IndexNumber"]) != wanted_season:
+                        continue
+                    episodes = pages("Shows/%s/Episodes" % series_id,
+                                     {"seasonId": entry["Id"], "userId": self._user,
+                                      "isMissing": "false", "Fields": "MediaSources"})
+                    for episode in episodes:
+                        if episode.get("IsMissing") or episode.get("LocationType") == "Virtual":
+                            continue
+                        first = episode.get("IndexNumber")
+                        if first is None:
+                            raise ValueError("Jellyfin剧集缺少集号")
+                        last = episode.get("IndexNumberEnd") or first
+                        exists.update(range(int(first), int(last) + 1))
+            return sorted(exists)
+        except Exception as err:
+            ExceptionUtils.exception_traceback(err)
+            log.error("【Jellyfin】合并媒体库季集失败：%s" % str(err))
             return None
-        return []
 
     def get_no_exists_episodes(self, meta_info, season, total_num):
         """

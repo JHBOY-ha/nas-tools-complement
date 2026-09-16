@@ -258,6 +258,13 @@ class DbHelper:
             )
         )
 
+    def get_media_transfer_history(self, tmdbid, mtype):
+        if not tmdbid:
+            return []
+        types = [MediaType.MOVIE.value] if mtype == MediaType.MOVIE else [MediaType.TV.value, MediaType.ANIME.value]
+        return self._db.query(TRANSFERHISTORY).filter(
+            TRANSFERHISTORY.TMDBID == int(tmdbid), TRANSFERHISTORY.TYPE.in_(types)).all()
+
     def get_transfer_history(self, search, page, rownum):
         """
         查询识别转移记录
@@ -1595,6 +1602,17 @@ class DbHelper:
                 DATE=time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time())),
                 SITE=media_info.site
             ))
+
+    @DbPersist(_db)
+    def save_download_context(self, context_id, downloader, payload):
+        self._db.insert(DOWNLOADCONTEXT(ID=context_id, DOWNLOADER=downloader,
+                                       PAYLOAD=json.dumps(payload, ensure_ascii=False)))
+
+    def get_download_context(self, context_id, downloader):
+        row = self._db.query(DOWNLOADCONTEXT).filter(
+            DOWNLOADCONTEXT.ID == context_id,
+            DOWNLOADCONTEXT.DOWNLOADER == downloader).first()
+        return json.loads(row.PAYLOAD) if row else None
 
     def get_download_history(self, date=None, hid=None, num=30, page=1):
         """

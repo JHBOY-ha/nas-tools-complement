@@ -515,6 +515,11 @@ class MetaBase(object):
     def set_tmdb_info(self, info):
         if not info:
             return
+        if (info.get("media_type") == MediaType.MOVIE
+                and self.begin_episode is not None
+                and self.type in [MediaType.TV, MediaType.ANIME]):
+            # 拒绝整份冲突结果，避免保留剧集类型却接收电影ID。
+            return
         self.type = self.__get_tmdb_type(info)
         if not self.type:
             return
