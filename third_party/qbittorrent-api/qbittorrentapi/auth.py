@@ -1,4 +1,5 @@
 from logging import getLogger
+import re
 
 from qbittorrentapi import Version
 from qbittorrentapi.decorators import login_required
@@ -122,7 +123,14 @@ class AuthAPIMixIn(Request):
         :return: SID auth cookie from qBittorrent or None if one isn't already acquired
         """
         if self._http_session:
-            return self._http_session.cookies.get("SID", None)
+            cookies = self._http_session.cookies
+            legacy_sid = cookies.get("SID", None)
+            if legacy_sid:
+                return legacy_sid
+            # The WebUI port in the cookie may differ from a reverse proxy port.
+            for cookie in cookies:
+                if cookie.value and re.match(r"QBT_SID_[0-9]+\Z", cookie.name):
+                    return cookie.value
         return None
 
     @login_required
