@@ -52,6 +52,8 @@ class Qbittorrent(_IDownloadClient):
         return True if ctype in [cls.schema, cls.client_type] else False
 
     def connect(self):
+        self.qbc = None
+        self.ver = None
         if self.host and self.port:
             self.qbc = self.__login_qbittorrent()
 
@@ -68,12 +70,12 @@ class Qbittorrent(_IDownloadClient):
                                         password=self.password,
                                         VERIFY_WEBUI_CERTIFICATE=False,
                                         REQUESTS_ARGS={'timeout': (10, 30)})
-            try:
-                qbt.auth_log_in()
-                self.ver = qbt.app_version()
-            except qbittorrentapi.LoginFailed as e:
-                print(str(e))
+            qbt.auth_log_in()
+            self.ver = qbt.app_version()
             return qbt
+        except qbittorrentapi.LoginFailed:
+            log.error(f"【{self.client_type}】qBittorrent认证失败：未获取有效登录会话，请检查账号密码和服务端认证配置")
+            return None
         except Exception as err:
             ExceptionUtils.exception_traceback(err)
             log.error(f"【{self.client_type}】qBittorrent连接出错：{str(err)}")
