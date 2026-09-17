@@ -212,23 +212,11 @@ class RssChecker(object):
                     # 识别种子名称，开始检索TMDB
                     media_info = MetaInfo(title=meta_name,
                                           mtype=mediatype)
-                    cache_info = self.media.get_cache_info(media_info)
                     if taskinfo.get("recognization") == "Y":
-                        if cache_info.get("id"):
-                            # 有缓存，直接使用缓存
-                            media_info.tmdb_id = cache_info.get("id")
-                            media_info.type = cache_info.get("type")
-                            media_info.title = cache_info.get("title")
-                            media_info.year = cache_info.get("year")
-                        else:
-                            media_info = self.media.get_media_info(title=meta_name,
-                                                                   mtype=mediatype)
-                            if not media_info:
-                                log.warn("【RssChecker】%s 识别媒体信息出错！" % title)
-                                continue
-                            if not media_info.tmdb_info:
-                                log.info("【RssChecker】%s 识别为 %s 未匹配到媒体信息" % (title, media_info.get_name()))
-                                continue
+                        media_info = self.media.get_media_info(title=meta_name, mtype=mediatype)
+                        if not media_info or not media_info.tmdb_info:
+                            log.warn("【RssChecker】%s 未匹配到有效媒体信息，保留待重试" % title)
+                            continue
                         # 检查是否已存在
                         if media_info.type == MediaType.MOVIE:
                             exist_flag, no_exists, _ = self.downloader.check_exists_medias(meta_info=media_info,
@@ -239,6 +227,9 @@ class RssChecker(object):
                         else:
                             exist_flag, no_exists, _ = self.downloader.check_exists_medias(meta_info=media_info,
                                                                                            no_exists=no_exists)
+                            if exist_flag is None:
+                                log.warn("【RssChecker】%s 季集信息未能确认，保留待重试" % title)
+                                continue
                             # 当前剧集已存在，跳过
                             if exist_flag:
                                 # 已全部存在

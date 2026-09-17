@@ -237,6 +237,13 @@ class LLMMetaParser(object):
 
         meta_info.note = note
 
+        # A verified external candidate can correct the rule parser's default movie type.
+        if llm_result and llm_result.get("candidate_verified") and not mtype_hint:
+            if llm_result.get("type") == MediaType.ANIME:
+                meta_info.type = MediaType.ANIME
+            elif meta_info.type == MediaType.MOVIE and llm_result.get("tmdb_type") == "tv":
+                meta_info.type = MediaType.TV
+
         # 外部强制指定类型优先
         if mtype_hint:
             meta_info.type = mtype_hint

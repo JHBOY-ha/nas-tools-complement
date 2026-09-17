@@ -125,8 +125,16 @@ class Downloader:
         tmdb_type = info.get("media_type")
         if tmdb_type not in [MediaType.MOVIE, MediaType.TV]:
             return None
+        # TMDB AsObj is mapping-like, but nested objects are not JSON serializable.
+        def plain(value):
+            if hasattr(value, "items"):
+                return {key: plain(item) for key, item in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [plain(item) for item in value]
+            return value
+
         payload = {
-            "tmdb_info": dict(info, media_type=tmdb_type.name),
+            "tmdb_info": plain(dict(info, media_type=tmdb_type.name)),
             "source_title": media_info.org_string,
             "seasons": media_info.get_season_list(),
             "episodes": media_info.get_episode_list()
@@ -150,6 +158,55 @@ class Downloader:
             raise ValueError("下载任务的作品身份记录缺失，需手动核对")
         payload["tmdb_info"]["media_type"] = MediaType[payload["tmdb_info"]["media_type"]]
         return payload
+
+    def get_monitored_download_contexts(self, file_list):
+        """Resolve exact downloader file membership; never infer identity from a parent folder."""
+        client = self.default_client
+        if not client:
+            return {}
+        torrents, error = client.get_torrents()
+        if error:
+            raise ValueError("无法查询下载任务身份，稍后重试目录同步")
+        wanted = {os.path.realpath(path): path for path in file_list}
+        result = {}
+        for torrent in torrents:
+            is_qb = self._default_client_type == DownloaderType.QB
+            tags = torrent.get("tags") if is_qb else getattr(torrent, "labels", [])
+            if "NASTOOL_CTX_" not in str(tags):
+                continue
+            save_path = torrent.get("save_path") if is_qb else torrent.download_dir
+            if not save_path:
+                continue
+            root = os.path.realpath(client.get_replace_path(save_path))
+            if not any(os.path.commonpath([root, path]) == root for path in wanted):
+                continue
+            tid = torrent.get("hash") if is_qb else torrent.id
+            files = client.get_files(tid)
+            if not files:
+                raise ValueError("无法读取下载文件清单，稍后重试目录同步")
+            if isinstance(files, dict):
+                files = files.values()
+            members = set()
+            for item in files:
+                name = item.get("name") if hasattr(item, "get") else item.name
+                if name:
+                    path = os.path.realpath(os.path.join(root, name))
+                    if os.path.commonpath([root, path]) == root:
+                        members.add(path)
+            matches = members.intersection(wanted)
+            if not matches:
+                continue
+            progress = torrent.get("progress", 0) if is_qb else torrent.progress / 100
+            if progress < 1:
+                raise ValueError("下载任务尚未完成，稍后重试目录同步")
+            context = self._get_download_context({"tags": tags}, self._default_client_type)
+            # Monitor batches can contain only one file of a multi-file torrent.
+            context["allow_episode_fallback"] = len(members) == 1
+            for path in matches:
+                if wanted[path] in result:
+                    raise ValueError("文件属于多个带身份的下载任务，需核对")
+                result[wanted[path]] = context
+        return result
 
     def download(self,
                  media_info,
@@ -761,7 +818,7 @@ class Downloader:
         if not total_ep:
             total_ep = {}
         # 查找的季
-        if not meta_info.begin_season:
+        if meta_info.begin_season is None:
             search_season = None
         else:
             search_season = meta_info.get_season_list()
@@ -782,6 +839,11 @@ class Downloader:
                 total_seasons = []
                 if search_season:
                     for season in search_season:
+                        known_seasons = {entry.get("season_number") for entry in tv_info.get("seasons", [])}
+                        if known_seasons and season not in known_seasons:
+                            return None, no_exists, ["TMDB作品不存在请求的季，需核对识别结果"]
+                        if search_episode and len(search_season) != 1:
+                            return None, no_exists, ["多季资源的集数归属不明确，需核对"]
                         if total_ep.get(season):
                             episode_num = total_ep.get(season)
                         else:
@@ -789,7 +851,11 @@ class Downloader:
                         if not episode_num:
                             log.info("【Downloader】%s 第%s季 不存在" % (meta_info.get_title_string(), season))
                             message_list.append("%s 第%s季 不存在" % (meta_info.get_title_string(), season))
-                            continue
+                            return None, no_exists, message_list
+                        if search_episode and any(e < 1 or e > episode_num for e in search_episode):
+                            message_list.append("请求集数超出TMDB季集范围，需核对季号或绝对集数")
+                            log.warn("【Downloader】%s" % message_list[-1])
+                            return None, no_exists, message_list
                         total_seasons.append({"season_number": season, "episode_count": episode_num})
                         log.info(
                             "【Downloader】%s 第%s季 共有 %s 集" % (meta_info.get_title_string(), season, episode_num))
@@ -809,7 +875,7 @@ class Downloader:
                     for season in total_seasons:
                         season_number = season.get("season_number")
                         episode_count = season.get("episode_count")
-                        if not season_number or not episode_count:
+                        if season_number is None or not episode_count:
                             continue
                         # 检查Emby
                         no_exists_episodes = self.mediaserver.get_no_exists_episodes(meta_info,

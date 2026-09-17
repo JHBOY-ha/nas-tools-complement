@@ -251,6 +251,9 @@ class Rss:
                                             media_info.get_title_string(),
                                             rss_no_exists.get(media_info.tmdb_id)
                                         ))
+                                if exist_flag is None:
+                                    log.warn("【Rss】季集信息未能确认，保留待重试")
+                                    continue
                                 # 本地已存在
                                 if exist_flag:
                                     continue

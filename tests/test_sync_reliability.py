@@ -52,7 +52,7 @@ class RecognitionTests(unittest.TestCase):
         self.ns = env()
         cls = load_class('app/media/media.py', 'Media', [
             '__search_media_with_name', '__extract_llm_tmdb_target', '__resolve_tmdb_mtype',
-            'get_media_info_on_files', 'get_cache_info', '__make_cache_key'], self.ns)
+            'get_media_info_on_files', 'get_cache_info', '__make_cache_key', '_valid_media_identity', '__search_tv_by_name'], self.ns)
         self.media = cls()
 
     def test_anime_searches_tv_with_or_without_year(self):
@@ -74,7 +74,35 @@ class RecognitionTests(unittest.TestCase):
         self.media.meta.get_meta_data_by_key.return_value = {'id': 123, 'type': MediaType.MOVIE}
         self.assertEqual({}, self.media.get_cache_info(meta))
         self.media.meta.get_meta_data_by_key.return_value = {'id': 456, 'type': MediaType.TV}
+        self.assertEqual({}, self.media.get_cache_info(meta))
+        self.media.meta.get_meta_data_by_key.return_value = {'id': 456, 'type': MediaType.ANIME}
         self.assertEqual(456, self.media.get_cache_info(meta)['id'])
+
+    def test_anime_rejects_live_action_and_absent_season(self):
+        meta = NS(type=MediaType.ANIME, begin_season=2, get_season_list=lambda: [2])
+        info = {'media_type': MediaType.TV, 'genres': [{'id': 18}],
+                'seasons': [{'season_number': 1}]}
+        self.assertFalse(self.media._valid_media_identity(meta, info))
+        info['genres'] = [{'id': 16}]
+        self.assertFalse(self.media._valid_media_identity(meta, info))
+        info['seasons'].append({'season_number': 2})
+        self.assertTrue(self.media._valid_media_identity(meta, info))
+
+    def test_verified_tv_can_correct_default_movie_but_not_explicit_hint(self):
+        meta = NS(type=MediaType.MOVIE, note={'llm': {
+            'tmdb_id': 123, 'tmdb_type': 'tv', 'candidate_verified': True}})
+        self.assertEqual(123, self.media._Media__extract_llm_tmdb_target(meta)[0])
+        self.assertEqual((None, None), self.media._Media__extract_llm_tmdb_target(meta, MediaType.MOVIE))
+
+    def test_anime_search_skips_same_named_live_action(self):
+        self.ns['TMDbException'] = RuntimeError
+        self.media.search = Mock(total_results=2)
+        self.media.search.tv_shows.return_value = [
+            {'id': 7030, 'name': '花样少男少女', 'genre_ids': [18]},
+            {'id': 123, 'name': '花样少男少女', 'genre_ids': [16]}]
+        self.media._Media__compare_tmdb_names = lambda a, b: a == b
+        found = self.media._Media__search_tv_by_name('花样少男少女', None, anime_only=True)
+        self.assertEqual(123, found['id'])
 
     def test_movie_result_does_not_mutate_episode_identity(self):
         cls = load_class('app/media/meta/_base.py', 'MetaBase', ['set_tmdb_info'], self.ns)
@@ -102,6 +130,26 @@ class RecognitionTests(unittest.TestCase):
             result = self.media.get_media_info_on_files([path], info, MediaType.TV,
                 download_context={'tmdb_info': info, 'seasons': list(seasons), 'episodes': episodes})
         return result, meta
+
+    def test_monitored_batch_keeps_each_file_identity(self):
+        self.ns['PathUtils'] = NS(get_parent_paths=lambda p, n: str(Path(p).parents[n - 1]),
+                                  get_bluray_dir=lambda p: None)
+        self.media.tmdb = True
+        self.media.save_rename_cache = Mock()
+        metas = [NS(type=MediaType.MOVIE, set_tmdb_info=Mock()) for _ in range(3)]
+        self.ns['MetaInfo'] = Mock(side_effect=metas)
+        with tempfile.TemporaryDirectory() as directory:
+            paths = [str(Path(directory) / ('film%s.mkv' % i)) for i in range(3)]
+            for path in paths:
+                Path(path).touch()
+            infos = [{'media_type': MediaType.MOVIE, 'id': i} for i in [101, 202, 303]]
+            contexts = {paths[i]: {'tmdb_info': infos[i]} for i in range(2)}
+            result = self.media.get_media_info_on_files(paths, infos[2], MediaType.MOVIE,
+                                                       download_contexts=contexts)
+            self.assertEqual(3, len(result))
+            for meta, info in zip(metas, infos):
+                meta.set_tmdb_info.assert_called_once_with(info)
+            self.media.save_rename_cache.assert_called_once_with('film2.mkv', infos[2])
 
     def test_rss_identity_survives_different_file_title(self):
         result, meta = self.identify_file('abbreviated - 03.mkv', [3])
@@ -183,7 +231,7 @@ class DownloadTests(unittest.TestCase):
     def setUp(self):
         self.ns = env()
         cls = load_class('app/downloader/downloader.py', 'Downloader',
-                         ['transfer', '_get_download_context', '_create_download_context', 'check_exists_medias'], self.ns)
+                         ['transfer', '_get_download_context', '_create_download_context', 'check_exists_medias', 'get_monitored_download_contexts'], self.ns)
         self.d = cls()
         self.d.default_client = Mock()
         self.d._default_client_type = NS(value='QB')
@@ -218,7 +266,14 @@ class DownloadTests(unittest.TestCase):
             return True
         self.d.dbhelper.save_download_context.side_effect = save
         self.d.dbhelper.get_download_context.side_effect = lambda k, d: json.loads(records[(k, d)])
-        media = NS(tmdb_info={'id': 123, 'media_type': MediaType.TV}, org_string='RSS title',
+        namespace = {'sys': __import__('sys'), 'TMDbException': RuntimeError}
+        tree = ast.parse((ROOT / 'app/media/tmdbv3api/as_obj.py').read_text())
+        tree.body = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+        exec(compile(tree, 'as_obj.py', 'exec'), namespace)
+        info = namespace['AsObj'](id=123, media_type=MediaType.TV,
+                                  genres=[{'id': 16}], seasons=[{'season_number': 2}],
+                                  external_ids={'nested': {'value': 'test'}})
+        media = NS(tmdb_info=info, org_string='RSS title',
                    get_season_list=lambda: [2], get_episode_list=lambda: [3])
         tag = self.d._create_download_context(media, self.d._default_client_type)
         task = {'path': '/different/file.mkv', 'id': 'hash', 'tags': 'user-tag, ' + tag}
@@ -229,6 +284,8 @@ class DownloadTests(unittest.TestCase):
         self.assertEqual(123, context['tmdb_info']['id'])
         self.assertEqual(MediaType.TV, context['tmdb_info']['media_type'])
         self.assertEqual([3], context['episodes'])
+        self.assertEqual('test', context['tmdb_info']['external_ids']['nested']['value'])
+        self.assertEqual([{'id': 16}], context['tmdb_info']['genres'])
 
     def test_missing_context_fails_closed(self):
         self.d.dbhelper.get_download_context.return_value = None
@@ -257,6 +314,43 @@ class DownloadTests(unittest.TestCase):
         exists, missing, _ = self.d.check_exists_medias(meta, total_ep={1: 3})
         self.assertTrue(exists)
         self.assertEqual([3], missing[123][0]['episodes'])
+
+    def test_out_of_range_and_missing_season_are_unknown(self):
+        self.d.media = Mock()
+        self.d.media.get_tmdb_info.return_value = {'id': 245842}
+        self.d.mediaserver = Mock()
+        meta = NS(type=MediaType.ANIME, tmdb_id=245842, begin_season=1,
+                  get_season_list=lambda: [1], get_episode_list=lambda: list(range(13, 25)),
+                  get_title_string=lambda: '杖与剑的魔剑谭')
+        for count in [12, 0]:
+            self.d.media.get_tmdb_season_episodes_num.return_value = count
+            self.assertIsNone(self.d.check_exists_medias(meta)[0])
+        self.d.mediaserver.get_no_exists_episodes.assert_not_called()
+
+    def test_monitor_exact_membership_completion_and_conflicts(self):
+        self.ns['DownloaderType'] = NS(QB=self.d._default_client_type)
+        client = self.d.default_client
+        client.get_replace_path.side_effect = lambda p: p
+        torrent = {'hash': 'a', 'save_path': '/downloads', 'progress': 1,
+                   'tags': 'NASTOOL_CTX_one'}
+        client.get_torrents.return_value = ([torrent], False)
+        client.get_files.return_value = [{'name': 'show/01.mkv'}, {'name': 'show/02.mkv'}]
+        self.d.dbhelper.get_download_context.side_effect = lambda *args: {
+            'tmdb_info': {'id': 285743, 'media_type': 'TV'}, 'episodes': [1, 2]}
+        wanted = ['/downloads/show/01.mkv', '/downloads/show/other.mkv', '/downloads2/show/01.mkv']
+        contexts = self.d.get_monitored_download_contexts(wanted)
+        self.assertEqual([wanted[0]], list(contexts))
+        self.assertFalse(contexts[wanted[0]]['allow_episode_fallback'])
+        torrent['progress'] = .5
+        with self.assertRaises(ValueError):
+            self.d.get_monitored_download_contexts(wanted)
+        torrent['progress'] = 1
+        client.get_torrents.return_value = ([torrent, torrent], False)
+        with self.assertRaises(ValueError):
+            self.d.get_monitored_download_contexts(wanted)
+        client.get_torrents.return_value = ([], True)
+        with self.assertRaises(ValueError):
+            self.d.get_monitored_download_contexts(wanted)
 
 
 class QueueTests(unittest.TestCase):

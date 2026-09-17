@@ -576,9 +576,18 @@ class FileTransfer:
             media_type = tmdb_info["media_type"]
             log.info("【Rmt】使用下载任务作品身份：%s，TMDB %s/%s" % (
                 download_context.get("source_title"), media_type.value, tmdb_info.get("id")))
+        contexts = {}
+        if in_from == SyncType.MON and not tmdb_info:
+            # Import lazily: Downloader owns a FileTransfer instance.
+            from app.downloader import Downloader
+            try:
+                contexts = Downloader().get_monitored_download_contexts(file_list)
+            except Exception as err:
+                log.warn("【Rmt】%s" % err)
+                return __finish_transfer(False, str(err))
         Medias = self.media.get_media_info_on_files(
             file_list, tmdb_info, media_type, season, episode[0],
-            download_context=download_context)
+            download_context=download_context, download_contexts=contexts)
         if len(Medias or {}) != len(file_list):
             return __finish_transfer(False, "部分文件未能识别或与下载任务季集冲突，请核对")
         if not Medias:

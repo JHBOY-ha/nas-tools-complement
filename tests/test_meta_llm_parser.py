@@ -115,6 +115,8 @@ class LLMMetaParserTest(TestCase):
 
     def setUp(self):
         self.parser = LLMMetaParser()
+        self._parser_state = dict(self.parser.__dict__)
+        self.addCleanup(self._restore_parser)
         self.parser._enabled = True
         self.parser._mode = "rule_first"
         self.parser._base_url = "https://api.openai.com/v1"
@@ -127,6 +129,10 @@ class LLMMetaParserTest(TestCase):
         self.parser._confidence_threshold = 0.75
         self.parser._client = None
         self.parser._parse_cache = {}
+
+    def _restore_parser(self):
+        self.parser.__dict__.clear()
+        self.parser.__dict__.update(self._parser_state)
 
     def test_parse_disabled_should_not_call_client(self):
         self.parser._enabled = False
@@ -156,6 +162,16 @@ class LLMMetaParserTest(TestCase):
         self.assertEqual("2023", meta_info.year)
         self.assertEqual("HDR", meta_info.resource_effect)
         self.assertTrue(meta_info.note.get("llm", {}).get("applied"))
+
+    def test_verified_candidate_corrects_default_type_but_respects_hint(self):
+        self.parser._mode = "rule_first"
+        result = {"type": MediaType.ANIME, "tmdb_type": "tv", "tmdb_id": 123,
+                  "candidate_verified": True, "confidence": .95}
+        for hint, expected in [(None, MediaType.ANIME), (MediaType.MOVIE, MediaType.MOVIE)]:
+            meta = MetaInfo("Example 2024", use_llm=False)
+            with patch.object(self.parser, "parse", return_value=result):
+                self.parser.merge_into(meta, meta.org_string, mtype_hint=hint)
+            self.assertEqual(expected, meta.type)
 
     def test_merge_llm_first_override_existing(self):
         self.parser._mode = "llm_first"
