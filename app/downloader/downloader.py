@@ -1064,39 +1064,55 @@ class Downloader:
         # 匹配的资源中排序分组选最好的一个下载
         # 按站点顺序、资源匹配顺序、做种人数下载数逆序排序
         media_list = sorted(media_list, key=lambda x: get_sort_str(x), reverse=True)
-        def get_identity(item):
-            """Return a stable identity for one logical media resource."""
-            tmdb_id = str(getattr(item, "tmdb_id", "") or "").strip()
-            if tmdb_id:
-                if item.type == MediaType.MOVIE:
-                    return "tmdb", "movie", tmdb_id
-                return (
-                    "tmdb",
-                    "tv",
-                    tmdb_id,
-                    tuple(item.get_season_list()),
-                    tuple(item.get_episode_list())
-                )
-            if item.type != MediaType.MOVIE:
-                return (
-                    "name",
-                    "tv",
-                    item.get_title_string(),
-                    tuple(item.get_season_list()),
-                    tuple(item.get_episode_list())
-                )
-            return "name", "movie", item.get_title_string()
 
         # 排序后重新加入数组，只保留每个逻辑媒体的最高优先级资源。
-        can_download_list_item = []
-        can_download_keys = set()
+        best_items = {}
         for t_item in media_list:
-            identity = get_identity(t_item)
-            if identity in can_download_keys:
-                continue
-            can_download_keys.add(identity)
-            can_download_list_item.append(t_item)
-        return can_download_list_item
+            identity = self.get_download_identity(t_item)
+            current = best_items.get(identity)
+            if current is None or self._download_priority(t_item) > self._download_priority(current):
+                best_items[identity] = t_item
+        return list(best_items.values())
+
+    @staticmethod
+    def get_download_identity(item):
+        """Return a stable identity for one logical media resource."""
+        tmdb_id = str(getattr(item, "tmdb_id", "") or "").strip()
+        media_type = getattr(item, "type", None)
+        if tmdb_id:
+            if media_type == MediaType.MOVIE:
+                return "tmdb", "movie", tmdb_id
+            return (
+                "tmdb",
+                "tv",
+                tmdb_id,
+                tuple(item.get_season_list()),
+                tuple(item.get_episode_list())
+            )
+        if media_type != MediaType.MOVIE:
+            return (
+                "name",
+                "tv",
+                item.get_title_string(),
+                tuple(item.get_season_list()),
+                tuple(item.get_episode_list())
+            )
+        return "name", "movie", item.get_title_string()
+
+    def _download_priority(self, item):
+        """Return the quality priority used when two items share an identity."""
+        def number(value):
+            try:
+                return int(value or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        res_order = number(getattr(item, "res_order", 0))
+        site_order = number(getattr(item, "site_order", 0))
+        seeders = number(getattr(item, "seeders", 0))
+        if self._download_order == "seeder":
+            return res_order, seeders, site_order
+        return res_order, site_order, seeders
 
     def get_download_dirs(self, setting=None):
         """

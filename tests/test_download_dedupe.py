@@ -34,6 +34,16 @@ class DownloadDedupeTest(TestCase):
 
         self.assertEqual(result, [high])
 
+    def test_same_tmdb_episode_prefers_priority_over_release_title(self):
+        downloader = Downloader()
+        downloader._download_order = None
+        low = self._item(298103, 1, 11, "A title", 10)
+        high = self._item(298103, 1, 11, "Z title", 90)
+
+        result = downloader.get_download_list([low, high])
+
+        self.assertEqual(result, [high])
+
     def test_different_tmdb_ids_are_not_collapsed_by_same_display_name(self):
         downloader = Downloader()
         downloader._download_order = None

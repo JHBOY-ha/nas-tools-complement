@@ -311,8 +311,13 @@ class RssChecker(object):
         # 同一 RSS 扫描中可能同时出现同一季集的多个发布版本。逐条检查
         # 媒体库只能发现已经落盘的文件，无法发现本轮尚未添加的下载，因
         # 此需要在真正添加前按 TMDB/季/集再做一次去重。
-        raw_download_count = len(rss_download_torrents)
+        raw_download_torrents = list(rss_download_torrents)
+        raw_download_count = len(raw_download_torrents)
         rss_download_torrents = self.downloader.get_download_list(rss_download_torrents)
+        duplicate_rss_torrents = {}
+        for media in raw_download_torrents:
+            identity = self.downloader.get_download_identity(media)
+            duplicate_rss_torrents.setdefault(identity, []).append(media)
         if raw_download_count != len(rss_download_torrents):
             log.info("【RssChecker】%s 去除 %s 个重复媒体资源，保留 %s 个下载任务"
                      % (taskinfo.get("name"),
@@ -331,6 +336,12 @@ class RssChecker(object):
                                                        can_item=media)
                     # 下载类型的 这里下载成功了 插入数据库
                     self.dbhelper.insert_rss_torrents(media)
+                    # 同一媒体在本轮可能有多个 RSS enclosure。首选任务添加成功后，
+                    # 将被去重的 enclosure 记入历史，避免下一轮在首选任务完成前再次下载。
+                    media_identity = self.downloader.get_download_identity(media)
+                    for duplicate in duplicate_rss_torrents.get(media_identity, []):
+                        if duplicate is not media:
+                            self.dbhelper.insert_rss_torrents(duplicate)
                     # 登记自定义RSS任务下载记录
                     downloader = self.downloader.get_default_client_type().value
                     if media.download_setting:
