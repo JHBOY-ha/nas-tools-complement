@@ -600,7 +600,9 @@ export class LayoutNavbar extends CustomElement {
   }
 
   update_active(page) {
-    this._active_name = page ?? window.history.state?.page;
+    // 字幕任务设置是字幕的子页面，返回历史记录时也保持父菜单选中。
+    const activePage = page ?? window.history.state?.page;
+    this._active_name = activePage === "subtitle_task_settings" ? "subtitle" : activePage;
     this.updateComplete.then(() => this.show_collapse(this._active_name));
   }
 
