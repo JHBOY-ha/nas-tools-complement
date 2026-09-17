@@ -2,6 +2,7 @@ import datetime
 import os.path
 import time
 import json
+import re
 from enum import Enum
 from sqlalchemy import cast, func
 
@@ -1613,6 +1614,69 @@ class DbHelper:
             DOWNLOADCONTEXT.ID == context_id,
             DOWNLOADCONTEXT.DOWNLOADER == downloader).first()
         return json.loads(row.PAYLOAD) if row else None
+
+    def get_legacy_download_context(self, download_id):
+        """Recover identity for tasks created before DOWNLOAD_CONTEXT was added.
+
+        The only safe legacy link is the downloader id embedded in the RSS enclosure
+        and the matching download history.  A title-only match is deliberately not
+        accepted because abbreviated torrent names are often ambiguous.
+        """
+        download_id = str(download_id or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{4,128}", download_id):
+            return None
+        rss_rows = self._db.query(RSSTORRENTS).filter(
+            RSSTORRENTS.ENCLOSURE.contains(download_id, autoescape=True)).all()
+        history_rows = self._db.query(DOWNLOADHISTORY).filter(
+            DOWNLOADHISTORY.ENCLOSURE.contains(download_id, autoescape=True)).all()
+        matches = []
+        for rss in rss_rows:
+            for history in history_rows:
+                if not rss.ENCLOSURE or rss.ENCLOSURE != history.ENCLOSURE:
+                    continue
+                tmdb_id = str(history.TMDBID or "").strip()
+                if not tmdb_id.isdigit() or int(tmdb_id) <= 0:
+                    continue
+                identity = (
+                    tmdb_id,
+                    str(history.TYPE or rss.TYPE or "").strip(),
+                    str(rss.SEASON or "").strip(),
+                    str(rss.EPISODE or "").strip()
+                )
+                matches.append((identity, rss, history))
+        identities = {item[0] for item in matches}
+        if len(identities) != 1:
+            return None
+        _, rss, history = matches[0]
+
+        def parse_numbers(value, prefix):
+            value = str(value or "").upper()
+            numbers = [int(item) for item in re.findall(r"%s(\d+)" % prefix, value)]
+            if not numbers:
+                return []
+            if len(numbers) == 1:
+                return numbers
+            return list(range(numbers[0], numbers[-1] + 1))
+
+        media_type = str(history.TYPE or rss.TYPE or "").strip()
+        if media_type in (MediaType.MOVIE.value, "MOV", "movie"):
+            tmdb_type = MediaType.MOVIE
+            seasons = []
+        else:
+            tmdb_type = MediaType.TV
+            seasons = parse_numbers(rss.SEASON, "S")
+            if not seasons:
+                return None
+        return {
+            "tmdb_info": {"id": int(history.TMDBID), "media_type": tmdb_type},
+            "source_title": history.TORRENT or rss.TORRENT_NAME,
+            "legacy_type": media_type,
+            "title": history.TITLE or rss.TITLE,
+            "year": history.YEAR or rss.YEAR,
+            "seasons": seasons,
+            "episodes": parse_numbers(rss.EPISODE, "E"),
+            "legacy": True
+        }
 
     def get_download_history(self, date=None, hid=None, num=30, page=1):
         """

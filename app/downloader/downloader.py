@@ -150,7 +150,35 @@ class Downloader:
             tags = [tag.strip() for tag in tags.split(",")]
         context_tags = [tag for tag in tags if tag.startswith("NASTOOL_CTX_")]
         if not context_tags:
-            return None
+            # Tasks created before DOWNLOAD_CONTEXT used only the generic NASTOOL
+            # tag.  Recover them through the exact downloader id/RSS enclosure link
+            # when the legacy records are unambiguous.
+            context = self.dbhelper.get_legacy_download_context(task.get("id"))
+            if not context:
+                return None
+            tmdb_info = self.media.get_tmdb_info(
+                mtype=context["tmdb_info"]["media_type"],
+                tmdbid=context["tmdb_info"]["id"])
+            if not tmdb_info:
+                # The exact RSS/hash association is already authoritative.  Keep
+                # enough metadata to organize the file when TMDB is temporarily
+                # unreachable; a later refresh can replace this partial record.
+                tmdb_info = dict(context["tmdb_info"])
+                if context["tmdb_info"]["media_type"] == MediaType.MOVIE:
+                    tmdb_info.update({
+                        "title": context.get("title"),
+                        "release_date": context.get("year")
+                    })
+                else:
+                    tmdb_info.update({
+                        "name": context.get("title"),
+                        "first_air_date": context.get("year"),
+                        "genre_ids": [16] if context.get("legacy_type") in
+                        (MediaType.ANIME.value, "ANI", "anime") else []
+                    })
+                log.warn("【Downloader】旧下载任务无法查询 TMDB 详情，使用已验证的 RSS 元数据")
+            context["tmdb_info"] = tmdb_info
+            return context
         if len(context_tags) != 1:
             raise ValueError("下载任务有多个作品身份标记，需手动核对")
         payload = self.dbhelper.get_download_context(context_tags[0][12:], dl_type.value)
@@ -172,8 +200,6 @@ class Downloader:
         for torrent in torrents:
             is_qb = self._default_client_type == DownloaderType.QB
             tags = torrent.get("tags") if is_qb else getattr(torrent, "labels", [])
-            if "NASTOOL_CTX_" not in str(tags):
-                continue
             save_path = torrent.get("save_path") if is_qb else torrent.download_dir
             if not save_path:
                 continue
@@ -199,7 +225,10 @@ class Downloader:
             progress = torrent.get("progress", 0) if is_qb else torrent.progress / 100
             if progress < 1:
                 raise ValueError("下载任务尚未完成，稍后重试目录同步")
-            context = self._get_download_context({"tags": tags}, self._default_client_type)
+            context = self._get_download_context(
+                {"id": tid, "tags": tags}, self._default_client_type)
+            if not context:
+                continue
             # Monitor batches can contain only one file of a multi-file torrent.
             context["allow_episode_fallback"] = len(members) == 1
             for path in matches:

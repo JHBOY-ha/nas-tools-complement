@@ -564,9 +564,22 @@ class FileTransfer:
         if not file_list:
             return __finish_transfer(True, msg)
 
+        # Resolve downloader identity before consulting the transfer blacklist.
+        # Older tasks may have been blacklisted after a wrong filename match; an
+        # exact RSS/hash association must be allowed to repair those files.
+        contexts = {}
+        if in_from == SyncType.MON and not tmdb_info and not download_context:
+            from app.downloader import Downloader
+            try:
+                contexts = Downloader().get_monitored_download_contexts(file_list)
+            except Exception as err:
+                log.warn("【Rmt】%s" % err)
+                return __finish_transfer(False, str(err))
+
         # 目录同步模式下，过滤掉文件列表中已处理过的
         if in_from == SyncType.MON:
-            file_list = list(filter(self.dbhelper.is_transfer_notin_blacklist, file_list))
+            file_list = [file_path for file_path in file_list
+                         if file_path in contexts or self.dbhelper.is_transfer_notin_blacklist(file_path)]
             if not file_list:
                 log.info("【Rmt】所有文件均已成功转移过，没有需要处理的文件！如需重新处理，请清理缓存（服务->清理转移缓存）")
                 return __finish_transfer(True, "没有新文件需要处理")
@@ -576,15 +589,6 @@ class FileTransfer:
             media_type = tmdb_info["media_type"]
             log.info("【Rmt】使用下载任务作品身份：%s，TMDB %s/%s" % (
                 download_context.get("source_title"), media_type.value, tmdb_info.get("id")))
-        contexts = {}
-        if in_from == SyncType.MON and not tmdb_info:
-            # Import lazily: Downloader owns a FileTransfer instance.
-            from app.downloader import Downloader
-            try:
-                contexts = Downloader().get_monitored_download_contexts(file_list)
-            except Exception as err:
-                log.warn("【Rmt】%s" % err)
-                return __finish_transfer(False, str(err))
         Medias = self.media.get_media_info_on_files(
             file_list, tmdb_info, media_type, season, episode[0],
             download_context=download_context, download_contexts=contexts)

@@ -103,10 +103,20 @@ class Sync(object):
                     log.info("【Sync】%s 不进行识别和重命名" % monpath)
                 if target_path and not os.path.exists(target_path):
                     log.info("【Sync】目的目录不存在，正在创建：%s" % target_path)
-                    os.makedirs(target_path)
+                    try:
+                        os.makedirs(target_path)
+                    except OSError as err:
+                        # A broken NAS symlink or a transient mount error must not
+                        # prevent the remaining monitor paths from starting.
+                        log.error("【Sync】目的目录无法创建，跳过该监控路径：%s - %s" % (target_path, str(err)))
+                        continue
                 if unknown_path and not os.path.exists(unknown_path):
                     log.info("【Sync】未识别目录不存在，正在创建：%s" % unknown_path)
-                    os.makedirs(unknown_path)
+                    try:
+                        os.makedirs(unknown_path)
+                    except OSError as err:
+                        log.error("【Sync】未识别目录无法创建，跳过该监控路径：%s - %s" % (unknown_path, str(err)))
+                        continue
                 # 登记关系
                 if os.path.exists(monpath):
                     self.sync_dir_config[monpath] = {

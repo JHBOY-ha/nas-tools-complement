@@ -239,6 +239,8 @@ class DownloadTests(unittest.TestCase):
         self.d._pt_rmt_mode = 'link'
         self.d.filetransfer = Mock()
         self.d.dbhelper = Mock()
+        self.d.dbhelper.get_legacy_download_context.return_value = None
+        self.d.media = Mock()
         self.d.default_client.get_transfer_task.return_value = [{'path': '/mock/file', 'id': 'hash'}]
 
     def test_failed_transfer_retries_without_organized_tag(self):
@@ -293,6 +295,20 @@ class DownloadTests(unittest.TestCase):
         self.d.transfer()
         self.d.filetransfer.transfer_media.assert_not_called()
         self.d.default_client.set_torrents_status.assert_not_called()
+
+    def test_legacy_context_uses_exact_rss_metadata_when_tmdb_is_temporarily_down(self):
+        self.d.dbhelper.get_legacy_download_context.return_value = {
+            'tmdb_info': {'id': 285743, 'media_type': MediaType.TV},
+            'legacy_type': MediaType.ANIME.value,
+            'title': '和青梅竹马之间不会有恋爱喜剧', 'year': '2026',
+            'seasons': [1], 'episodes': []}
+        self.d.media.get_tmdb_info.return_value = None
+        value = self.d._get_download_context(
+            {'id': 'f99ef0a1705d43ac1ca19c59727e7d5b534cc9b4', 'tags': 'NASTOOL'},
+            self.d._default_client_type)
+        self.assertEqual(285743, value['tmdb_info']['id'])
+        self.assertEqual('和青梅竹马之间不会有恋爱喜剧', value['tmdb_info']['name'])
+        self.assertEqual([16], value['tmdb_info']['genre_ids'])
 
     def test_jellyfin_empty_result_still_checks_local_movies(self):
         self.d.mediaserver = Mock()
@@ -351,6 +367,33 @@ class DownloadTests(unittest.TestCase):
         client.get_torrents.return_value = ([], True)
         with self.assertRaises(ValueError):
             self.d.get_monitored_download_contexts(wanted)
+
+    def test_monitor_recovers_legacy_rss_identity_by_hash(self):
+        self.ns['DownloaderType'] = NS(QB=self.d._default_client_type)
+        client = self.d.default_client
+        client.get_replace_path.side_effect = lambda p: p
+        client.get_torrents.return_value = ([{
+            'hash': 'f99ef0a1705d43ac1ca19c59727e7d5b534cc9b4',
+            'save_path': '/downloads', 'content_path': '/downloads/show',
+            'progress': 1, 'tags': 'NASTOOL'
+        }], False)
+        client.get_files.return_value = [{'name': 'show/05.mkv'}, {'name': 'show/06.mkv'}]
+        client.get_legacy_download_context = Mock()
+        self.d.dbhelper.get_legacy_download_context.return_value = {
+            'tmdb_info': {'id': 285743, 'media_type': MediaType.TV},
+            'source_title': 'RSS title', 'seasons': [1], 'episodes': []}
+        self.d.media = Mock()
+        self.d.media.get_tmdb_info.return_value = {
+            'id': 285743, 'media_type': MediaType.TV, 'name': '和青梅竹马之间不会有恋爱喜剧',
+            'genre_ids': [16], 'seasons': [{'season_number': 1, 'episode_count': 12}]
+        }
+        path = '/downloads/show/05.mkv'
+        contexts = self.d.get_monitored_download_contexts([path])
+        self.assertEqual(285743, contexts[path]['tmdb_info']['id'])
+        self.assertFalse(contexts[path]['allow_episode_fallback'])
+        self.d.dbhelper.get_legacy_download_context.assert_called_once_with(
+            'f99ef0a1705d43ac1ca19c59727e7d5b534cc9b4')
+        self.d.media.get_tmdb_info.assert_called_once_with(mtype=MediaType.TV, tmdbid=285743)
 
 
 class QueueTests(unittest.TestCase):
