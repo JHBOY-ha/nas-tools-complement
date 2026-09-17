@@ -36,6 +36,9 @@ class Subtitle:
     _local_path = None
     _opensubtitles_enable = False
     _repair_lock = threading.RLock()
+    # The client shares a login token; serialize check/search/download/publication
+    # so concurrent requests cannot spend quota for the same missing subtitle.
+    _opensubtitles_lock = threading.RLock()
     _jellyfin_iso639_2 = {
         "ar": "ara", "bg": "bul", "zh": "chi", "cs": "cze", "da": "dan", "nl": "dut",
         "en": "eng", "fi": "fin", "fr": "fre", "de": "ger", "el": "gre", "he": "heb",
@@ -2235,17 +2238,7 @@ class Subtitle:
     def __valid_subtitle_content(content):
         if not content or len(content) > 20 * 1024 * 1024:
             return False, None
-        text = None
-        encodings = ["utf-8-sig"]
-        if content.startswith((b"\xff\xfe", b"\xfe\xff")):
-            encodings.append("utf-16")
-        encodings.extend(("gb18030", "big5"))
-        for encoding in encodings:
-            try:
-                text = content.decode(encoding)
-                break
-            except UnicodeDecodeError:
-                continue
+        _, text = SubtitleHealth.decode_text(content)
         if text is None:
             return False, None
         leading = text.lstrip().lower()
@@ -2270,21 +2263,26 @@ class Subtitle:
 
     def __save_opensubtitles_content(self, item, candidate, text):
         target = self.__subtitle_target(item, candidate.get("language"))
-        if os.path.exists(target):
-            return True, "字幕已存在：%s" % target
-        temp_target = "%s.nastool.tmp" % target
+        temp_target = None
         try:
-            with open(temp_target, "w", encoding="utf-8", newline="\n") as subtitle_file:
+            with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", newline="\n", delete=False,
+                    dir=os.path.dirname(os.path.abspath(target)),
+                    prefix=".opensubtitles-", suffix=".tmp") as subtitle_file:
+                temp_target = subtitle_file.name
                 subtitle_file.write(text)
-            os.replace(temp_target, target)
+            self.__publish_file_no_replace(temp_target, target)
             return True, target
+        except FileExistsError:
+            return False, "字幕已由其他请求发布，未覆盖：%s" % target
         except OSError as err:
-            try:
-                if os.path.exists(temp_target):
-                    os.remove(temp_target)
-            except OSError:
-                pass
             return False, "字幕写入失败：%s" % err
+        finally:
+            if temp_target:
+                try:
+                    os.remove(temp_target)
+                except OSError:
+                    pass
 
     def __download_opensubtitles(self, items, selected_file_id=None):
         """Search freely, then consume at most one /download quota per item."""
@@ -2308,6 +2306,10 @@ class Subtitle:
         return all(success for success, _ in results), "；".join(messages)
 
     def __download_opensubtitles_item(self, item, selected_file_id=None):
+        with self._opensubtitles_lock:
+            return self.__download_opensubtitles_item_locked(item, selected_file_id)
+
+    def __download_opensubtitles_item_locked(self, item, selected_file_id=None):
         existing = self.__existing_opensubtitles_target(item)
         if existing:
             return True, "字幕已存在：%s" % existing

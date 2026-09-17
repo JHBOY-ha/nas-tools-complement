@@ -5,6 +5,8 @@ from pathlib import Path
 import importlib.util
 import sys
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import types
 from enum import Enum
 from unittest import TestCase
@@ -455,3 +457,91 @@ class OpenSubtitlesApiTest(TestCase):
             Path(str(base) + ".srt").write_text(
                 "1\n00:00:01,000 --> 00:00:02,000\nThis is an English subtitle.\n", encoding="utf-16")
             self.assertIsNone(subtitle._Subtitle__existing_opensubtitles_target({"file": str(base)}))
+
+    def test_download_decodes_big5_without_garbled_text(self):
+        text = "1\n00:00:01,000 --> 00:00:02,000\n這是中文字幕內容，我們現在開始學習。\n"
+        for encoding in ("utf-8", "utf-16", "gb18030", "big5"):
+            with self.subTest(encoding=encoding):
+                valid, decoded = self.subtitle_module.Subtitle._Subtitle__valid_subtitle_content(
+                    text.encode(encoding))
+                self.assertTrue(valid)
+                self.assertEqual(text, decoded)
+        for content in (b"", b"<html>not a subtitle --> </html>", b'{"error":"-->"}'):
+            self.assertFalse(self.subtitle_module.Subtitle._Subtitle__valid_subtitle_content(content)[0])
+
+    def test_download_preserves_subtitle_published_during_write(self):
+        subtitle = self._subtitle()
+        original_link = self.subtitle_module.os.link
+        with tempfile.TemporaryDirectory() as directory:
+            item = {"file": str(Path(directory) / "Movie")}
+            target = Path(item["file"] + ".chi.zh-cn.srt")
+
+            def concurrent_publish(source, destination):
+                target.write_text("manually uploaded subtitle", encoding="utf-8")
+                return original_link(source, destination)
+
+            with patch.object(self.subtitle_module.os, "link", side_effect=concurrent_publish):
+                ok, message = subtitle._Subtitle__save_opensubtitles_content(
+                    item, {"language": "zh-cn"}, "downloaded subtitle")
+            self.assertFalse(ok)
+            self.assertIn("未覆盖", message)
+            self.assertEqual("manually uploaded subtitle", target.read_text(encoding="utf-8"))
+            self.assertEqual([target.name], sorted(p.name for p in Path(directory).iterdir()))
+
+    def test_concurrent_publications_keep_one_complete_file_and_clean_temps(self):
+        subtitle = self._subtitle()
+        original_link = self.subtitle_module.os.link
+        barrier = threading.Barrier(2)
+        sources = []
+        with tempfile.TemporaryDirectory() as directory:
+            item = {"file": str(Path(directory) / "Movie")}
+            target = Path(item["file"] + ".chi.zh-cn.srt")
+
+            def racing_link(source, destination):
+                sources.append(source)
+                barrier.wait(timeout=5)
+                return original_link(source, destination)
+
+            def publish(content):
+                return subtitle._Subtitle__save_opensubtitles_content(item, {"language": "zh-cn"}, content)
+
+            with patch.object(self.subtitle_module.os, "link", side_effect=racing_link):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    futures = [executor.submit(publish, content) for content in ("A" * 10000, "B" * 20000)]
+                    results = [future.result(timeout=10) for future in futures]
+            self.assertEqual(1, sum(ok for ok, _ in results))
+            self.assertEqual(2, len(set(sources)))
+            self.assertIn(target.read_text(encoding="utf-8"), ("A" * 10000, "B" * 20000))
+            self.assertEqual([target.name], sorted(p.name for p in Path(directory).iterdir()))
+
+    def test_concurrent_download_requests_spend_quota_once(self):
+        subtitle = self._subtitle()
+        subtitle.opensubtitles.search_subtitles.return_value = ([{
+            "file_id": 42, "language": "zh-cn", "high_confidence": True
+        }], "")
+        subtitle.opensubtitles.download.return_value = ({"link": "https://example.test/sub"}, "")
+        start = threading.Barrier(2)
+        with tempfile.TemporaryDirectory() as directory:
+            item = {"name": "Movie", "file": str(Path(directory) / "Movie")}
+
+            def request():
+                start.wait(timeout=5)
+                return subtitle.download_subtitle([item])
+
+            with patch.object(subtitle, "_Subtitle__fetch_temporary_subtitle", return_value=(
+                    "1\n00:00:01,000 --> 00:00:02,000\n你好\n", "")):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    futures = [executor.submit(request) for _ in range(2)]
+                    results = [future.result(timeout=10) for future in futures]
+            self.assertTrue(all(ok for ok, _ in results))
+            subtitle.opensubtitles.download.assert_called_once_with(42)
+            subtitle.opensubtitles.search_subtitles.assert_called_once()
+
+    def test_failed_publication_removes_its_temporary_file(self):
+        subtitle = self._subtitle()
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(subtitle, "_Subtitle__publish_file_no_replace", side_effect=OSError("read-only")):
+                ok, _ = subtitle._Subtitle__save_opensubtitles_content(
+                    {"file": str(Path(directory) / "Movie")}, {"language": "zh-cn"}, "subtitle")
+            self.assertFalse(ok)
+            self.assertEqual([], list(Path(directory).iterdir()))

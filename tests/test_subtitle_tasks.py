@@ -617,13 +617,52 @@ class SubtitleTaskManagerTest(TestCase):
     def test_real_upload_processor_publishes_canonical_copy(self):
         register_subtitle_task_processors(self.manager)
         self.manager.start()
-        task, _ = self.manager.submit_upload(
-            "user", [_File("subtitle.srt", SRT)], self.payload(), server="emby"
-        )
-        detail = self.wait_terminal(self.manager, task["task_id"], timeout=10)
+        with patch("app.helper.subtitle_task_processors.MediaLibrary") as library:
+            library.return_value.validate_subtitle_refresh_context.return_value = {
+                "valid": False, "reason": "test media is not in a media server library"
+            }
+            task, _ = self.manager.submit_upload(
+                "user", [_File("subtitle.srt", SRT)], self.payload(), server="emby"
+            )
+            detail = self.wait_terminal(self.manager, task["task_id"], timeout=10)
+            library.return_value.validate_subtitle_refresh_context.assert_called_once()
         self.assertEqual(detail["status"], "succeeded", detail)
         self.assertTrue(os.path.isfile(os.path.join(self.temp.name, "Movie.eng.srt")))
         self.assertEqual(detail["result"]["refresh"]["status"], "skipped")
+
+    def test_partial_upload_allows_new_request_but_preserves_request_id(self):
+        calls = []
+
+        def processor(manager, task_id):
+            calls.append(task_id)
+            manager.finish_task(task_id, "partial" if len(calls) == 1 else "succeeded", {})
+
+        self.manager.register_processor("upload", processor)
+        first, reused = self.manager.submit_upload(
+            "user", [_File("subtitle.srt", SRT)], self.payload(),
+            request_id="first", server="emby"
+        )
+        self.assertFalse(reused)
+        self.assertEqual("partial", self.wait_terminal(self.manager, first["task_id"])["status"])
+        duplicate, reused = self.manager.submit_upload(
+            "user", [_File("subtitle.srt", SRT)], self.payload(),
+            request_id="first", server="emby"
+        )
+        self.assertTrue(reused)
+        self.assertEqual(first["task_id"], duplicate["task_id"])
+        retry, reused = self.manager.submit_upload(
+            "user", [_File("subtitle.srt", SRT)], self.payload(),
+            request_id="retry", server="emby"
+        )
+        self.assertFalse(reused)
+        self.assertNotEqual(first["task_id"], retry["task_id"])
+        self.assertEqual("succeeded", self.wait_terminal(self.manager, retry["task_id"])["status"])
+        self.assertEqual(2, len(calls))
+        duplicate, reused = self.manager.submit_upload(
+            "user", [_File("subtitle.srt", SRT)], self.payload(), server="emby"
+        )
+        self.assertTrue(reused)
+        self.assertEqual(retry["task_id"], duplicate["task_id"])
 
     def test_settings_cross_field_validation(self):
         self.manager.start()

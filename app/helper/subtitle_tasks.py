@@ -823,10 +823,12 @@ class SubtitleTaskManager:
             return None
         status_filter = SUBTITLETASK.STATUS.in_(list(ACTIVE_STATES))
         if task_type == "upload":
+            # A fresh request must be able to retry failed/canceled items in a
+            # partial batch. Explicit request IDs remain idempotent above.
             cutoff = time.time() - 600
             status_filter = or_(
                 status_filter,
-                (SUBTITLETASK.STATUS.in_(["succeeded", "partial"]))
+                (SUBTITLETASK.STATUS == "succeeded")
                 & (SUBTITLETASK.FINISHED_AT >= cutoff)
             )
         return query.filter(
