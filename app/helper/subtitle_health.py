@@ -976,6 +976,11 @@ class SubtitleHealth:
             }
         return statuses
 
+    @classmethod
+    def decode_text(cls, raw):
+        """Return detected encoding and decoded subtitle text without changing the file."""
+        return cls.__decode_text(raw)
+
     @staticmethod
     def __decode_text(raw):
         if raw.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):

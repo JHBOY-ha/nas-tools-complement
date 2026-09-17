@@ -34,3 +34,6 @@ CLAUDE.md
 
 docker/compose.local.yml
 docker/pm2.local.config.js
+
+# Local Codex preferences
+/.codex/config.toml
