@@ -2,7 +2,7 @@
 
 ## 字幕设置与任务资源限制
 
-- `web/templates/setting/subtitle.html` 负责字幕服务配置，提供 OpenSubtitles 官网链接和任务设置入口。
+- `web/templates/setting/subtitle.html` 负责字幕服务配置和任务设置入口；配置弹窗内仅保留并突出 OpenSubtitles API Consumers 快捷按钮，不另设重复的官网入口，首页卡片只打开配置。
 - `web/templates/setting/subtitle_task_settings.html` 为独立任务设置页，经登录保护的 `/subtitle_task_settings` 路由加载，兼容现有 `navmenu` 的 POST 加载及浏览器历史恢复。
 - 子页面保留导航栏“设置 → 字幕”选中状态，提供返回字幕和共享任务中心入口。
 - 资源限制按上传队列与空间、进程与任务预算、检测与记录分组；配置键、安全范围和后端执行语义保持不变。

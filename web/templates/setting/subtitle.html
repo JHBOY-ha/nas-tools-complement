@@ -15,28 +15,20 @@
 <div class="page-body">
   <div class="container-xl">
     <div class="d-grid gap-3 grid-normal-card">
-      <div class="card card-link-pop p-0">
-        <!-- 配置与官网分别响应点击，外链不会触发配置弹窗。 -->
-        <a class="d-block text-reset text-decoration-none" href="#modal-opensubtitles"
-           data-bs-toggle="modal" data-bs-target="#modal-opensubtitles" aria-label="配置 OpenSubtitles">
-          <div class="card-cover card-cover-blurred text-center">
-            <span class="avatar avatar-xl avatar-thumb avatar-rounded"
-                  style="background-image: url(../static/img/opensubtitles.png)">
-            </span>
-          </div>
-          <div class="card-body text-center">
-            <div class="card-title mb-1">OpenSubtitles</div>
-            <div class="text-muted">{% if Config.subtitle %}{% if Config.subtitle.server == "opensubtitles" %}<span
-                    class="badge bg-green" title="已开启"></span> 正在使用{% endif %}{% endif %}</div>
-          </div>
-        </a>
-        <div class="card-footer text-center">
-          <a href="https://www.opensubtitles.com/" target="_blank" rel="noopener noreferrer"
-             class="btn btn-outline-primary w-100" aria-label="访问 OpenSubtitles 官网（新窗口打开）">
-            访问官网 <span class="ms-1" aria-hidden="true">↗</span>
-          </a>
+      <!-- 首页卡片只负责打开配置，API Consumers 快捷入口放在弹窗内。 -->
+      <a class="card card-link-pop p-0" href="#modal-opensubtitles"
+         data-bs-toggle="modal" data-bs-target="#modal-opensubtitles" aria-label="配置 OpenSubtitles">
+        <div class="card-cover card-cover-blurred text-center">
+          <span class="avatar avatar-xl avatar-thumb avatar-rounded"
+                style="background-image: url(../static/img/opensubtitles.png)">
+          </span>
         </div>
-      </div>
+        <div class="card-body text-center">
+          <div class="card-title mb-1">OpenSubtitles</div>
+          <div class="text-muted">{% if Config.subtitle %}{% if Config.subtitle.server == "opensubtitles" %}<span
+                  class="badge bg-green" title="已开启"></span> 正在使用{% endif %}{% endif %}</div>
+        </div>
+      </a>
       <a class="card card-link-pop p-0" href="#" data-bs-toggle="modal"
          data-bs-target="#modal-chinesesubfinder">
         <div class="card-cover card-cover-blurred text-center bg-lime">
@@ -127,9 +119,19 @@
             </div>
           </div>
         </div>
+        <!-- 将原有行内链接提升为明确按钮，用户可在配置时直接获取 API Key。 -->
         <div class="alert alert-info mb-0">
-          API Key需在 <a href="https://www.opensubtitles.com/consumers" target="_blank" rel="noopener">OpenSubtitles API Consumers</a>
-          创建。测试账户和搜索不会消耗下载次数，生成字幕临时链接时才消耗配额。
+          <div class="w-100">
+            <h4 class="mb-2">获取 OpenSubtitles API Key</h4>
+            <p class="mb-3">登录官网后，在 API Consumers 中创建 Consumer，即可获取 API Key。</p>
+            <div class="d-flex flex-wrap gap-2 mb-3">
+              <a href="https://www.opensubtitles.com/consumers" target="_blank" rel="noopener noreferrer"
+                 class="btn btn-outline-primary" aria-label="获取 API Key：打开 OpenSubtitles API Consumers（新窗口打开）">
+                OpenSubtitles API Consumers <span class="ms-1" aria-hidden="true">↗</span>
+              </a>
+            </div>
+            <p class="mb-0 small">测试账户和搜索不会消耗下载次数，生成字幕临时链接时才消耗配额。</p>
+          </div>
         </div>
       </div>
       <div class="modal-footer">

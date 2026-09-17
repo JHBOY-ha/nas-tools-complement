@@ -46,6 +46,7 @@ omitted:
 - 图标复用 `macro/svg.html` 的 Tabler 图标，操作始终带文字。
 - 字段明确单位和范围，原生数字输入有对应 label；错误通过文字及 `aria-invalid`/`aria-describedby` 表达。
 - 主按钮提交配置，次按钮重新读取；请求中禁用重复操作，失败保留填写内容。
+- OpenSubtitles 配置弹窗的说明区仅保留 API Consumers 快捷按钮，以“获取 API Key”标题说明用途，不增加重复官网入口；首页服务卡片只打开配置。
 - 外链新窗口打开，提供可访问名称和 `noopener noreferrer`，不得嵌套在配置触发器中。
 - 不增加动画；继承既有按钮焦点、悬停和禁用状态。
 
