@@ -445,12 +445,14 @@ class Subtitle:
         if "big5" in encoding:
             return "zh-TW"
         try:
-            with open(subtitle_file, "r", encoding="utf-8-sig", errors="ignore") as file_obj:
-                text = file_obj.read(512 * 1024)
+            with open(subtitle_file, "rb") as file_obj:
+                detected_encoding, text = SubtitleHealth.decode_text(file_obj.read(512 * 1024))
         except OSError:
             return ""
         if not text:
             return ""
+        if "big5" in detected_encoding.lower().replace("-", ""):
+            return "zh-TW"
 
         ext = os.path.splitext(subtitle_file)[-1].lower()
         if ext in [".ass", ".ssa"]:
@@ -647,7 +649,8 @@ class Subtitle:
 
     @staticmethod
     def __subtitle_language_suffix(language):
-        return "chi.zh-tw" if language == "zh-tw" else "chi.zh-cn"
+        return {"zh-cn": "chi.zh-cn", "ze": "chi.zh-cn",
+                "zh-tw": "chi.zh-tw"}.get(language, language)
 
     def __subtitle_target(self, item, language):
         return "%s.%s.srt" % (item.get("file"), self.__subtitle_language_suffix(language))
@@ -656,22 +659,38 @@ class Subtitle:
         media_base = str(item.get("file") or "")
         media_dir = os.path.dirname(media_base) or "."
         media_name = os.path.basename(media_base)
+        wanted = set(self.opensubtitles.languages)
+        if "ze" in wanted:
+            wanted.add("zh-cn")
         try:
             for file_name in os.listdir(media_dir):
                 stem, extension = os.path.splitext(file_name)
-                if extension.lower() in RMT_SUBEXT and (stem == media_name or stem.startswith("%s." % media_name)):
-                    return os.path.join(media_dir, file_name)
+                if extension.lower() not in RMT_SUBEXT or not (
+                        stem == media_name or stem.startswith("%s." % media_name)):
+                    continue
+                target = os.path.join(media_dir, file_name)
+                if not os.path.isfile(target):
+                    continue
+                # Inspect language tags after the media name, never the title itself.
+                suffix = stem[len(media_name):].lower().replace("_", "-")
+                # Emby appends collision numbers to the language tag (zh-CN(1)).
+                tokens = {re.sub(r"\([0-9]+\)$", "", token)
+                          for token in suffix.strip(".").split(".")}
+                aliases = {"eng": "en", "english": "en",
+                           "zh-hans": "zh-cn", "chs": "zh-cn", "cn": "zh-cn",
+                           "zh-hant": "zh-tw", "cht": "zh-tw", "tw": "zh-tw",
+                           "ze": "zh-cn"}
+                languages = {aliases.get(token, token) for token in tokens}
+                if not languages.intersection({"zh-cn", "zh-tw"}) and tokens.intersection(
+                        {"zh", "chi", "zho", "chinese"}):
+                    languages.update({"zh-cn", "zh-tw"})
+                if stem == media_name:
+                    inferred = self.__infer_subtitle_language(target).lower()
+                    languages = {aliases.get(inferred, inferred)}
+                if languages.intersection(wanted):
+                    return target
         except OSError:
             pass
-
-        checked = set()
-        for language in self.opensubtitles.languages:
-            base_target = "%s.%s" % (item.get("file"), self.__subtitle_language_suffix(language))
-            for extension in RMT_SUBEXT:
-                target = "%s%s" % (base_target, extension)
-                if target not in checked and os.path.exists(target):
-                    return target
-                checked.add(target)
         return None
 
     @staticmethod
@@ -750,55 +769,66 @@ class Subtitle:
         configured, error = self.opensubtitles.is_configured(require_login=True)
         if not configured:
             return False, error
-        for item in items or []:
-            if not item or not item.get("name") or not item.get("file"):
-                continue
-            existing = self.__existing_opensubtitles_target(item)
-            if existing:
-                return True, "字幕已存在：%s" % existing
-            log.info("【Subtitle】开始通过OpenSubtitles.com API检索字幕：%s" % item.get("name"))
-            candidates, error = self.opensubtitles.search_subtitles(item)
-            if error:
-                return False, error
-            if not candidates:
-                return False, "%s 未检索到中文字幕" % item.get("name")
+        items = [item for item in items or [] if item and item.get("name") and item.get("file")]
+        if not items:
+            return False, "没有可处理的媒体文件"
+        if selected_file_id is not None and len(items) != 1:
+            return False, "手动选择字幕时只能处理一个媒体文件"
+        results = [self.__download_opensubtitles_item(item, selected_file_id) for item in items]
+        if len(results) == 1:
+            return results[0]
+        messages = []
+        for item, (success, result) in zip(items, results):
+            message = result.get("msg", "") if isinstance(result, dict) else result
+            messages.append("%s：%s" % (item.get("name"), message))
+        return all(success for success, _ in results), "；".join(messages)
 
-            selected = None
-            if selected_file_id is not None:
-                try:
-                    selected_id = int(selected_file_id)
-                except (TypeError, ValueError):
-                    return False, "字幕候选ID无效"
-                selected = next((candidate for candidate in candidates
-                                 if candidate.get("file_id") == selected_id), None)
-                if not selected:
-                    return False, "所选字幕已不在当前检索结果中，请重新选择"
-            else:
-                selected = next((candidate for candidate in candidates
-                                 if candidate.get("high_confidence")), None)
-                if not selected:
-                    return False, {
-                        "msg": "未找到高置信字幕，请确认候选后再消耗一次下载配额",
-                        "candidates": self.__public_candidates(candidates)
-                    }
+    def __download_opensubtitles_item(self, item, selected_file_id=None):
+        existing = self.__existing_opensubtitles_target(item)
+        if existing:
+            return True, "字幕已存在：%s" % existing
+        log.info("【Subtitle】开始通过OpenSubtitles.com API检索字幕：%s" % item.get("name"))
+        candidates, error = self.opensubtitles.search_subtitles(item)
+        if error:
+            return False, error
+        if not candidates:
+            return False, "%s 未检索到中文字幕" % item.get("name")
 
-            payload, error = self.opensubtitles.download(selected.get("file_id"))
-            if error:
-                return False, error
-            text, error = self.__fetch_temporary_subtitle(payload.get("link"))
-            if error:
-                return False, error
-            success, result = self.__save_opensubtitles_content(item, selected, text)
-            if not success:
-                return False, result
-            remaining = payload.get("remaining")
-            reset_time = payload.get("reset_time")
-            quota = "，剩余下载次数：%s" % remaining if remaining is not None else ""
-            if reset_time:
-                quota += "，重置时间：%s" % reset_time
-            log.info("【Subtitle】OpenSubtitles字幕下载成功：%s%s" % (result, quota))
-            return True, "字幕下载成功：%s%s" % (result, quota)
-        return False, "没有可处理的媒体文件"
+        selected = None
+        if selected_file_id is not None:
+            try:
+                selected_id = int(selected_file_id)
+            except (TypeError, ValueError):
+                return False, "字幕候选ID无效"
+            selected = next((candidate for candidate in candidates
+                             if candidate.get("file_id") == selected_id), None)
+            if not selected:
+                return False, "所选字幕已不在当前检索结果中，请重新选择"
+        else:
+            selected = next((candidate for candidate in candidates
+                             if candidate.get("high_confidence")), None)
+            if not selected:
+                return False, {
+                    "msg": "未找到高置信字幕，请确认候选后再消耗一次下载配额",
+                    "candidates": self.__public_candidates(candidates)
+                }
+
+        payload, error = self.opensubtitles.download(selected.get("file_id"))
+        if error:
+            return False, error
+        text, error = self.__fetch_temporary_subtitle(payload.get("link"))
+        if error:
+            return False, error
+        success, result = self.__save_opensubtitles_content(item, selected, text)
+        if not success:
+            return False, result
+        remaining = payload.get("remaining")
+        reset_time = payload.get("reset_time")
+        quota = "，剩余下载次数：%s" % remaining if remaining is not None else ""
+        if reset_time:
+            quota += "，重置时间：%s" % reset_time
+        log.info("【Subtitle】OpenSubtitles字幕下载成功：%s%s" % (result, quota))
+        return True, "字幕下载成功：%s%s" % (result, quota)
 
     def __download_chinesesubfinder(self, items):
         """

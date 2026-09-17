@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 
 import os
+from pathlib import Path
 import importlib.util
 import sys
 import tempfile
 import types
 from enum import Enum
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 class FakeResponse:
@@ -32,6 +33,7 @@ class OpenSubtitlesApiTest(TestCase):
             root_path = os.path.dirname(os.path.dirname(__file__))
             os.environ["NASTOOL_CONFIG"] = os.path.join(root_path, "config", "config.yaml")
         cls.module = cls._load_client_module()
+        cls.subtitle_module = cls._load_subtitle_module()
 
     @staticmethod
     def _load_client_module():
@@ -72,6 +74,44 @@ class OpenSubtitlesApiTest(TestCase):
                     sys.modules.pop(name, None)
                 else:
                     sys.modules[name] = original
+
+    @classmethod
+    def _load_subtitle_module(cls):
+        """Exercise real subtitle orchestration without unrelated browser/UI imports."""
+        stubs = {
+            "lxml": types.SimpleNamespace(etree=object),
+            "log": types.SimpleNamespace(info=lambda *args, **kwargs: None),
+            "app.conf": types.SimpleNamespace(SiteConf=object),
+            "app.helper": types.SimpleNamespace(OpenSubtitles=cls.module.OpenSubtitles),
+            "app.helper.subtitle_align": types.SimpleNamespace(SubtitleAligner=object),
+            "app.utils": types.SimpleNamespace(**{name: object for name in (
+                "RequestUtils", "PathUtils", "SystemUtils", "StringUtils", "ExceptionUtils")}),
+            "app.utils.commons": types.SimpleNamespace(singleton=lambda klass: klass),
+            "app.utils.types": types.SimpleNamespace(MediaType=cls.module.MediaType, RmtMode=object),
+            "config": types.SimpleNamespace(Config=cls.module.Config, RMT_MEDIAEXT=[".mkv"],
+                                            RMT_SUBEXT=[".srt", ".ass", ".ssa", ".smi", ".vtt", ".sub"]),
+            "version": types.SimpleNamespace(APP_VERSION="test"),
+        }
+        with patch.dict(sys.modules, stubs):
+            health_spec = importlib.util.spec_from_file_location(
+                "app.helper.subtitle_health",
+                Path(__file__).resolve().parents[1] / "app" / "helper" / "subtitle_health.py")
+            health_module = importlib.util.module_from_spec(health_spec)
+            health_spec.loader.exec_module(health_module)
+            sys.modules["app.helper.subtitle_health"] = health_module
+            spec = importlib.util.spec_from_file_location(
+                "_subtitle_under_test", Path(__file__).resolve().parents[1] / "app" / "subtitle.py")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        return module
+
+    def _subtitle(self):
+        subtitle = object.__new__(self.subtitle_module.Subtitle)
+        subtitle._server = "opensubtitles"
+        subtitle._opensubtitles_enable = True
+        subtitle.opensubtitles = Mock(languages=["zh-cn", "ze", "zh-tw"])
+        subtitle.opensubtitles.is_configured.return_value = (True, "")
+        return subtitle
 
     @staticmethod
     def _client():
@@ -245,11 +285,7 @@ class OpenSubtitlesApiTest(TestCase):
         self.assertEqual(1, len(post_calls))
 
     def test_low_confidence_returns_candidates_without_download(self):
-        try:
-            from app.subtitle import Subtitle
-            from app.utils.types import MediaType
-        except ModuleNotFoundError as error:
-            self.skipTest("optional NAS-Tools runtime dependency unavailable: %s" % error)
+        MediaType = self.module.MediaType
 
         class FakeOpenSubtitles:
             languages = ["zh-cn"]
@@ -280,7 +316,7 @@ class OpenSubtitlesApiTest(TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             base_path = os.path.join(temp_dir, "Movie")
-            subtitle = Subtitle()
+            subtitle = self._subtitle()
             fake = FakeOpenSubtitles()
             subtitle.opensubtitles = fake
             subtitle._opensubtitles_enable = True
@@ -295,3 +331,127 @@ class OpenSubtitlesApiTest(TestCase):
         self.assertFalse(ok)
         self.assertEqual(0, fake.download_calls)
         self.assertEqual(99, result["candidates"][0]["file_id"])
+
+    def test_existing_subtitles_respect_language_and_media_identity(self):
+        subtitle = self._subtitle()
+        cases = [
+            (".eng.srt", "English subtitle text", False),
+            (".en.forced.srt", "English subtitle text", False),
+            (".srt", "This is an English subtitle with enough letters.", False),
+            (".srt", "这是中文字幕内容", True),
+            (".chi.zh-cn.srt", "字幕", True),
+            (".CHT.ASS", "字幕", True),
+            (".zh-Hans.srt", "字幕", True),
+            (".chi.zh-tw.srt", "字幕", True),
+            (".extended.chi.srt", "字幕", True),
+        ]
+        for suffix, content, expected in cases:
+            with self.subTest(suffix=suffix, content=content), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory) / "Movie.English.Chinese"
+                target = Path(str(base) + suffix)
+                target.write_text(content, encoding="utf-8")
+                actual = subtitle._Subtitle__existing_opensubtitles_target({"file": str(base)})
+                self.assertEqual(str(target) if expected else None, actual)
+
+    def test_traditional_subtitle_does_not_block_simplified_only(self):
+        subtitle = self._subtitle()
+        subtitle.opensubtitles.languages = ["zh-cn"]
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory) / "Movie"
+            Path(str(base) + ".chi.zh-tw.srt").write_text("字幕", encoding="utf-8")
+            self.assertIsNone(subtitle._Subtitle__existing_opensubtitles_target({"file": str(base)}))
+
+    def test_non_chinese_download_keeps_language_suffix(self):
+        subtitle = self._subtitle()
+        self.assertEqual("Movie.en.srt", subtitle._Subtitle__subtitle_target({"file": "Movie"}, "en"))
+
+    def test_batch_continues_after_existing_subtitle_and_search_failure(self):
+        subtitle = self._subtitle()
+        with tempfile.TemporaryDirectory() as directory:
+            items = [{"name": name, "file": str(Path(directory) / name)}
+                     for name in ("Existing", "Failed", "New")]
+            Path(items[0]["file"] + ".chi.zh-cn.srt").write_text("字幕", encoding="utf-8")
+            subtitle.opensubtitles.search_subtitles.side_effect = [
+                ([], "检索失败"),
+                ([{"file_id": 42, "language": "zh-cn", "high_confidence": True}], ""),
+            ]
+            subtitle.opensubtitles.download.return_value = ({"link": "https://example.test/sub"}, "")
+            with patch.object(subtitle, "_Subtitle__fetch_temporary_subtitle",
+                              return_value=("1\n00:00:01,000 --> 00:00:02,000\n你好\n", "")):
+                ok, result = subtitle.download_subtitle(items)
+            self.assertFalse(ok)
+            self.assertIn("检索失败", result)
+            self.assertTrue(Path(items[2]["file"] + ".chi.zh-cn.srt").is_file())
+            self.assertEqual(2, subtitle.opensubtitles.search_subtitles.call_count)
+            subtitle.opensubtitles.download.assert_called_once_with(42)
+
+    def test_manual_candidate_cannot_be_applied_to_multiple_media(self):
+        subtitle = self._subtitle()
+        ok, _ = subtitle.download_subtitle([
+            {"name": "A", "file": "A"}, {"name": "B", "file": "B"}], selected_file_id=42)
+        self.assertFalse(ok)
+        subtitle.opensubtitles.search_subtitles.assert_not_called()
+        subtitle.opensubtitles.download.assert_not_called()
+
+    def test_temporary_link_retry_does_not_request_another_download(self):
+        subtitle = self._subtitle()
+        client = Mock()
+        client.get_res.side_effect = [FakeResponse(status_code=503), FakeResponse(
+            content=b"1\n00:00:01,000 --> 00:00:02,000\nHello\n")]
+        with patch.object(self.subtitle_module, "RequestUtils", return_value=client):
+            text, error = subtitle._Subtitle__fetch_temporary_subtitle("https://example.test/sub")
+        self.assertEqual("", error)
+        self.assertIn("Hello", text)
+        self.assertEqual(2, client.get_res.call_count)
+        subtitle.opensubtitles.download.assert_not_called()
+
+    def test_numbered_subtitles_prevent_another_download(self):
+        for suffix, languages, expected in [
+            (".zh-CN(1).srt", ["zh-cn"], True),
+            (".zh-TW(12).ass", ["zh-tw"], True),
+            (".zh-TW(1).srt", ["zh-cn"], False),
+            (".en(1).srt", ["zh-cn"], False),
+        ]:
+            with self.subTest(suffix=suffix, languages=languages), tempfile.TemporaryDirectory() as directory:
+                subtitle = self._subtitle()
+                subtitle.opensubtitles.languages = languages
+                base = Path(directory) / "Movie"
+                path = Path(str(base) + suffix)
+                path.write_text("字幕内容", encoding="utf-8")
+                item = {"name": "Movie", "file": str(base)}
+                self.assertEqual(str(path) if expected else None,
+                                 subtitle._Subtitle__existing_opensubtitles_target(item))
+                if expected:
+                    ok, _ = subtitle.download_subtitle([item])
+                    self.assertTrue(ok)
+                    subtitle.opensubtitles.search_subtitles.assert_not_called()
+                    subtitle.opensubtitles.download.assert_not_called()
+
+    def test_untagged_chinese_encodings_prevent_another_download(self):
+        cases = [
+            ("utf-8", "这是中文字幕内容，我们现在开始学习。", "zh-cn"),
+            ("utf-16", "这是中文字幕内容，我们现在开始学习。", "zh-cn"),
+            ("gb18030", "这是中文字幕内容，我们现在开始学习。", "zh-cn"),
+            ("big5", "這是中文字幕內容，我們現在開始學習。", "zh-tw"),
+        ]
+        for encoding, dialogue, language in cases:
+            with self.subTest(encoding=encoding), tempfile.TemporaryDirectory() as directory:
+                subtitle = self._subtitle()
+                subtitle.opensubtitles.languages = [language]
+                base = Path(directory) / "Movie"
+                path = Path(str(base) + ".srt")
+                raw = ("1\n00:00:01,000 --> 00:00:02,000\n" + dialogue + "\n").encode(encoding)
+                path.write_bytes(raw)
+                ok, _ = subtitle.download_subtitle([{"name": "Movie", "file": str(base)}])
+                self.assertTrue(ok)
+                subtitle.opensubtitles.search_subtitles.assert_not_called()
+                subtitle.opensubtitles.download.assert_not_called()
+                self.assertEqual(raw, path.read_bytes())
+
+    def test_utf16_english_does_not_block_chinese_download(self):
+        subtitle = self._subtitle()
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory) / "Movie"
+            Path(str(base) + ".srt").write_text(
+                "1\n00:00:01,000 --> 00:00:02,000\nThis is an English subtitle.\n", encoding="utf-16")
+            self.assertIsNone(subtitle._Subtitle__existing_opensubtitles_target({"file": str(base)}))
