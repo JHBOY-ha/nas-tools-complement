@@ -308,6 +308,17 @@ class RssChecker(object):
                 ExceptionUtils.exception_traceback(e)
                 log.error("【RssChecker】处理RSS发生错误：%s - %s" % (str(e), traceback.format_exc()))
                 continue
+        # 同一 RSS 扫描中可能同时出现同一季集的多个发布版本。逐条检查
+        # 媒体库只能发现已经落盘的文件，无法发现本轮尚未添加的下载，因
+        # 此需要在真正添加前按 TMDB/季/集再做一次去重。
+        raw_download_count = len(rss_download_torrents)
+        rss_download_torrents = self.downloader.get_download_list(rss_download_torrents)
+        if raw_download_count != len(rss_download_torrents):
+            log.info("【RssChecker】%s 去除 %s 个重复媒体资源，保留 %s 个下载任务"
+                     % (taskinfo.get("name"),
+                        raw_download_count - len(rss_download_torrents),
+                        len(rss_download_torrents)))
+        res_num = len(rss_download_torrents) + len(rss_subscribe_torrents) + len(rss_search_torrents)
         log.info("【RssChecker】%s 处理结束，匹配到 %s 个有效资源" % (taskinfo.get("name"), res_num))
         # 添加下载
         if rss_download_torrents:

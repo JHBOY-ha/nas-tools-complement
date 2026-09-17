@@ -1064,20 +1064,38 @@ class Downloader:
         # 匹配的资源中排序分组选最好的一个下载
         # 按站点顺序、资源匹配顺序、做种人数下载数逆序排序
         media_list = sorted(media_list, key=lambda x: get_sort_str(x), reverse=True)
-        # 控重
+        def get_identity(item):
+            """Return a stable identity for one logical media resource."""
+            tmdb_id = str(getattr(item, "tmdb_id", "") or "").strip()
+            if tmdb_id:
+                if item.type == MediaType.MOVIE:
+                    return "tmdb", "movie", tmdb_id
+                return (
+                    "tmdb",
+                    "tv",
+                    tmdb_id,
+                    tuple(item.get_season_list()),
+                    tuple(item.get_episode_list())
+                )
+            if item.type != MediaType.MOVIE:
+                return (
+                    "name",
+                    "tv",
+                    item.get_title_string(),
+                    tuple(item.get_season_list()),
+                    tuple(item.get_episode_list())
+                )
+            return "name", "movie", item.get_title_string()
+
+        # 排序后重新加入数组，只保留每个逻辑媒体的最高优先级资源。
         can_download_list_item = []
-        can_download_list = []
-        # 排序后重新加入数组，按真实名称控重，即只取每个名称的第一个
+        can_download_keys = set()
         for t_item in media_list:
-            # 控重的主链是名称、年份、季、集
-            if t_item.type != MediaType.MOVIE:
-                media_name = "%s%s" % (t_item.get_title_string(),
-                                       t_item.get_season_episode_string())
-            else:
-                media_name = t_item.get_title_string()
-            if media_name not in can_download_list:
-                can_download_list.append(media_name)
-                can_download_list_item.append(t_item)
+            identity = get_identity(t_item)
+            if identity in can_download_keys:
+                continue
+            can_download_keys.add(identity)
+            can_download_list_item.append(t_item)
         return can_download_list_item
 
     def get_download_dirs(self, setting=None):

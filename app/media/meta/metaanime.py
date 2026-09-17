@@ -15,6 +15,18 @@ class MetaAnime(MetaBase):
     """
     _anime_no_words = ['CHS&CHT', 'MP4', 'GB MP4', 'WEB-DL']
     _name_nostring_re = r"S\d{2}\s*-\s*S\d{2}|S\d{2}|\s+S\d{1,2}|EP?\d{2,4}\s*-\s*EP?\d{2,4}|EP?\d{2,4}|\s+EP?\d{1,4}"
+    _roman_season_map = {
+        "I": 1,
+        "II": 2,
+        "III": 3,
+        "IV": 4,
+        "V": 5,
+        "VI": 6,
+        "VII": 7,
+        "VIII": 8,
+        "IX": 9,
+        "X": 10,
+    }
 
     def __init__(self, title, subtitle=None, fileflag=False):
         super().__init__(title, subtitle, fileflag)
@@ -40,6 +52,20 @@ class MetaAnime(MetaBase):
                     name_match = re.search(r'\[(.+?)]', title)
                     if name_match and name_match.group(1):
                         name = name_match.group(1).strip()
+                # anitopy does not treat a Roman numeral before an episode
+                # separator as a season (for example ``Youjo Senki II - 11``).
+                # Recover this explicit marker before LLM data is merged so a
+                # missing LLM season cannot silently default the episode to S01.
+                anime_season = anitopy_info.get("anime_season")
+                if not anime_season and name:
+                    roman_match = re.search(
+                        r"(?i)(?<![A-Z])\b(I{2,3}|IV|V?I{1,3}|IX|X)\b"
+                        r"\s*[-–—]\s*\d{1,4}(?=\D|$)",
+                        title
+                    )
+                    if roman_match:
+                        anime_season = self._roman_season_map.get(
+                            roman_match.group(1).upper())
                 # 拆份中英文名称
                 if name:
                     lastword_type = ""
@@ -74,7 +100,6 @@ class MetaAnime(MetaBase):
                 if str(year).isdigit():
                     self.year = str(year)
                 # 季号
-                anime_season = anitopy_info.get("anime_season")
                 # 如果 anitopy 没有识别出季数，尝试从标题末尾提取
                 # 匹配格式: "标题 2 - 05" 或 "标题 2nd Season" 等
                 if not anime_season and name:

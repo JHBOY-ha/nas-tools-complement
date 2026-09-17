@@ -32,3 +32,13 @@ class MetaInfoTest(TestCase):
                 "audio_codec": meta_info.audio_encode or ""
             }
             self.assertEqual(target, info.get("target"))
+
+    def test_anime_roman_numeral_season_is_preserved(self):
+        meta_info = MetaInfo(
+            "[LoliHouse] 幼女战记II / Youjo Senki II - 11 "
+            "[WebRip 1080p HEVC-10bit AAC]",
+            use_llm=False
+        )
+
+        self.assertEqual(meta_info.begin_season, 2)
+        self.assertEqual(meta_info.begin_episode, 11)
