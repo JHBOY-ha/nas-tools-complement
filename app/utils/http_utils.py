@@ -20,7 +20,8 @@ class RequestUtils:
                  session=None,
                  timeout=None,
                  referer=None,
-                 content_type=None):
+                 content_type=None,
+                 verify=False):
         if not content_type:
             content_type = "application/x-www-form-urlencoded; charset=UTF-8"
         if headers:
@@ -51,6 +52,9 @@ class RequestUtils:
             self._session = session
         if timeout:
             self._timeout = timeout
+        # Keep the historical default for existing integrations, while
+        # allowing credential-bearing clients to opt into certificate checks.
+        self._verify = bool(verify)
 
     def post(self, url, params=None, json=None):
         if json is None:
@@ -59,7 +63,7 @@ class RequestUtils:
             if self._session:
                 return self._session.post(url,
                                           data=params,
-                                          verify=False,
+                                          verify=self._verify,
                                           headers=self._headers,
                                           proxies=self._proxies,
                                           timeout=self._timeout,
@@ -67,7 +71,7 @@ class RequestUtils:
             else:
                 return requests.post(url,
                                      data=params,
-                                     verify=False,
+                                     verify=self._verify,
                                      headers=self._headers,
                                      proxies=self._proxies,
                                      timeout=self._timeout,
@@ -79,14 +83,14 @@ class RequestUtils:
         try:
             if self._session:
                 r = self._session.get(url,
-                                      verify=False,
+                                      verify=self._verify,
                                       headers=self._headers,
                                       proxies=self._proxies,
                                       timeout=self._timeout,
                                       params=params)
             else:
                 r = requests.get(url,
-                                 verify=False,
+                                 verify=self._verify,
                                  headers=self._headers,
                                  proxies=self._proxies,
                                  timeout=self._timeout,
@@ -95,53 +99,58 @@ class RequestUtils:
         except requests.exceptions.RequestException:
             return None
 
-    def get_res(self, url, params=None, allow_redirects=True):
+    def get_res(self, url, params=None, allow_redirects=True, stream=False):
         try:
             if self._session:
                 return self._session.get(url,
                                          params=params,
-                                         verify=False,
+                                         verify=self._verify,
                                          headers=self._headers,
                                          proxies=self._proxies,
                                          cookies=self._cookies,
                                          timeout=self._timeout,
-                                         allow_redirects=allow_redirects)
+                                         allow_redirects=allow_redirects,
+                                         stream=stream)
             else:
                 return requests.get(url,
                                     params=params,
-                                    verify=False,
+                                    verify=self._verify,
                                     headers=self._headers,
                                     proxies=self._proxies,
                                     cookies=self._cookies,
                                     timeout=self._timeout,
-                                    allow_redirects=allow_redirects)
+                                    allow_redirects=allow_redirects,
+                                    stream=stream)
         except requests.exceptions.RequestException:
             return None
 
-    def post_res(self, url, params=None, allow_redirects=True, files=None, json=None):
+    def post_res(self, url, params=None, allow_redirects=True, files=None, json=None,
+                 stream=False):
         try:
             if self._session:
                 return self._session.post(url,
                                           data=params,
-                                          verify=False,
+                                          verify=self._verify,
                                           headers=self._headers,
                                           proxies=self._proxies,
                                           cookies=self._cookies,
                                           timeout=self._timeout,
                                           allow_redirects=allow_redirects,
                                           files=files,
-                                          json=json)
+                                          json=json,
+                                          stream=stream)
             else:
                 return requests.post(url,
                                      data=params,
-                                     verify=False,
+                                     verify=self._verify,
                                      headers=self._headers,
                                      proxies=self._proxies,
                                      cookies=self._cookies,
                                      timeout=self._timeout,
                                      allow_redirects=allow_redirects,
                                      files=files,
-                                     json=json)
+                                     json=json,
+                                     stream=stream)
         except requests.exceptions.RequestException:
             return None
 

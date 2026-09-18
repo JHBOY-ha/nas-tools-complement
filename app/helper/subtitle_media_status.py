@@ -11,6 +11,8 @@ from app.db.models import SUBTITLEMEDIASTATUS
 class SubtitleMediaStatusStore:
     """SQLite-backed media subtitle snapshots used by read-only library views."""
 
+    _query_chunk_size = 500
+
     def __init__(self, db=None):
         self._db = db or MainDb()
 
@@ -33,6 +35,33 @@ class SubtitleMediaStatusStore:
         except Exception:
             # Isolated tests and the very first pre-init request may observe a
             # database before create_all has installed the new snapshot table.
+            self._db.rollback()
+            return {}
+
+    def list_for_paths(self, server, media_paths):
+        """Read only requested paths, normalized and chunked below SQLite limits."""
+        server = str(server or "").strip().lower()
+        paths = []
+        seen = set()
+        for media_path in media_paths or []:
+            normalized = self.normalize_path(media_path)
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                paths.append(normalized)
+        if not server or not paths:
+            return {}
+        snapshots = {}
+        try:
+            for offset in range(0, len(paths), self._query_chunk_size):
+                chunk = paths[offset:offset + self._query_chunk_size]
+                rows = self._db.query(SUBTITLEMEDIASTATUS).filter(
+                    SUBTITLEMEDIASTATUS.SERVER == server,
+                    SUBTITLEMEDIASTATUS.MEDIA_PATH.in_(chunk)
+                ).all()
+                snapshots.update({row.MEDIA_PATH: self._as_dict(row) for row in rows})
+            return snapshots
+        except Exception:
+            # Match list_for_server/get behavior during first-run schema setup.
             self._db.rollback()
             return {}
 

@@ -683,6 +683,8 @@ class SUBTITLEAUDITSTATE(Base):
         Index('INDX_SUBTITLE_AUDIT_STATE_STATUS', 'STATUS'),
         Index('INDX_SUBTITLE_AUDIT_STATE_UPDATED', 'UPDATED_AT'),
         Index('INDX_SUBTITLE_AUDIT_STATE_SERVER_UPDATED', 'SERVER', 'UPDATED_AT'),
+        Index('INDX_SUBTITLE_AUDIT_STATE_SERVER_PATH_UPDATED',
+              'SERVER', 'SUBTITLE_PATH', 'UPDATED_AT'),
     )
 
     ID = Column(Integer, Sequence('ID'), primary_key=True)

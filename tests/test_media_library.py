@@ -401,7 +401,10 @@ class MediaLibraryTest(TestCase):
             snapshot = {
                 "checked_at": "2026-07-13T20:00:00+08:00",
                 "media_statuses": {
-                    key: {"status": "error", "reason": "Invalid data", "subtitle_count": 2}
+                    key: {
+                        "status": "error", "reason": "Invalid data", "subtitle_count": 2,
+                        "checked_at": "2026-07-12T19:00:00+08:00"
+                    }
                 }
             }
 
@@ -414,7 +417,10 @@ class MediaLibraryTest(TestCase):
             self.assertEqual(item["subtitle_audit_status"], "error")
             self.assertEqual(item["subtitle_audit_label"], "外挂字幕无法识别")
             self.assertEqual(item["subtitle_audit_count"], 2)
-            self.assertEqual(item["subtitle_audit_checked_at"], snapshot["checked_at"])
+            self.assertEqual(
+                item["subtitle_audit_checked_at"],
+                snapshot["media_statuses"][key]["checked_at"]
+            )
 
     def test_single_movie_recheck_updates_latest_status_without_rewriting_history(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1073,6 +1079,59 @@ class MediaLibraryTest(TestCase):
         item = library.list_items({})["items"][0]
         self.assertEqual(item["subtitle_status_source"], "audit")
         self.assertTrue(item["subtitle_status_checked_at"])
+
+    def test_default_page_targets_24_paths_but_subtitle_filter_targets_candidates(self):
+        class _ServerType:
+            value = "Jellyfin"
+
+        rows = []
+        histories = []
+        for index in range(30):
+            rows.append(types.SimpleNamespace(
+                ITEM_ID=str(index), LIBRARY="lib", ITEM_TYPE="Movie",
+                TITLE="Movie %02d" % index, ORGIN_TITLE="", YEAR="2024",
+                TMDBID=str(index), IMDBID="", PATH="/server/%02d.mkv" % index,
+                JSON=json.dumps({"MediaStreams": []})
+            ))
+            histories.append(types.SimpleNamespace(
+                ID=index, MODE="link", TYPE="电影", CATEGORY="", TMDBID=str(index),
+                TITLE="Movie %02d" % index, YEAR="2024", SEASON_EPISODE="",
+                DEST_PATH="/nas/library", DEST_FILENAME="%02d.mkv" % index
+            ))
+        library = MediaLibrary.__new__(MediaLibrary)
+        library.media_server = Mock()
+        library.media_server.get_type.return_value = _ServerType()
+        library.mediadb = Mock()
+        library.mediadb.list_items.return_value = rows
+        library.dbhelper = Mock()
+        library.dbhelper.get_transfer_histories_with_dest.return_value = histories
+        library.category = Mock()
+        library.category.get_movie_categorys.return_value = []
+        library.category.get_tv_categorys.return_value = []
+        library.category.get_anime_categorys.return_value = []
+        library.subtitle_status_store = Mock()
+        library.subtitle_status_store.list_for_paths.return_value = {}
+        empty_audit = {"movie": {}, "tv": {}, "anime": {}}
+
+        with patch.object(
+                MediaLibrary, "_MediaLibrary__latest_audit_snapshots",
+                return_value=empty_audit
+        ) as audit_query, patch("app.library.os.path.isfile",
+                                side_effect=AssertionError("NAS stat")), \
+                patch("app.library.subprocess.run", side_effect=AssertionError("ffprobe")):
+            default_result = library.list_items({})
+            default_status_paths = library.subtitle_status_store.list_for_paths.call_args.args[1]
+            default_audit_paths = audit_query.call_args.args[1]
+            library.subtitle_status_store.list_for_paths.reset_mock()
+            audit_query.reset_mock()
+            filtered_result = library.list_items({"subtitle": "missing"})
+            filtered_status_paths = library.subtitle_status_store.list_for_paths.call_args.args[1]
+
+        self.assertEqual(len(default_result["items"]), 24)
+        self.assertEqual(len(default_status_paths), 24)
+        self.assertEqual(len(default_audit_paths), 24)
+        self.assertEqual(filtered_result["total"], 0)
+        self.assertEqual(len(filtered_status_paths), 30)
 
     def test_local_poster_prefers_poster_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:

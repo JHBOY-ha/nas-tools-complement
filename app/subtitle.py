@@ -10,6 +10,7 @@ import threading
 import time
 import uuid
 from contextlib import nullcontext
+from urllib.parse import urlsplit
 
 from lxml import etree
 
@@ -39,6 +40,8 @@ class Subtitle:
     # The client shares a login token; serialize check/search/download/publication
     # so concurrent requests cannot spend quota for the same missing subtitle.
     _opensubtitles_lock = threading.RLock()
+    _opensubtitles_download_limit = 20 * 1024 * 1024
+    _opensubtitles_download_chunk = 64 * 1024
     _jellyfin_iso639_2 = {
         "ar": "ara", "bg": "bul", "zh": "chi", "cs": "cze", "da": "dan", "nl": "dut",
         "en": "eng", "fi": "fin", "fr": "fre", "de": "ger", "el": "gre", "he": "heb",
@@ -2270,15 +2273,71 @@ class Subtitle:
         return True, text
 
     def __fetch_temporary_subtitle(self, link):
+        """Read one HTTPS download through a strict 20 MiB streaming boundary.
+
+        Only transport/read failures and 5xx responses are transient.  Size,
+        content-type, HTTP 4xx and subtitle-validation failures are final so a
+        deterministic bad response is never fetched twice.
+        """
+        try:
+            parsed = urlsplit(str(link or "").strip())
+            parsed.port
+        except ValueError:
+            parsed = None
+        if not parsed or parsed.scheme.lower() != "https" or not parsed.hostname \
+                or parsed.username is not None or parsed.password is not None:
+            return None, "字幕临时链接不安全，已拒绝下载"
+
         headers = {"User-Agent": "NAS-Tools %s" % APP_VERSION, "Accept": "text/plain,*/*"}
-        response = None
+        status = "N/A"
         for _ in range(2):
-            response = RequestUtils(headers=headers, proxies=Config().get_proxies(), timeout=30).get_res(link)
-            if response is not None and response.status_code == 200:
-                valid, text = self.__valid_subtitle_content(response.content)
+            response = None
+            try:
+                response = RequestUtils(
+                    headers=headers, proxies=Config().get_proxies(), timeout=30,
+                    verify=True
+                ).get_res(link, allow_redirects=False, stream=True)
+                if response is None:
+                    continue
+                status = response.status_code
+                if status >= 500:
+                    continue
+                if status != 200:
+                    break
+                content_type = str(response.headers.get("Content-Type") or "").lower()
+                if "text/html" in content_type or "application/json" in content_type:
+                    break
+                declared_size = response.headers.get("Content-Length")
+                try:
+                    declared_size = int(declared_size) if declared_size is not None else None
+                except (TypeError, ValueError):
+                    declared_size = None
+                if declared_size is not None and declared_size > self._opensubtitles_download_limit:
+                    return None, "字幕临时链接内容超过 20 MiB 上限"
+
+                content = bytearray()
+                try:
+                    for chunk in response.iter_content(
+                            chunk_size=self._opensubtitles_download_chunk):
+                        if not chunk:
+                            continue
+                        content.extend(chunk)
+                        if len(content) > self._opensubtitles_download_limit:
+                            return None, "字幕临时链接内容超过 20 MiB 上限"
+                except Exception:
+                    continue
+                valid, text = self.__valid_subtitle_content(bytes(content))
                 if valid:
                     return text, ""
-        status = response.status_code if response is not None else "N/A"
+                break
+            finally:
+                if response is not None:
+                    try:
+                        response.close()
+                    except Exception:
+                        # Closing is best-effort at the requests adapter layer;
+                        # it must not turn a deterministic failure into a retry.
+                        pass
         return None, "字幕临时链接下载失败（HTTP %s），未再次消耗下载配额" % status
 
     def __save_opensubtitles_content(self, item, candidate, text):

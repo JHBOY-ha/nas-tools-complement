@@ -63,6 +63,7 @@ _AUDIT_SNAPSHOT_CACHE_SECONDS = 30
 _MULTIPART_OVERHEAD_BYTES = 1024 * 1024
 _STANDARD_STAGING_FACTOR = 3
 _ALIGN_STAGING_FACTOR = 6
+_QUEUE_POSITION_UNSET = object()
 
 _POLICY_RANGES = {
     "max_upload_queue": (1, 32),
@@ -277,6 +278,10 @@ class SubtitleTaskManager:
             self._db.session.execute(sql_text(
                 "CREATE INDEX IF NOT EXISTS INDX_SUBTITLE_AUDIT_STATE_SERVER_UPDATED "
                 "ON SUBTITLE_AUDIT_STATE (SERVER, UPDATED_AT)"
+            ))
+            self._db.session.execute(sql_text(
+                "CREATE INDEX IF NOT EXISTS INDX_SUBTITLE_AUDIT_STATE_SERVER_PATH_UPDATED "
+                "ON SUBTITLE_AUDIT_STATE (SERVER, SUBTITLE_PATH, UPDATED_AT)"
             ))
             self._db.commit()
         except Exception:
@@ -868,14 +873,33 @@ class SubtitleTaskManager:
                 query = query.filter(SUBTITLETASK.STATUS.in_([str(value).lower() for value in statuses]))
             total = query.count()
             rows = query.order_by(SUBTITLETASK.CREATED_AT.desc()).limit(limit).offset(offset).all()
+            # Queue positions are global scheduler positions, not positions in
+            # the caller's filtered page.  Build them once per refresh so the
+            # task list remains three queries regardless of queue length.
+            queued_rows = self._db.query(SUBTITLETASK.ID).filter(
+                SUBTITLETASK.TYPE.in_(["upload", "repair"]),
+                SUBTITLETASK.STATUS.in_(["queued", "recovering"])
+            ).order_by(
+                SUBTITLETASK.PRIORITY.desc(),
+                SUBTITLETASK.CREATED_AT.asc(),
+                SUBTITLETASK.ID.asc()
+            ).all()
+            queue_positions = {
+                str(queued[0]): index
+                for index, queued in enumerate(queued_rows, 1)
+            }
             return {
-                "items": [self._task_dict(row, include_result=False, include_items=False) for row in rows],
+                "items": [self._task_dict(
+                    row, include_result=False, include_items=False,
+                    queue_position=queue_positions.get(str(row.ID))
+                ) for row in rows],
                 "total": total,
                 "limit": limit,
                 "offset": offset
             }
 
-    def _task_dict(self, row, include_result=True, include_items=False):
+    def _task_dict(self, row, include_result=True, include_items=False,
+                   queue_position=_QUEUE_POSITION_UNSET):
         now = time.time()
         active_seconds = float(row.ACTIVE_SECONDS or 0)
         if row.RUN_STARTED_AT and row.STATUS in ["running", "canceling"]:
@@ -898,7 +922,8 @@ class SubtitleTaskManager:
             "status": row.STATUS,
             "server": row.SERVER or "",
             "scope_key": row.SCOPE_KEY or "",
-            "queue_position": self._queue_position(row),
+            "queue_position": self._queue_position(row)
+            if queue_position is _QUEUE_POSITION_UNSET else queue_position,
             "cancellable": row.STATUS in ACTIVE_STATES,
             "progress": progress,
             "payload": _loads(row.PAYLOAD, {}),
@@ -920,11 +945,18 @@ class SubtitleTaskManager:
     def _queue_position(self, row):
         if row.STATUS not in ["queued", "recovering"] or row.TYPE not in ["upload", "repair"]:
             return None
-        return self._db.query(SUBTITLETASK).filter(
+        queued_rows = self._db.query(SUBTITLETASK.ID).filter(
             SUBTITLETASK.TYPE.in_(["upload", "repair"]),
-            SUBTITLETASK.STATUS.in_(["queued", "recovering"]),
-            SUBTITLETASK.CREATED_AT <= row.CREATED_AT
-        ).count()
+            SUBTITLETASK.STATUS.in_(["queued", "recovering"])
+        ).order_by(
+            SUBTITLETASK.PRIORITY.desc(),
+            SUBTITLETASK.CREATED_AT.asc(),
+            SUBTITLETASK.ID.asc()
+        ).all()
+        return next((
+            index for index, queued in enumerate(queued_rows, 1)
+            if str(queued[0]) == str(row.ID)
+        ), None)
 
     @staticmethod
     def _staging_identity(stat_result):
@@ -1728,7 +1760,8 @@ class SubtitleTaskManager:
                 SUBTITLETASK.STATUS.in_(["queued", "recovering"])
             ).order_by(
                 SUBTITLETASK.PRIORITY.desc(),
-                SUBTITLETASK.CREATED_AT.asc()
+                SUBTITLETASK.CREATED_AT.asc(),
+                SUBTITLETASK.ID.asc()
             ).first()
             if not row:
                 return None
@@ -2525,21 +2558,26 @@ class SubtitleTaskManager:
             existing_by_path = {row.SUBTITLE_PATH: row for row in existing}
             for normalized, media_path, value in chunk:
                 row = existing_by_path.get(normalized)
+                stored_value = dict(value)
+                # The timestamp belongs to this path-level observation, not to
+                # whichever category scan happened to finish most recently.
+                stored_value["checked_at"] = _iso(now)
                 if row:
                     row.MEDIA_PATH = media_path
                     row.STATUS = str(value.get("status") or "error")
                     row.REASON = str(value.get("reason") or "")
-                    row.RESULT = _dumps(value)
+                    row.RESULT = _dumps(stored_value)
                     row.TASK_ID = task_id
                     row.CONFIRMED_AT = now
                     row.UPDATED_AT = now
                 else:
                     self._db.insert(self._audit_state_row(
-                        scope_key, server, normalized, media_path, value, task_id, now
+                        scope_key, server, normalized, media_path, stored_value, task_id, now
                     ))
 
-    def _insert_audit_states(self, scope_key, server, media_statuses, task_id):
-        now = time.time()
+    def _insert_audit_states(self, scope_key, server, media_statuses, task_id,
+                             confirmed_at=None):
+        now = float(confirmed_at if confirmed_at is not None else time.time())
         for key, value in (media_statuses or {}).items():
             media_path = str((value or {}).get("media_path") or key)
             normalized = os.path.normcase(os.path.normpath(media_path))
@@ -2549,6 +2587,8 @@ class SubtitleTaskManager:
 
     @staticmethod
     def _audit_state_row(scope_key, server, normalized, media_path, value, task_id, now):
+        stored_value = dict(value or {})
+        stored_value["checked_at"] = _iso(now)
         return SUBTITLEAUDITSTATE(
             SCOPE_KEY=str(scope_key),
             SERVER=str(server).lower(),
@@ -2556,7 +2596,7 @@ class SubtitleTaskManager:
             MEDIA_PATH=media_path,
             STATUS=str((value or {}).get("status") or "error"),
             REASON=str((value or {}).get("reason") or ""),
-            RESULT=_dumps(value or {}),
+            RESULT=_dumps(stored_value),
             TASK_ID=task_id,
             CONFIRMED_AT=now,
             UPDATED_AT=now
@@ -2567,23 +2607,52 @@ class SubtitleTaskManager:
             SUBTITLEAUDITSTATE.SCOPE_KEY == str(scope_key),
             SUBTITLEAUDITSTATE.SERVER == str(server).lower()
         ).all()
-        return {
-            row.SUBTITLE_PATH: _loads(row.RESULT, {})
-            for row in rows
-        }
+        states = {}
+        for row in rows:
+            value = _loads(row.RESULT, {})
+            value = dict(value) if isinstance(value, dict) else {}
+            value.setdefault("checked_at", _iso(row.CONFIRMED_AT))
+            states[row.SUBTITLE_PATH] = value
+        return states
 
-    def latest_audit_snapshots(self, server):
-        """Aggregate the newest confirmed state per media path for library cards."""
+    def latest_audit_snapshots(self, server, media_paths=None):
+        """Aggregate newest states by category/path, optionally for target paths only."""
         server = str(server or "").lower()
+        normalized_paths = None
+        if media_paths is not None:
+            normalized_paths = []
+            seen_paths = set()
+            for path in media_paths or []:
+                value = str(path or "").strip()
+                if not value:
+                    continue
+                normalized = os.path.normcase(os.path.normpath(value))
+                if normalized and normalized not in seen_paths:
+                    seen_paths.add(normalized)
+                    normalized_paths.append(normalized)
+            if not normalized_paths:
+                return {"movie": {}, "tv": {}, "anime": {}}
         with self._lock:
-            cached = self._audit_snapshot_cache.get(server)
-            if cached and cached[0] > time.monotonic():
-                return cached[1]
-            rows = self._db.query(SUBTITLEAUDITSTATE).filter(
-                SUBTITLEAUDITSTATE.SERVER == server
-            ).order_by(SUBTITLEAUDITSTATE.UPDATED_AT.desc()).limit(
-                _AUDIT_STATE_MAX_ROWS
-            ).all()
+            if normalized_paths is None:
+                cached = self._audit_snapshot_cache.get(server)
+                if cached and cached[0] > time.monotonic():
+                    return cached[1]
+                rows = self._db.query(SUBTITLEAUDITSTATE).filter(
+                    SUBTITLEAUDITSTATE.SERVER == server
+                ).order_by(SUBTITLEAUDITSTATE.UPDATED_AT.desc()).limit(
+                    _AUDIT_STATE_MAX_ROWS
+                ).all()
+            else:
+                # Chunk target paths below SQLite's common host-parameter cap;
+                # every path appears in one chunk, so per-chunk ordering still
+                # selects the newest category/path record deterministically.
+                rows = []
+                for offset in range(0, len(normalized_paths), 500):
+                    chunk = normalized_paths[offset:offset + 500]
+                    rows.extend(self._db.query(SUBTITLEAUDITSTATE).filter(
+                        SUBTITLEAUDITSTATE.SERVER == server,
+                        SUBTITLEAUDITSTATE.SUBTITLE_PATH.in_(chunk)
+                    ).order_by(SUBTITLEAUDITSTATE.UPDATED_AT.desc()).all())
             snapshots = {}
             seen = set()
             for row in rows:
@@ -2596,16 +2665,32 @@ class SubtitleTaskManager:
                     continue
                 seen.add(unique)
                 snapshot = snapshots.setdefault(category, {
-                    "checked_at": _iso(row.CONFIRMED_AT),
+                    "checked_at": "",
+                    "_checked_at_epoch": 0,
                     "server": server,
                     "media_statuses": {}
                 })
-                snapshot["media_statuses"][row.SUBTITLE_PATH] = _loads(row.RESULT, {})
-            self._audit_snapshot_cache[server] = (
-                time.monotonic() + _AUDIT_SNAPSHOT_CACHE_SECONDS,
-                snapshots
-            )
-            return snapshots
+                if float(row.CONFIRMED_AT or 0) > snapshot["_checked_at_epoch"]:
+                    snapshot["_checked_at_epoch"] = float(row.CONFIRMED_AT or 0)
+                    snapshot["checked_at"] = _iso(row.CONFIRMED_AT)
+                value = _loads(row.RESULT, {})
+                value = dict(value) if isinstance(value, dict) else {}
+                # Upgrade old rows lazily in memory; never invent the current
+                # batch time for media that was not part of that batch.
+                value.setdefault("checked_at", _iso(row.CONFIRMED_AT))
+                snapshot["media_statuses"][row.SUBTITLE_PATH] = value
+            for snapshot in snapshots.values():
+                snapshot.pop("_checked_at_epoch", None)
+            result = {
+                category: snapshots.get(category) or {}
+                for category in ["movie", "tv", "anime"]
+            }
+            if normalized_paths is None:
+                self._audit_snapshot_cache[server] = (
+                    time.monotonic() + _AUDIT_SNAPSHOT_CACHE_SECONDS,
+                    result
+                )
+            return result
 
     def _invalidate_audit_snapshot_cache(self, server=None):
         if server is None:
@@ -3009,10 +3094,14 @@ class SubtitleTaskManager:
                 # Importing every historical snapshot would violate its unique
                 # (scope, server, path) key when the same media appears twice.
                 latest_states_by_scope[(scope_key, scope_payload["server"])] = (
-                    media_statuses, task_id
+                    media_statuses, task_id, checked_at
                 )
-            for (scope_key, server), (media_statuses, task_id) in latest_states_by_scope.items():
-                self._insert_audit_states(scope_key, server, media_statuses, task_id)
+            for (scope_key, server), state in latest_states_by_scope.items():
+                media_statuses, task_id, confirmed_at = state
+                self._insert_audit_states(
+                    scope_key, server, media_statuses, task_id,
+                    confirmed_at=confirmed_at
+                )
             latest = store.get("latest") or {}
             for category, snapshot in latest.items():
                 server = str((snapshot or {}).get("server") or "emby")
@@ -3020,8 +3109,10 @@ class SubtitleTaskManager:
                     "server": server, "category": category,
                     "subcategory": "", "mode": "legacy"
                 })
+                confirmed_at = self._parse_time((snapshot or {}).get("checked_at")) or now
                 self._insert_audit_states(
-                    scope_key, server, (snapshot or {}).get("media_statuses") or {}, None
+                    scope_key, server, (snapshot or {}).get("media_statuses") or {}, None,
+                    confirmed_at=confirmed_at
                 )
             self._db.commit()
             backup = history_file + ".migrated.bak"

@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 
 import tests.test_subtitle_upload  # optional dependency stubs
 import tests.test_media_library  # media/server dependency stubs
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import scoped_session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -19,6 +19,7 @@ from app.db.models import (
     Base, SUBTITLEAUDITSTATE, SUBTITLEMEDIASTATUS, SUBTITLETASK, TRANSFERHISTORY
 )
 from app.helper.db_helper import DbHelper
+from app.helper.subtitle_media_status import SubtitleMediaStatusStore
 from app.subtitle import Subtitle
 from app.helper.subtitle_task_processors import register_subtitle_task_processors
 from app.helper.subtitle_task_processors import _update_media_status_after_mutation
@@ -924,6 +925,101 @@ class SubtitleTaskManagerTest(TestCase):
         self.assertEqual(len(states), 1)
         self.assertEqual(states[0].STATUS, "ok")
         self.assertTrue(os.path.isfile(history_file + ".migrated.bak"))
+
+    def test_audit_state_keeps_each_media_checked_at_and_backfills_old_rows(self):
+        self.manager._db.init_db()
+        scope = json.dumps({"category": "movie"}, sort_keys=True)
+        first_media = os.path.join(self.temp.name, "First.mkv")
+        second_media = os.path.join(self.temp.name, "Second.mkv")
+        initial = {
+            first_media: {"media_path": first_media, "status": "warning"},
+            second_media: {"media_path": second_media, "status": "ok"},
+        }
+        with patch("app.helper.subtitle_tasks.time.time", return_value=1000.0):
+            self.manager.replace_audit_states(scope, "emby", initial, task_id="first")
+        with patch("app.helper.subtitle_tasks.time.time", return_value=2000.0):
+            self.manager.upsert_audit_states(scope, "emby", {
+                second_media: {"media_path": second_media, "status": "warning"}
+            }, task_id="second")
+
+        rows = {
+            row.SUBTITLE_PATH: row
+            for row in self.manager._db.query(SUBTITLEAUDITSTATE).all()
+        }
+        first_key = os.path.normcase(os.path.normpath(first_media))
+        second_key = os.path.normcase(os.path.normpath(second_media))
+        first_result = json.loads(rows[first_key].RESULT)
+        second_result = json.loads(rows[second_key].RESULT)
+        self.assertEqual(rows[first_key].CONFIRMED_AT, 1000.0)
+        self.assertEqual(rows[second_key].CONFIRMED_AT, 2000.0)
+        self.assertNotEqual(first_result["checked_at"], second_result["checked_at"])
+
+        # Simulate a pre-upgrade row: aggregation must use this row's own
+        # confirmation time, never the newest category scan timestamp.
+        first_result.pop("checked_at")
+        rows[first_key].RESULT = json.dumps(first_result)
+        self.manager._db.commit()
+        snapshots = self.manager.latest_audit_snapshots(
+            "emby", media_paths=[first_media, second_media]
+        )
+        statuses = snapshots["movie"]["media_statuses"]
+        self.assertEqual(statuses[first_key]["checked_at"],
+                         datetime.datetime.fromtimestamp(
+                             1000.0, datetime.timezone.utc
+                         ).astimezone().isoformat(timespec="seconds"))
+        self.assertEqual(statuses[second_key]["checked_at"], second_result["checked_at"])
+
+    def test_targeted_status_stores_chunk_and_exclude_unrelated_rows(self):
+        self.manager._db.init_db()
+        snapshots = []
+        for index in range(1105):
+            snapshots.append({
+                "media_path": os.path.join(self.temp.name, "%04d.mkv" % index),
+                "media_exists": True,
+                "has_external": bool(index % 2),
+            })
+        self.manager._upsert_media_statuses_uncommitted("emby", snapshots, 1000.0)
+        self.manager._db.commit()
+        store = SubtitleMediaStatusStore(db=self.manager._db)
+        wanted = [snapshots[2]["media_path"], snapshots[900]["media_path"]]
+
+        result = store.list_for_paths("emby", wanted + wanted)
+
+        self.assertEqual(set(result), {
+            store.normalize_path(path) for path in wanted
+        })
+
+    def test_list_tasks_builds_scheduler_positions_with_three_queries(self):
+        self.manager._db.init_db()
+        rows = [
+            ("low-late", 10, 20.0),
+            ("high", 100, 30.0),
+            ("low-early", 10, 10.0),
+        ]
+        for task_id, priority, created_at in rows:
+            self.manager._db.insert(SUBTITLETASK(
+                ID=task_id, TYPE="upload", OWNER="user", STATUS="queued",
+                PRIORITY=priority, SERVER="emby", PAYLOAD="{}", POLICY="{}",
+                PHASE="queued", COMPLETED=0, METRICS="{}", CANCEL_REQUESTED=0,
+                ACTIVE_SECONDS=0, CREATED_AT=created_at, QUEUED_AT=created_at,
+                UPDATED_AT=created_at
+            ))
+        self.manager._db.commit()
+        statements = []
+
+        def count_selects(_conn, _cursor, statement, _parameters, _context, _executemany):
+            if statement.lstrip().upper().startswith("SELECT"):
+                statements.append(statement)
+
+        event.listen(self.manager._db.engine, "before_cursor_execute", count_selects)
+        try:
+            result = self.manager.list_tasks(admin=True, limit=20)
+        finally:
+            event.remove(self.manager._db.engine, "before_cursor_execute", count_selects)
+
+        positions = {item["task_id"]: item["queue_position"] for item in result["items"]}
+        self.assertEqual(positions, {"high": 1, "low-early": 2, "low-late": 3})
+        self.assertEqual(len(statements), 3)
 
     def test_settings_reject_impossible_staging_volume(self):
         self.manager.start()

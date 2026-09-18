@@ -14,11 +14,15 @@ from unittest.mock import Mock, patch
 
 
 class FakeResponse:
-    def __init__(self, status_code=200, payload=None, content=b""):
+    def __init__(self, status_code=200, payload=None, content=b"", headers=None,
+                 chunks=None, iter_error=None):
         self.status_code = status_code
         self._payload = payload or {}
         self.content = content
-        self.headers = {}
+        self.headers = headers or {}
+        self._chunks = chunks
+        self._iter_error = iter_error
+        self.closed = False
 
     @property
     def ok(self):
@@ -26,6 +30,18 @@ class FakeResponse:
 
     def json(self):
         return self._payload
+
+    def iter_content(self, chunk_size=1):
+        if self._iter_error:
+            raise self._iter_error
+        if self._chunks is not None:
+            yield from self._chunks
+            return
+        for offset in range(0, len(self.content), chunk_size):
+            yield self.content[offset:offset + chunk_size]
+
+    def close(self):
+        self.closed = True
 
 
 class OpenSubtitlesApiTest(TestCase):
@@ -266,6 +282,49 @@ class OpenSubtitlesApiTest(TestCase):
         self.assertEqual("api-key", request_headers[0]["Api-Key"])
         self.assertEqual("Bearer jwt-token", request_headers[0]["Authorization"])
 
+    def test_api_requests_verify_tls_and_never_follow_redirects(self):
+        client = self._client()
+        calls = []
+
+        class FakeRequestUtils:
+            def __init__(self, *args, **kwargs):
+                calls.append(("init", kwargs))
+
+            def post_res(self, url, params=None, allow_redirects=True, files=None, json=None):
+                calls.append(("post", {"url": url, "allow_redirects": allow_redirects}))
+                return FakeResponse(payload={
+                    "token": "jwt", "base_url": "https://api.opensubtitles.com"
+                })
+
+        with patch.object(self.module, "RequestUtils", FakeRequestUtils):
+            ok, error = client.login()
+
+        self.assertTrue(ok, error)
+        self.assertTrue(calls[0][1]["verify"])
+        self.assertFalse(calls[1][1]["allow_redirects"])
+
+    def test_login_rejects_insecure_or_hostless_base_url_and_clears_token(self):
+        for base_url in ["http://api.opensubtitles.com", "https:///api/v1"]:
+            with self.subTest(base_url=base_url):
+                client = self._client()
+                client._token = "stale"
+                response = FakeResponse(payload={"token": "fresh", "base_url": base_url})
+                with patch.object(client, "_raw_request", return_value=response):
+                    ok, error = client.login(force=True)
+                self.assertFalse(ok)
+                self.assertIn("不安全", error)
+                self.assertIsNone(client._token)
+                self.assertEqual(client.API_ROOT, client._base_url)
+
+    def test_download_rejects_insecure_temporary_link(self):
+        client = self._client()
+        client._token = "jwt-token"
+        with patch.object(client, "_request", return_value=(
+                FakeResponse(), {"link": "http://download.example/subtitle.srt"}, "")):
+            payload, error = client.download(123)
+        self.assertIsNone(payload)
+        self.assertIn("不安全", error)
+
     def test_download_5xx_does_not_request_a_second_link(self):
         client = self._client()
         client._token = "jwt-token"
@@ -398,14 +457,77 @@ class OpenSubtitlesApiTest(TestCase):
     def test_temporary_link_retry_does_not_request_another_download(self):
         subtitle = self._subtitle()
         client = Mock()
-        client.get_res.side_effect = [FakeResponse(status_code=503), FakeResponse(
+        responses = [FakeResponse(status_code=503), FakeResponse(
             content=b"1\n00:00:01,000 --> 00:00:02,000\nHello\n")]
+        client.get_res.side_effect = responses
         with patch.object(self.subtitle_module, "RequestUtils", return_value=client):
             text, error = subtitle._Subtitle__fetch_temporary_subtitle("https://example.test/sub")
         self.assertEqual("", error)
         self.assertIn("Hello", text)
         self.assertEqual(2, client.get_res.call_count)
+        self.assertTrue(all(response.closed for response in responses))
+        self.assertTrue(client.get_res.call_args.kwargs["stream"])
+        self.assertFalse(client.get_res.call_args.kwargs["allow_redirects"])
         subtitle.opensubtitles.download.assert_not_called()
+
+    def test_temporary_link_declared_oversize_closes_without_retry(self):
+        subtitle = self._subtitle()
+        response = FakeResponse(headers={"Content-Length": str(20 * 1024 * 1024 + 1)})
+        client = Mock()
+        client.get_res.return_value = response
+        with patch.object(self.subtitle_module, "RequestUtils", return_value=client) as request:
+            text, error = subtitle._Subtitle__fetch_temporary_subtitle("https://example.test/sub")
+        self.assertIsNone(text)
+        self.assertIn("20 MiB", error)
+        self.assertEqual(client.get_res.call_count, 1)
+        self.assertTrue(response.closed)
+        self.assertTrue(request.call_args.kwargs["verify"])
+
+    def test_temporary_link_stream_oversize_closes_without_retry(self):
+        subtitle = self._subtitle()
+        subtitle._opensubtitles_download_limit = 10
+        response = FakeResponse(chunks=[b"12345678", b"901"])
+        client = Mock()
+        client.get_res.return_value = response
+        with patch.object(self.subtitle_module, "RequestUtils", return_value=client):
+            text, error = subtitle._Subtitle__fetch_temporary_subtitle("https://example.test/sub")
+        self.assertIsNone(text)
+        self.assertIn("20 MiB", error)
+        self.assertEqual(client.get_res.call_count, 1)
+        self.assertTrue(response.closed)
+
+    def test_temporary_link_read_error_retries_once_and_closes_both(self):
+        subtitle = self._subtitle()
+        responses = [
+            FakeResponse(iter_error=OSError("stream reset")),
+            FakeResponse(content=b"1\n00:00:01,000 --> 00:00:02,000\nHello\n")
+        ]
+        client = Mock()
+        client.get_res.side_effect = responses
+        with patch.object(self.subtitle_module, "RequestUtils", return_value=client):
+            text, error = subtitle._Subtitle__fetch_temporary_subtitle("https://example.test/sub")
+        self.assertEqual("", error)
+        self.assertIn("Hello", text)
+        self.assertEqual(client.get_res.call_count, 2)
+        self.assertTrue(all(response.closed for response in responses))
+
+    def test_temporary_link_deterministic_failures_do_not_retry(self):
+        subtitle = self._subtitle()
+        for response in [
+            FakeResponse(status_code=404),
+            FakeResponse(headers={"Content-Type": "application/json"}, content=b"{}"),
+            FakeResponse(content=b"not a subtitle")
+        ]:
+            with self.subTest(status=response.status_code, headers=response.headers):
+                client = Mock()
+                client.get_res.return_value = response
+                with patch.object(self.subtitle_module, "RequestUtils", return_value=client):
+                    text, _ = subtitle._Subtitle__fetch_temporary_subtitle(
+                        "https://example.test/sub"
+                    )
+                self.assertIsNone(text)
+                self.assertEqual(client.get_res.call_count, 1)
+                self.assertTrue(response.closed)
 
     def test_numbered_subtitles_prevent_another_download(self):
         for suffix, languages, expected in [

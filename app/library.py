@@ -79,9 +79,6 @@ class MediaLibrary:
         rows = self.mediadb.list_items(server_type=server_type)
         transfer_histories = self.dbhelper.get_transfer_histories_with_dest()
         transfer_history_index = self.__build_transfer_history_index(transfer_histories)
-        status_snapshots = self.__status_store().list_for_server(server_type)
-        audit_snapshots = self.__latest_audit_snapshots(server_type)
-        movie_audit_snapshot = audit_snapshots["movie"]
         items = []
         categories = {"movie": set(), "tv": set(), "anime": set()}
         for row in rows:
@@ -101,11 +98,24 @@ class MediaLibrary:
                 continue
             items.append(item)
 
+        # Default browsing is page-first: SQLite subtitle state is fetched only
+        # for the visible paths.  Filters/sorts expand the target set solely to
+        # already business-filtered candidates and load only the needed state.
+        candidate_paths = self.__item_media_paths(items)
+        needs_candidate_status = subtitle != "all" or sort_by in ["internal", "external"]
+        needs_candidate_audit = sort_by in ["external", "audit"]
+        status_snapshots = self.__status_snapshots_for_paths(
+            server_type, candidate_paths
+        ) if needs_candidate_status else {}
+        audit_snapshots = self.__latest_audit_snapshots(
+            server_type, candidate_paths
+        ) if needs_candidate_audit else {"movie": {}, "tv": {}, "anime": {}}
+
         if subtitle != "all":
             enriched_items = []
             for item in items:
                 self.__fill_snapshot_subtitle_summary(
-                    item, status_snapshots, movie_audit_snapshot
+                    item, status_snapshots, (audit_snapshots.get("movie") or {})
                 )
                 if subtitle == "missing" and item["subtitle_status"] != "missing_chinese":
                     continue
@@ -132,11 +142,16 @@ class MediaLibrary:
         start = (page - 1) * page_size
         end = start + page_size
         page_items = items[start:end]
+        page_paths = self.__item_media_paths(page_items)
+        if not needs_candidate_status:
+            status_snapshots = self.__status_snapshots_for_paths(server_type, page_paths)
+        if not needs_candidate_audit:
+            audit_snapshots = self.__latest_audit_snapshots(server_type, page_paths)
+        movie_audit_snapshot = audit_snapshots.get("movie") or {}
         for item in page_items:
-            if not item.get("subtitle_status"):
-                self.__fill_snapshot_subtitle_summary(
-                    item, status_snapshots, movie_audit_snapshot
-                )
+            self.__fill_snapshot_subtitle_summary(
+                item, status_snapshots, movie_audit_snapshot
+            )
             for key in ["_sort_internal", "_sort_external", "_sort_audit"]:
                 item.pop(key, None)
             item.pop("media_streams", None)
@@ -745,6 +760,46 @@ class MediaLibrary:
             self.subtitle_status_store = store
         return store
 
+    @staticmethod
+    def __item_media_paths(items):
+        """Return de-duplicated media paths represented by candidate cards."""
+        paths = []
+        seen = set()
+        for item in items or []:
+            if item.get("media_type") == "movie":
+                item_paths = [item.get("target_path") or item.get("path")]
+            else:
+                item_paths = [
+                    episode.get("path")
+                    for episode in (item.get("linked_episodes") or [])
+                ]
+            for path in item_paths:
+                normalized = SubtitleMediaStatusStore.normalize_path(path)
+                if normalized and normalized not in seen:
+                    seen.add(normalized)
+                    paths.append(path)
+        return paths
+
+    def __status_snapshots_for_paths(self, server_type, media_paths):
+        """Use the bounded path API while tolerating legacy injected stores."""
+        store = self.__status_store()
+        try:
+            snapshots = store.list_for_paths(server_type, media_paths)
+            if isinstance(snapshots, dict):
+                return snapshots
+        except AttributeError:
+            pass
+        # Compatibility is limited to test/custom stores that predate the new
+        # interface; the built-in store always takes the targeted branch.
+        snapshots = store.list_for_server(server_type)
+        if not isinstance(snapshots, dict):
+            return {}
+        wanted = {
+            SubtitleMediaStatusStore.normalize_path(path)
+            for path in media_paths or [] if path
+        }
+        return {key: value for key, value in snapshots.items() if key in wanted}
+
     def __fill_snapshot_subtitle_summary(self, item, snapshots, audit_snapshot=None):
         """Fill UI state from synchronized metadata and SQLite only."""
         if item.get("media_type") == "movie":
@@ -856,8 +911,10 @@ class MediaLibrary:
         item["subtitle_audit_status"] = status
         item["subtitle_audit_label"] = label
         item["subtitle_audit_badge"] = badge
-        item["subtitle_audit_checked_at"] = audit_status.get("checked_at") \
-            or audit_snapshot.get("checked_at") or ""
+        # A category-level batch time must never make an untouched media card
+        # look freshly checked.  Old rows are backfilled from CONFIRMED_AT by
+        # the SQLite aggregation layer; truly unknown per-item times stay blank.
+        item["subtitle_audit_checked_at"] = audit_status.get("checked_at") or ""
         item["subtitle_audit_count"] = audit_status.get("subtitle_count") or 0
 
     @classmethod
@@ -919,10 +976,12 @@ class MediaLibrary:
         return cls.__latest_audit_snapshots(server_type).get(category) or {}
 
     @classmethod
-    def __latest_audit_snapshots(cls, server_type):
+    def __latest_audit_snapshots(cls, server_type, media_paths=None):
         try:
             from app.helper.subtitle_tasks import get_subtitle_task_manager
-            sqlite_snapshots = get_subtitle_task_manager().latest_audit_snapshots(server_type)
+            sqlite_snapshots = get_subtitle_task_manager().latest_audit_snapshots(
+                server_type, media_paths=media_paths
+            )
             return {
                 category: sqlite_snapshots.get(category) or {}
                 for category in ["movie", "tv", "anime"]

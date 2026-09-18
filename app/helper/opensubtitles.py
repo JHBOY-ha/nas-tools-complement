@@ -2,6 +2,7 @@ import os
 import re
 import struct
 from difflib import SequenceMatcher
+from urllib.parse import urlsplit, urlunsplit
 
 from app.utils.http_utils import RequestUtils
 from app.utils.types import MediaType
@@ -128,14 +129,50 @@ class OpenSubtitles:
         return headers
 
     def _raw_request(self, method, url, params=None, json_data=None, authenticated=False):
+        if not self._https_url(url):
+            return None
         request = RequestUtils(
             headers=self._headers(authenticated=authenticated),
             proxies=Config().get_proxies(),
-            timeout=15
+            timeout=15,
+            verify=True
         )
         if method == "POST":
-            return request.post_res(url, json=json_data)
-        return request.get_res(url, params=params)
+            return request.post_res(url, json=json_data, allow_redirects=False)
+        return request.get_res(url, params=params, allow_redirects=False)
+
+    @classmethod
+    def _api_base_url(cls, value):
+        """Normalize an API root while rejecting malformed or downgraded URLs."""
+        value = str(value or "api.opensubtitles.com").strip().rstrip("/")
+        if "://" not in value:
+            value = "https://%s" % value
+        try:
+            parsed = urlsplit(value)
+            # Accessing port validates malformed values such as ``:not-a-port``.
+            parsed.port
+        except ValueError:
+            return None
+        if parsed.scheme.lower() != "https" or not parsed.hostname \
+                or parsed.username is not None or parsed.password is not None:
+            return None
+        path = parsed.path.rstrip("/")
+        if not path.endswith("/api/v1"):
+            path = "%s/api/v1" % path
+        return urlunsplit(("https", parsed.netloc, path, "", ""))
+
+    @staticmethod
+    def _https_url(value):
+        """Accept only absolute HTTPS URLs with a usable host and no credentials."""
+        try:
+            parsed = urlsplit(str(value or "").strip())
+            parsed.port
+        except ValueError:
+            return False
+        return bool(
+            parsed.scheme.lower() == "https" and parsed.hostname
+            and parsed.username is None and parsed.password is None
+        )
 
     def _request(self, method, path, params=None, json_data=None, authenticated=False,
                  retry_server_error=True):
@@ -157,7 +194,7 @@ class OpenSubtitles:
             response = self._raw_request(method, url, params=params, json_data=json_data,
                                          authenticated=authenticated)
         payload = self._safe_json(response)
-        if response is None or not response.ok:
+        if response is None or not 200 <= response.status_code < 300:
             return response, payload, self._response_error(response, payload, "OpenSubtitles请求失败")
         return response, payload, ""
 
@@ -173,15 +210,18 @@ class OpenSubtitles:
             json_data={"username": self._username, "password": self._password}
         )
         payload = self._safe_json(response)
-        if response is None or not response.ok or not payload.get("token"):
+        if response is None or not 200 <= response.status_code < 300 or not payload.get("token"):
             self._token = None
             self._last_error = self._response_error(response, payload, "OpenSubtitles登录失败")
             return False, self._last_error
+        base_url = self._api_base_url(payload.get("base_url"))
+        if not base_url:
+            self._token = None
+            self._base_url = self.API_ROOT
+            self._last_error = "OpenSubtitles登录失败：服务端返回了不安全的API地址"
+            return False, self._last_error
         self._token = payload.get("token")
-        base_url = str(payload.get("base_url") or "api.opensubtitles.com").strip().rstrip("/")
-        if not base_url.startswith("http"):
-            base_url = "https://%s" % base_url
-        self._base_url = "%s/api/v1" % base_url if not base_url.endswith("/api/v1") else base_url
+        self._base_url = base_url
         return True, ""
 
     def get_user_info(self):
@@ -333,4 +373,6 @@ class OpenSubtitles:
             return None, error
         if not payload.get("link"):
             return None, "OpenSubtitles未返回字幕下载链接"
+        if not self._https_url(payload.get("link")):
+            return None, "OpenSubtitles返回了不安全的字幕下载链接"
         return payload, ""
