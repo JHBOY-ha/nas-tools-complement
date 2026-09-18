@@ -1527,14 +1527,18 @@ def library_image(itemid):
             poster_file = MediaLibrary().get_local_poster_file(itemid)
             if poster_file:
                 return send_file(poster_file)
-            return "", 404
+            response = make_response("", 404)
+            response.headers["Cache-Control"] = "private, max-age=300"
+            return response
         response = make_response(res.content)
         response.headers["Content-Type"] = res.headers.get("Content-Type") or "image/jpeg"
         response.headers["Cache-Control"] = "private, max-age=3600"
         return response
     except Exception as e:
         ExceptionUtils.exception_traceback(e)
-        return "", 404
+        response = make_response("", 404)
+        response.headers["Cache-Control"] = "private, max-age=300"
+        return response
 
 
 # 媒体服务器页面

@@ -13,7 +13,7 @@
   let busy = false;
 
   function showMessage(text, tone) {
-    message.className = "alert alert-" + tone + " mb-3";
+    message.className = text ? "alert alert-" + tone + " mb-3" : "d-none";
     message.textContent = text;
   }
 
@@ -41,7 +41,8 @@
     fields.forEach(function (field) {
       field.classList.remove("is-invalid");
       field.removeAttribute("aria-invalid");
-      field.removeAttribute("aria-describedby");
+      // 清除校验错误时保留字段帮助关联。
+      field.setAttribute("aria-describedby", field.id + "_help");
     });
     form.querySelectorAll("[data-policy-error]").forEach(function (node) { node.remove(); });
   }
@@ -55,7 +56,7 @@
     field.after(error);
     field.classList.add("is-invalid");
     field.setAttribute("aria-invalid", "true");
-    field.setAttribute("aria-describedby", error.id);
+    field.setAttribute("aria-describedby", field.id + "_help " + error.id);
     field.focus();
     showMessage("请修正标出的设置后再保存。", "danger");
     return null;
@@ -92,7 +93,8 @@
       if (!root.isConnected) return;
       applyPolicy(response);
       clearErrors();
-      showMessage("已读取当前配置。修改后点击“保存任务限制”。", "info");
+      // 读取完成后收起状态，避免常驻说明挤占设置页面。
+      showMessage("", "info");
     }).catch(function (error) {
       if (root.isConnected) showMessage((error && error.message) || "读取失败，请点击“重新读取”重试。", "danger");
     }).finally(function () {

@@ -7,7 +7,7 @@ import tempfile
 import threading
 import time
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import tests.test_subtitle_upload  # optional dependency stubs
 import tests.test_media_library  # media/server dependency stubs
@@ -15,9 +15,13 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import scoped_session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.db.models import Base, SUBTITLEAUDITSTATE, SUBTITLETASK
+from app.db.models import (
+    Base, SUBTITLEAUDITSTATE, SUBTITLEMEDIASTATUS, SUBTITLETASK, TRANSFERHISTORY
+)
+from app.helper.db_helper import DbHelper
 from app.subtitle import Subtitle
 from app.helper.subtitle_task_processors import register_subtitle_task_processors
+from app.helper.subtitle_task_processors import _update_media_status_after_mutation
 from app.helper.subtitle_tasks import (
     SubtitleTaskError,
     SubtitleTaskManager,
@@ -613,6 +617,93 @@ class SubtitleTaskManagerTest(TestCase):
         release.set()
         self.assertEqual(detail["status"], "canceled")
         self.assertEqual(self.manager._db.query(SUBTITLEAUDITSTATE).count(), 0)
+
+    def test_media_status_snapshot_upsert_includes_negative_coverage(self):
+        self.manager._db.init_db()
+        now = time.time()
+        self.manager._upsert_media_statuses_uncommitted("emby", [{
+            "media_path": self.media,
+            "media_exists": True,
+            "has_internal": None,
+            "has_chinese_internal": None,
+            "has_external": False,
+            "has_chinese_external": False,
+            "status": "external_checked",
+            "source": "audit"
+        }], now)
+        self.manager._db.commit()
+
+        row = self.manager._db.query(SUBTITLEMEDIASTATUS).one()
+        self.assertEqual(row.SERVER, "emby")
+        self.assertEqual(row.MEDIA_PATH, os.path.normcase(os.path.abspath(self.media)))
+        self.assertEqual(row.HAS_EXTERNAL, 0)
+        self.assertEqual(row.STATUS, "external_checked")
+
+    def test_mutation_snapshot_uses_sqlite_only_fallback_after_cancellation(self):
+        abort_check = Mock(return_value=True)
+        heavy_operation = Mock()
+        with patch(
+                "app.helper.subtitle_task_processors.MediaLibrary.update_external_subtitle_audit_status"
+        ) as full_refresh, patch(
+                "app.helper.subtitle_task_processors.MediaLibrary.update_external_subtitle_snapshot",
+                return_value={"status": "has_chinese_external"}
+        ) as snapshot:
+            result = _update_media_status_after_mutation(
+                self.media, "emby", [self.media + ".zh-CN.srt"],
+                abort_check=abort_check,
+                probe_timeout_seconds=5,
+                heavy_operation=heavy_operation
+            )
+
+        full_refresh.assert_not_called()
+        snapshot.assert_called_once_with(
+            self.media, "emby", subtitle_files=[self.media + ".zh-CN.srt"],
+            complete=False, media_exists=True
+        )
+        self.assertEqual(result["status"], "has_chinese_external")
+
+    def test_mutation_snapshot_full_check_inherits_task_resource_guards(self):
+        abort_check = Mock(return_value=False)
+        heavy_operation = Mock()
+        subtitle_files = [self.media + ".zh-CN.srt"]
+        with patch(
+                "app.helper.subtitle_task_processors.MediaLibrary.update_external_subtitle_audit_status",
+                return_value={"status": "ok"}
+        ) as full_refresh, patch(
+                "app.helper.subtitle_task_processors.MediaLibrary.update_external_subtitle_snapshot"
+        ) as snapshot:
+            result = _update_media_status_after_mutation(
+                self.media, "emby", subtitle_files,
+                abort_check=abort_check,
+                probe_timeout_seconds=5,
+                heavy_operation=heavy_operation
+            )
+
+        full_refresh.assert_called_once_with(
+            self.media, "emby", cancel_check=abort_check,
+            probe_timeout_seconds=5, heavy_operation=heavy_operation,
+            known_subtitle_files=subtitle_files
+        )
+        snapshot.assert_not_called()
+        self.assertEqual(result["status"], "ok")
+
+    def test_targeted_transfer_lookup_falls_back_to_title_when_tmdb_differs(self):
+        database = _MemoryDb()
+        database.init_db()
+        database.insert(TRANSFERHISTORY(
+            MODE="link", TYPE="电影", TMDBID=999, TITLE="Movie", YEAR="2024",
+            DEST_PATH=self.temp.name, DEST_FILENAME="Movie.mkv", DATE="2026-09-18"
+        ))
+        database.commit()
+        helper = DbHelper()
+        helper._db = database
+
+        rows = helper.get_transfer_histories_for_media(
+            tmdbid="100", title="Movie", year="2024"
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].TITLE, "Movie")
 
     def test_real_upload_processor_publishes_canonical_copy(self):
         register_subtitle_task_processors(self.manager)

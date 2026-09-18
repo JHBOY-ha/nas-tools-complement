@@ -151,6 +151,10 @@ class SubtitleAlignTest(TestCase):
 
             self.assertTrue(ret["applied"], ret)
             self.assertEqual(ret["mode"], "offset")
+            self.assertGreaterEqual(ret["confidence"], 0.78)
+            self.assertEqual(ret["inliers"], 5)
+            self.assertEqual(ret["outliers"], 0)
+            self.assertEqual(ret["model"], "median_offset")
             with open(source, "r", encoding="utf-8") as file_obj:
                 self.assertIn("00:00:03,000 --> 00:00:04,000", file_obj.read())
 
@@ -179,10 +183,37 @@ class SubtitleAlignTest(TestCase):
 
             self.assertTrue(ret["applied"], ret)
             self.assertEqual(ret["mode"], "segmented")
+            self.assertLessEqual(ret["residual_p95_ms"], 1000)
             with open(source, "r", encoding="utf-8") as file_obj:
                 content = file_obj.read()
-            self.assertIn("00:00:08,400 --> 00:00:09,500", content)
-            self.assertIn("00:00:12,800 --> 00:00:13,800", content)
+            self.assertIn("00:00:08,067 --> 00:00:09,333", content)
+            self.assertIn("00:00:12,600 --> 00:00:13,600", content)
+
+    def test_auto_selects_affine_model_for_mild_linear_drift(self):
+        def stamp(milliseconds):
+            total = milliseconds // 1000
+            return "%02d:%02d:%02d,%03d" % (
+                total // 3600, (total // 60) % 60, total % 60, milliseconds % 1000
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = os.path.join(tmpdir, "source.srt")
+            reference = os.path.join(tmpdir, "reference.srt")
+            source_entries = []
+            reference_entries = []
+            for index in range(6):
+                start = 1000 + index * 30000
+                source_entries.append((stamp(start), stamp(start + 1000), "线性漂移对白%d" % index))
+                mapped = int(start * 1.02 + 1000)
+                reference_entries.append((stamp(mapped), stamp(mapped + 1020), "线性漂移对白%d" % index))
+            _write(source, _srt(source_entries))
+            _write(reference, _srt(reference_entries))
+
+            ret = SubtitleAligner.align_with_reference_file(source, reference)
+
+            self.assertTrue(ret["applied"], ret)
+            self.assertEqual(ret["mode"], "affine", ret)
+            self.assertEqual(ret["model"], "linear_drift")
 
     def test_forced_offset_mode_uses_single_offset_for_drift(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -213,7 +244,7 @@ class SubtitleAlignTest(TestCase):
                 content = file_obj.read()
             self.assertIn("00:00:08,400 --> 00:00:09,400", content)
 
-    def test_forced_segmented_mode_uses_segment_mapping_for_stable_offset(self):
+    def test_forced_segmented_mode_requires_confirmed_timeline_change(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             source = os.path.join(tmpdir, "source.srt")
             reference = os.path.join(tmpdir, "reference.srt")
@@ -235,7 +266,8 @@ class SubtitleAlignTest(TestCase):
             ret = SubtitleAligner.align_with_reference_file(source, reference, align_mode="segmented")
 
             self.assertTrue(ret["applied"], ret)
-            self.assertEqual(ret["mode"], "segmented")
+            self.assertEqual(ret["mode"], "offset")
+            self.assertEqual(ret["model"], "median_offset")
 
     def test_low_confidence_keeps_original_subtitle(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -603,3 +635,161 @@ class SubtitleAlignTest(TestCase):
         self.assertIn("大小限制", message)
         command = run_process.call_args.args[0]
         self.assertEqual(command[command.index("-fs") + 1], "11")
+
+    def test_reference_extraction_cache_hits_and_media_fingerprint_invalidates(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            media = os.path.join(tmpdir, "Movie.mkv")
+            first = os.path.join(tmpdir, "first.srt")
+            second = os.path.join(tmpdir, "second.srt")
+            open(media, "wb").close()
+
+            def extract(_media, _stream, output, **_kwargs):
+                _write(output, _srt([("00:00:01,000", "00:00:02,000", "reference line")]))
+                return True, ""
+
+            fingerprints = [
+                {"path": media, "size": 0, "mtime_ns": 1, "stream_index": 0,
+                 "cache_version": "v1", "ffmpeg_version": "ffmpeg"},
+                {"path": media, "size": 0, "mtime_ns": 1, "stream_index": 0,
+                 "cache_version": "v1", "ffmpeg_version": "ffmpeg"},
+                {"path": media, "size": 1, "mtime_ns": 2, "stream_index": 0,
+                 "cache_version": "v1", "ffmpeg_version": "ffmpeg"}
+            ]
+            with patch("app.helper.subtitle_align.Config") as config_cls, \
+                    patch.object(
+                        SubtitleAligner, "_SubtitleAligner__reference_fingerprint",
+                        side_effect=fingerprints
+                    ), patch.object(
+                        SubtitleAligner, "_SubtitleAligner__extract_reference_subtitle",
+                        side_effect=extract
+                    ) as extractor:
+                config_cls.return_value.get_temp_path.return_value = tmpdir
+                first_result = SubtitleAligner._SubtitleAligner__get_or_extract_reference(
+                    media, 0, first, max_bytes=1024 * 1024, cache_max_bytes=1024 * 1024
+                )
+                second_result = SubtitleAligner._SubtitleAligner__get_or_extract_reference(
+                    media, 0, second, max_bytes=1024 * 1024, cache_max_bytes=1024 * 1024
+                )
+                third_result = SubtitleAligner._SubtitleAligner__get_or_extract_reference(
+                    media, 0, second, max_bytes=1024 * 1024, cache_max_bytes=1024 * 1024
+                )
+
+            self.assertFalse(first_result[2])
+            self.assertTrue(second_result[2])
+            self.assertFalse(third_result[2])
+            self.assertEqual(extractor.call_count, 2)
+
+    def test_llm_translation_samples_large_reference_within_batch_budget(self):
+        cues = [
+            {"start": index * 1000, "end": index * 1000 + 800,
+             "text": "information rich reference line %03d" % index}
+            for index in range(120)
+        ]
+        mock_client = Mock()
+        mock_client.is_ready.return_value = True
+        mock_client.complete_json.side_effect = lambda **kwargs: [
+            {"id": item["id"], "text": "译文 %s" % item["id"]}
+            for item in __import__("json").loads(kwargs["user_prompt"])["items"]
+        ]
+        SubtitleAligner._llm_translation_cache.clear()
+        with patch("app.helper.subtitle_align.LLMClient", return_value=mock_client), \
+                patch.object(SubtitleAligner, "_SubtitleAligner__llm_batch_size", return_value=10):
+            translated, message = SubtitleAligner._SubtitleAligner__translate_reference_cues(
+                cues, target_language="zh-CN", max_batches=2
+            )
+
+        self.assertEqual(message, "")
+        self.assertIsNotNone(translated)
+        self.assertLessEqual(mock_client.complete_json.call_count, 2)
+        self.assertEqual(
+            sum(1 for cue in translated if str(cue["text"]).startswith("译文")), 20
+        )
+
+    def test_llm_translation_does_not_resample_an_explicit_empty_selection(self):
+        cues = [{"start": 0, "end": 800, "text": "reference content"}]
+        mock_client = Mock()
+        mock_client.is_ready.return_value = True
+        with patch("app.helper.subtitle_align.LLMClient", return_value=mock_client):
+            translated, message = SubtitleAligner._SubtitleAligner__translate_reference_cues(
+                cues, target_language="zh-CN", selected_cues=[]
+            )
+
+        self.assertIsNone(translated)
+        self.assertIn("没有可用", message)
+        mock_client.complete_json.assert_not_called()
+
+    def test_segment_controls_use_group_medians_instead_of_raw_anchor_knots(self):
+        anchors = [
+            {
+                "source_time": index * 1000,
+                "reference_time": index * 1000 + offset,
+                "score": 0.9
+            }
+            for index, offset in enumerate([0, 0, 1500, 2000, 2000, 2000])
+        ]
+
+        controls = SubtitleAligner._SubtitleAligner__segment_controls(anchors)
+
+        self.assertEqual(len(controls), 2)
+        self.assertEqual(controls[0]["source_time"], 1000)
+        self.assertEqual(controls[0]["reference_time"], 1000)
+        self.assertEqual(controls[1]["source_time"], 4000)
+        self.assertEqual(controls[1]["reference_time"], 6000)
+
+    def test_post_alignment_validation_rejects_large_anchor_residual(self):
+        original = [
+            {"start": index * 1000, "end": index * 1000 + 800, "text": str(index)}
+            for index in range(5)
+        ]
+        aligned = [dict(cue) for cue in original]
+        anchors = [
+            {
+                "source_index": index,
+                "source_time": cue["start"],
+                "reference_time": cue["start"] + 5000,
+                "score": 0.9
+            }
+            for index, cue in enumerate(original)
+        ]
+
+        valid, reason, residual = (
+            SubtitleAligner._SubtitleAligner__validate_aligned_timeline(
+                original, aligned, anchors
+            )
+        )
+
+        self.assertFalse(valid)
+        self.assertIn("残差过大", reason)
+        self.assertEqual(residual, 5000)
+
+    def test_outlier_anchor_is_removed_before_rewrite(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = os.path.join(tmpdir, "source.srt")
+            reference = os.path.join(tmpdir, "reference.srt")
+            source_entries = []
+            reference_entries = []
+            for index in range(7):
+                start = 1 + index * 10
+                source_entries.append((
+                    "00:01:%02d,000" % start if start < 60 else "00:02:%02d,000" % (start - 60),
+                    "00:01:%02d,800" % start if start < 60 else "00:02:%02d,800" % (start - 60),
+                    "独特对白内容第%d句" % index
+                ))
+                shifted = start + 2
+                if index == 3:
+                    shifted += 120
+                minutes = 1 + shifted // 60
+                seconds = shifted % 60
+                reference_entries.append((
+                    "00:%02d:%02d,000" % (minutes, seconds),
+                    "00:%02d:%02d,800" % (minutes, seconds),
+                    "独特对白内容第%d句" % index
+                ))
+            _write(source, _srt(source_entries))
+            _write(reference, _srt(reference_entries))
+
+            ret = SubtitleAligner.align_with_reference_file(source, reference)
+
+            self.assertTrue(ret["applied"], ret)
+            self.assertGreaterEqual(ret["outliers"], 1)
+            self.assertGreaterEqual(ret["inliers"], 5)

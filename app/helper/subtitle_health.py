@@ -63,6 +63,11 @@ class SubtitleHealth:
     _validator_version = "subtitle-health-v2"
     _max_local_text_bytes = 20 * 1024 * 1024
     _ffprobe_version = None
+    _chinese_filename_re = re.compile(
+        r"(^|[.\-_\[( ])(zh(?:[-_]?(?:cn|hans|chs|sg|sc|tw|hant|cht|hk))?|"
+        r"zho|chi|chs|cht|cn|sc|tc|简|简中|简体|繁|繁中|繁体|中文|中文字幕)"
+        r"($|[.\-_\]) ])", re.I
+    )
     _nas_skip_directories = {
         "@eadir", "@recycle", "@sharesnap", "@snapshot", "#recycle",
         "$recycle.bin", ".snapshot", ".snapshots", ".recycle",
@@ -393,7 +398,9 @@ class SubtitleHealth:
     @classmethod
     def list_external_subtitles(cls, media_file, max_results=None, cancel_check=None):
         """返回关联外挂字幕；调用方可用 ``max_results`` 建立任务硬上限。"""
-        return list(cls.iter_external_subtitles(
+        # The iterator keeps directory reads bounded; sorting only the bounded
+        # result makes repair order deterministic across filesystems.
+        return sorted(cls.iter_external_subtitles(
             media_file,
             max_results=max_results,
             cancel_check=cancel_check
@@ -489,6 +496,12 @@ class SubtitleHealth:
                 accumulator["partial"] = True
                 break
             seen_media.add(media_key)
+            cls.__emit_audit_progress(accumulator, media_file)
+            if not os.path.isfile(media_file):
+                cls.__record_media_coverage(
+                    accumulator, media_file, media_exists=False
+                )
+                continue
             directory = os.path.dirname(media_file)
             if not directory:
                 continue
@@ -500,13 +513,11 @@ class SubtitleHealth:
                 accumulator["partial"] = True
                 break
             group = groups.setdefault(directory_key, {"directory": directory, "media": {}})
-            cls.__emit_audit_progress(accumulator, media_file)
             # linked mode receives explicit, trusted TRANSFER_HISTORY targets.
             # A library media entry may itself be a symlink to the download
             # volume; keep its lexical path so subtitles beside the link are
             # still audited.  Subtitle symlinks remain rejected below.
-            if os.path.isfile(media_file):
-                group["media"][os.path.normcase(os.path.abspath(media_file))] = media_file
+            group["media"][os.path.normcase(os.path.abspath(media_file))] = media_file
         accumulator["root_count"] = len(groups)
         accumulator["root_sample"] = []
         for group in groups.values():
@@ -536,6 +547,7 @@ class SubtitleHealth:
                 key=lambda item: len(item[0]), reverse=True
             )
             try:
+                scan_error_count = len(accumulator["scan_errors"])
                 with os.scandir(directory) as entries:
                     accumulator["directories"] += 1
                     cls.__emit_audit_progress(accumulator, directory)
@@ -558,6 +570,10 @@ class SubtitleHealth:
                         if not cls.__audit_pair(
                                 accumulator, entry.path, media_file):
                             break
+                if not accumulator.get("stop_reason") \
+                        and len(accumulator["scan_errors"]) == scan_error_count:
+                    for media_file in selected_paths:
+                        cls.__record_media_coverage(accumulator, media_file)
             except OSError as error:
                 cls.__record_scan_error(accumulator, error, directory)
                 continue
@@ -644,6 +660,9 @@ class SubtitleHealth:
                             accumulator, subtitle_file, media_file):
                         dir_names[:] = []
                         break
+                if not accumulator.get("stop_reason"):
+                    for _, media_file in media_bases:
+                        cls.__record_media_coverage(accumulator, media_file)
                 if accumulator.get("stop_reason"):
                     break
             if accumulator.get("stop_reason"):
@@ -708,6 +727,7 @@ class SubtitleHealth:
             "cache_hits": 0,
             "summary": {"total": 0, "ok": 0, "warning": 0, "error": 0},
             "media_statuses": {},
+            "media_snapshots": {},
             "issues": [],
             "issue_count": 0,
             "inaccessible_roots": [],
@@ -797,6 +817,10 @@ class SubtitleHealth:
                 except Exception as error:
                     ExceptionUtils.exception_traceback(error)
         cls.__accumulate_audit_result(accumulator, result)
+        if media_file:
+            cls.__record_media_coverage(
+                accumulator, media_file, subtitle_file=subtitle_file
+            )
         cls.__emit_audit_progress(accumulator, subtitle_file)
         return not cls.__should_stop_audit(accumulator)
 
@@ -844,6 +868,34 @@ class SubtitleHealth:
             accumulator["issue_count"] += 1
             if len(accumulator["issues"]) < accumulator["issue_limit"]:
                 accumulator["issues"].append(result)
+
+    @classmethod
+    def __record_media_coverage(cls, accumulator, media_file, subtitle_file=None,
+                                media_exists=True):
+        """Record negative as well as positive audit coverage for library snapshots."""
+        media_file = os.path.normpath(str(media_file or "").strip())
+        if not media_file:
+            return
+        key = os.path.normcase(os.path.abspath(media_file))
+        snapshot = accumulator["media_snapshots"].setdefault(key, {
+            "media_path": media_file,
+            "media_exists": bool(media_exists),
+            "has_internal": None,
+            "has_chinese_internal": None,
+            "has_external": False,
+            "has_chinese_external": False,
+            "status": "external_checked" if media_exists else "unknown",
+            "source": "audit"
+        })
+        if subtitle_file:
+            snapshot["has_external"] = True
+            subtitle_stem = os.path.splitext(os.path.basename(subtitle_file))[0]
+            media_stem = os.path.splitext(os.path.basename(media_file))[0]
+            language_part = subtitle_stem[len(media_stem):] \
+                if subtitle_stem.casefold().startswith(media_stem.casefold()) else subtitle_stem
+            if cls._chinese_filename_re.search(language_part):
+                snapshot["has_chinese_external"] = True
+                snapshot["status"] = "has_chinese_external"
 
     @classmethod
     def __should_stop_audit(cls, accumulator):
@@ -908,6 +960,7 @@ class SubtitleHealth:
             "scan_error_paths": accumulator["scan_error_paths"],
             "summary": accumulator["summary"],
             "media_statuses": accumulator["media_statuses"],
+            "media_snapshots": list(accumulator["media_snapshots"].values()),
             "issues": accumulator["issues"],
             "issues_truncated": max(
                 accumulator["issue_count"] - len(accumulator["issues"]), 0

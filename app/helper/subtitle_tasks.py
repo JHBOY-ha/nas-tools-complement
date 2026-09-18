@@ -17,6 +17,7 @@ import log
 from app.db.main_db import MainDb
 from app.db.models import (
     SUBTITLEAUDITSTATE,
+    SUBTITLEMEDIASTATUS,
     SUBTITLEPROBECACHE,
     SUBTITLETASK,
     SUBTITLETASKITEM,
@@ -2367,7 +2368,8 @@ class SubtitleTaskManager:
             self._invalidate_audit_snapshot_cache(server)
 
     def commit_audit_result(self, task_id, scope_key, server, media_statuses,
-                            result, status, message, replace=False):
+                            result, status, message, replace=False,
+                            media_snapshots=None):
         """Atomically publish visible audit state and the task terminal status.
 
         ``cancel_task`` uses the same manager lock, so a cancellation either
@@ -2428,6 +2430,9 @@ class SubtitleTaskManager:
                     self._upsert_audit_states_uncommitted(
                         scope_key, server, media_statuses, task_id, now
                     )
+                self._upsert_media_statuses_uncommitted(
+                    server, media_snapshots or [], now
+                )
                 self._checkpoint_active(row, now, keep_running=False)
                 row.STATUS = status
                 row.PHASE = "complete"
@@ -2443,6 +2448,51 @@ class SubtitleTaskManager:
                 raise
             self._invalidate_audit_snapshot_cache(server)
             return self._task_dict(row, include_result=True, include_items=True)
+
+    def _upsert_media_statuses_uncommitted(self, server, snapshots, now):
+        """Publish inspected media snapshots in the same audit transaction."""
+        server = str(server or "").lower()
+        normalized = []
+        for snapshot in snapshots:
+            path = os.path.normcase(os.path.abspath(os.path.normpath(
+                str((snapshot or {}).get("media_path") or "")
+            )))
+            if path:
+                normalized.append((path, snapshot))
+        for offset in range(0, len(normalized), 500):
+            chunk = normalized[offset:offset + 500]
+            paths = [path for path, _ in chunk]
+            existing = self._db.query(SUBTITLEMEDIASTATUS).filter(
+                SUBTITLEMEDIASTATUS.SERVER == server,
+                SUBTITLEMEDIASTATUS.MEDIA_PATH.in_(paths)
+            ).all()
+            rows_by_path = {row.MEDIA_PATH: row for row in existing}
+            for path, snapshot in chunk:
+                row = rows_by_path.get(path)
+                values = {
+                    "MEDIA_EXISTS": self._nullable_flag(snapshot.get("media_exists")),
+                    "HAS_INTERNAL": self._nullable_flag(snapshot.get("has_internal")),
+                    "HAS_CHINESE_INTERNAL": self._nullable_flag(snapshot.get("has_chinese_internal")),
+                    "HAS_EXTERNAL": self._nullable_flag(snapshot.get("has_external")),
+                    "HAS_CHINESE_EXTERNAL": self._nullable_flag(snapshot.get("has_chinese_external")),
+                    "STATUS": str(snapshot.get("status") or "unknown"),
+                    "SOURCE": str(snapshot.get("source") or "audit"),
+                    "CHECKED_AT": now,
+                    "UPDATED_AT": now,
+                }
+                if row:
+                    for key, value in values.items():
+                        setattr(row, key, value)
+                else:
+                    self._db.insert(SUBTITLEMEDIASTATUS(
+                        SERVER=server, MEDIA_PATH=path, **values
+                    ))
+
+    @staticmethod
+    def _nullable_flag(value):
+        if value is None:
+            return None
+        return 1 if bool(value) else 0
 
     def upsert_audit_states(self, scope_key, server, media_statuses, task_id=None):
         now = time.time()

@@ -698,6 +698,35 @@ class SUBTITLEAUDITSTATE(Base):
     UPDATED_AT = Column(Float, nullable=False)
 
 
+class SUBTITLEMEDIASTATUS(Base):
+    """Last known subtitle state for one media path.
+
+    This table is intentionally independent from audit task history: library
+    rendering reads it directly and therefore never needs to touch NAS paths.
+    """
+
+    __tablename__ = 'SUBTITLE_MEDIA_STATUS'
+    __table_args__ = (
+        UniqueConstraint('SERVER', 'MEDIA_PATH', name='UN_SUBTITLE_MEDIA_STATUS_PATH'),
+        Index('INDX_SUBTITLE_MEDIA_STATUS_SERVER', 'SERVER'),
+        Index('INDX_SUBTITLE_MEDIA_STATUS_STATUS', 'STATUS'),
+        Index('INDX_SUBTITLE_MEDIA_STATUS_CHECKED', 'CHECKED_AT'),
+    )
+
+    ID = Column(Integer, Sequence('ID'), primary_key=True)
+    SERVER = Column(Text, nullable=False)
+    MEDIA_PATH = Column(Text, nullable=False)
+    MEDIA_EXISTS = Column(Integer)
+    HAS_INTERNAL = Column(Integer)
+    HAS_CHINESE_INTERNAL = Column(Integer)
+    HAS_EXTERNAL = Column(Integer)
+    HAS_CHINESE_EXTERNAL = Column(Integer)
+    STATUS = Column(Text, nullable=False, server_default=text("'unknown'"))
+    SOURCE = Column(Text, nullable=False, server_default=text("'unknown'"))
+    CHECKED_AT = Column(Float, nullable=False)
+    UPDATED_AT = Column(Float, nullable=False)
+
+
 class SUBTITLETASKSETTING(Base):
     """Single-row policy override used when new tasks take their snapshot."""
 

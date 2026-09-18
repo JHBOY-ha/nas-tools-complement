@@ -388,6 +388,13 @@ class Subtitle:
                         temporary_dir=work_dir,
                         reference_max_bytes=(
                             int(policy.get("text_file_limit_mb") or 20) * 1024 * 1024
+                        ),
+                        # Reference text is bounded to 10% of the existing
+                        # staging quota and never exceeds 256 MiB.
+                        reference_cache_max_bytes=min(
+                            256 * 1024 * 1024,
+                            int(policy.get("staging_quota_mb") or 2048)
+                            * 1024 * 1024 // 10
                         )
                     )
                 if canceled() or alignment.get("message") == "任务已取消":
@@ -2007,8 +2014,21 @@ class Subtitle:
             if renameat2(-100, os.fsencode(source), -100, os.fsencode(target), 1) != 0:
                 error_number = ctypes.get_errno()
                 raise OSError(error_number, os.strerror(error_number), target)
-        except AttributeError as error:
-            raise OSError(errno.ENOTSUP, "renameat2(RENAME_NOREPLACE) 不可用") from error
+        except AttributeError:
+            # macOS and other POSIX systems may not expose Linux renameat2.
+            # Files in this workflow are on one volume: link creation is an
+            # atomic no-replace claim, and unlinking the source keeps the same
+            # inode at the destination.  A crash between the two operations is
+            # recoverable from the persisted transaction manifest.
+            os.link(source, target, follow_symlinks=False)
+            try:
+                os.unlink(source)
+            except OSError:
+                try:
+                    os.unlink(target)
+                except OSError:
+                    pass
+                raise
 
     @staticmethod
     def __file_identity(path):

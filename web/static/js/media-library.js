@@ -620,6 +620,11 @@ function library_item_card(item, index) {
   const poster = library_escape_html(item.poster_url || "");
   const type_initial = library_escape_html((item.media_type_name || "媒").substring(0, 1));
   const subtitle_label = library_escape_html(item.subtitle_label || "未检测");
+  const subtitle_checked_at = library_escape_html(item.subtitle_status_checked_at || "");
+  const subtitle_source = library_escape_html(item.subtitle_status_source || "");
+  const subtitle_state_title = subtitle_checked_at
+      ? `状态来源：${subtitle_source || "快照"}；检查时间：${subtitle_checked_at}`
+      : "尚无媒体级字幕状态快照";
   const subtitle_audit_label = library_escape_html(item.subtitle_audit_label || "");
   const subtitle_audit_badge = library_escape_html(item.subtitle_audit_badge || "");
   const subtitle_audit_checked_at = library_escape_html(item.subtitle_audit_checked_at || "");
@@ -672,7 +677,7 @@ function library_item_card(item, index) {
         </div>
         <div class="lit-library-card-subtitle-line">
           <span class="dot ${dot_class}"></span>
-          <span class="lit-library-card-meta">${subtitle_label}</span>
+          <span class="lit-library-card-meta" title="${subtitle_state_title}">${subtitle_label}</span>
         </div>
         ${is_movie && subtitle_audit_label ? `
         <div class="lit-library-card-audit">
@@ -1090,10 +1095,13 @@ function init_media_library_page(options) {
     update_library_filter_badge();
   });
   $("#library_filter_keyword").unbind("keydown").keydown(function (event) {
-    if (event.key === "Enter") {
+    if (event.key === "Enter" && !event.isComposing) {
       event.preventDefault();
       apply_library_filters();
     }
+  });
+  $("#library_filter_keyword_clear").unbind("click").click(function () {
+    $("#library_filter_keyword").val("").trigger("input").trigger("focus");
   });
 
   update_library_sort_order_labels();

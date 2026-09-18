@@ -644,3 +644,20 @@ body, .page {
         grid-template-columns: 1fr;
     }
 }
+
+/* 字幕任务字段帮助：保留圆形问号样式，提供可点击区域和明确键盘焦点。 */
+#subtitle-task-settings-page .subtitle-policy-help {
+    width: 1.5rem;
+    height: 1.5rem;
+    flex-shrink: 0;
+}
+
+#subtitle-task-settings-page .subtitle-policy-help[aria-expanded="true"] {
+    color: var(--tblr-primary-fg, #fff);
+    background: var(--tblr-primary);
+}
+
+#subtitle-task-settings-page .subtitle-policy-help:focus-visible {
+    outline: 2px solid var(--tblr-primary);
+    outline-offset: 2px;
+}

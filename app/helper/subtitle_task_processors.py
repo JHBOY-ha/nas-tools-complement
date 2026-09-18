@@ -15,6 +15,31 @@ _LOCAL_REFRESH_MIN_BUDGET_SECONDS = 300
 _LOCAL_REFRESH_POST_VALIDATION_SECONDS = 180
 
 
+def _update_media_status_after_mutation(media_file, server_type, subtitle_files,
+                                        abort_check, probe_timeout_seconds,
+                                        heavy_operation):
+    """Refresh one snapshot, falling back to mutation facts after interruption.
+
+    The fallback performs SQLite work only.  It records already-published
+    subtitles without extending a canceled or budget-exhausted NAS task.
+    """
+    if not abort_check():
+        try:
+            return MediaLibrary.update_external_subtitle_audit_status(
+                media_file, server_type,
+                cancel_check=abort_check,
+                probe_timeout_seconds=probe_timeout_seconds,
+                heavy_operation=heavy_operation,
+                known_subtitle_files=subtitle_files
+            )
+        except (InterruptedError, TimeoutError):
+            pass
+    return MediaLibrary.update_external_subtitle_snapshot(
+        media_file, server_type, subtitle_files=subtitle_files,
+        complete=False, media_exists=True
+    )
+
+
 class _TaskPathGuard:
     """Revalidate persisted canonical media paths at every destructive boundary."""
 
@@ -460,6 +485,34 @@ def process_upload_task(manager, task_id):
             for item_result in results:
                 if item_result.get("success"):
                     item_result.setdefault("data", {}).setdefault("warnings", []).append(result_warning)
+        published_subtitles = []
+        for item_result in results:
+            if not item_result.get("success"):
+                continue
+            item_data = item_result.get("data") or {}
+            published_subtitles.extend([
+                item_data.get("canonical_subtitle"),
+                item_data.get("companion_subtitle")
+            ])
+        try:
+            _update_media_status_after_mutation(
+                requested_canonical_media, server_type,
+                [path for path in published_subtitles if path],
+                abort_check=should_abort,
+                probe_timeout_seconds=int(policy.get("ffprobe_timeout_seconds") or 10),
+                heavy_operation=heavy_operation
+            )
+        except Exception as warning:
+            for item_result in results:
+                if item_result.get("success"):
+                    item_result.setdefault("data", {}).setdefault("warnings", []).append(
+                        f"媒体字幕状态快照更新失败：{str(warning)}"
+                    )
+        # The bounded targeted check above may consume the final task budget.
+        # Re-evaluate terminal signals before deciding whether to refresh the
+        # media server.
+        processing_timed_out = budget_exhausted()
+        was_canceled = canceled()
     if successes and not was_canceled and not processing_timed_out:
         try:
             manager.update_progress(
@@ -626,6 +679,21 @@ def process_repair_task(manager, task_id):
             manager.invalidate_audit_states([requested_media_file])
         except Exception as warning:
             warnings.append(f"检测状态失效失败：{str(warning)}")
+        processed_subtitles = []
+        for item in processed:
+            processed_subtitles.extend([
+                item.get("target"), item.get("target_companion")
+            ])
+        try:
+            _update_media_status_after_mutation(
+                requested_media_file, server_type,
+                [path for path in processed_subtitles if path],
+                abort_check=should_abort,
+                probe_timeout_seconds=int(policy.get("ffprobe_timeout_seconds") or 10),
+                heavy_operation=heavy_operation
+            )
+        except Exception as warning:
+            warnings.append(f"媒体字幕状态快照更新失败：{str(warning)}")
     if canceled():
         status = "partial" if processed else "canceled"
         refresh = {"status": "skipped", "scope": "none", "message": "任务已取消"}
@@ -819,9 +887,11 @@ def process_audit_task(manager, task_id):
         # Probe cache is intentionally retained, but canceled scans must not
         # update the visible latest state or audit history.
         result.pop("media_statuses", None)
+        result.pop("media_snapshots", None)
         return _finish(manager, task_id, "canceled", result=result, message="字幕检测已取消")
 
     media_statuses = result.pop("media_statuses", {})
+    media_snapshots = result.pop("media_snapshots", [])
     result["checked_at"] = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
     result["scope_key"] = scope_key
     status = "partial" if result.get("partial") or not result.get("coverage_complete") else "succeeded"
@@ -829,7 +899,8 @@ def process_audit_task(manager, task_id):
     return manager.commit_audit_result(
         task_id, scope_key, server_type, media_statuses,
         result=result, status=status, message=message,
-        replace=bool(result.get("coverage_complete"))
+        replace=bool(result.get("coverage_complete")),
+        media_snapshots=media_snapshots
     )
 
 

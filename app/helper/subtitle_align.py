@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 from difflib import SequenceMatcher
+from statistics import median
 
 import log
 from app.utils import ExceptionUtils
@@ -49,14 +50,23 @@ class SubtitleAligner:
     _max_cues = 2500
     _reference_search_window = 350
     _max_match_comparisons = 150000
+    _candidate_limit_per_cue = 24
+    _min_anchor_coverage = 0.15
+    _minimum_cue_duration_ms = 200
+    _max_aligned_anchor_residual_ms = 2000
     _llm_translation_cache = {}
     _llm_translation_cache_ttl = 60 * 60
+    _reference_cache_lock = threading.RLock()
+    _reference_cache_ttl = 30 * 24 * 60 * 60
+    _reference_cache_version = "embedded-text-v1"
+    _ffmpeg_version = None
 
     @classmethod
     def align_subtitle(cls, subtitle_file, media_file, align_mode="auto", cancel_check=None,
                        ffprobe_timeout=None, ffmpeg_timeout=None, llm_timeout=180,
                        llm_max_batches=8, remaining_budget=None,
-                       temporary_dir=None, reference_max_bytes=20 * 1024 * 1024):
+                       temporary_dir=None, reference_max_bytes=20 * 1024 * 1024,
+                       reference_cache_max_bytes=16 * 1024 * 1024):
         """
         返回 {"applied": bool, "skipped": bool, "message": str, "mode": str, ...}
         低置信度或环境不可用时只跳过，不抛出业务异常。
@@ -111,13 +121,15 @@ class SubtitleAligner:
             with tempfile.TemporaryDirectory(
                     prefix=".subtitle-reference-", dir=temporary_parent) as tmpdir:
                 reference_file = os.path.join(tmpdir, "reference.srt")
-                ok, msg = cls.__extract_reference_subtitle(
-                    media_file,
-                    stream.get("index"),
-                    reference_file,
+                ok, msg, cache_hit = cls.__get_or_extract_reference(
+                    media_file, stream.get("index"), reference_file,
                     cancel_check=cancel_check,
                     timeout=bounded_timeout(ffmpeg_timeout, cls._ffmpeg_timeout),
-                    max_bytes=reference_max_bytes
+                    max_bytes=reference_max_bytes,
+                    cache_max_bytes=min(
+                        max(int(reference_cache_max_bytes or 0), 0),
+                        256 * 1024 * 1024
+                    )
                 )
                 if not ok:
                     return cls.__skip(msg)
@@ -136,6 +148,7 @@ class SubtitleAligner:
                 ret["stream_index"] = stream.get("index")
                 ret["source_language"] = source_language
                 ret["reference_language"] = reference_language
+                ret["reference_cache_hit"] = cache_hit
                 return ret
         except _SubtitleProcessCanceled:
             return cls.__skip("任务已取消")
@@ -168,26 +181,101 @@ class SubtitleAligner:
         if reference_language == "unknown":
             reference_language = cls.__detect_cues_language(reference.get("cues"))
         cross_language = not cls.__is_same_language(source_language, reference_language)
+        original_reference_cues = reference.get("cues")
+        translated_ids = set()
+        remaining_llm_batches = 0
         if cross_language:
             if not allow_llm:
                 return cls.__skip("参考字幕与上传字幕语言不同，未启用 LLM 跨语言对齐")
+            total_batches = max(1, min(int(llm_max_batches or 8), 20))
+            initial_batches = max(1, (total_batches + 1) // 2)
+            initial_timeout = float(llm_timeout) * initial_batches / total_batches
+            initial_selection = cls.__select_translation_cues(
+                original_reference_cues,
+                cls.__llm_batch_size() * initial_batches
+            )
             translated_cues, translate_msg = cls.__translate_reference_cues(
-                reference.get("cues"),
+                original_reference_cues,
                 target_language=source_language,
                 cancel_check=cancel_check,
-                timeout=llm_timeout,
-                max_batches=llm_max_batches
+                timeout=initial_timeout,
+                max_batches=initial_batches,
+                selected_cues=initial_selection
             )
             if not translated_cues:
                 return cls.__skip(translate_msg or "LLM 翻译参考字幕失败")
             reference["cues"] = translated_cues
+            translated_ids = {
+                int(cue.get("_source_index")) for cue in initial_selection
+            }
+            remaining_llm_batches = total_batches - initial_batches
         anchors, budget_exhausted = cls.__match_anchors(source.get("cues"), reference.get("cues"))
         if budget_exhausted:
             return cls.__skip("字幕匹配超出处理预算，跳过自动对齐")
-        valid, reason = cls.__validate_anchors(anchors)
+        valid, reason, diagnostics = cls.__validate_anchors(
+            anchors, source.get("cues")
+        )
+        if not valid and cross_language and remaining_llm_batches > 0:
+            remaining_candidates = [
+                dict(cue, _source_index=index)
+                for index, cue in enumerate(original_reference_cues)
+                if index not in translated_ids
+            ]
+            supplemental_selection = cls.__select_translation_cues(
+                remaining_candidates,
+                cls.__llm_batch_size() * remaining_llm_batches
+            )
+            supplemental = None
+            supplemental_message = ""
+            if supplemental_selection:
+                supplemental, supplemental_message = cls.__translate_reference_cues(
+                    original_reference_cues,
+                    target_language=source_language,
+                    cancel_check=cancel_check,
+                    timeout=max(float(llm_timeout) - initial_timeout, 0.1),
+                    max_batches=remaining_llm_batches,
+                    selected_cues=supplemental_selection
+                )
+            if supplemental:
+                for cue in supplemental_selection:
+                    cue_id = int(cue.get("_source_index"))
+                    reference["cues"][cue_id]["text"] = supplemental[cue_id]["text"]
+                anchors, budget_exhausted = cls.__match_anchors(
+                    source.get("cues"), reference.get("cues")
+                )
+                if budget_exhausted:
+                    return cls.__skip("字幕匹配超出处理预算，跳过自动对齐")
+                valid, reason, diagnostics = cls.__validate_anchors(
+                    anchors, source.get("cues")
+                )
+            elif supplemental_message:
+                reason = supplemental_message
         if not valid:
-            return cls.__skip(reason)
-        aligned_cues, mode = cls.__align_cues(source.get("cues"), anchors, align_mode=align_mode)
+            result = cls.__skip(reason)
+            result.update({
+                key: diagnostics.get(key) for key in [
+                    "confidence", "inliers", "outliers", "coverage", "residual_p95_ms"
+                ]
+            })
+            return result
+        robust_anchors = diagnostics.get("anchors") or anchors
+        aligned_cues, mode, model = cls.__align_cues(
+            source.get("cues"), robust_anchors,
+            align_mode=align_mode, diagnostics=diagnostics
+        )
+        valid_timeline, timeline_reason, model_residual_p95 = cls.__validate_aligned_timeline(
+            source.get("cues"), aligned_cues, robust_anchors
+        )
+        if model_residual_p95 is not None:
+            diagnostics["residual_p95_ms"] = model_residual_p95
+        if not valid_timeline:
+            result = cls.__skip(timeline_reason)
+            result.update({
+                key: diagnostics.get(key) for key in [
+                    "confidence", "inliers", "outliers", "coverage", "residual_p95_ms"
+                ]
+            })
+            return result
         source["cues"] = aligned_cues
         cls.write_file(subtitle_file, source)
         return {
@@ -195,7 +283,13 @@ class SubtitleAligner:
             "skipped": False,
             "message": "自动对齐完成",
             "mode": mode,
-            "anchors": len(anchors),
+            "model": model,
+            "anchors": len(robust_anchors),
+            "confidence": diagnostics.get("confidence"),
+            "inliers": diagnostics.get("inliers"),
+            "outliers": diagnostics.get("outliers"),
+            "coverage": diagnostics.get("coverage"),
+            "residual_p95_ms": diagnostics.get("residual_p95_ms"),
             "cross_language": cross_language,
             "source_language": source_language,
             "reference_language": reference_language
@@ -237,7 +331,12 @@ class SubtitleAligner:
 
     @staticmethod
     def __skip(message):
-        return {"applied": False, "skipped": True, "message": message, "mode": "skip", "anchors": 0}
+        return {
+            "applied": False, "skipped": True, "message": message,
+            "mode": "skip", "model": "none", "anchors": 0,
+            "confidence": 0.0, "inliers": 0, "outliers": 0,
+            "coverage": 0.0, "residual_p95_ms": None
+        }
 
     @classmethod
     def __select_reference_stream(cls, media_file, preferred_language="zh-CN", allow_cross_language=False,
@@ -419,6 +518,140 @@ class SubtitleAligner:
             ExceptionUtils.exception_traceback(e)
             return False, f"抽取参考字幕失败：{str(e)}"
 
+    @classmethod
+    def __get_or_extract_reference(cls, media_file, stream_index, output_file,
+                                   cancel_check=None, timeout=None, max_bytes=None,
+                                   cache_max_bytes=0):
+        """Reuse only complete, fingerprint-matched embedded text extraction."""
+        fingerprint = cls.__reference_fingerprint(media_file, stream_index, cancel_check)
+        cache_root = os.path.join(Config().get_temp_path(), "subtitle-reference-cache")
+        cache_key = hashlib.sha256(json.dumps(
+            fingerprint, ensure_ascii=False, sort_keys=True
+        ).encode("utf-8")).hexdigest()
+        cache_file = os.path.join(cache_root, cache_key + ".srt")
+        manifest_file = os.path.join(cache_root, cache_key + ".json")
+        if cache_max_bytes > 0:
+            with cls._reference_cache_lock:
+                cls.__prune_reference_cache(cache_root, cache_max_bytes)
+                try:
+                    with open(manifest_file, "r", encoding="utf-8") as file_obj:
+                        manifest = json.load(file_obj)
+                    fresh = time.time() - float(manifest.get("created_at") or 0) <= cls._reference_cache_ttl
+                    if fresh and manifest.get("fingerprint") == fingerprint \
+                            and os.path.isfile(cache_file) \
+                            and 0 < os.path.getsize(cache_file) <= int(max_bytes or 0):
+                        shutil.copyfile(cache_file, output_file)
+                        os.utime(manifest_file, None)
+                        return True, "", True
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    pass
+        ok, message = cls.__extract_reference_subtitle(
+            media_file, stream_index, output_file,
+            cancel_check=cancel_check, timeout=timeout, max_bytes=max_bytes
+        )
+        if not ok or cache_max_bytes <= 0 or not os.path.isfile(output_file):
+            return ok, message, False
+        if cancel_check and cancel_check():
+            return False, "任务已取消", False
+        with cls._reference_cache_lock:
+            os.makedirs(cache_root, exist_ok=True)
+            temp_cache = cache_file + ".tmp"
+            temp_manifest = manifest_file + ".tmp"
+            try:
+                shutil.copyfile(output_file, temp_cache)
+                with open(temp_manifest, "w", encoding="utf-8") as file_obj:
+                    json.dump({
+                        "fingerprint": fingerprint,
+                        "created_at": time.time(),
+                        "size": os.path.getsize(temp_cache)
+                    }, file_obj, ensure_ascii=False, sort_keys=True)
+                os.replace(temp_cache, cache_file)
+                os.replace(temp_manifest, manifest_file)
+                cls.__prune_reference_cache(cache_root, cache_max_bytes)
+            finally:
+                for path in [temp_cache, temp_manifest]:
+                    if os.path.exists(path):
+                        try:
+                            os.remove(path)
+                        except OSError:
+                            pass
+        return True, "", False
+
+    @classmethod
+    def __reference_fingerprint(cls, media_file, stream_index, cancel_check=None):
+        stat = os.stat(media_file)
+        return {
+            "path": os.path.normcase(os.path.abspath(media_file)),
+            "size": stat.st_size,
+            "mtime_ns": getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1000000000)),
+            "stream_index": int(stream_index),
+            "cache_version": cls._reference_cache_version,
+            "ffmpeg_version": cls.__get_ffmpeg_version(cancel_check)
+        }
+
+    @classmethod
+    def __get_ffmpeg_version(cls, cancel_check=None):
+        if cls._ffmpeg_version is not None:
+            return cls._ffmpeg_version
+        try:
+            result = cls.__run_process(
+                ["ffmpeg", "-version"], timeout=3, cancel_check=cancel_check
+            )
+            cls._ffmpeg_version = (result.stdout or "").splitlines()[0].strip() or "unknown"
+        except Exception:
+            cls._ffmpeg_version = "unknown"
+        return cls._ffmpeg_version
+
+    @classmethod
+    def __prune_reference_cache(cls, cache_root, max_bytes):
+        if not os.path.isdir(cache_root):
+            return
+        now = time.time()
+        entries = []
+        total = 0
+        for name in os.listdir(cache_root):
+            if not name.endswith(".srt"):
+                continue
+            data_file = os.path.join(cache_root, name)
+            manifest_file = os.path.splitext(data_file)[0] + ".json"
+            try:
+                size = os.path.getsize(data_file)
+                modified = os.path.getmtime(manifest_file)
+            except OSError:
+                for path in [data_file, manifest_file]:
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+                continue
+            if now - modified > cls._reference_cache_ttl:
+                for path in [data_file, manifest_file]:
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+                continue
+            total += size
+            entries.append((modified, size, data_file, manifest_file))
+        for name in os.listdir(cache_root):
+            if name.endswith(".json"):
+                manifest_file = os.path.join(cache_root, name)
+                data_file = os.path.splitext(manifest_file)[0] + ".srt"
+                if not os.path.isfile(data_file):
+                    try:
+                        os.remove(manifest_file)
+                    except OSError:
+                        pass
+        for _, size, data_file, manifest_file in sorted(entries):
+            if total <= max_bytes:
+                break
+            for path in [data_file, manifest_file]:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            total -= size
+
     @staticmethod
     def __stop_process(process):
         """Terminate a child and escalate to kill without blocking indefinitely."""
@@ -593,7 +826,7 @@ class SubtitleAligner:
 
     @classmethod
     def __translate_reference_cues(cls, reference_cues, target_language, cancel_check=None,
-                                   timeout=180, max_batches=8):
+                                   timeout=180, max_batches=8, selected_cues=None):
         if not cls.__is_llm_alignment_enabled():
             return None, "LLM 跨语言对齐未启用"
         client = LLMClient()
@@ -611,7 +844,13 @@ class SubtitleAligner:
             return None, "LLM 字幕对齐超时"
         deadline = started + total_timeout
         max_batches = max(1, min(int(max_batches or 8), 20))
-        for batch in cls.__iter_translation_batches(reference_cues):
+        if selected_cues is None:
+            selected_cues = cls.__select_translation_cues(
+                reference_cues, cls.__llm_batch_size() * max_batches
+            )
+        if not selected_cues:
+            return None, "没有可用的参考字幕样本"
+        for batch in cls.__iter_translation_batches(selected_cues):
             if cancel_check and cancel_check():
                 return None, "任务已取消"
             if batch_count >= max_batches:
@@ -648,6 +887,30 @@ class SubtitleAligner:
         return translated_cues, ""
 
     @classmethod
+    def __select_translation_cues(cls, cues, limit):
+        """Uniformly sample information-rich cues instead of translating a film."""
+        candidates = []
+        for index, cue in enumerate(cues or []):
+            text = cls.__clean_llm_subtitle_text(cue.get("text"))
+            normalized = cls.__normalize_text(text)
+            if len(normalized) < 4:
+                continue
+            score = min(len(set(normalized)), 40) + min(len(normalized), 80) / 10
+            source_index = int(cue.get("_source_index", index))
+            candidates.append((source_index, score, dict(cue, _source_index=source_index)))
+        limit = max(1, int(limit or 1))
+        if len(candidates) <= limit:
+            return [item[2] for item in candidates]
+        selected = []
+        # One best cue per temporal bucket keeps coverage while preferring
+        # names/numbers/content over repeated interjections.
+        for bucket in range(limit):
+            start = bucket * len(candidates) // limit
+            end = max((bucket + 1) * len(candidates) // limit, start + 1)
+            selected.append(max(candidates[start:end], key=lambda item: item[1])[2])
+        return selected
+
+    @classmethod
     def __is_llm_alignment_enabled(cls):
         subtitle = Config().get_config("subtitle") or {}
         alignment = subtitle.get("alignment") or {}
@@ -663,7 +926,7 @@ class SubtitleAligner:
             text = cls.__clean_llm_subtitle_text(cue.get("text"))
             if not text:
                 continue
-            item = {"id": index, "text": text}
+            item = {"id": int(cue.get("_source_index", index)), "text": text}
             item_len = len(text)
             if batch and (len(batch) >= batch_size or char_count + item_len > char_limit):
                 yield batch
@@ -769,39 +1032,102 @@ class SubtitleAligner:
 
     @classmethod
     def __match_anchors(cls, source_cues, reference_cues):
-        anchors = []
-        last_reference_index = -1
+        """Build fuzzy candidates, then select the highest-scoring monotonic chain."""
         comparisons = 0
         normalized_references = [cls.__normalize_text(cue.get("text")) for cue in reference_cues]
+        index = {}
+        for reference_index, text in enumerate(normalized_references):
+            for gram in cls.__text_ngrams(text):
+                index.setdefault(gram, []).append(reference_index)
+        candidate_groups = []
         for source_index, source in enumerate(source_cues):
             source_text = cls.__normalize_text(source.get("text"))
             if len(source_text) < 4:
                 continue
-            best = None
-            search_start = last_reference_index + 1
-            search_end = min(len(reference_cues), search_start + cls._reference_search_window)
-            for reference_index in range(search_start, search_end):
+            overlap = {}
+            for gram in cls.__text_ngrams(source_text):
+                for reference_index in index.get(gram, []):
+                    overlap[reference_index] = overlap.get(reference_index, 0) + 1
+            expected = int(source_index * len(reference_cues) / max(len(source_cues), 1))
+            candidate_indices = sorted(
+                overlap,
+                key=lambda value: (-overlap[value], abs(value - expected), value)
+            )[:cls._candidate_limit_per_cue]
+            if not candidate_indices:
+                half = cls._reference_search_window // 2
+                candidate_indices = range(
+                    max(0, expected - half), min(len(reference_cues), expected + half)
+                )
+            group = []
+            for reference_index in candidate_indices:
                 comparisons += 1
                 if comparisons > cls._max_match_comparisons:
-                    return anchors, True
+                    return [], True
                 reference_text = normalized_references[reference_index]
                 if len(reference_text) < 4:
                     continue
                 score = SequenceMatcher(None, source_text, reference_text).ratio()
-                if score >= cls._min_match_score and (not best or score > best.get("score")):
-                    best = {
+                if score >= cls._min_match_score:
+                    group.append({
                         "source_index": source_index,
                         "reference_index": reference_index,
                         "source_time": source.get("start"),
                         "reference_time": reference_cues[reference_index].get("start"),
                         "score": score
-                    }
-                    if score >= 0.98:
-                        break
-            if best:
-                anchors.append(best)
-                last_reference_index = best.get("reference_index")
-        return anchors, False
+                    })
+            if group:
+                candidate_groups.append(group)
+        return cls.__monotonic_anchor_chain(candidate_groups, len(reference_cues)), False
+
+    @staticmethod
+    def __text_ngrams(text, size=3):
+        if len(text) <= size:
+            return {text} if text else set()
+        return {text[index:index + size] for index in range(len(text) - size + 1)}
+
+    @classmethod
+    def __monotonic_anchor_chain(cls, groups, reference_count):
+        """Weighted LIS using a Fenwick tree; one anchor per source cue."""
+        tree = [None] * (max(reference_count, 1) + 2)
+        nodes = []
+
+        def query(position):
+            best = None
+            while position > 0:
+                value = tree[position]
+                if value and (not best or value[0] > best[0]):
+                    best = value
+                position -= position & -position
+            return best
+
+        def update(position, value):
+            while position < len(tree):
+                if not tree[position] or value[0] > tree[position][0]:
+                    tree[position] = value
+                position += position & -position
+
+        for group in groups:
+            pending = []
+            for anchor in group:
+                ref_position = int(anchor["reference_index"]) + 1
+                previous = query(ref_position - 1)
+                node_index = len(nodes)
+                nodes.append({
+                    "anchor": anchor,
+                    "previous": previous[1] if previous else None,
+                    "value": (previous[0] if previous else 0) + 1 + anchor["score"]
+                })
+                pending.append((ref_position, (nodes[node_index]["value"], node_index)))
+            for position, value in pending:
+                update(position, value)
+        best = query(len(tree) - 1)
+        chain = []
+        node_index = best[1] if best else None
+        while node_index is not None:
+            node = nodes[node_index]
+            chain.append(node["anchor"])
+            node_index = node["previous"]
+        return list(reversed(chain))
 
     @staticmethod
     def __normalize_text(text):
@@ -813,52 +1139,210 @@ class SubtitleAligner:
         return text
 
     @classmethod
-    def __validate_anchors(cls, anchors):
+    def __validate_anchors(cls, anchors, source_cues=None):
         if len(anchors) < cls._min_anchors:
-            return False, "匹配锚点不足，跳过自动对齐"
-        avg_score = sum(anchor.get("score", 0) for anchor in anchors) / len(anchors)
+            return False, "匹配锚点不足，跳过自动对齐", cls.__empty_diagnostics(anchors)
+        slope, intercept = cls.__robust_linear_model(anchors)
+        residuals = [
+            anchor["reference_time"] - (slope * anchor["source_time"] + intercept)
+            for anchor in anchors
+        ]
+        center = median(residuals)
+        mad = median([abs(value - center) for value in residuals])
+        threshold = max(500, 3 * 1.4826 * mad)
+        inliers = [
+            anchor for anchor, residual in zip(anchors, residuals)
+            if abs(residual - center) <= threshold
+        ]
+        outliers = len(anchors) - len(inliers)
+        if len(inliers) < cls._min_anchors:
+            return False, "有效匹配锚点不足，跳过自动对齐", cls.__empty_diagnostics(anchors, outliers)
+        avg_score = sum(anchor.get("score", 0) for anchor in inliers) / len(inliers)
+        source_span = max(
+            (source_cues or [{}])[-1].get("end", 0) - (source_cues or [{}])[0].get("start", 0), 1
+        )
+        coverage = max(inliers[-1]["source_time"] - inliers[0]["source_time"], 0) / source_span
+        inlier_residuals = [
+            abs(anchor["reference_time"] - (slope * anchor["source_time"] + intercept))
+            for anchor in inliers
+        ]
+        residual_p95 = cls.__percentile(inlier_residuals, 0.95)
+        diagnostics = {
+            "anchors": inliers, "inliers": len(inliers), "outliers": outliers,
+            "coverage": round(min(coverage, 1.0), 4),
+            "confidence": round(min(1.0, avg_score * min(1.0, coverage / 0.5)), 4),
+            "residual_p95_ms": int(round(residual_p95)),
+            "slope": slope, "intercept": intercept
+        }
         if avg_score < cls._min_avg_score:
-            return False, "字幕文本匹配度不足，跳过自动对齐"
-        offsets = [anchor.get("reference_time") - anchor.get("source_time") for anchor in anchors]
-        for left, right in zip(offsets, offsets[1:]):
-            if abs(right - left) > cls._max_offset_jump_ms:
-                return False, "时间轴跳变过大，跳过自动对齐"
-        for left, right in zip(anchors, anchors[1:]):
+            return False, "字幕文本匹配度不足，跳过自动对齐", diagnostics
+        if coverage < cls._min_anchor_coverage:
+            return False, "匹配锚点时间覆盖不足，跳过自动对齐", diagnostics
+        for left, right in zip(inliers, inliers[1:]):
             source_delta = right.get("source_time") - left.get("source_time")
             reference_delta = right.get("reference_time") - left.get("reference_time")
             if source_delta <= 0 or reference_delta <= 0:
-                return False, "锚点顺序异常，跳过自动对齐"
+                return False, "锚点顺序异常，跳过自动对齐", diagnostics
             ratio = reference_delta / source_delta
             if ratio < cls._min_stretch_ratio or ratio > cls._max_stretch_ratio:
-                return False, "分段变速超出安全范围，跳过自动对齐"
-        return True, ""
+                return False, "分段变速超出安全范围，跳过自动对齐", diagnostics
+        return True, "", diagnostics
+
+    @staticmethod
+    def __empty_diagnostics(anchors=None, outliers=0):
+        return {
+            "anchors": list(anchors or []), "inliers": len(anchors or []),
+            "outliers": outliers, "coverage": 0.0, "confidence": 0.0,
+            "residual_p95_ms": None, "slope": 1.0, "intercept": 0.0
+        }
 
     @classmethod
-    def __align_cues(cls, cues, anchors, align_mode="auto"):
+    def __robust_linear_model(cls, anchors):
+        pairs = []
+        step = max(1, len(anchors) // 30)
+        sampled = anchors[::step]
+        if sampled[-1] is not anchors[-1]:
+            sampled.append(anchors[-1])
+        for left_index, left in enumerate(sampled):
+            for right in sampled[left_index + 1:]:
+                delta = right["source_time"] - left["source_time"]
+                if delta > 0:
+                    pairs.append((right["reference_time"] - left["reference_time"]) / delta)
+        slope = median(pairs) if pairs else 1.0
+        slope = min(max(slope, cls._min_stretch_ratio), cls._max_stretch_ratio)
+        intercept = median([
+            anchor["reference_time"] - slope * anchor["source_time"]
+            for anchor in anchors
+        ])
+        return slope, intercept
+
+    @staticmethod
+    def __percentile(values, fraction):
+        values = sorted(values or [0])
+        position = max(0, min(len(values) - 1, int(round((len(values) - 1) * fraction))))
+        return values[position]
+
+    @classmethod
+    def __align_cues(cls, cues, anchors, align_mode="auto", diagnostics=None):
         offsets = [anchor.get("reference_time") - anchor.get("source_time") for anchor in anchors]
+        # Upper median preserves millisecond integer behavior for even-sized
+        # anchor sets while remaining insensitive to extreme offsets.
         median_offset = sorted(offsets)[len(offsets) // 2]
         if align_mode == "offset":
-            return [cls.__shift_cue(cue, median_offset) for cue in cues], "offset"
+            return [cls.__shift_cue(cue, median_offset) for cue in cues], "offset", "median_offset"
         if align_mode == "segmented":
-            return [cls.__map_cue(cue, anchors) for cue in cues], "segmented"
-        if max(abs(offset - median_offset) for offset in offsets) <= cls._stable_offset_ms:
-            return [cls.__shift_cue(cue, median_offset) for cue in cues], "offset"
-        return [cls.__map_cue(cue, anchors) for cue in cues], "segmented"
+            if cls.__segmentation_confirmed(anchors):
+                controls = cls.__segment_controls(anchors)
+                return [cls.__map_cue(cue, controls) for cue in cues], "segmented", "confirmed_segments"
+            return [cls.__shift_cue(cue, median_offset) for cue in cues], "offset", "median_offset"
+        offset_residual = cls.__percentile(
+            [abs(value - median_offset) for value in offsets], 0.95
+        )
+        if offset_residual <= cls._stable_offset_ms:
+            return [cls.__shift_cue(cue, median_offset) for cue in cues], "offset", "median_offset"
+        diagnostics = diagnostics or {}
+        slope = float(diagnostics.get("slope") or 1.0)
+        intercept = float(diagnostics.get("intercept") or 0.0)
+        residual_value = diagnostics.get("residual_p95_ms")
+        affine_residual = float(
+            offset_residual if residual_value is None else residual_value
+        )
+        if 0.95 <= slope <= 1.05 and affine_residual < offset_residual * 0.7:
+            return [
+                cls.__affine_cue(cue, slope, intercept) for cue in cues
+            ], "affine", "linear_drift"
+        controls = cls.__segment_controls(anchors)
+        if len(controls) >= 2 and cls.__segmentation_confirmed(anchors):
+            return [cls.__map_cue(cue, controls) for cue in cues], "segmented", "confirmed_segments"
+        return [cls.__shift_cue(cue, median_offset) for cue in cues], "offset", "median_offset"
+
+    @classmethod
+    def __segment_controls(cls, anchors):
+        """Collapse consecutive anchors into robust median segment controls."""
+        if len(anchors) <= 2:
+            return list(anchors)
+        # Three agreeing anchors are the minimum evidence for a local control;
+        # cap the number of controls so long films cannot overfit every line.
+        group_count = max(2, min(32, len(anchors) // 3))
+        controls = []
+        for group_index in range(group_count):
+            start = group_index * len(anchors) // group_count
+            end = (group_index + 1) * len(anchors) // group_count
+            group = anchors[start:end]
+            source_time = median([anchor["source_time"] for anchor in group])
+            offset = median([
+                anchor["reference_time"] - anchor["source_time"]
+                for anchor in group
+            ])
+            controls.append({
+                "source_time": source_time,
+                "reference_time": source_time + offset,
+                "score": median([anchor.get("score", 0) for anchor in group])
+            })
+        return controls
+
+    @classmethod
+    def __segmentation_confirmed(cls, anchors):
+        if len(anchors) < cls._min_anchors:
+            return False
+        offsets = [anchor["reference_time"] - anchor["source_time"] for anchor in anchors]
+        window = min(3, max(2, len(offsets) // 2))
+        # A segment is only accepted when multiple anchors on both sides agree
+        # on the change; one isolated match can never create a time-axis knot.
+        return abs(median(offsets[-window:]) - median(offsets[:window])) \
+            > cls._stable_offset_ms
+
+    @classmethod
+    def __affine_cue(cls, cue, slope, intercept):
+        start = max(0, slope * cue.get("start") + intercept)
+        end = max(start + cls._minimum_cue_duration_ms, slope * cue.get("end") + intercept)
+        return dict(cue, start=start, end=end)
 
     @classmethod
     def __shift_cue(cls, cue, offset):
         start = max(0, cue.get("start") + offset)
-        end = max(start + 200, cue.get("end") + offset)
+        end = max(start + cls._minimum_cue_duration_ms, cue.get("end") + offset)
         return dict(cue, start=start, end=end)
 
     @classmethod
     def __map_cue(cls, cue, anchors):
-        original_duration = max(200, cue.get("end") - cue.get("start"))
+        original_duration = max(cls._minimum_cue_duration_ms, cue.get("end") - cue.get("start"))
         start = cls.__map_time(cue.get("start"), anchors)
         end = cls.__map_time(cue.get("end"), anchors)
         if end <= start:
             end = start + original_duration
-        return dict(cue, start=max(0, start), end=max(start + 200, end))
+        return dict(cue, start=max(0, start), end=max(start + cls._minimum_cue_duration_ms, end))
+
+    @classmethod
+    def __validate_aligned_timeline(cls, original, aligned, anchors=None):
+        if len(original) != len(aligned):
+            return False, "对齐结果数量异常，已保留原字幕", None
+        previous_start = -1
+        for before, after in zip(original, aligned):
+            start = float(after.get("start") or 0)
+            end = float(after.get("end") or 0)
+            if start < previous_start:
+                return False, "对齐后时间轴非单调，已保留原字幕", None
+            if end - start < cls._minimum_cue_duration_ms:
+                return False, "对齐后字幕时长过短，已保留原字幕", None
+            original_duration = max(float(before.get("end") - before.get("start")), 1)
+            ratio = (end - start) / original_duration
+            if ratio < cls._min_stretch_ratio or ratio > cls._max_stretch_ratio:
+                return False, "对齐后字幕伸缩超出安全范围，已保留原字幕", None
+            previous_start = start
+        residuals = []
+        for anchor in anchors or []:
+            try:
+                source_index = int(anchor.get("source_index"))
+                mapped_start = float(aligned[source_index].get("start") or 0)
+                residuals.append(abs(mapped_start - float(anchor.get("reference_time") or 0)))
+            except (IndexError, TypeError, ValueError):
+                return False, "对齐后锚点索引异常，已保留原字幕", None
+        residual_p95 = int(round(cls.__percentile(residuals, 0.95))) if residuals else None
+        if residual_p95 is not None \
+                and residual_p95 > cls._max_aligned_anchor_residual_ms:
+            return False, "对齐后锚点残差过大，已保留原字幕", residual_p95
+        return True, "", residual_p95
 
     @staticmethod
     def __map_time(value, anchors):

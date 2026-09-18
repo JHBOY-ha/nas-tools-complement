@@ -12,6 +12,7 @@ import log
 from app.db.media_db import MediaDb
 from app.helper.db_helper import DbHelper
 from app.helper.subtitle_health import SubtitleHealth
+from app.helper.subtitle_media_status import SubtitleMediaStatusStore
 from app.media.category import Category
 from app.mediaserver import MediaServer
 from app.utils import ExceptionUtils, PathUtils
@@ -26,6 +27,10 @@ class MediaLibrary:
     _subtitle_dir_cache_lock = threading.RLock()
     _subtitle_dir_cache_ttl = 30
     _subtitle_dir_cache_limit = 4096
+    _poster_cache = {}
+    _poster_cache_lock = threading.RLock()
+    _poster_success_ttl = 3600
+    _poster_failure_ttl = 300
     _chinese_sub_re = re.compile(
         r"(^|[.\-_\[\( ])(zh[-_]?(cn|hans|chs|sg|sc|tw|hant|cht|hk)|"
         r"zho|chi|chs|cht|cn|sc|tc|简|简中|简体|繁|繁中|繁体|中文|中文字幕)"
@@ -43,6 +48,7 @@ class MediaLibrary:
         self.dbhelper = DbHelper()
         self.category = Category()
         self.media_server = MediaServer()
+        self.subtitle_status_store = SubtitleMediaStatusStore()
 
     def list_items(self, data=None):
         """
@@ -73,12 +79,16 @@ class MediaLibrary:
         rows = self.mediadb.list_items(server_type=server_type)
         transfer_histories = self.dbhelper.get_transfer_histories_with_dest()
         transfer_history_index = self.__build_transfer_history_index(transfer_histories)
+        status_snapshots = self.__status_store().list_for_server(server_type)
         audit_snapshots = self.__latest_audit_snapshots(server_type)
         movie_audit_snapshot = audit_snapshots["movie"]
         items = []
         categories = {"movie": set(), "tv": set(), "anime": set()}
         for row in rows:
-            item = self.__build_item(row, transfer_histories=transfer_history_index, include_status=False)
+            item = self.__build_item(
+                row, transfer_histories=transfer_history_index,
+                include_status=False, verify_paths=False
+            )
             if not item:
                 continue
             if item["media_type"] in categories:
@@ -94,21 +104,20 @@ class MediaLibrary:
         if subtitle != "all":
             enriched_items = []
             for item in items:
-                self.__fill_subtitle_summary(
-                    item,
-                    allow_ffprobe=False,
-                    audit_snapshot=movie_audit_snapshot
+                self.__fill_snapshot_subtitle_summary(
+                    item, status_snapshots, movie_audit_snapshot
                 )
                 if subtitle == "missing" and item["subtitle_status"] != "missing_chinese":
                     continue
-                if subtitle == "ok" and item["subtitle_status"] == "missing_chinese":
+                if subtitle == "ok" and item["subtitle_status"] not in [
+                        "has_chinese_external", "has_chinese_internal"]:
                     continue
                 enriched_items.append(item)
             items = enriched_items
 
         if sort_by != "default":
             for item in items:
-                self.__fill_sort_metrics(item, audit_snapshots)
+                self.__fill_sort_metrics(item, audit_snapshots, status_snapshots)
             items.sort(key=lambda item: (
                 str(item.get("title") or item.get("original_title") or "").lower(),
                 str(item.get("year") or ""),
@@ -125,14 +134,13 @@ class MediaLibrary:
         page_items = items[start:end]
         for item in page_items:
             if not item.get("subtitle_status"):
-                self.__fill_subtitle_summary(
-                    item,
-                    allow_ffprobe=False,
-                    audit_snapshot=movie_audit_snapshot
+                self.__fill_snapshot_subtitle_summary(
+                    item, status_snapshots, movie_audit_snapshot
                 )
             for key in ["_sort_internal", "_sort_external", "_sort_audit"]:
                 item.pop(key, None)
             item.pop("media_streams", None)
+            item.pop("media_streams_known", None)
             item.pop("linked_episodes", None)
         return {
             "code": 0,
@@ -181,7 +189,13 @@ class MediaLibrary:
         ret_items = []
         for episode in episodes:
             media_path = episode.get("path") or ""
-            status = self.detect_subtitle_status(media_path, episode.get("media_streams") or [])
+            snapshot = self.__status_store().get(server_type, media_path)
+            status = self.__status_from_snapshot(
+                snapshot, episode.get("media_streams") or [],
+                streams_known=episode.get(
+                    "media_streams_known", "media_streams" in episode
+                )
+            )
             server_item_id = episode.get("server_item_id") or episode.get("id")
             parent_server_item_id = episode.get("parent_server_item_id") \
                 or episode.get("series_id") or row.ITEM_ID
@@ -200,7 +214,9 @@ class MediaLibrary:
                 "subtitle_status": status.get("status"),
                 "subtitle_label": status.get("label"),
                 "subtitle_badge": status.get("badge"),
-                "can_upload": bool(media_path and os.path.isfile(media_path))
+                "subtitle_status_source": status.get("source") or "",
+                "subtitle_status_checked_at": status.get("checked_at") or "",
+                "can_upload": bool(media_path and (not snapshot or snapshot.get("media_exists") is not False))
             })
         return {"code": 0, "items": ret_items, "total": len(ret_items)}
 
@@ -297,8 +313,13 @@ class MediaLibrary:
                 log.error("【MediaLibrary】保存字幕检测记录失败：%s" % str(e))
                 result["history"] = self.get_external_subtitle_audit_history().get("history") or []
                 result["history_warning"] = "检测完成，但保存检测记录失败"
-            # 旧同步接口不返回可能很大的状态映射；任务处理器需保留它写入 SQLite。
+            self.__status_store().upsert_many(
+                server_type, result.get("media_snapshots") or [], source="audit"
+            )
+            # 旧同步接口已在此落库，不返回可能很大的状态映射；后台任务以
+            # persist_history=False 保留映射并在终态事务中统一提交。
             result.pop("media_statuses", None)
+            result.pop("media_snapshots", None)
         return result
 
     def get_external_subtitle_audit_history(self):
@@ -307,15 +328,78 @@ class MediaLibrary:
         return {"code": 0, "history": store.get("history") or []}
 
     @classmethod
-    def update_external_subtitle_audit_status(cls, media_file, server_type):
+    def update_external_subtitle_snapshot(cls, media_file, server_type,
+                                          subtitle_files=None, complete=False,
+                                          media_exists=True):
+        """Update one media snapshot without enumerating its NAS directory.
+
+        ``complete`` is reserved for callers that just finished a full targeted
+        inspection.  Mutation fallbacks merge with the previous positive state
+        so a canceled task cannot erase an older Chinese-subtitle observation.
+        """
+        server_type = str(server_type or "emby").lower()
+        media_file = os.path.normpath(media_file or "")
+        if not media_file:
+            return {}
+        subtitle_files = [path for path in (subtitle_files or []) if path]
+        store = SubtitleMediaStatusStore()
+        previous = store.get(server_type, media_file) or {}
+        has_external = bool(subtitle_files) or (
+            not complete and bool(previous.get("has_external"))
+        )
+        has_chinese_external = any(
+            cls.__subtitle_filename_has_chinese(media_file, path)
+            for path in subtitle_files
+        ) or (not complete and bool(previous.get("has_chinese_external")))
+        snapshot = {
+            "media_path": media_file,
+            "media_exists": bool(media_exists),
+            "has_internal": previous.get("has_internal"),
+            "has_chinese_internal": previous.get("has_chinese_internal"),
+            "has_external": has_external,
+            "has_chinese_external": has_chinese_external,
+            "status": "has_chinese_external" if has_chinese_external else "external_checked",
+            "source": "post_process"
+        }
+        store.upsert_many(server_type, [snapshot], source="post_process")
+        return snapshot
+
+    @classmethod
+    def update_external_subtitle_audit_status(cls, media_file, server_type,
+                                              cancel_check=None,
+                                              probe_timeout_seconds=10,
+                                              heavy_operation=None,
+                                              known_subtitle_files=None):
         """二次处理后仅复检并更新单个电影的最新状态，不触发全库扫描。"""
         server_type = str(server_type or "emby").lower()
         media_file = os.path.normpath(media_file or "")
         if not media_file:
             return {}
-        results = SubtitleHealth.inspect_media_subtitles(media_file, server_type)
+        if cancel_check and cancel_check():
+            raise InterruptedError("媒体字幕状态复检已取消")
+        results = SubtitleHealth.inspect_media_subtitles(
+            media_file, server_type,
+            cancel_check=cancel_check,
+            probe_timeout_seconds=probe_timeout_seconds,
+            heavy_operation=heavy_operation
+        )
+        if cancel_check and cancel_check():
+            raise InterruptedError("媒体字幕状态复检已取消")
         aggregate = SubtitleHealth.aggregate_media_subtitles(results)
         checked_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        # This explicit post-processing check may touch exactly one media
+        # directory.  The library list later reads only this SQLite snapshot.
+        cls.update_external_subtitle_snapshot(
+            media_file, server_type,
+            subtitle_files=[
+                path for path in (
+                    [result.get("path") for result in results]
+                    + list(known_subtitle_files or [])
+                ) if path
+            ],
+            complete=True,
+            media_exists=os.path.isfile(media_file)
+        )
         key = os.path.normcase(media_file)
         with cls._subtitle_audit_lock:
             store = cls.__load_subtitle_audit_store()
@@ -343,6 +427,21 @@ class MediaLibrary:
             }
             cls.__write_subtitle_audit_store(store)
         return aggregate
+
+    @classmethod
+    def __subtitle_filename_has_chinese(cls, media_file, subtitle_file):
+        """Classify a known subtitle path without reading its directory."""
+        subtitle_stem = os.path.splitext(os.path.basename(subtitle_file or ""))[0]
+        media_stem = os.path.splitext(os.path.basename(media_file or ""))[0]
+        if not subtitle_stem or not media_stem:
+            return False
+        if subtitle_stem.casefold() == media_stem.casefold():
+            # Preserve the library's historical behavior for an exact-name
+            # subtitle, which is treated as the media's primary subtitle.
+            return True
+        language_part = subtitle_stem[len(media_stem):] \
+            if subtitle_stem.casefold().startswith(media_stem.casefold()) else subtitle_stem
+        return bool(cls._chinese_sub_re.search(language_part))
 
     def get_external_subtitle_audit_categories(self):
         """返回当前分类 YAML 中配置的媒体小分类。"""
@@ -534,13 +633,23 @@ class MediaLibrary:
             return ""
         current_server_type = self.media_server.get_type()
         server_type = current_server_type.value if current_server_type else Config().get_config('media').get('media_server')
-        transfer_histories = self.dbhelper.get_transfer_histories_with_dest()
-        for row in self.mediadb.list_items(server_type=server_type):
-            if str(row.ITEM_ID) != str(item_id):
-                continue
-            item = self.__build_item(row, transfer_histories=transfer_histories, include_status=False)
+        cache_key = (str(server_type or "").lower(), str(item_id))
+        now = time.time()
+        with self._poster_cache_lock:
+            cached = self._poster_cache.get(cache_key)
+            if cached and cached[0] > now:
+                return cached[1]
+        rows = self.mediadb.find_items(server_type=server_type, item_ids=[item_id])
+        for row in rows:
+            transfer_histories = self.dbhelper.get_transfer_histories_for_media(
+                tmdbid=row.TMDBID, title=row.TITLE, year=row.YEAR
+            )
+            item = self.__build_item(
+                row, transfer_histories=transfer_histories,
+                include_status=False, verify_paths=False
+            )
             if not item:
-                return ""
+                break
             search_dirs = []
             if item.get("target_path"):
                 search_dirs.append(os.path.dirname(item.get("target_path")))
@@ -549,10 +658,14 @@ class MediaLibrary:
             for search_dir in search_dirs:
                 poster_file = self.__find_local_poster(search_dir)
                 if poster_file:
+                    with self._poster_cache_lock:
+                        self._poster_cache[cache_key] = (now + self._poster_success_ttl, poster_file)
                     return poster_file
+        with self._poster_cache_lock:
+            self._poster_cache[cache_key] = (now + self._poster_failure_ttl, "")
         return ""
 
-    def __build_item(self, row, transfer_histories=None, include_status=True):
+    def __build_item(self, row, transfer_histories=None, include_status=True, verify_paths=True):
         item_json = self.__loads_json(row.JSON)
         media_path = row.PATH or item_json.get("Path") or ""
         media_type, category = self.classify_path(media_path, row.ITEM_TYPE)
@@ -571,11 +684,14 @@ class MediaLibrary:
             category = primary_history.CATEGORY or self.classify_path(target_path, row.ITEM_TYPE)[1]
             display_path = target_path
             if media_type == "movie":
-                target_path = target_path if target_path and os.path.isfile(target_path) else ""
+                target_path = target_path if target_path and (
+                    not verify_paths or os.path.isfile(target_path)
+                ) else ""
                 display_path = target_path
             elif primary_history.DEST_PATH:
                 display_path = primary_history.DEST_PATH
-        elif media_type == "movie" and media_path and os.path.isfile(media_path):
+        elif verify_paths and media_type == "movie" and media_path \
+                and os.path.isfile(media_path):
             target_path = media_path
 
         item = {
@@ -597,9 +713,10 @@ class MediaLibrary:
             "server_path": media_path,
             "target_path": target_path,
             "linked": linked,
-            "can_upload": bool(target_path and os.path.isfile(target_path)),
+            "can_upload": bool(target_path and (not verify_paths or os.path.isfile(target_path))),
             "poster_url": f"/library/image/{row.ITEM_ID}",
             "media_streams": item_json.get("MediaStreams") or [],
+            "media_streams_known": "MediaStreams" in item_json,
             "linked_episodes": self.__series_history_items(
                 matches,
                 parent_server_item_id=row.ITEM_ID,
@@ -608,6 +725,8 @@ class MediaLibrary:
             "subtitle_status": "",
             "subtitle_label": "",
             "subtitle_badge": "",
+            "subtitle_status_source": "",
+            "subtitle_status_checked_at": "",
             "subtitle_audit_status": "",
             "subtitle_audit_label": "",
             "subtitle_audit_badge": "",
@@ -618,6 +737,79 @@ class MediaLibrary:
         if include_status:
             self.__fill_subtitle_summary(item)
         return item
+
+    def __status_store(self):
+        store = getattr(self, "subtitle_status_store", None)
+        if store is None:
+            store = SubtitleMediaStatusStore()
+            self.subtitle_status_store = store
+        return store
+
+    def __fill_snapshot_subtitle_summary(self, item, snapshots, audit_snapshot=None):
+        """Fill UI state from synchronized metadata and SQLite only."""
+        if item.get("media_type") == "movie":
+            media_path = item.get("target_path") or item.get("path") or ""
+            snapshot = snapshots.get(SubtitleMediaStatusStore.normalize_path(media_path))
+            status = self.__status_from_snapshot(
+                snapshot, item.get("media_streams") or [],
+                streams_known=item.get("media_streams_known", False)
+            )
+            item["missing_count"] = 1 if status.get("status") == "missing_chinese" else 0
+        else:
+            episode_statuses = []
+            for episode in item.get("linked_episodes") or []:
+                media_path = episode.get("path") or ""
+                snapshot = snapshots.get(SubtitleMediaStatusStore.normalize_path(media_path))
+                episode_statuses.append(
+                    self.__status_from_snapshot(
+                        snapshot, episode.get("media_streams") or [],
+                        streams_known=episode.get("media_streams_known", False)
+                    )
+                )
+            missing_count = sum(
+                1 for status in episode_statuses
+                if status.get("status") == "missing_chinese"
+            )
+            item["missing_count"] = missing_count
+            status = self.__summary_series_status(episode_statuses, missing_count)
+            checked = [
+                value.get("checked_at") for value in episode_statuses
+                if value.get("checked_at")
+            ]
+            sources = {value.get("source") for value in episode_statuses if value.get("source")}
+            status["checked_at"] = max(checked) if checked else ""
+            status["source"] = sources.pop() if len(sources) == 1 else ("mixed" if sources else "")
+        item["subtitle_status"] = status.get("status")
+        item["subtitle_label"] = status.get("label")
+        item["subtitle_badge"] = status.get("badge")
+        item["subtitle_status_source"] = status.get("source") or ""
+        item["subtitle_status_checked_at"] = status.get("checked_at") or ""
+        if item.get("media_type") == "movie":
+            self.__fill_movie_audit_summary(item, audit_snapshot)
+        snapshot = snapshot if item.get("media_type") == "movie" else None
+        if snapshot and snapshot.get("media_exists") is False:
+            item["can_upload"] = False
+        return item
+
+    @classmethod
+    def __status_from_snapshot(cls, snapshot, media_streams=None, streams_known=True):
+        has_internal, has_chinese_internal = cls.__detect_streams(media_streams or [])
+        if snapshot and snapshot.get("has_chinese_external"):
+            status = ("has_chinese_external", "已有外挂中文字幕", "bg-green")
+        elif has_chinese_internal or (snapshot and snapshot.get("has_chinese_internal")):
+            status = ("has_chinese_internal", "已有内嵌中文字幕", "bg-azure")
+        elif snapshot and snapshot.get("media_exists") is True and (
+                streams_known or snapshot.get("has_chinese_internal") is False):
+            status = ("missing_chinese", "缺中文字幕", "bg-orange")
+        else:
+            status = ("unknown", "未检测", "bg-secondary")
+        return {
+            "status": status[0], "label": status[1], "badge": status[2],
+            "source": (snapshot or {}).get("source") or (
+                "media_server" if has_internal else ""
+            ),
+            "checked_at": (snapshot or {}).get("checked_at") or ""
+        }
 
     def __fill_subtitle_summary(self, item, allow_ffprobe=True, audit_snapshot=None):
         if item.get("media_type") == "movie":
@@ -669,7 +861,7 @@ class MediaLibrary:
         item["subtitle_audit_count"] = audit_status.get("subtitle_count") or 0
 
     @classmethod
-    def __fill_sort_metrics(cls, item, audit_snapshots):
+    def __fill_sort_metrics(cls, item, audit_snapshots, status_snapshots=None):
         media_type = item.get("media_type") or ""
         paths = []
         if media_type == "movie":
@@ -683,9 +875,17 @@ class MediaLibrary:
             ])
 
         has_internal, _ = cls.__detect_streams(item.get("media_streams") or [])
+        if not has_internal and media_type == "movie" and paths:
+            media_snapshot = (status_snapshots or {}).get(
+                SubtitleMediaStatusStore.normalize_path(paths[0])
+            ) or {}
+            has_internal = bool(media_snapshot.get("has_internal"))
         if not has_internal and media_type != "movie":
             has_internal = any(
                 cls.__detect_streams(episode.get("media_streams") or [])[0]
+                or bool(((status_snapshots or {}).get(
+                    SubtitleMediaStatusStore.normalize_path(episode.get("path"))
+                ) or {}).get("has_internal"))
                 for episode in (item.get("linked_episodes") or [])
             )
         snapshot = (audit_snapshots or {}).get(media_type) or {}
@@ -700,14 +900,22 @@ class MediaLibrary:
             if audit_status:
                 has_external = True
                 audit_ranks.append(audit_priority.get(audit_status, 0))
-            elif cls.has_external_subtitle(media_path):
-                has_external = True
+            media_snapshot = (status_snapshots or {}).get(
+                SubtitleMediaStatusStore.normalize_path(media_path)
+            ) or {}
+            has_external = has_external or bool(media_snapshot.get("has_external"))
         item["_sort_internal"] = 1 if has_internal else 0
         item["_sort_external"] = 1 if has_external else 0
         item["_sort_audit"] = max(audit_ranks) if audit_ranks else 1
 
     @classmethod
     def __latest_audit_snapshot(cls, category, server_type):
+        # Compatibility helper for the legacy audit-history API.  The library
+        # list itself calls the plural SQLite-only method below.
+        store = cls.__load_subtitle_audit_store()
+        snapshot = (store.get("latest") or {}).get(category) or {}
+        if str(snapshot.get("server") or "").lower() == str(server_type or "").lower():
+            return snapshot
         return cls.__latest_audit_snapshots(server_type).get(category) or {}
 
     @classmethod
@@ -715,24 +923,14 @@ class MediaLibrary:
         try:
             from app.helper.subtitle_tasks import get_subtitle_task_manager
             sqlite_snapshots = get_subtitle_task_manager().latest_audit_snapshots(server_type)
-            if sqlite_snapshots:
-                return {
-                    category: sqlite_snapshots.get(category) or {}
-                    for category in ["movie", "tv", "anime"]
-                }
+            return {
+                category: sqlite_snapshots.get(category) or {}
+                for category in ["movie", "tv", "anime"]
+            }
         except Exception:
-            # During first-run DB creation and isolated unit tests the task tables
-            # may not exist yet; the legacy JSON remains a read-only fallback.
-            pass
-        store = cls.__load_subtitle_audit_store()
-        snapshots = {}
-        for category in ["movie", "tv", "anime"]:
-            snapshot = (store.get("latest") or {}).get(category) or {}
-            if str(snapshot.get("server") or "").lower() == str(server_type or "").lower():
-                snapshots[category] = snapshot
-            else:
-                snapshots[category] = {}
-        return snapshots
+            # Library rendering must remain database-only.  Legacy JSON is
+            # migrated by the task manager lifecycle, never read by this page.
+            return {"movie": {}, "tv": {}, "anime": {}}
 
     @classmethod
     def __save_subtitle_audit(cls, result):
@@ -972,7 +1170,8 @@ class MediaLibrary:
                 "episode": self.__parse_season_episode(season_episode)[1],
                 "season_episode": season_episode,
                 "path": media_path,
-                "media_streams": server_episode.get("media_streams") or []
+                "media_streams": server_episode.get("media_streams") or [],
+                "media_streams_known": bool(server_episode) and "media_streams" in server_episode
             })
         return items
 
