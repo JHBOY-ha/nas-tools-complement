@@ -27,11 +27,18 @@
               <div class="card-subtitle mt-1">筛选媒体后，可上传字幕或按分类检测影视服务器识别情况</div>
             </div>
             <div class="card-actions">
-              <button class="btn" type="button" data-subtitle-task-center aria-label="打开字幕任务中心">
+              <!-- 任务入口共用尺寸类，按钮和链接都继承任务中心的触控高度。 -->
+              <button class="btn lit-library-task-action" type="button" data-subtitle-task-center
+                      aria-label="打开字幕任务中心">
                 {{ SVG.check() }}
                 任务中心
                 <span class="badge bg-primary text-white d-none" data-subtitle-task-count>0</span>
               </button>
+              <a class="btn lit-library-task-action" href="/?next=subtitle_task_settings"
+                 onclick="navmenu('subtitle_task_settings'); return false;" aria-label="打开字幕任务设置">
+                {{ SVG.adjustments() }}
+                任务设置
+              </a>
               <button class="btn btn-outline-primary" type="button" onclick="run_library_subtitle_audit()">
                 {{ SVG.check() }}
                 检测外挂字幕

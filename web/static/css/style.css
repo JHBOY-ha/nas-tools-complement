@@ -189,6 +189,11 @@ body, .page {
     gap: 0.5rem;
 }
 
+/* 字幕库任务入口共用任务中心的触控高度，宽度继承同一 btn 内边距和图标规则。 */
+.lit-library-task-action {
+    min-height: 2.75rem;
+}
+
 .lit-library-result-bar {
     min-height: 2rem;
     display: flex;

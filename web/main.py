@@ -1572,7 +1572,7 @@ def subtitle():
                            Config=Config().get_config())
 
 
-# 独立字幕任务设置页；同时支持直接读取与 navmenu 的 POST 页面加载。
+# 字幕库的独立任务设置页；同时支持直接读取与 navmenu 的 POST 页面加载。
 @App.route('/subtitle_task_settings', methods=['POST', 'GET'])
 @login_required
 def subtitle_task_settings_page():

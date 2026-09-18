@@ -10,8 +10,9 @@
           <button type="button" class="btn" data-subtitle-task-center aria-label="打开字幕任务中心">
             任务中心 <span class="badge bg-primary text-white d-none" data-subtitle-task-count>0</span>
           </button>
-          <a class="btn" href="/?next=subtitle" onclick="navmenu('subtitle'); return false;">
-            {{ SVG.arrow_back_up() }} 返回字幕
+          <!-- 任务设置归属字幕库，返回时恢复其媒体整理上下文。 -->
+          <a class="btn" href="/?next=medialibrary" onclick="navmenu('medialibrary'); return false;">
+            {{ SVG.arrow_back_up() }} 返回字幕库
           </a>
         </div>
       </div>

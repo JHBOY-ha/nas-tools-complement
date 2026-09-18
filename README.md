@@ -304,7 +304,7 @@ Python 中 `"" in ".sql"` 返回 `True`，导致无扩展名文件被错误包�
 | 文件 | 变更说明 |
 |:-----|:---------|
 | `web/templates/rename/mediafile.html` | 文件管理页新增“上传字幕”按钮与上传弹窗 |
-| `web/templates/rename/medialibrary.html` | 字幕库页面、筛选与排序、分类检测、状态说明、上传与对齐入口 |
+| `web/templates/rename/medialibrary.html` | 字幕库页面、筛选与排序、分类检测、状态说明、上传对齐与任务设置入口 |
 | `web/static/js/media-library.js` | 字幕库列表、分页、延迟加载、筛选排序、剧集选择、检测记录和二次处理交互 |
 | `web/static/js/subtitle-tasks.js` | 共享字幕任务中心、上传字节进度、后台轮询、重连和显式取消 |
 | `web/static/js/media-sync.js` | 抽离媒体库同步弹窗逻辑，供首页复用 |
@@ -354,7 +354,7 @@ Python 中 `"" in ".sql"` 返回 `True`，导致无扩展名文件被错误包�
 - 字幕库：`媒体整理 → 字幕库`
 - 文件管理上传：`媒体整理 → 文件管理 → 选中电影 → 上传字幕`
 - 字幕检测：`媒体整理 → 字幕库 → 外挂字幕全部检测`
-- 任务与资源限制：`设置 → 字幕 → 任务设置`（独立页面，支持返回字幕服务配置）
+- 任务与资源限制：`媒体整理 → 字幕库 → 任务设置`（独立页面，支持返回字幕库）
 - LLM 配置：`设置 → 基础设置 → LLM识别`
 
 </details>

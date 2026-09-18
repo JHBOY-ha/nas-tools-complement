@@ -2,9 +2,10 @@
 
 ## 字幕设置与任务资源限制
 
-- `web/templates/setting/subtitle.html` 负责字幕服务配置和任务设置入口；配置弹窗内仅保留并突出 OpenSubtitles API Consumers 快捷按钮，不另设重复的官网入口，首页卡片只打开配置。
+- `web/templates/setting/subtitle.html` 只负责字幕服务配置；配置弹窗内仅保留并突出 OpenSubtitles API Consumers 快捷按钮，不另设重复的官网入口，首页卡片只打开配置。
 - `web/templates/setting/subtitle_task_settings.html` 为独立任务设置页，经登录保护的 `/subtitle_task_settings` 路由加载，兼容现有 `navmenu` 的 POST 加载及浏览器历史恢复。
-- 子页面保留导航栏“设置 → 字幕”选中状态，提供返回字幕和共享任务中心入口。
+- `web/templates/rename/medialibrary.html` 在字幕库工具栏提供任务设置入口；“任务设置”与“任务中心”共用尺寸规则。
+- 子页面保留导航栏“媒体整理 → 字幕库”选中状态，提供返回字幕库和共享任务中心入口。
 - 资源限制按上传队列与空间、进程与任务预算、检测与记录分组；每个字段旁以“？”按钮展开说明，默认隐藏说明及已读取状态，保留保存和错误反馈。配置键、安全范围和后端执行语义保持不变。
 - `web/static/js/subtitle-task-settings.js` 复用 `SubtitleTasks.request`，管理读取、保存、字段校验及失败反馈。初次读取失败禁止保存，请求期间禁止重复操作，离开页面后旧请求不得更新新页面。
 - `/subtitle/tasks/settings` 继续作为唯一策略读写接口，管理员权限与新任务配置快照规则由现有后端负责。
