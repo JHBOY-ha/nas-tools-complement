@@ -4,7 +4,7 @@ import time
 import json
 import re
 from enum import Enum
-from sqlalchemy import cast, func
+from sqlalchemy import and_, cast, func, or_
 
 from app.db import MainDb, DbPersist
 from app.db.models import *
@@ -331,6 +331,62 @@ class DbHelper:
                                                       TRANSFERHISTORY.DEST_FILENAME != '').order_by(
             TRANSFERHISTORY.DATE.desc(), TRANSFERHISTORY.ID.desc()
         ).all()
+
+    def get_transfer_histories_by_dest_full_path(self, dest_full_path):
+        """Query only transfer rows for one canonical destination media file."""
+        if not dest_full_path:
+            return []
+        normalized = os.path.normpath(str(dest_full_path))
+        dest_path = os.path.dirname(normalized)
+        dest_filename = os.path.basename(normalized)
+        return self._db.query(TRANSFERHISTORY).filter(
+            TRANSFERHISTORY.DEST_PATH == dest_path,
+            TRANSFERHISTORY.DEST_FILENAME == dest_filename
+        ).order_by(TRANSFERHISTORY.DATE.desc(), TRANSFERHISTORY.ID.desc()).all()
+
+    def get_transfer_histories_for_media(self, tmdbid=None, title=None, year=None):
+        """Bound poster fallback/history lookup to one synchronized media item."""
+        query = self._db.query(TRANSFERHISTORY).filter(
+            TRANSFERHISTORY.DEST_PATH.isnot(None),
+            TRANSFERHISTORY.DEST_FILENAME.isnot(None),
+            TRANSFERHISTORY.DEST_PATH != '',
+            TRANSFERHISTORY.DEST_FILENAME != ''
+        )
+        matchers = []
+        if tmdbid:
+            matchers.append(TRANSFERHISTORY.TMDBID == str(tmdbid))
+        if title:
+            title_matchers = [TRANSFERHISTORY.TITLE == str(title)]
+            if year:
+                # Older transfer rows may not contain a year.  Keep them as
+                # candidates and let MediaLibrary's exact matcher decide.
+                title_matchers.append(or_(
+                    TRANSFERHISTORY.YEAR == str(year),
+                    TRANSFERHISTORY.YEAR.is_(None),
+                    TRANSFERHISTORY.YEAR == ''
+                ))
+            matchers.append(and_(*title_matchers))
+        if not matchers:
+            return []
+        query = query.filter(or_(*matchers))
+        return query.order_by(
+            TRANSFERHISTORY.DATE.desc(), TRANSFERHISTORY.ID.desc()
+        ).all()
+
+    def iter_transfer_histories_with_dest(self, batch_size=500):
+        """分批迭代已有目标文件的转移历史，避免大型媒体库一次载入内存。"""
+        try:
+            batch_size = max(50, min(int(batch_size or 500), 5000))
+        except (TypeError, ValueError):
+            batch_size = 500
+        query = self._db.query(TRANSFERHISTORY).filter(
+            TRANSFERHISTORY.DEST_PATH.isnot(None),
+            TRANSFERHISTORY.DEST_FILENAME.isnot(None),
+            TRANSFERHISTORY.DEST_PATH != '',
+            TRANSFERHISTORY.DEST_FILENAME != ''
+        ).order_by(TRANSFERHISTORY.DATE.desc(), TRANSFERHISTORY.ID.desc())
+        for row in query.yield_per(batch_size):
+            yield row
 
     @DbPersist(_db)
     def delete_transfer_log_by_id(self, logid):

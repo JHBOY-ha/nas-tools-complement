@@ -114,6 +114,60 @@ class MediaServer:
             return False
         return server.refresh_root_library()
 
+    def refresh_subtitle_target_by_type(self, server_type, server_item_id=None,
+                                        parent_server_item_id=None,
+                                        library_id=None, media_path=None):
+        """刷新单个字幕目标，无法可靠定位时跳过，绝不回退全库。"""
+        server_type = getattr(server_type, "value", server_type)
+        server_type = str(server_type or "").strip().lower()
+        server = self.get_server_by_type(server_type)
+        if not server:
+            return {
+                "status": "skipped", "server": server_type,
+                "scope": "none", "message": "媒体服务器未配置或类型无效"
+            }
+        refresh_method = getattr(server, "refresh_subtitle_target", None)
+        if not callable(refresh_method):
+            return {
+                "status": "skipped", "server": server_type,
+                "scope": "none", "message": "当前媒体服务器不支持局部刷新"
+            }
+        try:
+            result = refresh_method(
+                server_item_id=server_item_id,
+                parent_server_item_id=parent_server_item_id,
+                library_id=library_id,
+                media_path=media_path
+            )
+            if not isinstance(result, dict):
+                result = {
+                    "status": "refreshed" if result else "failed",
+                    "scope": "item" if server_item_id else "none"
+                }
+            result.setdefault("server", server_type)
+            result.setdefault("status", "failed")
+            return result
+        except Exception as e:
+            ExceptionUtils.exception_traceback(e)
+            return {
+                "status": "failed", "server": server_type,
+                "scope": "none", "message": "媒体服务器局部刷新异常：%s" % str(e)
+            }
+
+    def refresh_subtitle_target(self, server_item_id=None,
+                                parent_server_item_id=None,
+                                library_id=None, media_path=None):
+        """按当前服务器执行局部刷新。"""
+        current_type = self.get_type()
+        server_type = current_type.value if current_type else ""
+        return self.refresh_subtitle_target_by_type(
+            server_type,
+            server_item_id=server_item_id,
+            parent_server_item_id=parent_server_item_id,
+            library_id=library_id,
+            media_path=media_path
+        )
+
     def get_image_by_id(self, item_id, image_type):
         """
         根据ItemId从媒体服务器查询图片地址
@@ -193,6 +247,14 @@ class MediaServer:
         if not self.server:
             return []
         return self.server.get_episodes(series_id)
+
+    def get_episodes_by_type(self, server_type, series_id):
+        """Read episodes from the explicitly selected server instance."""
+        server_type = getattr(server_type, "value", server_type)
+        server = self.get_server_by_type(str(server_type or "").strip().lower())
+        if not server or not hasattr(server, "get_episodes"):
+            return []
+        return server.get_episodes(series_id) or []
 
     def sync_mediaserver(self):
         """
