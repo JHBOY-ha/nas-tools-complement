@@ -547,7 +547,7 @@ class SubtitleHealth:
                 key=lambda item: len(item[0]), reverse=True
             )
             try:
-                scan_error_count = len(accumulator["scan_errors"])
+                scan_error_total = accumulator["scan_error_count"]
                 with os.scandir(directory) as entries:
                     accumulator["directories"] += 1
                     cls.__emit_audit_progress(accumulator, directory)
@@ -571,7 +571,7 @@ class SubtitleHealth:
                                 accumulator, entry.path, media_file):
                             break
                 if not accumulator.get("stop_reason") \
-                        and len(accumulator["scan_errors"]) == scan_error_count:
+                        and accumulator["scan_error_count"] == scan_error_total:
                     for media_file in selected_paths:
                         cls.__record_media_coverage(
                             accumulator, media_file, coverage_complete=True
@@ -651,7 +651,7 @@ class SubtitleHealth:
                     [(os.path.splitext(name)[0], os.path.join(current_dir, name)) for name in media_files],
                     key=lambda item: len(item[0]), reverse=True
                 )
-                scan_error_count = len(accumulator["scan_errors"])
+                scan_error_total = accumulator["scan_error_count"]
                 for sub_name in file_names:
                     if os.path.splitext(sub_name)[-1].lower() not in RMT_SUBEXT:
                         continue
@@ -664,7 +664,7 @@ class SubtitleHealth:
                         dir_names[:] = []
                         break
                 if not accumulator.get("stop_reason") \
-                        and len(accumulator["scan_errors"]) == scan_error_count:
+                        and accumulator["scan_error_count"] == scan_error_total:
                     for _, media_file in media_bases:
                         cls.__record_media_coverage(
                             accumulator, media_file, coverage_complete=True
@@ -739,6 +739,7 @@ class SubtitleHealth:
             "inaccessible_roots": [],
             "inaccessible_count": 0,
             "scan_errors": [],
+            "scan_error_count": 0,
             "scan_error_paths": [],
             "scan_error_path_set": set(),
             "partial": False,
@@ -946,6 +947,9 @@ class SubtitleHealth:
     @staticmethod
     def __record_scan_error(accumulator, error, path):
         accumulator["partial"] = True
+        # Keep this counter unbounded; the returned error list is capped at 100,
+        # but coverage decisions must still observe errors after that cap.
+        accumulator["scan_error_count"] = accumulator.get("scan_error_count", 0) + 1
         if len(accumulator["scan_errors"]) < 100:
             accumulator["scan_errors"].append(str(error))
         path = os.path.normpath(str(path or "").strip())

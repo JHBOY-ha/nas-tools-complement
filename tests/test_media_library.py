@@ -1318,6 +1318,53 @@ class SubtitleLowIoTest(TestCase):
         )
         self.assertEqual(status["status"], "unknown")
 
+    def test_scan_errors_after_report_limit_do_not_publish_negative_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            noisy_media = []
+            for index in range(100):
+                directory = os.path.join(tmpdir, "noisy-%03d" % index)
+                os.makedirs(directory)
+                media_file = os.path.join(directory, "Movie.mkv")
+                open(media_file, "wb").close()
+                noisy_media.append(media_file)
+
+            healthy_directory = os.path.join(tmpdir, "healthy")
+            os.makedirs(healthy_directory)
+            healthy_media = os.path.join(healthy_directory, "Movie.mkv")
+            open(healthy_media, "wb").close()
+
+            class BrokenEntry:
+                name = "Movie.zh-CN.srt"
+                path = os.path.join(healthy_directory, name)
+
+                @staticmethod
+                def is_symlink():
+                    return False
+
+                @staticmethod
+                def is_file(follow_symlinks=False):
+                    raise OSError("permission denied")
+
+            class BrokenDirectory:
+                def __enter__(self):
+                    return iter([BrokenEntry()])
+
+                def __exit__(self, *_args):
+                    return False
+
+            def scandir(path):
+                if os.path.normpath(path) == os.path.normpath(healthy_directory):
+                    return BrokenDirectory()
+                raise OSError("permission denied")
+
+            with patch("app.helper.subtitle_health.os.scandir", side_effect=scandir):
+                result = SubtitleHealth.audit_linked_media(
+                    noisy_media + [healthy_media], "jellyfin"
+                )
+
+        self.assertEqual(len(result["scan_errors"]), 100)
+        self.assertEqual(result["media_snapshots"], [])
+
     def test_linked_audit_keeps_explicit_media_symlink_lexical_path(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             media_file = os.path.join(tmpdir, "Movie.mkv")
