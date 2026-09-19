@@ -25,7 +25,8 @@ def _load_web_request_guards():
     tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
     wanted_constants = {
         "_SUBTITLE_UPLOAD_HTTP_LIMIT",
-        "_SUBTITLE_UPLOAD_MAX_FORM_MEMORY",
+        "_SUBTITLE_UPLOAD_MULTIPART_BUFFER",
+        "_SUBTITLE_UPLOAD_MAX_FIELD_BYTES",
         "_SUBTITLE_UPLOAD_MAX_PARTS",
         "_SUBTITLE_UPLOAD_MAX_FILE_PARTS",
     }
@@ -219,6 +220,53 @@ class MultipartRequestGuardTest(TestCase):
         finally:
             request.close()
             builder.close()
+
+    def test_real_multipart_upload_larger_than_one_decoder_chunk_is_accepted(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            WEB_GUARDS.Config = lambda: SimpleNamespace(get_temp_path=lambda: temp_dir)
+            subtitle = (
+                b"1\r\n00:00:01,000 --> 00:00:02,000\r\nSubtitle text\r\n\r\n"
+                * 14000
+            )
+            self.assertGreater(len(subtitle), 700000)
+            builder = EnvironBuilder(
+                path="/subtitle/upload", method="POST",
+                data={
+                    "media_path": "/media/Movie.mkv",
+                    "file": (io.BytesIO(subtitle), "Movie.zh-CN.srt")
+                }
+            )
+            environ = builder.get_environ()
+            input_stream = environ["wsgi.input"]
+            request = WEB_GUARDS._NasToolsRequest(environ)
+            try:
+                self.assertEqual(request.form["media_path"], "/media/Movie.mkv")
+                self.assertEqual(request.files["file"].read(), subtitle)
+            finally:
+                request.close()
+                input_stream.close()
+                builder.close()
+
+    def test_multipart_field_budget_remains_separate_from_decoder_buffer(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            WEB_GUARDS.Config = lambda: SimpleNamespace(get_temp_path=lambda: temp_dir)
+            builder = EnvironBuilder(
+                path="/subtitle/upload", method="POST",
+                data={
+                    "media_path": "x" * (WEB_GUARDS._SUBTITLE_UPLOAD_MAX_FIELD_BYTES + 1),
+                    "file": (io.BytesIO(b"subtitle"), "Movie.zh-CN.srt")
+                }
+            )
+            environ = builder.get_environ()
+            input_stream = environ["wsgi.input"]
+            request = WEB_GUARDS._NasToolsRequest(environ)
+            try:
+                with self.assertRaises(RequestEntityTooLarge):
+                    _ = request.files
+            finally:
+                request.close()
+                input_stream.close()
+                builder.close()
 
     def test_request_rejects_41st_file_part_without_creating_temp_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:

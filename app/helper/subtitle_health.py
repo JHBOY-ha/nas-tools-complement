@@ -573,7 +573,9 @@ class SubtitleHealth:
                 if not accumulator.get("stop_reason") \
                         and len(accumulator["scan_errors"]) == scan_error_count:
                     for media_file in selected_paths:
-                        cls.__record_media_coverage(accumulator, media_file)
+                        cls.__record_media_coverage(
+                            accumulator, media_file, coverage_complete=True
+                        )
             except OSError as error:
                 cls.__record_scan_error(accumulator, error, directory)
                 continue
@@ -649,6 +651,7 @@ class SubtitleHealth:
                     [(os.path.splitext(name)[0], os.path.join(current_dir, name)) for name in media_files],
                     key=lambda item: len(item[0]), reverse=True
                 )
+                scan_error_count = len(accumulator["scan_errors"])
                 for sub_name in file_names:
                     if os.path.splitext(sub_name)[-1].lower() not in RMT_SUBEXT:
                         continue
@@ -660,9 +663,12 @@ class SubtitleHealth:
                             accumulator, subtitle_file, media_file):
                         dir_names[:] = []
                         break
-                if not accumulator.get("stop_reason"):
+                if not accumulator.get("stop_reason") \
+                        and len(accumulator["scan_errors"]) == scan_error_count:
                     for _, media_file in media_bases:
-                        cls.__record_media_coverage(accumulator, media_file)
+                        cls.__record_media_coverage(
+                            accumulator, media_file, coverage_complete=True
+                        )
                 if accumulator.get("stop_reason"):
                     break
             if accumulator.get("stop_reason"):
@@ -871,8 +877,8 @@ class SubtitleHealth:
 
     @classmethod
     def __record_media_coverage(cls, accumulator, media_file, subtitle_file=None,
-                                media_exists=True):
-        """Record negative as well as positive audit coverage for library snapshots."""
+                                media_exists=True, coverage_complete=False):
+        """Record positives immediately and negatives only after a full directory scan."""
         media_file = os.path.normpath(str(media_file or "").strip())
         if not media_file:
             return
@@ -882,11 +888,16 @@ class SubtitleHealth:
             "media_exists": bool(media_exists),
             "has_internal": None,
             "has_chinese_internal": None,
-            "has_external": False,
-            "has_chinese_external": False,
-            "status": "external_checked" if media_exists else "unknown",
-            "source": "audit"
+            "has_external": None,
+            "has_chinese_external": None,
+            "status": "unknown",
+            "source": "audit",
+            "_external_coverage_complete": False
         })
+        if not media_exists:
+            snapshot["has_external"] = False
+            snapshot["has_chinese_external"] = False
+            return
         if subtitle_file:
             snapshot["has_external"] = True
             subtitle_stem = os.path.splitext(os.path.basename(subtitle_file))[0]
@@ -896,6 +907,14 @@ class SubtitleHealth:
             if cls._chinese_filename_re.search(language_part):
                 snapshot["has_chinese_external"] = True
                 snapshot["status"] = "has_chinese_external"
+        if coverage_complete:
+            snapshot["_external_coverage_complete"] = True
+            if snapshot["has_external"] is not True:
+                snapshot["has_external"] = False
+            if snapshot["has_chinese_external"] is not True:
+                snapshot["has_chinese_external"] = False
+            if snapshot["has_chinese_external"] is not True:
+                snapshot["status"] = "external_checked"
 
     @classmethod
     def __should_stop_audit(cls, accumulator):
@@ -947,6 +966,16 @@ class SubtitleHealth:
     def __finish_audit(cls, accumulator):
         elapsed = max(time.monotonic() - accumulator["started"], 0)
         partial = bool(accumulator["partial"] or accumulator["scan_errors"])
+        media_snapshots = []
+        for stored_snapshot in accumulator["media_snapshots"].values():
+            snapshot = dict(stored_snapshot)
+            coverage_complete = bool(snapshot.pop("_external_coverage_complete", False))
+            # A partial directory may have yielded only a non-Chinese subtitle.
+            # Do not publish that incomplete observation as a negative result;
+            # absence from the update preserves an existing positive snapshot.
+            if coverage_complete or snapshot.get("has_chinese_external") is True \
+                    or snapshot.get("media_exists") is False:
+                media_snapshots.append(snapshot)
         cls.__emit_audit_progress(accumulator, "", force=True)
         return {
             "code": 0,
@@ -960,7 +989,7 @@ class SubtitleHealth:
             "scan_error_paths": accumulator["scan_error_paths"],
             "summary": accumulator["summary"],
             "media_statuses": accumulator["media_statuses"],
-            "media_snapshots": list(accumulator["media_snapshots"].values()),
+            "media_snapshots": media_snapshots,
             "issues": accumulator["issues"],
             "issues_truncated": max(
                 accumulator["issue_count"] - len(accumulator["issues"]), 0

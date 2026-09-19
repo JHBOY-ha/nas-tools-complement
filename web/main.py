@@ -55,7 +55,11 @@ from web.security import require_auth
 ConfigLock = Lock()
 
 _SUBTITLE_UPLOAD_HTTP_LIMIT = 260 * 1024 * 1024
-_SUBTITLE_UPLOAD_MAX_FORM_MEMORY = 64 * 1024
+# Werkzeug 2.1 reads multipart bodies in 64 KiB chunks and retains a small
+# boundary tail.  Keep the decoder buffer above one full chunk, while enforcing
+# the smaller aggregate field budget explicitly after parsing.
+_SUBTITLE_UPLOAD_MULTIPART_BUFFER = 128 * 1024
+_SUBTITLE_UPLOAD_MAX_FIELD_BYTES = 64 * 1024
 _SUBTITLE_UPLOAD_MAX_PARTS = 64
 _SUBTITLE_UPLOAD_MAX_FILE_PARTS = 40
 
@@ -218,10 +222,15 @@ class _NasToolsRequest(FlaskRequest):
         return self.path.rstrip("/") == "/subtitle/upload"
 
     def _load_form_data(self):
-        if self._is_subtitle_upload():
+        is_subtitle_upload = self._is_subtitle_upload()
+        if is_subtitle_upload:
             # These assignments work with the Flask 3 properties and with the
             # plain Request attributes used by the pinned Flask/Werkzeug 2.1.
-            self.max_form_memory_size = _SUBTITLE_UPLOAD_MAX_FORM_MEMORY
+            self.max_form_memory_size = (
+                _SUBTITLE_UPLOAD_MULTIPART_BUFFER
+                if self.mimetype == "multipart/form-data"
+                else _SUBTITLE_UPLOAD_MAX_FIELD_BYTES
+            )
             try:
                 self.max_form_parts = _SUBTITLE_UPLOAD_MAX_PARTS
             except (AttributeError, TypeError):
@@ -244,12 +253,28 @@ class _NasToolsRequest(FlaskRequest):
                         _SUBTITLE_UPLOAD_HTTP_LIMIT
                     )
                 )
-        return super()._load_form_data()
+        result = super()._load_form_data()
+        if is_subtitle_upload:
+            # The multipart decoder's memory option protects its rolling
+            # buffer, not submitted field values.  Bound all non-file fields
+            # separately so increasing the decoder headroom does not weaken
+            # the request policy.
+            field_bytes = sum(
+                len(str(key).encode("utf-8")) + len(str(value).encode("utf-8"))
+                for key, value in self.__dict__.get("form", {}).items(multi=True)
+            )
+            if field_bytes > _SUBTITLE_UPLOAD_MAX_FIELD_BYTES:
+                raise RequestEntityTooLarge("字幕上传表单字段超过 64 KiB")
+        return result
 
     def make_form_data_parser(self):
         parser = super().make_form_data_parser()
         if self._is_subtitle_upload():
-            parser.max_form_memory_size = _SUBTITLE_UPLOAD_MAX_FORM_MEMORY
+            parser.max_form_memory_size = (
+                _SUBTITLE_UPLOAD_MULTIPART_BUFFER
+                if self.mimetype == "multipart/form-data"
+                else _SUBTITLE_UPLOAD_MAX_FIELD_BYTES
+            )
             if hasattr(parser, "max_form_parts"):
                 parser.max_form_parts = _SUBTITLE_UPLOAD_MAX_PARTS
         return parser

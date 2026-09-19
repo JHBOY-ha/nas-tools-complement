@@ -1283,6 +1283,41 @@ class SubtitleLowIoTest(TestCase):
         self.assertFalse(snapshot["has_external"])
         self.assertEqual(snapshot["status"], "external_checked")
 
+    def test_partial_linked_audit_does_not_publish_false_chinese_negative(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            media_file = os.path.join(tmpdir, "Movie.mkv")
+            english = os.path.join(tmpdir, "Movie.eng.srt")
+            chinese = os.path.join(tmpdir, "Movie.zh-CN.srt")
+            open(media_file, "wb").close()
+            for subtitle in (english, chinese):
+                with open(subtitle, "w", encoding="utf-8") as file_obj:
+                    file_obj.write("1\n00:00:01,000 --> 00:00:02,000\nText\n")
+
+            real_scandir = os.scandir
+
+            class OrderedEntries:
+                def __enter__(self):
+                    entries = list(real_scandir(tmpdir))
+                    return iter(sorted(entries, key=lambda entry: entry.name))
+
+                def __exit__(self, *_args):
+                    return False
+
+            with patch("app.helper.subtitle_health.os.scandir",
+                       return_value=OrderedEntries()), patch.object(
+                           SubtitleHealth, "_ffprobe_version", "test"):
+                result = SubtitleHealth.audit_linked_media(
+                    [media_file], "jellyfin", subtitle_limit=1
+                )
+
+        self.assertTrue(result["partial"])
+        self.assertEqual(result["stop_reason"], "subtitle_limit")
+        self.assertEqual(result["media_snapshots"], [])
+        status = MediaLibrary._MediaLibrary__status_from_snapshot(
+            None, [], streams_known=True
+        )
+        self.assertEqual(status["status"], "unknown")
+
     def test_linked_audit_keeps_explicit_media_symlink_lexical_path(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             media_file = os.path.join(tmpdir, "Movie.mkv")
