@@ -18,11 +18,10 @@
             <div>
               <h3 class="card-title d-flex align-items-center gap-2">
                 <span>字幕状态总览</span>
-                <button class="btn btn-icon btn-sm btn-ghost-secondary" type="button"
+                <!-- 问号外观与基础设置一致，长篇状态说明继续通过原有弹窗展示。 -->
+                <button class="form-help subtitle-help border-0 p-0" type="button"
                         data-bs-toggle="modal" data-bs-target="#index-library-help-modal"
-                        aria-label="查看字幕库状态说明" title="查看说明">
-                  {{ SVG.circle_question() }}
-                </button>
+                        aria-label="查看字幕库状态说明" title="查看说明">?</button>
               </h3>
               <div class="card-subtitle mt-1">筛选媒体后，可上传字幕或按分类检测影视服务器识别情况</div>
             </div>

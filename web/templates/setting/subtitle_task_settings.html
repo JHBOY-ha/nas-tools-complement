@@ -1,4 +1,10 @@
 {% import 'macro/svg.html' as SVG %}
+{# 与基础设置共用 form-help 和 tooltip；同一文案同时提供给浮层和输入框辅助说明。 #}
+{% macro policy_help(id, label, text) -%}
+  <button type="button" class="form-help subtitle-help border-0 p-0" data-bs-toggle="tooltip"
+          title="{{ text }}" aria-label="{{ label }}">?</button>
+  <span class="visually-hidden" id="{{ id }}">{{ text }}</span>
+{%- endmacro %}
 <div class="container-xl" id="subtitle-task-settings-page">
   <div class="page-header d-print-none">
     <div class="row align-items-center g-3">
@@ -19,7 +25,7 @@
     </div>
   </div>
   <div class="page-body">
-    <!-- 说明默认收起，复用 Bootstrap collapse；独立按钮支持点击和键盘展开，不触发表单提交。 -->
+    <!-- 帮助沿用基础设置的悬停/聚焦浮动提示，不展开占用表单布局。 -->
     <form id="subtitle_task_settings_form" novalidate>
       <section class="card mb-3" aria-label="上传队列与空间">
         <div class="card-body">
@@ -30,98 +36,58 @@
               <div class="col-12 col-md-6 col-xl-4">
                 <div class="d-flex align-items-center gap-1 mb-2">
                   <label class="form-label mb-0" for="subtitle_task_max_upload_queue">等待批次数</label>
-                  <button type="button" class="form-help subtitle-policy-help border-0 p-0"
-                          data-bs-toggle="collapse" data-bs-target="#subtitle_task_max_upload_queue_help"
-                          aria-expanded="false" aria-controls="subtitle_task_max_upload_queue_help" aria-label="等待批次数说明">?</button>
+                  {{ policy_help("subtitle_task_max_upload_queue_help", "等待批次数说明", "最多允许等待处理的上传批次数。队列满时拒绝新上传，请等待已有任务完成后重试。默认 10；范围 1–32。") }}
                 </div>
                 <input class="form-control" type="number" id="subtitle_task_max_upload_queue" data-policy-key="max_upload_queue" min="1" max="32" aria-describedby="subtitle_task_max_upload_queue_help" required>
-                <div class="collapse" id="subtitle_task_max_upload_queue_help">
-                  <div class="form-hint mt-2">最多允许等待处理的上传批次数。队列满时拒绝新上传，请等待已有任务完成后重试。默认 10；范围 1–32。</div>
-                </div>
               </div>
               <div class="col-12 col-md-6 col-xl-4">
                 <div class="d-flex align-items-center gap-1 mb-2">
                   <label class="form-label mb-0" for="subtitle_task_text_file_limit_mb">文本字幕单文件（MiB）</label>
-                  <button type="button" class="form-help subtitle-policy-help border-0 p-0"
-                          data-bs-toggle="collapse" data-bs-target="#subtitle_task_text_file_limit_mb_help"
-                          aria-expanded="false" aria-controls="subtitle_task_text_file_limit_mb_help" aria-label="文本字幕单文件（MiB）说明">?</button>
+                  {{ policy_help("subtitle_task_text_file_limit_mb_help", "文本字幕单文件（MiB）说明", "单个 SRT、ASS 等文本字幕文件的大小上限。MiB 为文件容量单位，1 MiB = 1024 × 1024 字节。默认 20；范围 1–100。") }}
                 </div>
                 <input class="form-control" type="number" id="subtitle_task_text_file_limit_mb" data-policy-key="text_file_limit_mb" min="1" max="100" aria-describedby="subtitle_task_text_file_limit_mb_help" required>
-                <div class="collapse" id="subtitle_task_text_file_limit_mb_help">
-                  <div class="form-hint mt-2">单个 SRT、ASS 等文本字幕文件的大小上限。MiB 为文件容量单位，1 MiB = 1024 × 1024 字节。默认 20；范围 1–100。</div>
-                </div>
               </div>
               <div class="col-12 col-md-6 col-xl-4">
                 <div class="d-flex align-items-center gap-1 mb-2">
                   <label class="form-label mb-0" for="subtitle_task_vobsub_limit_mb">VobSub 成对文件（MiB）</label>
-                  <button type="button" class="form-help subtitle-policy-help border-0 p-0"
-                          data-bs-toggle="collapse" data-bs-target="#subtitle_task_vobsub_limit_mb_help"
-                          aria-expanded="false" aria-controls="subtitle_task_vobsub_limit_mb_help" aria-label="VobSub 成对文件（MiB）说明">?</button>
+                  {{ policy_help("subtitle_task_vobsub_limit_mb_help", "VobSub 成对文件（MiB）说明", "一组 VobSub 字幕（.sub 与 .idx 两个文件）的合计大小上限，两个文件需成对上传。默认 200；范围 10–250。") }}
                 </div>
                 <input class="form-control" type="number" id="subtitle_task_vobsub_limit_mb" data-policy-key="vobsub_limit_mb" min="10" max="250" aria-describedby="subtitle_task_vobsub_limit_mb_help" required>
-                <div class="collapse" id="subtitle_task_vobsub_limit_mb_help">
-                  <div class="form-hint mt-2">一组 VobSub 字幕（.sub 与 .idx 两个文件）的合计大小上限，两个文件需成对上传。默认 200；范围 10–250。</div>
-                </div>
               </div>
               <div class="col-12 col-md-6 col-xl-4">
                 <div class="d-flex align-items-center gap-1 mb-2">
                   <label class="form-label mb-0" for="subtitle_task_batch_limit_mb">单批总量（MiB）</label>
-                  <button type="button" class="form-help subtitle-policy-help border-0 p-0"
-                          data-bs-toggle="collapse" data-bs-target="#subtitle_task_batch_limit_mb_help"
-                          aria-expanded="false" aria-controls="subtitle_task_batch_limit_mb_help" aria-label="单批总量（MiB）说明">?</button>
+                  {{ policy_help("subtitle_task_batch_limit_mb_help", "单批总量（MiB）说明", "一次上传所有字幕文件的合计大小上限，不得小于文本单文件或 VobSub 成对文件上限。默认 250；范围 20–250。") }}
                 </div>
                 <input class="form-control" type="number" id="subtitle_task_batch_limit_mb" data-policy-key="batch_limit_mb" min="20" max="250" aria-describedby="subtitle_task_batch_limit_mb_help" required>
-                <div class="collapse" id="subtitle_task_batch_limit_mb_help">
-                  <div class="form-hint mt-2">一次上传所有字幕文件的合计大小上限，不得小于文本单文件或 VobSub 成对文件上限。默认 250；范围 20–250。</div>
-                </div>
               </div>
               <div class="col-12 col-md-6 col-xl-4">
                 <div class="d-flex align-items-center gap-1 mb-2">
                   <label class="form-label mb-0" for="subtitle_task_staging_quota_mb">暂存总额度（MiB）</label>
-                  <button type="button" class="form-help subtitle-policy-help border-0 p-0"
-                          data-bs-toggle="collapse" data-bs-target="#subtitle_task_staging_quota_mb_help"
-                          aria-expanded="false" aria-controls="subtitle_task_staging_quota_mb_help" aria-label="暂存总额度（MiB）说明">?</button>
+                  {{ policy_help("subtitle_task_staging_quota_mb_help", "暂存总额度（MiB）说明", "字幕任务暂存文件的总空间额度。至少为单批总量的 6 倍，为编码转换、临时文件和对齐参考留出空间。默认 2048；范围 256–4096。") }}
                 </div>
                 <input class="form-control" type="number" id="subtitle_task_staging_quota_mb" data-policy-key="staging_quota_mb" min="256" max="4096" aria-describedby="subtitle_task_staging_quota_mb_help" required>
-                <div class="collapse" id="subtitle_task_staging_quota_mb_help">
-                  <div class="form-hint mt-2">字幕任务暂存文件的总空间额度。至少为单批总量的 6 倍，为编码转换、临时文件和对齐参考留出空间。默认 2048；范围 256–4096。</div>
-                </div>
               </div>
               <div class="col-12 col-md-6 col-xl-4">
                 <div class="d-flex align-items-center gap-1 mb-2">
                   <label class="form-label mb-0" for="subtitle_task_reserve_free_mb">最少保留空间（MiB）</label>
-                  <button type="button" class="form-help subtitle-policy-help border-0 p-0"
-                          data-bs-toggle="collapse" data-bs-target="#subtitle_task_reserve_free_mb_help"
-                          aria-expanded="false" aria-controls="subtitle_task_reserve_free_mb_help" aria-label="最少保留空间（MiB）说明">?</button>
+                  {{ policy_help("subtitle_task_reserve_free_mb_help", "最少保留空间（MiB）说明", "暂存磁盘必须保留的可用空间。空间不足时拒绝新上传，避免任务耗尽磁盘。默认 1024；范围 256–51200。") }}
                 </div>
                 <input class="form-control" type="number" id="subtitle_task_reserve_free_mb" data-policy-key="reserve_free_mb" min="256" max="51200" aria-describedby="subtitle_task_reserve_free_mb_help" required>
-                <div class="collapse" id="subtitle_task_reserve_free_mb_help">
-                  <div class="form-hint mt-2">暂存磁盘必须保留的可用空间。空间不足时拒绝新上传，避免任务耗尽磁盘。默认 1024；范围 256–51200。</div>
-                </div>
               </div>
               <div class="col-12 col-md-6 col-xl-4">
                 <div class="d-flex align-items-center gap-1 mb-2">
                   <label class="form-label mb-0" for="subtitle_task_max_batch_items">单批字幕数量</label>
-                  <button type="button" class="form-help subtitle-policy-help border-0 p-0"
-                          data-bs-toggle="collapse" data-bs-target="#subtitle_task_max_batch_items_help"
-                          aria-expanded="false" aria-controls="subtitle_task_max_batch_items_help" aria-label="单批字幕数量说明">?</button>
+                  {{ policy_help("subtitle_task_max_batch_items_help", "单批字幕数量说明", "一次上传允许的逻辑字幕数量；一组 .sub 与 .idx 成对文件算作一条字幕。默认 20；范围 1–20。") }}
                 </div>
                 <input class="form-control" type="number" id="subtitle_task_max_batch_items" data-policy-key="max_batch_items" min="1" max="20" aria-describedby="subtitle_task_max_batch_items_help" required>
-                <div class="collapse" id="subtitle_task_max_batch_items_help">
-                  <div class="form-hint mt-2">一次上传允许的逻辑字幕数量；一组 .sub 与 .idx 成对文件算作一条字幕。默认 20；范围 1–20。</div>
-                </div>
               </div>
               <div class="col-12 col-md-6 col-xl-4">
                 <div class="d-flex align-items-center gap-1 mb-2">
                   <label class="form-label mb-0" for="subtitle_task_llm_max_batch_items">LLM 对齐单批数量</label>
-                  <button type="button" class="form-help subtitle-policy-help border-0 p-0"
-                          data-bs-toggle="collapse" data-bs-target="#subtitle_task_llm_max_batch_items_help"
-                          aria-expanded="false" aria-controls="subtitle_task_llm_max_batch_items_help" aria-label="LLM 对齐单批数量说明">?</button>
+                  {{ policy_help("subtitle_task_llm_max_batch_items_help", "LLM 对齐单批数量说明", "选择 LLM 对齐时，一次上传允许的字幕数量，不得超过普通单批字幕数量。默认 5；范围 1–5。") }}
                 </div>
                 <input class="form-control" type="number" id="subtitle_task_llm_max_batch_items" data-policy-key="llm_max_batch_items" min="1" max="5" aria-describedby="subtitle_task_llm_max_batch_items_help" required>
-                <div class="collapse" id="subtitle_task_llm_max_batch_items_help">
-                  <div class="form-hint mt-2">选择 LLM 对齐时，一次上传允许的字幕数量，不得超过普通单批字幕数量。默认 5；范围 1–5。</div>
-                </div>
               </div>
             </div>
 
@@ -137,62 +103,37 @@
               <div class="col-12 col-md-6 col-xl-4">
                 <div class="d-flex align-items-center gap-1 mb-2">
                   <label class="form-label mb-0" for="subtitle_task_heavy_process_concurrency">重型进程并发</label>
-                  <button type="button" class="form-help subtitle-policy-help border-0 p-0"
-                          data-bs-toggle="collapse" data-bs-target="#subtitle_task_heavy_process_concurrency_help"
-                          aria-expanded="false" aria-controls="subtitle_task_heavy_process_concurrency_help" aria-label="重型进程并发说明">?</button>
+                  {{ policy_help("subtitle_task_heavy_process_concurrency_help", "重型进程并发说明", "上传、修复和检测共享的 ffprobe、ffmpeg 或 LLM 重型操作并发上限。上传与检测各自串行执行；NAS 建议保持 1，减少磁盘与 CPU 压力。默认 1；范围 1–2。") }}
                 </div>
                 <input class="form-control" type="number" id="subtitle_task_heavy_process_concurrency" data-policy-key="heavy_process_concurrency" min="1" max="2" aria-describedby="subtitle_task_heavy_process_concurrency_help" required>
-                <div class="collapse" id="subtitle_task_heavy_process_concurrency_help">
-                  <div class="form-hint mt-2">上传、修复和检测共享的 ffprobe、ffmpeg 或 LLM 重型操作并发上限。上传与检测各自串行执行；NAS 建议保持 1，减少磁盘与 CPU 压力。默认 1；范围 1–2。</div>
-                </div>
               </div>
               <div class="col-12 col-md-6 col-xl-4">
                 <div class="d-flex align-items-center gap-1 mb-2">
                   <label class="form-label mb-0" for="subtitle_task_ffprobe_timeout_seconds">ffprobe 超时（秒）</label>
-                  <button type="button" class="form-help subtitle-policy-help border-0 p-0"
-                          data-bs-toggle="collapse" data-bs-target="#subtitle_task_ffprobe_timeout_seconds_help"
-                          aria-expanded="false" aria-controls="subtitle_task_ffprobe_timeout_seconds_help" aria-label="ffprobe 超时（秒）说明">?</button>
+                  {{ policy_help("subtitle_task_ffprobe_timeout_seconds_help", "ffprobe 超时（秒）说明", "单次 ffprobe 媒体或字幕探测的最长等待时间，超时后停止该次探测。默认 10；范围 3–60。") }}
                 </div>
                 <input class="form-control" type="number" id="subtitle_task_ffprobe_timeout_seconds" data-policy-key="ffprobe_timeout_seconds" min="3" max="60" aria-describedby="subtitle_task_ffprobe_timeout_seconds_help" required>
-                <div class="collapse" id="subtitle_task_ffprobe_timeout_seconds_help">
-                  <div class="form-hint mt-2">单次 ffprobe 媒体或字幕探测的最长等待时间，超时后停止该次探测。默认 10；范围 3–60。</div>
-                </div>
               </div>
               <div class="col-12 col-md-6 col-xl-4">
                 <div class="d-flex align-items-center gap-1 mb-2">
                   <label class="form-label mb-0" for="subtitle_task_ffmpeg_timeout_seconds">ffmpeg 超时（秒）</label>
-                  <button type="button" class="form-help subtitle-policy-help border-0 p-0"
-                          data-bs-toggle="collapse" data-bs-target="#subtitle_task_ffmpeg_timeout_seconds_help"
-                          aria-expanded="false" aria-controls="subtitle_task_ffmpeg_timeout_seconds_help" aria-label="ffmpeg 超时（秒）说明">?</button>
+                  {{ policy_help("subtitle_task_ffmpeg_timeout_seconds_help", "ffmpeg 超时（秒）说明", "单次 ffmpeg 字幕处理的最长等待时间，超时后停止该次处理。默认 60；范围 10–600。") }}
                 </div>
                 <input class="form-control" type="number" id="subtitle_task_ffmpeg_timeout_seconds" data-policy-key="ffmpeg_timeout_seconds" min="10" max="600" aria-describedby="subtitle_task_ffmpeg_timeout_seconds_help" required>
-                <div class="collapse" id="subtitle_task_ffmpeg_timeout_seconds_help">
-                  <div class="form-hint mt-2">单次 ffmpeg 字幕处理的最长等待时间，超时后停止该次处理。默认 60；范围 10–600。</div>
-                </div>
               </div>
               <div class="col-12 col-md-6 col-xl-4">
                 <div class="d-flex align-items-center gap-1 mb-2">
                   <label class="form-label mb-0" for="subtitle_task_llm_timeout_seconds">LLM 单字幕超时（秒）</label>
-                  <button type="button" class="form-help subtitle-policy-help border-0 p-0"
-                          data-bs-toggle="collapse" data-bs-target="#subtitle_task_llm_timeout_seconds_help"
-                          aria-expanded="false" aria-controls="subtitle_task_llm_timeout_seconds_help" aria-label="LLM 单字幕超时（秒）说明">?</button>
+                  {{ policy_help("subtitle_task_llm_timeout_seconds_help", "LLM 单字幕超时（秒）说明", "单条字幕进行 LLM 对齐的最长等待时间，避免响应缓慢的服务长期占用任务。默认 180；范围 30–900。") }}
                 </div>
                 <input class="form-control" type="number" id="subtitle_task_llm_timeout_seconds" data-policy-key="llm_timeout_seconds" min="30" max="900" aria-describedby="subtitle_task_llm_timeout_seconds_help" required>
-                <div class="collapse" id="subtitle_task_llm_timeout_seconds_help">
-                  <div class="form-hint mt-2">单条字幕进行 LLM 对齐的最长等待时间，避免响应缓慢的服务长期占用任务。默认 180；范围 30–900。</div>
-                </div>
               </div>
               <div class="col-12 col-md-6 col-xl-4">
                 <div class="d-flex align-items-center gap-1 mb-2">
                   <label class="form-label mb-0" for="subtitle_task_upload_budget_minutes">上传/修复任务预算（分钟）</label>
-                  <button type="button" class="form-help subtitle-policy-help border-0 p-0"
-                          data-bs-toggle="collapse" data-bs-target="#subtitle_task_upload_budget_minutes_help"
-                          aria-expanded="false" aria-controls="subtitle_task_upload_budget_minutes_help" aria-label="上传/修复任务预算（分钟）说明">?</button>
+                  {{ policy_help("subtitle_task_upload_budget_minutes_help", "上传/修复任务预算（分钟）说明", "单个上传或修复任务的累计处理时间上限。任务恢复后继续累计，达到预算后停止处理。默认 60；范围 1–360。") }}
                 </div>
                 <input class="form-control" type="number" id="subtitle_task_upload_budget_minutes" data-policy-key="upload_budget_minutes" min="1" max="360" aria-describedby="subtitle_task_upload_budget_minutes_help" required>
-                <div class="collapse" id="subtitle_task_upload_budget_minutes_help">
-                  <div class="form-hint mt-2">单个上传或修复任务的累计处理时间上限。任务恢复后继续累计，达到预算后停止处理。默认 60；范围 1–360。</div>
-                </div>
               </div>
             </div>
 
@@ -208,74 +149,44 @@
               <div class="col-12 col-md-6 col-xl-4">
                 <div class="d-flex align-items-center gap-1 mb-2">
                   <label class="form-label mb-0" for="subtitle_task_audit_max_changed">新增/变化字幕上限</label>
-                  <button type="button" class="form-help subtitle-policy-help border-0 p-0"
-                          data-bs-toggle="collapse" data-bs-target="#subtitle_task_audit_max_changed_help"
-                          aria-expanded="false" aria-controls="subtitle_task_audit_max_changed_help" aria-label="新增/变化字幕上限说明">?</button>
+                  {{ policy_help("subtitle_task_audit_max_changed_help", "新增/变化字幕上限说明", "一次检测允许处理的新增或发生变化的字幕数量上限，用于限制重复探测和磁盘读取量。默认 10000；范围 100–50000。") }}
                 </div>
                 <input class="form-control" type="number" id="subtitle_task_audit_max_changed" data-policy-key="audit_max_changed" min="100" max="50000" aria-describedby="subtitle_task_audit_max_changed_help" required>
-                <div class="collapse" id="subtitle_task_audit_max_changed_help">
-                  <div class="form-hint mt-2">一次检测允许处理的新增或发生变化的字幕数量上限，用于限制重复探测和磁盘读取量。默认 10000；范围 100–50000。</div>
-                </div>
               </div>
               <div class="col-12 col-md-6 col-xl-4">
                 <div class="d-flex align-items-center gap-1 mb-2">
                   <label class="form-label mb-0" for="subtitle_task_audit_max_minutes">单次检测上限（分钟）</label>
-                  <button type="button" class="form-help subtitle-policy-help border-0 p-0"
-                          data-bs-toggle="collapse" data-bs-target="#subtitle_task_audit_max_minutes_help"
-                          aria-expanded="false" aria-controls="subtitle_task_audit_max_minutes_help" aria-label="单次检测上限（分钟）说明">?</button>
+                  {{ policy_help("subtitle_task_audit_max_minutes_help", "单次检测上限（分钟）说明", "单次字幕检测的最长执行时间，达到上限后停止继续扫描。默认 60；范围 5–240。") }}
                 </div>
                 <input class="form-control" type="number" id="subtitle_task_audit_max_minutes" data-policy-key="audit_max_minutes" min="5" max="240" aria-describedby="subtitle_task_audit_max_minutes_help" required>
-                <div class="collapse" id="subtitle_task_audit_max_minutes_help">
-                  <div class="form-hint mt-2">单次字幕检测的最长执行时间，达到上限后停止继续扫描。默认 60；范围 5–240。</div>
-                </div>
               </div>
               <div class="col-12 col-md-6 col-xl-4">
                 <div class="d-flex align-items-center gap-1 mb-2">
                   <label class="form-label mb-0" for="subtitle_task_audit_max_directories">深扫目录上限</label>
-                  <button type="button" class="form-help subtitle-policy-help border-0 p-0"
-                          data-bs-toggle="collapse" data-bs-target="#subtitle_task_audit_max_directories_help"
-                          aria-expanded="false" aria-controls="subtitle_task_audit_max_directories_help" aria-label="深扫目录上限说明">?</button>
+                  {{ policy_help("subtitle_task_audit_max_directories_help", "深扫目录上限说明", "深度目录扫描最多遍历的目录数量，避免大媒体库扫描长期占用磁盘。默认 50000；范围 1000–200000。") }}
                 </div>
                 <input class="form-control" type="number" id="subtitle_task_audit_max_directories" data-policy-key="audit_max_directories" min="1000" max="200000" aria-describedby="subtitle_task_audit_max_directories_help" required>
-                <div class="collapse" id="subtitle_task_audit_max_directories_help">
-                  <div class="form-hint mt-2">深度目录扫描最多遍历的目录数量，避免大媒体库扫描长期占用磁盘。默认 50000；范围 1000–200000。</div>
-                </div>
               </div>
               <div class="col-12 col-md-6 col-xl-4">
                 <div class="d-flex align-items-center gap-1 mb-2">
                   <label class="form-label mb-0" for="subtitle_task_audit_max_issues">问题明细上限</label>
-                  <button type="button" class="form-help subtitle-policy-help border-0 p-0"
-                          data-bs-toggle="collapse" data-bs-target="#subtitle_task_audit_max_issues_help"
-                          aria-expanded="false" aria-controls="subtitle_task_audit_max_issues_help" aria-label="问题明细上限说明">?</button>
+                  {{ policy_help("subtitle_task_audit_max_issues_help", "问题明细上限说明", "单次检测最多保存的问题明细数量，用于控制结果体积。默认 200；范围 20–1000。") }}
                 </div>
                 <input class="form-control" type="number" id="subtitle_task_audit_max_issues" data-policy-key="audit_max_issues" min="20" max="1000" aria-describedby="subtitle_task_audit_max_issues_help" required>
-                <div class="collapse" id="subtitle_task_audit_max_issues_help">
-                  <div class="form-hint mt-2">单次检测最多保存的问题明细数量，用于控制结果体积。默认 200；范围 20–1000。</div>
-                </div>
               </div>
               <div class="col-12 col-md-6 col-xl-4">
                 <div class="d-flex align-items-center gap-1 mb-2">
                   <label class="form-label mb-0" for="subtitle_task_task_retention_days">任务保留（天）</label>
-                  <button type="button" class="form-help subtitle-policy-help border-0 p-0"
-                          data-bs-toggle="collapse" data-bs-target="#subtitle_task_task_retention_days_help"
-                          aria-expanded="false" aria-controls="subtitle_task_task_retention_days_help" aria-label="任务保留（天）说明">?</button>
+                  {{ policy_help("subtitle_task_task_retention_days_help", "任务保留（天）说明", "已结束任务记录的保留天数，超期后由清理流程移除；不清理排队或运行中的任务。默认 7；范围 1–90。") }}
                 </div>
                 <input class="form-control" type="number" id="subtitle_task_task_retention_days" data-policy-key="task_retention_days" min="1" max="90" aria-describedby="subtitle_task_task_retention_days_help" required>
-                <div class="collapse" id="subtitle_task_task_retention_days_help">
-                  <div class="form-hint mt-2">已结束任务记录的保留天数，超期后由清理流程移除；不清理排队或运行中的任务。默认 7；范围 1–90。</div>
-                </div>
               </div>
               <div class="col-12 col-md-6 col-xl-4">
                 <div class="d-flex align-items-center gap-1 mb-2">
                   <label class="form-label mb-0" for="subtitle_task_task_retention_count">任务记录上限</label>
-                  <button type="button" class="form-help subtitle-policy-help border-0 p-0"
-                          data-bs-toggle="collapse" data-bs-target="#subtitle_task_task_retention_count_help"
-                          aria-expanded="false" aria-controls="subtitle_task_task_retention_count_help" aria-label="任务记录上限说明">?</button>
+                  {{ policy_help("subtitle_task_task_retention_count_help", "任务记录上限说明", "最多保留的已结束任务记录数，超出后优先清理较旧记录；同时受保留天数限制。默认 100；范围 20–2000。") }}
                 </div>
                 <input class="form-control" type="number" id="subtitle_task_task_retention_count" data-policy-key="task_retention_count" min="20" max="2000" aria-describedby="subtitle_task_task_retention_count_help" required>
-                <div class="collapse" id="subtitle_task_task_retention_count_help">
-                  <div class="form-hint mt-2">最多保留的已结束任务记录数，超出后优先清理较旧记录；同时受保留天数限制。默认 100；范围 20–2000。</div>
-                </div>
               </div>
             </div>
 

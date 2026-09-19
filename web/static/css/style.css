@@ -194,6 +194,11 @@ body, .page {
     min-height: 2.75rem;
 }
 
+/* 文件管理任务入口沿用默认 btn 尺寸，与转移目录一致；覆盖任务中心动态注入的最小高度。 */
+.btn.mediafile-task-action {
+    min-height: 0;
+}
+
 .lit-library-result-bar {
     min-height: 2rem;
     display: flex;
@@ -650,19 +655,12 @@ body, .page {
     }
 }
 
-/* 字幕任务字段帮助：保留圆形问号样式，提供可点击区域和明确键盘焦点。 */
-#subtitle-task-settings-page .subtitle-policy-help {
-    width: 1.5rem;
-    height: 1.5rem;
+/* 字幕帮助继承基础设置 form-help 的尺寸与配色，仅补充弹性布局和键盘焦点。 */
+.subtitle-help {
     flex-shrink: 0;
 }
 
-#subtitle-task-settings-page .subtitle-policy-help[aria-expanded="true"] {
-    color: var(--tblr-primary-fg, #fff);
-    background: var(--tblr-primary);
-}
-
-#subtitle-task-settings-page .subtitle-policy-help:focus-visible {
+.subtitle-help:focus-visible {
     outline: 2px solid var(--tblr-primary);
     outline-offset: 2px;
 }
