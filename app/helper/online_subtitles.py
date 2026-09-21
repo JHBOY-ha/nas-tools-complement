@@ -111,9 +111,17 @@ class OnlineSubtitles:
         target = {"titles": list(dict.fromkeys(str(value).strip() for value in
                   [cls._query_title(keyword), context.get("title"), context.get("original_title")]
                   if value and str(value).strip())), "year": str(context.get("year") or "")}
-        years = re.findall(r"(?<!\d)((?:19|20)\d{2})(?!\d)", keyword)
-        if not target["year"] and len(years) == 1 and cls._query_title(keyword) != keyword:
-            target["year"] = years[0]
+        # A manually edited year must not be silently replaced by library metadata.
+        # Remove known titles first so titles such as "Blade Runner 2049" keep their numbers.
+        year_text = keyword
+        for title in sorted([str(context.get(key) or "") for key in ("title", "original_title")], key=len, reverse=True):
+            if title:
+                year_text = re.sub(re.escape(title), " ", year_text, flags=re.I)
+        years = re.findall(r"(?<!\d)((?:19|20)\d{2})(?!\d)", year_text)
+        if years and not re.fullmatch(r"(?:19|20)\d{2}", keyword):
+            target["year"] = years[-1]
+        elif context.get("query_edited"):
+            target["year"] = ""
         path_seasons, path_episodes = cls.episode_numbers(os.path.basename(media_path))
         query_seasons, query_episodes = cls.episode_numbers(keyword)
         for key, inferred in (("season", path_seasons or query_seasons), ("episode", path_episodes or query_episodes)):
@@ -176,11 +184,14 @@ class OnlineSubtitles:
         if not keyword or len(keyword) > 200:
             raise ValueError("请输入 1–200 字的影片名称")
         target = self.search_target(keyword, media_path, context)
-        query = self._query_title(keyword)
+        # Send editable keywords intact: keep aliases, years and release/version terms.
+        query = keyword
         if "episode" in target:
-            query += f" S{target['season']:02d}E{target['episode']:02d}"
-        elif target["year"]:
-            query += " " + target["year"]
+            seasons, episodes = self.episode_numbers(keyword)
+            if (seasons and seasons != {target["season"]}) or (episodes and episodes != {target["episode"]}):
+                raise ValueError("检索词的季集与目标视频不一致，请返回剧集列表选择对应集")
+            if not seasons or not episodes:
+                query += f" S{target['season']:02d}E{target['episode']:02d}"
         results, warnings = [], []
         if provider in ("all", "thunder"):
             try:

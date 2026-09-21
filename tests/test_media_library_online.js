@@ -21,7 +21,7 @@ const ctx = vm.createContext({$, console, Set, document: {}, window: {}});
 vm.runInContext(fs.readFileSync('web/static/js/media-library.js', 'utf8'), ctx);
 ctx.library_current_series_id = 'show';
 ctx.library_current_series_title = 'Example';
-ctx.library_items_cache = {show: {original_title: 'Original Example'}};
+ctx.library_items_cache = {show: {original_title: 'Original Example', year: '2024'}};
 ctx.library_episodes_cache = [
   {season: 1, episode: 2, title: 'A', path: '/media/S01E02.mkv', can_upload: true},
   {season: 2, episode: 1, title: 'B', path: '/media/S02E01.mkv', can_upload: true},
@@ -38,7 +38,8 @@ $('#library_online_provider').val('thunder');
 ctx.open_library_online_episode(2);
 const payload = JSON.parse(ajax.data);
 assert.equal(payload.media_path, '/media/S02E02.mkv');
-assert.equal(payload.keyword, 'Example');
+assert.equal(payload.keyword, 'Example Original Example 2024 S02E02');
+assert.equal(payload.media.query_edited, false);
 assert.equal(payload.media.season, 2);
 assert.equal(payload.media.episode, 2);
 assert.equal(payload.media.original_title, 'Original Example');
@@ -50,4 +51,16 @@ ctx.open_library_online_episode(0);
 previous.success({code: 0, items: [{name: 'stale'}]});
 assert.equal(ctx.library_online_results.length, 0);
 assert.equal(JSON.parse(ajax.data).media_path, '/media/S01E02.mkv');
-console.log('Episode selection, request binding and stale-response checks passed');
+// Editing keywords preserves year and release terms without changing the destination.
+$('#library_online_keyword').val('Original Example 2023 S01E02 1080p BluRay');
+ctx.search_library_online_subtitles();
+const edited = JSON.parse(ajax.data);
+assert.equal(edited.keyword, 'Original Example 2023 S01E02 1080p BluRay');
+assert.equal(edited.media.query_edited, true);
+assert.equal(edited.media_path, '/media/S01E02.mkv');
+ctx.reset_library_online_keyword();
+assert.equal($('#library_online_keyword').val(), 'Example Original Example 2024 S01E02');
+assert.equal(ctx.library_online_keyword_for({title: 'Alien', original_title: 'alien', year: 1979}), 'Alien 1979');
+assert.equal(ctx.library_online_keyword_for({title: '星际穿越', original_title: 'Interstellar', year: 2014}), '星际穿越 Interstellar 2014');
+assert.equal(ctx.library_online_keyword_for({title: 'Only title'}), 'Only title');
+console.log('Episode binding, default keywords, manual editing and reset checks passed');

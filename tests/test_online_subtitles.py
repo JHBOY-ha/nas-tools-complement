@@ -171,6 +171,32 @@ class OnlineSubtitleTest(unittest.TestCase):
         self.assertEqual(OnlineSubtitles._query_title('1984'), '1984')
         self.assertEqual(OnlineSubtitles._query_title('1917'), '1917')
 
+    def test_editable_keywords_are_sent_intact_to_both_providers(self):
+        service = OnlineSubtitles('token')
+        keyword = '星际穿越 Interstellar 2014 1080p BluRay'
+        with patch.object(service, 'cid', return_value=''), patch.object(service, '_json', side_effect=[{'code': 0, 'data': []}, {'status': 0, 'sub': {'subs': []}}]) as request:
+            service.search(keyword, '/movie.mkv', 'all', {'title': '星际穿越', 'original_title': 'Interstellar', 'year': '2014', 'query_edited': True})
+        self.assertEqual(request.call_args_list[0].args[1]['name'], keyword)
+        self.assertEqual(request.call_args_list[1].args[1]['q'], keyword)
+
+    def test_manual_year_edit_and_removal_override_metadata(self):
+        context = {'title': 'Dune', 'year': '2021', 'query_edited': True}
+        self.assertEqual(OnlineSubtitles.search_target('Dune 1984', '/Dune.mkv', context)['year'], '1984')
+        self.assertEqual(OnlineSubtitles.search_target('Dune 1080p', '/Dune.mkv', context)['year'], '')
+        self.assertEqual(OnlineSubtitles.search_target('Blade Runner 2049', '/movie.mkv', {'title': 'Blade Runner 2049', 'year': '2017', 'query_edited': True})['year'], '')
+        self.assertEqual(OnlineSubtitles.search_target('2001 A Space Odyssey 1968', '/movie.mkv', {'title': '2001 A Space Odyssey', 'year': '1968'})['year'], '1968')
+
+    def test_episode_keywords_preserve_release_terms_and_do_not_duplicate_episode(self):
+        service = OnlineSubtitles()
+        context = {'title': 'Show', 'season': 1, 'episode': 2, 'media_type': 'episode'}
+        with patch.object(service, 'cid', return_value=''), patch.object(service, '_json', return_value={'code': 0, 'data': []}) as request:
+            service.search('Show 2024 S01E02 1080p', '/Show.S01E02.mkv', 'thunder', context)
+            self.assertEqual(request.call_args.args[1]['name'], 'Show 2024 S01E02 1080p')
+            service.search('Show 2024 1080p', '/Show.S01E02.mkv', 'thunder', context)
+            self.assertEqual(request.call_args.args[1]['name'], 'Show 2024 1080p S01E02')
+            with self.assertRaises(ValueError):
+                service.search('Show S01E03', '/Show.S01E02.mkv', 'thunder', context)
+
 
 class OnlineSubtitleRouteTest(unittest.TestCase):
     def setUp(self):

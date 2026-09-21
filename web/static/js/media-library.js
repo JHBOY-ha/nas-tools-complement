@@ -780,6 +780,7 @@ function init_media_library_page(options) {
 var library_online_path = "";
 var library_online_generation = 0;
 var library_online_results = [];
+var library_online_default_keyword = "";
 
 function open_library_online_movie(item_id) {
   const item = library_items_cache[item_id];
@@ -796,9 +797,29 @@ function open_library_online_episode(index) {
   if (!episode || !episode.path) { return; }
   $("#index-library-episodes-modal").modal("hide");
   open_library_online_subtitles(library_current_series_title, episode.path, {
-    title: library_current_series_title, original_title: series.original_title,
+    title: library_current_series_title, original_title: series.original_title, year: series.year,
     media_type: "episode", season: episode.season, episode: episode.episode
   });
+}
+
+function library_online_keyword_for(media, fallback) {
+  const parts = [];
+  [media.title || fallback, media.original_title].forEach(function (value) {
+    const title = String(value || "").trim();
+    if (title && !parts.some(function (part) { return part.toLowerCase() === title.toLowerCase(); })) {
+      parts.push(title);
+    }
+  });
+  if (media.year) { parts.push(String(media.year)); }
+  if (media.media_type === "episode" && media.season !== "" && media.season != null
+      && media.episode !== "" && media.episode != null) {
+    parts.push(`S${String(media.season).padStart(2, "0")}E${String(media.episode).padStart(2, "0")}`);
+  }
+  return parts.join(" ");
+}
+
+function reset_library_online_keyword() {
+  $("#library_online_keyword").val(library_online_default_keyword);
 }
 
 function open_library_online_subtitles(name, path, media) {
@@ -810,7 +831,8 @@ function open_library_online_subtitles(name, path, media) {
   library_online_results = [];
   $("#library_online_media").text((name || "") + episode_label);
   $("#library_online_target_path").text(`保存到：${path}`);
-  $("#library_online_keyword").val(name || "");
+  library_online_default_keyword = library_online_keyword_for(library_online_media, name);
+  reset_library_online_keyword();
   $("#library_online_results").empty();
   $("#library_online_search").prop("disabled", false);
   $("#library-online-subtitle-modal").modal("show");
@@ -826,7 +848,7 @@ function search_library_online_subtitles() {
   $("#library_online_results").text("正在检索在线字幕...");
   $.ajax({
     type: "POST", url: "/library/subtitle/search", contentType: "application/json", dataType: "json", timeout: 90000,
-    data: JSON.stringify({keyword: keyword, media_path: library_online_path, provider: $("#library_online_provider").val(), media: library_online_media}),
+    data: JSON.stringify({keyword: keyword, media_path: library_online_path, provider: $("#library_online_provider").val(), media: Object.assign({}, library_online_media, {query_edited: keyword !== library_online_default_keyword})}),
     success: function (ret) {
       if (generation !== library_online_generation) { return; }
       if (ret.code !== 0) { $("#library_online_results").text(ret.msg || "检索失败"); return; }
