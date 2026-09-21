@@ -256,11 +256,13 @@ def process_upload_task(manager, task_id):
     original_media = requested_original_media
     server_type = str(task.get("server") or payload.get("server") or "emby").lower()
     align_mode = str(payload.get("align_mode") or payload.get("align") or "none").lower()
-    path_guard = _TaskPathGuard(payload, {
-        "source": original_media,
-        "target": canonical_media
-    })
-    path_guard.validate_media_paths()
+    path_guard = None
+    if not payload.get("season_targets"):
+        path_guard = _TaskPathGuard(payload, {
+            "source": original_media,
+            "target": canonical_media
+        })
+        path_guard.validate_media_paths()
     started = time.monotonic()
     total_budget_seconds = max(float(policy.get("upload_budget_minutes") or 60) * 60, 60)
     already_active = float((task.get("progress") or {}).get("elapsed_seconds") or 0)
@@ -290,7 +292,10 @@ def process_upload_task(manager, task_id):
     for item_index, item in enumerate(items):
         if str(item.get("status") or "").lower() == "succeeded":
             if manager.verify_upload_item_output(task_id, _item_id(item)):
-                previous = item.get("result") or {}
+                previous = dict(item.get("result") or {})
+                recovered_target = (payload.get("season_targets") or {}).get(item.get("source_name"))
+                if recovered_target:
+                    previous["canonical_media_file"] = recovered_target["canonical_media_file"]
                 results.append({
                     "filename": item.get("source_name") or "",
                     "success": True,
@@ -355,6 +360,14 @@ def process_upload_task(manager, task_id):
 
         publication_returned = False
         try:
+            if payload.get("season_targets"):
+                target = payload["season_targets"].get(source_name)
+                if not target:
+                    raise ValueError("字幕缺少已确认的剧集目标")
+                canonical_media = target["canonical_media_file"]
+                original_media = canonical_media
+                path_guard = _TaskPathGuard(target, {"source": canonical_media, "target": canonical_media})
+                path_guard.validate_media_paths()
             manager.ensure_task_target_space(task_id, canonical_media)
             trusted_hashes = {}
             trusted_hash_lookup = getattr(manager, "trusted_upload_item_hashes", None)
@@ -384,6 +397,7 @@ def process_upload_task(manager, task_id):
                 trusted_companion_hash=trusted_hashes.get("companion") or ""
             )
             publication_returned = True
+            data["canonical_media_file"] = canonical_media
             data["source_subtitle"] = data.get("canonical_subtitle") if canonical_media == original_media else ""
             data["linked_target"] = canonical_media != original_media
             _update_item(
@@ -477,86 +491,103 @@ def process_upload_task(manager, task_id):
         "status": "skipped", "scope": "none",
         "message": "没有已发布字幕，无需刷新"
     }
-    if successes:
-        try:
-            manager.invalidate_audit_states([requested_canonical_media])
-        except Exception as warning:
-            result_warning = f"检测状态失效失败：{str(warning)}"
-            for item_result in results:
-                if item_result.get("success"):
-                    item_result.setdefault("data", {}).setdefault("warnings", []).append(result_warning)
-        published_subtitles = []
-        for item_result in results:
-            if not item_result.get("success"):
-                continue
-            item_data = item_result.get("data") or {}
-            published_subtitles.extend([
-                item_data.get("canonical_subtitle"),
-                item_data.get("companion_subtitle")
-            ])
-        try:
-            _update_media_status_after_mutation(
-                requested_canonical_media, server_type,
-                [path for path in published_subtitles if path],
-                abort_check=should_abort,
-                probe_timeout_seconds=int(policy.get("ffprobe_timeout_seconds") or 10),
-                heavy_operation=heavy_operation
-            )
-        except Exception as warning:
-            for item_result in results:
-                if item_result.get("success"):
-                    item_result.setdefault("data", {}).setdefault("warnings", []).append(
-                        f"媒体字幕状态快照更新失败：{str(warning)}"
-                    )
-        # The bounded targeted check above may consume the final task budget.
-        # Re-evaluate terminal signals before deciding whether to refresh the
-        # media server.
-        processing_timed_out = budget_exhausted()
-        was_canceled = canceled()
-    if successes and not was_canceled and not processing_timed_out:
-        try:
-            manager.update_progress(
-                task_id,
-                phase="refreshing",
-                completed=successes + failures,
-                total=len(items),
-                percent=99,
-                current_item="",
-                message="正在局部刷新媒体项目"
-            )
-        except Exception as warning:
-            for item_result in results:
-                if item_result.get("success"):
-                    item_result.setdefault("data", {}).setdefault("warnings", []).append(
-                        f"刷新阶段进度保存失败：{str(warning)}"
-                    )
-        try:
-            refresh = _localized_refresh(
-                payload, requested_canonical_media, server_type,
-                remaining_budget=remaining_budget
-            )
-        except Exception as warning:
+    media_groups = {}
+    for item_result in results:
+        if item_result.get("success"):
+            media = (item_result.get("data") or {}).get("canonical_media_file") or requested_canonical_media
+            media_groups.setdefault(media, []).append(item_result)
+    refreshes = []
+    original_payload = payload
+    original_requested_media = requested_canonical_media
+    for requested_canonical_media, media_results in media_groups.items():
+        payload = next((target for target in (original_payload.get("season_targets") or {}).values()
+                        if target.get("canonical_media_file") == requested_canonical_media), original_payload)
+        if successes:
+            try:
+                manager.invalidate_audit_states([requested_canonical_media])
+            except Exception as warning:
+                result_warning = f"检测状态失效失败：{str(warning)}"
+                for item_result in media_results:
+                    if item_result.get("success"):
+                        item_result.setdefault("data", {}).setdefault("warnings", []).append(result_warning)
+            published_subtitles = []
+            for item_result in media_results:
+                if not item_result.get("success"):
+                    continue
+                item_data = item_result.get("data") or {}
+                published_subtitles.extend([
+                    item_data.get("canonical_subtitle"),
+                    item_data.get("companion_subtitle")
+                ])
+            try:
+                _update_media_status_after_mutation(
+                    requested_canonical_media, server_type,
+                    [path for path in published_subtitles if path],
+                    abort_check=should_abort,
+                    probe_timeout_seconds=int(policy.get("ffprobe_timeout_seconds") or 10),
+                    heavy_operation=heavy_operation
+                )
+            except Exception as warning:
+                for item_result in media_results:
+                    if item_result.get("success"):
+                        item_result.setdefault("data", {}).setdefault("warnings", []).append(
+                            f"媒体字幕状态快照更新失败：{str(warning)}"
+                        )
+            # The bounded targeted check above may consume the final task budget.
+            # Re-evaluate terminal signals before deciding whether to refresh the
+            # media server.
+            processing_timed_out = budget_exhausted()
+            was_canceled = canceled()
+        if successes and not was_canceled and not processing_timed_out:
+            try:
+                manager.update_progress(
+                    task_id,
+                    phase="refreshing",
+                    completed=successes + failures,
+                    total=len(items),
+                    percent=99,
+                    current_item="",
+                    message="正在局部刷新媒体项目"
+                )
+            except Exception as warning:
+                for item_result in media_results:
+                    if item_result.get("success"):
+                        item_result.setdefault("data", {}).setdefault("warnings", []).append(
+                            f"刷新阶段进度保存失败：{str(warning)}"
+                        )
+            try:
+                refresh = _localized_refresh(
+                    payload, requested_canonical_media, server_type,
+                    remaining_budget=remaining_budget
+                )
+            except Exception as warning:
+                refresh = {
+                    "status": "failed", "scope": "none", "server": server_type,
+                    "message": f"局部刷新异常：{str(warning)}"
+                }
+            was_canceled = canceled()
+            if budget_exhausted():
+                refresh.setdefault("budget_limited", True)
+                refresh.setdefault(
+                    "budget_warning",
+                    "局部刷新跨过任务预算边界；字幕发布结果不受影响"
+                )
+        elif successes and was_canceled:
             refresh = {
-                "status": "failed", "scope": "none", "server": server_type,
-                "message": f"局部刷新异常：{str(warning)}"
+                "status": "skipped", "scope": "none",
+                "message": "任务已取消；已发布字幕交由媒体服务器实时监控发现"
             }
-        was_canceled = canceled()
-        if budget_exhausted():
-            refresh.setdefault("budget_limited", True)
-            refresh.setdefault(
-                "budget_warning",
-                "局部刷新跨过任务预算边界；字幕发布结果不受影响"
-            )
-    elif successes and was_canceled:
-        refresh = {
-            "status": "skipped", "scope": "none",
-            "message": "任务已取消；已发布字幕交由媒体服务器实时监控发现"
-        }
-    elif successes and processing_timed_out:
-        refresh = {
-            "status": "skipped", "scope": "none",
-            "message": "剩余任务预算不足，已跳过局部刷新；字幕交由实时监控发现"
-        }
+        elif successes and processing_timed_out:
+            refresh = {
+                "status": "skipped", "scope": "none",
+                "message": "剩余任务预算不足，已跳过局部刷新；字幕交由实时监控发现"
+            }
+        refreshes.append(dict(refresh, media_file=requested_canonical_media))
+    payload = original_payload
+    requested_canonical_media = original_requested_media
+    if original_payload.get("season_targets"):
+        refresh = {"scope": "episodes", "items": refreshes,
+                   "status": "failed" if any(item.get("status") == "failed" for item in refreshes) else "complete"}
 
     result = {
         "media_file": requested_original_media,

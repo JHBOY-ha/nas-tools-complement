@@ -646,3 +646,13 @@ docker pull jhboy/nastools-comp:2.10.2v1-amd64
 * 感谢 <a href="https://github.com/devome" target="_blank">nevinee</a> 完善docker构建
 * 感谢 <a href="https://github.com/tbc0309" target="_blank">tbc0309</a> 适配群晖套件
 * 感谢 PR 代码、完善WIKI、发布教程的所有大佬
+
+### 上传整季字幕包
+
+在“字幕库 → 选择剧集”中选择具体的一季，点击“上传整季字幕包”，选择 ZIP/RAR 后点击“预览匹配”。支持 SRT、ASS、SSA、VTT、SMI 文本字幕及包内子目录；RAR 需要 `rarfile` 和系统解压工具 `unrar`、`unar` 或 `bsdtar`。不处理嵌套压缩包、加密包及图形字幕。
+
+参照 [ChineseSubFinder 的整季字幕按季集分组方式](https://github.com/ChineseSubFinder/ChineseSubFinder/blob/master/pkg/downloader/downloader_things.go)，按 S01E02、1x02、EP02、第2集、[02] 等文件名解析对应剧集；只含集数时使用当前所选季。缺集、跨季、集数范围、无法识别或同集多个视频版本的文件不自动分配。匹配范围固定为当前电视剧和所选季，请在预览中核对目标路径；同集的不同语言/版本可取消勾选。
+
+点击“上传所选字幕”后创建一个持久后台任务，按集保存到对应视频旁，逐集复核路径授权、更新字幕快照并局部刷新媒体服务器。字幕包不会按内部路径直接解压到媒体目录，已有字幕不覆盖。关闭页面后后台继续，可通过任务中心查看逐项结果或取消，重启后按检查点恢复。
+
+“任务设置 → 整季字幕包数量”默认允许 100 个文本字幕，最高 200 个；压缩包及展开内容仍受单批总量、文本单文件、暂存额度和任务时间限制。LLM 对齐仍受 LLM 单批数量限制。一次任务的目标必须处于同一存储卷，跨卷时分开勾选提交。

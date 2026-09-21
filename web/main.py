@@ -2479,6 +2479,92 @@ def _subtitle_task_response(task, reused=False, created_message="已加入字幕
 
 
 # 手动上传字幕：HTTP 只负责流式暂存和入队，规范化/对齐/发布/刷新均在后台执行。
+def _upload_season_pack(manager, policy, upload_files):
+    """Preview and commit a server-resolved season mapping using bounded intake."""
+    import hashlib
+    from contextlib import ExitStack
+    from werkzeug.datastructures import FileStorage
+    from app.helper.subtitle_season_pack import open_pack, build_plan, MemberStream
+
+    if len(upload_files) != 1:
+        return {"code": -1, "msg": "请选择一个 ZIP 或 RAR 字幕包"}, 400
+    try:
+        season = int(request.form.get("season", ""))
+        if not 0 <= season <= 999:
+            raise ValueError()
+    except (TypeError, ValueError):
+        return {"code": -1, "msg": "请先选择具体的一季"}, 400
+    server = str(request.form.get("server") or "").lower()
+    if server not in ["emby", "jellyfin", "plex"]:
+        return {"code": -1, "msg": "请选择有效的影视服务器"}, 400
+    align = str(request.form.get("align") or "none").lower()
+    if align not in ["none", "auto", "offset", "segmented", "llm"]:
+        return {"code": -1, "msg": "字幕对齐模式无效"}, 400
+    episodes = MediaLibrary().get_episodes({"item_id": request.form.get("item_id"), "server": server})
+    if episodes.get("code") != 0:
+        return episodes, 400
+    stream = upload_files[0].stream
+    stream.seek(0)
+    digest = hashlib.sha256()
+    total = 0
+    for chunk in iter(lambda: stream.read(64 * 1024), b""):
+        total += len(chunk)
+        if total > policy["batch_limit_mb"] * 1024 * 1024:
+            return {"code": -1, "msg": "字幕包超过单批总量限制"}, 413
+        digest.update(chunk)
+    with open_pack(stream, policy) as (archive, members):
+        plan = build_plan(members, episodes.get("items") or [], season, digest.hexdigest())
+        if request.form.get("upload_mode") == "season_preview":
+            return dict(code=0, **plan)
+        if request.form.get("plan_id") != plan["plan_id"]:
+            return {"code": -1, "msg": "字幕包或剧集信息发生变化，请重新预览匹配"}, 409
+        selected_values = json.loads(request.form.get("members") or "[]")
+        if not isinstance(selected_values, list) or len(selected_values) > 200 or any(not isinstance(value, str) for value in selected_values):
+            return {"code": -1, "msg": "字幕文件选择无效"}, 400
+        selected = set(selected_values)
+        rows = [row for row in plan["rows"] if row["id"] in selected]
+        if not rows or len(rows) != len(selected) or any(not row["target"] for row in rows):
+            return {"code": -1, "msg": "请选择已匹配的字幕文件"}, 400
+        item_limit = min(policy.get("season_max_batch_items", 100),
+                         policy["llm_max_batch_items"] if align == "llm" else 200)
+        if len(rows) > item_limit:
+            return {"code": -1, "msg": f"当前模式最多选择 {item_limit} 个字幕，请减少勾选或调整任务设置"}, 413
+        targets = {}
+        roots = _get_all_media_library_root_paths()
+        with ExitStack() as stack:
+            files = []
+            for row in rows:
+                episode = row["target"]
+                media = os.path.normpath(episode["path"])
+                if os.path.splitext(media)[-1].lower() not in RMT_MEDIAEXT or not os.path.isfile(media):
+                    return {"code": -1, "msg": f"目标剧集不存在：{row['season_episode']}"}, 409
+                authorization = _path_authorization_snapshot(media, roots)
+                if not authorization:
+                    return {"code": -1, "msg": "目标剧集不在已配置的媒体库内，或路径已变化"}, 409
+                name = f"{int(row['id']):03d}-" + row["name"].replace("/", "-")
+                targets[name] = {
+                    "media_file": media, "target_media_file": media,
+                    "canonical_media_file": media, "linked_target": True,
+                    "server": server, "align_mode": align,
+                    "server_item_id": episode.get("server_item_id") or "",
+                    "parent_server_item_id": episode.get("parent_server_item_id") or "",
+                    "library_id": episode.get("library_id") or "",
+                    "path_authorization": {"source": authorization, "target": authorization}
+                }
+                entry = members[int(row["id"])][1]
+                reader = MemberStream(archive, entry)
+                stack.callback(reader.close)
+                files.append(FileStorage(reader, filename=name))
+            payload = dict(next(iter(targets.values())), season_targets=targets)
+            task, reused = manager.submit_upload(
+                owner=_subtitle_task_owner(), files=files, payload=payload, server=server,
+                request_id="season-" + hashlib.sha256(json.dumps(
+                    [request.form.get("request_id"), plan["plan_id"], sorted(selected), align, server]
+                ).encode()).hexdigest()
+            )
+        return _subtitle_task_response(task, reused, f"已匹配 {len(rows)} 个字幕并加入处理队列")
+
+
 @App.route('/subtitle/upload', methods=['POST'])
 @login_required
 def upload_subtitle():
@@ -2521,6 +2607,11 @@ def upload_subtitle():
         server_type = str(request.form.get("server") or Config().get_config('media').get('media_server') or "emby").lower()
         align_mode = str(request.form.get("align") or "none").lower()
         upload_files = request.files.getlist("file")
+        if request.form.get("upload_mode") in ["season_preview", "season_submit"]:
+            try:
+                return _upload_season_pack(manager, policy, upload_files)
+            except ValueError as error:
+                return {"code": -1, "msg": str(error)}, 400
         if not media_file:
             return {"code": -1, "msg": "媒体文件不能为空"}, 400
         media_file = os.path.normpath(media_file)

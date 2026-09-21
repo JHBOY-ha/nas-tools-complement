@@ -39,6 +39,7 @@ DEFAULT_POLICY = {
     "staging_quota_mb": 2048,
     "reserve_free_mb": 1024,
     "max_batch_items": 20,
+    "season_max_batch_items": 100,
     "llm_max_batch_items": 5,
     "heavy_process_concurrency": 1,
     "ffprobe_timeout_seconds": 10,
@@ -76,6 +77,7 @@ _POLICY_RANGES = {
     "staging_quota_mb": (256, 4096),
     "reserve_free_mb": (256, 51200),
     "max_batch_items": (1, 20),
+    "season_max_batch_items": (1, 200),
     "llm_max_batch_items": (1, 5),
     "heavy_process_concurrency": (1, 2),
     "ffprobe_timeout_seconds": (3, 60),
@@ -595,6 +597,10 @@ class SubtitleTaskManager:
                 canonical_media = str(payload.get("canonical_media_file") or "")
                 if canonical_media:
                     target_dir = os.path.dirname(os.path.abspath(canonical_media))
+                    volume = self._target_volume_key(target_dir)
+                    for target in (payload.get("season_targets") or {}).values():
+                        if self._target_volume_key(os.path.dirname(target["canonical_media_file"])) != volume:
+                            raise SubtitleTaskError("整季字幕目标跨越多个存储卷，请分开上传")
                     payload.update({
                         "target_volume_key": self._target_volume_key(target_dir),
                         # UTF conversion/normalization may expand text.  Keep
@@ -609,6 +615,7 @@ class SubtitleTaskManager:
                     "target": os.path.normcase(os.path.abspath(os.path.normpath(
                         canonical_media
                     ))) if canonical_media else "",
+                    "season_targets": payload.get("season_targets") or {},
                     "server": server,
                     "align": payload.get("align_mode") or "none",
                     # Sort logical signatures so multipart ordering does not
@@ -1188,8 +1195,12 @@ class SubtitleTaskManager:
             logical.append(item)
         if not logical:
             raise SubtitleTaskError("没有可处理的逻辑字幕")
-        if len(logical) > policy["max_batch_items"]:
-            raise TaskUploadTooLarge(f"单批最多上传 {policy['max_batch_items']} 个逻辑字幕")
+        season_targets = payload.get("season_targets") or {}
+        if season_targets and set(season_targets) != {item["source_name"] for item in logical}:
+            raise SubtitleTaskError("整季字幕与剧集映射不完整，请重新预览")
+        item_limit = policy.get("season_max_batch_items", 100) if season_targets else policy["max_batch_items"]
+        if len(logical) > item_limit:
+            raise TaskUploadTooLarge(f"本次最多上传 {item_limit} 个逻辑字幕")
         align_mode = str(payload.get("align_mode") or payload.get("align") or "none").lower()
         if align_mode == "llm" and len(logical) > policy["llm_max_batch_items"]:
             raise TaskUploadTooLarge(f"LLM 对齐单批最多 {policy['llm_max_batch_items']} 个字幕")
