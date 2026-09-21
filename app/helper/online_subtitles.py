@@ -62,6 +62,7 @@ class OnlineSubtitles:
                 return (digits.get(left, 1) * 10) + digits.get(right, 0)
             return digits.get(value, -1)
         seasons = {int(n) for n in re.findall(r"(?i)(?<![a-z0-9])s(\d{1,3})(?!\d)", text)}
+        seasons.update(int(n) for n in re.findall(r"(?i)(?<![a-z])season[ ._-]*(\d{1,3})(?!\d)", text))
         episodes = set()
         for match in re.finditer(r"(?i)(?<![a-z])e(?:p)?[ ._-]?(\d{1,4})(?:\s*[-~]\s*(?:e(?:p)?)?(\d{1,4}))?(?!\d)", text):
             start, end = int(match[1]), int(match[2] or match[1])

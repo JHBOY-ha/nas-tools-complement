@@ -12,6 +12,7 @@ import log
 from app.db.media_db import MediaDb
 from app.helper.db_helper import DbHelper
 from app.helper.subtitle_health import SubtitleHealth
+from app.helper.online_subtitles import OnlineSubtitles
 from app.media.category import Category
 from app.mediaserver import MediaServer
 from app.utils import ExceptionUtils, PathUtils
@@ -163,13 +164,14 @@ class MediaLibrary:
         ret_items = []
         for episode in episodes:
             media_path = episode.get("path") or ""
+            season_number, episode_number = self.resolve_episode_numbers(episode)
             status = self.detect_subtitle_status(media_path, episode.get("media_streams") or [])
             ret_items.append({
                 "id": episode.get("id"),
                 "title": episode.get("title") or "",
-                "season": episode.get("season") if episode.get("season") is not None else "",
-                "episode": episode.get("episode") or "",
-                "season_episode": self.__season_episode(episode.get("season"), episode.get("episode")),
+                "season": season_number,
+                "episode": episode_number,
+                "season_episode": self.__season_episode(season_number, episode_number),
                 "path": media_path,
                 "subtitle_status": status.get("status"),
                 "subtitle_label": status.get("label"),
@@ -942,6 +944,29 @@ class MediaLibrary:
             return default
 
     @staticmethod
+    def resolve_episode_numbers(episode):
+        """Fill sparse sync/transfer records from the selected file, preserving specials (S00)."""
+        values = {}
+        for key in ("season", "episode"):
+            value = episode.get(key)
+            try:
+                values[key] = int(value) if value not in (None, "") else ""
+                if values[key] != "" and values[key] < (0 if key == "season" else 1):
+                    values[key] = ""
+            except (ValueError, TypeError):
+                values[key] = ""
+        path = str(episode.get("path") or "").replace("\\", "/")
+        for candidate in (os.path.basename(path), episode.get("season_episode"),
+                          os.path.basename(os.path.dirname(path)), episode.get("title")):
+            seasons, episodes = OnlineSubtitles.episode_numbers(candidate)
+            for key, numbers in (("season", seasons), ("episode", episodes)):
+                if values[key] == "" and len(numbers) == 1:
+                    value = next(iter(numbers))
+                    if value >= (0 if key == "season" else 1):
+                        values[key] = value
+        return values["season"], values["episode"]
+
+    @staticmethod
     def __season_episode(season, episode):
         season = str(season).rjust(2, "0") if season not in [None, ""] else ""
         episode = str(episode).rjust(2, "0") if episode not in [None, ""] else ""
@@ -953,7 +978,7 @@ class MediaLibrary:
 
     @staticmethod
     def __parse_season_episode(season_episode):
-        match = re.search(r"S(\d+)E(\d+)", str(season_episode or ""), re.I)
-        if not match:
-            return "", ""
-        return match.group(1), match.group(2)
+        seasons, episodes = OnlineSubtitles.episode_numbers(season_episode)
+        season = str(next(iter(seasons))).zfill(2) if len(seasons) == 1 else ""
+        episode = str(next(iter(episodes))).zfill(2) if len(episodes) == 1 else ""
+        return season, episode

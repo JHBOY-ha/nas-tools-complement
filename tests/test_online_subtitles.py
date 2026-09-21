@@ -167,6 +167,13 @@ class OnlineSubtitleTest(unittest.TestCase):
         target = OnlineSubtitles.search_target('Show', '/Show.S00E02.mkv', {'season': 0, 'episode': 2})
         self.assertEqual(target['season'], 0)
 
+    def test_screenshot_query_rejects_unrelated_same_episode_results(self):
+        target = OnlineSubtitles.search_target('Re：从零开始的异世界生活 Re:ゼロから始める異世界生活 2016 S04E17', '/media/Re - S04E17 - 第17集.mkv',
+                                               {'title': 'Re：从零开始的异世界生活', 'original_title': 'Re:ゼロから始める異世界生活', 'season': 4, 'episode': 17, 'media_type': 'episode'})
+        for name in ['生活大爆炸.The.Big.Bang.Theory.S04E17.Chi_Eng.ass', '2016-04-17 Yutori.E01.ass']:
+            self.assertEqual(OnlineSubtitles.match_result({'name': name}, target), '')
+        self.assertEqual(OnlineSubtitles.match_result({'name': 'Re：从零开始的异世界生活.S04E17.ass'}, target), '剧名与季集匹配')
+
     def test_numeric_movie_title_is_preserved(self):
         self.assertEqual(OnlineSubtitles._query_title('1984'), '1984')
         self.assertEqual(OnlineSubtitles._query_title('1917'), '1917')

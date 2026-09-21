@@ -609,7 +609,7 @@ function open_library_episodes(item_id) {
       return;
     }
     if (library_current_series_id !== item_id) { return; }
-    library_episodes_cache = ret.items || [];
+    library_episodes_cache = (ret.items || []).map(library_fill_episode_numbers);
     const seasons = Array.from(new Set(library_episodes_cache.map(function (episode) { return String(episode.season); })))
         .sort(function (a, b) { return Number(a) - Number(b); });
     const season_select = $("#library_episode_season").empty().append($("<option>").val("").text("全部季"));
@@ -620,6 +620,20 @@ function open_library_episodes(item_id) {
     });
     filter_library_episodes(true);
   });
+}
+
+function library_fill_episode_numbers(episode) {
+  episode = Object.assign({}, episode);
+  const basename = String(episode.path || "").replace(/\\/g, "/").split("/").pop();
+  const match = basename.match(/(?:^|[^a-z0-9])S(\d{1,3})[ ._-]*E(\d{1,4})(?!\d)/i);
+  if (match) {
+    if (episode.season === "" || episode.season == null) { episode.season = Number(match[1]); }
+    if (episode.episode === "" || episode.episode == null) { episode.episode = Number(match[2]); }
+  }
+  if (episode.season !== "" && episode.season != null && episode.episode !== "" && episode.episode != null) {
+    episode.season_episode = `S${String(episode.season).padStart(2, "0")}E${String(episode.episode).padStart(2, "0")}`;
+  }
+  return episode;
 }
 
 function filter_library_episodes(reset_episode) {
@@ -792,7 +806,9 @@ function open_library_online_movie(item_id) {
 }
 
 function open_library_online_episode(index) {
-  const episode = library_episodes_cache[index];
+  const cached_episode = library_episodes_cache[index];
+  if (!cached_episode) { return; }
+  const episode = library_fill_episode_numbers(cached_episode);
   const series = library_items_cache[library_current_series_id] || {};
   if (!episode || !episode.path) { return; }
   $("#index-library-episodes-modal").modal("hide");
@@ -826,7 +842,9 @@ function open_library_online_subtitles(name, path, media) {
   library_online_path = path;
   library_online_media = media || {};
   const episode_label = library_online_media.media_type === "episode"
-      ? ` · 第 ${library_online_media.season} 季 第 ${library_online_media.episode} 集` : (library_online_media.year ? ` · ${library_online_media.year}` : "");
+      ? (library_online_media.season !== "" && library_online_media.season != null
+          && library_online_media.episode !== "" && library_online_media.episode != null
+          ? ` · 第 ${library_online_media.season} 季 第 ${library_online_media.episode} 集` : " · 季集未识别") : (library_online_media.year ? ` · ${library_online_media.year}` : "");
   library_online_generation += 1;
   library_online_results = [];
   $("#library_online_media").text((name || "") + episode_label);
@@ -856,7 +874,7 @@ function search_library_online_subtitles() {
       let html = (ret.warnings || []).map(function (warning) {
         return `<div class="alert alert-warning">${library_escape_html(warning)}</div>`;
       }).join("");
-      if (!library_online_results.length) { html += '<p class="text-muted">未找到符合片名、年份或季集条件的字幕，可使用原名检索或切换来源。</p>'; }
+      if (!library_online_results.length) { html += '<p class="text-muted">当前字幕源未返回符合目标片名和季集的字幕。可精简为单一片名检索，或配置 Assrt 后重试；请核对目标文件的季集编号。</p>'; }
       library_online_results.forEach(function (item, index) {
         html += `<div class="border-bottom py-3">
           <div class="fw-bold text-break">${library_escape_html(item.name)}</div>

@@ -64,3 +64,16 @@ assert.equal(ctx.library_online_keyword_for({title: 'Alien', original_title: 'al
 assert.equal(ctx.library_online_keyword_for({title: '星际穿越', original_title: 'Interstellar', year: 2014}), '星际穿越 Interstellar 2014');
 assert.equal(ctx.library_online_keyword_for({title: 'Only title'}), 'Only title');
 console.log('Episode binding, default keywords, manual editing and reset checks passed');
+
+// Sparse history records must show the season/episode present in the screenshot's filename.
+ctx.library_current_series_title = 'Re：从零开始的异世界生活';
+ctx.library_items_cache.show = {original_title: 'Re:ゼロから始める異世界生活', year: 2016};
+ctx.library_episodes_cache = [{season: '', episode: '', path: '/media/Season 4/Re：从零开始的异世界生活 - S04E17 - 第17集.mkv'}];
+ctx.open_library_online_episode(0);
+const recovered = JSON.parse(ajax.data);
+assert.equal(recovered.media.season, 4);
+assert.equal(recovered.media.episode, 17);
+assert.ok(recovered.keyword.endsWith('2016 S04E17'));
+assert.ok($('#library_online_media').content.includes('第 4 季 第 17 集'));
+assert.equal(ctx.library_fill_episode_numbers({path: '/media/S00E02.mkv'}).season, 0);
+console.log('Screenshot regression: missing metadata recovered as S04E17');
