@@ -14,6 +14,9 @@
 <div class="page-body">
   <div class="container-xl">
     <div class="d-grid gap-3 grid-normal-card">
+      <a class="card card-link-pop p-3" href="#" data-bs-toggle="modal" data-bs-target="#modal-online-subtitles">
+        <div class="card-body text-center"><div class="card-title">在线字幕</div><div class="text-muted">迅雷 · Assrt 名称检索与下载</div></div>
+      </a>
       {% if ChromeOk %}
       <a class="card card-link-pop p-0" href="#" data-bs-toggle="modal" data-bs-target="#modal-opensubtitles">
         <div class="card-cover card-cover-blurred text-center">
@@ -161,3 +164,14 @@
   }
 
 </script>
+<div class="modal modal-blur fade" id="modal-online-subtitles" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered"><div class="modal-content">
+    <div class="modal-header"><h5 class="modal-title">在线字幕</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button></div>
+    <div class="modal-body">
+      <p>迅雷无需配置。Assrt 按影片名称检索，需要 <a href="https://assrt.net/usercp.php" target="_blank" rel="noopener noreferrer">Assrt API Token</a>。</p>
+      <label for="subtitle.assrt.token" class="form-label">Assrt API Token</label>
+      <input id="subtitle.assrt.token" type="password" autocomplete="new-password" class="form-control" value="{{ ((Config.subtitle or {}).get('assrt') or {}).get('token') or '' }}">
+    </div>
+    <div class="modal-footer"><button type="button" class="btn btn-primary" onclick="ajax_post('update_config', input_select_GetVal('modal-online-subtitles'), function(ret) { if (ret.code === 0) { $('#modal-online-subtitles').modal('hide'); } else { show_fail_modal(ret.msg || '保存失败'); } });">保存</button></div>
+  </div></div>
+</div>

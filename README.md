@@ -621,6 +621,16 @@ docker pull jhboy/nastools-comp:2.10.2v1-amd64
    python3 app/filetransfer.py -m link -s /from/path -d /to/path
    ```
 
+### 字幕库在线字幕
+
+在字幕库顶部输入媒体名、原名或年份，点击“搜索影片”（或回车）查找已同步的媒体；搜索与类型、分类、字幕状态筛选可组合使用。
+
+电影卡片点击“在线字幕”，电视剧和动漫先“选择剧集”，再点击对应集的“在线字幕”。可编辑检索名称并选择迅雷或 Assrt；剧集默认携带季集编号。迅雷无需配置，优先展示与本地视频 CID 匹配的字幕。Assrt 的 Token 在“设置 → 字幕 → 在线字幕”保存，也可配置 `subtitle.assrt.token`，不影响原有自动字幕下载器。
+
+选择结果后点击“下载并保存”；ZIP/RAR 字幕包会先列出文件供选择。RAR 需要安装 Python 依赖 `rarfile` 及系统工具 `unrar` 或 `unar`。单次下载和字幕包展开内容限制为 20 MB。字幕保存到选中的媒体文件旁，经过现有格式与编码校验，保留已有字幕并刷新媒体服务器。下载结果有效期为 30 分钟，过期后重新搜索。媒体文件需位于已配置的媒体库目录内且可读取。
+
+在线检索协议和 CID 算法参考 [MeiamSubtitles](https://github.com/91270/MeiamSubtitles)，按 NASTool 的字幕库和上传流程重新实现；上游采用 Apache-2.0，许可见 `third_party/meiamsubtitles/LICENSE`。未接入已停止维护的旧 Shooter 接口。
+
 ## 鸣谢
 * 程序UI模板及图标来源于开源项目<a href="https://github.com/tabler/tabler">tabler</a>，此外项目中还使用到了开源模块：<a href="https://github.com/igorcmoura/anitopy" target="_blank">anitopy</a>、<a href="https://github.com/AnthonyBloomer/tmdbv3api" target="_blank">tmdbv3api</a>、<a href="https://github.com/pkkid/python-plexapi" target="_blank">python-plexapi</a>、<a href="https://github.com/rmartin16/qbittorrent-api">qbittorrent-api</a>、<a href="https://github.com/Trim21/transmission-rpc">transmission-rpc</a>等
 * 感谢 <a href="https://github.com/devome" target="_blank">nevinee</a> 完善docker构建

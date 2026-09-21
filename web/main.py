@@ -1132,6 +1132,84 @@ def library_episodes():
         return {"code": -1, "msg": str(e)}
 
 
+def _online_subtitle_service():
+    from app.helper.online_subtitles import OnlineSubtitles
+    config = Config().get_config("subtitle") or {}
+    return OnlineSubtitles((config.get("assrt") or {}).get("token"))
+
+
+def _online_subtitle_signer():
+    from itsdangerous import URLSafeTimedSerializer
+    return URLSafeTimedSerializer(App.secret_key, salt="online-subtitles")
+
+
+def _online_subtitle_media_path(value):
+    path = os.path.realpath(str(value or ""))
+    if not os.path.isfile(path) or os.path.splitext(path)[1].lower() not in RMT_MEDIAEXT:
+        raise ValueError("请选择可访问的媒体文件")
+    if not any(PathUtils.is_path_in_path(os.path.realpath(root), path)
+               for root in _get_all_media_library_root_paths()):
+        raise ValueError("媒体文件不在媒体库目录范围内")
+    return path
+
+
+@App.route('/library/subtitle/search', methods=['POST'])
+@login_required
+def library_online_subtitle_search():
+    try:
+        data = request.get_json(silent=True) or {}
+        path = _online_subtitle_media_path(data.get("media_path"))
+        items, warnings = _online_subtitle_service().search(data.get("keyword"), path, data.get("provider") or "all")
+        results = []
+        for item in items:
+            result = {key: item[key] for key in ("name", "provider", "format", "language", "hash_match")}
+            result["ticket"] = _online_subtitle_signer().dumps({"item": item, "path": path, "user": str(current_user.get_id())})
+            results.append(result)
+        return {"code": 0, "items": results, "warnings": warnings}
+    except ValueError as error:
+        return {"code": -1, "msg": str(error)}
+    except Exception:
+        return {"code": -1, "msg": "在线字幕检索失败，请稍后重试"}
+
+
+@App.route('/library/subtitle/download', methods=['POST'])
+@login_required
+def library_online_subtitle_download():
+    from io import BytesIO
+    from itsdangerous import BadData
+    from werkzeug.datastructures import FileStorage
+    try:
+        data = request.get_json(silent=True) or {}
+        try:
+            payload = _online_subtitle_signer().loads(data.get("ticket") or "", max_age=1800)
+        except BadData:
+            raise ValueError("搜索结果已过期，请重新搜索")
+        if payload.get("user") != str(current_user.get_id()):
+            raise ValueError("搜索结果无效，请重新搜索")
+        path = _online_subtitle_media_path(payload["path"])
+        name, content = _online_subtitle_service().files(payload["item"], data.get("member"))
+        if content is None:
+            return {"code": 0, "members": name}
+        server = str((Config().get_config("media") or {}).get("media_server") or "emby").lower()
+        if server not in ("emby", "jellyfin", "plex"):
+            raise ValueError("全局影视服务器配置无效")
+        success, message, result = Subtitle().upload_subtitle(
+            FileStorage(stream=BytesIO(content), filename=name), path,
+            target_media_file=path, server_type=server, align_mode="none")
+        if success:
+            MediaLibrary.invalidate_subtitle_directory_cache(path)
+            try:
+                if MediaServer().refresh_root_library_by_type(server) is False:
+                    message += "，但刷新媒体服务器失败"
+            except Exception:
+                message += "，但刷新媒体服务器失败"
+        return {"code": 0 if success else -1, "msg": message, "data": result}
+    except ValueError as error:
+        return {"code": -1, "msg": str(error)}
+    except Exception:
+        return {"code": -1, "msg": "字幕下载或解压失败；RAR 字幕包需安装 unrar，请尝试其他字幕"}
+
+
 @App.route('/library/subtitle/audit', methods=['POST'])
 @login_required
 def library_subtitle_audit():
