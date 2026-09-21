@@ -42,3 +42,17 @@ class MetaInfoTest(TestCase):
 
         self.assertEqual(meta_info.begin_season, 2)
         self.assertEqual(meta_info.begin_episode, 11)
+
+    def test_beyblade_x_is_part_of_title_not_season_ten(self):
+        meta = MetaInfo("[jibaketa] Beyblade X - 127 [WEB 1080p AVC AAC]", use_llm=False)
+        self.assertIn(meta.begin_season, (None, 1))
+        self.assertEqual(127, meta.begin_episode)
+        self.assertIn("X", meta.en_name)
+
+    def test_tsdm_bracket_title_keeps_name_season_and_episode(self):
+        meta = MetaInfo("【TSDM字幕组】[Re:从零开始的异世界生活 第4季][14]"
+                        "[HEVC-10bit 1080p AAC][MKV][简日内封字幕]"
+                        "[Re Zero kara Hajimeru Isekai Seikatsu 4th Season]", use_llm=False)
+        self.assertIn("从零开始", meta.get_name())
+        self.assertEqual(4, meta.begin_season)
+        self.assertEqual(14, meta.begin_episode)

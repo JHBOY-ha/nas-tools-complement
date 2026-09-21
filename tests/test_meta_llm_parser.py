@@ -107,6 +107,21 @@ from app.utils.types import MediaType
 
 
 class LLMMetaParserTest(TestCase):
+    def test_tsdm_search_starts_with_title_not_release_group(self):
+        queries = self.parser._LLMMetaParser__build_search_queries(
+            "【TSDM字幕组】[Re:从零开始的异世界生活 第4季][14]"
+            "[HEVC-10bit 1080p AAC][MKV][简日内封字幕]"
+            "[Re Zero kara Hajimeru Isekai Seikatsu 4th Season]")
+        self.assertIn("从零开始", queries[0])
+        self.assertNotIn("TSDM", queries[0])
+
+    def test_inferred_year_is_distinct_from_explicit_release_year(self):
+        for title, inferred in [("Example S01E12", True), ("Example 2026 S01E12", False)]:
+            meta = MetaInfo(title, use_llm=False)
+            with patch.object(self.parser, "parse", return_value={"year": "2025"}):
+                self.parser.merge_into(meta, title)
+            self.assertEqual(inferred, meta.note["llm"]["inferred_year"])
+
     @classmethod
     def setUpClass(cls):
         if not os.environ.get("NASTOOL_CONFIG"):

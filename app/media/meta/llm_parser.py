@@ -6,6 +6,7 @@ from urllib.parse import quote
 
 import log
 from app.media.tmdbv3api import TMDb, Search, TMDbException
+from app.media.meta.title_utils import promote_bracket_title
 from app.utils import ExceptionUtils, RequestUtils, StringUtils
 from app.utils.llm_client import LLMClient
 from app.utils.commons import singleton
@@ -218,12 +219,17 @@ class LLMMetaParser(object):
         }
 
         if llm_result:
+            original_year = meta_info.year
             self.__apply_result(meta_info, llm_result)
             note["llm"].update({
                 "applied": True,
                 "confidence": llm_result.get("confidence", 0),
                 "field_confidence": llm_result.get("field_confidence", {})
             })
+            note["llm"]["inferred_year"] = bool(
+                not original_year and meta_info.year
+                and not re.search(r"(?<!\d)(?:19|20)\d{2}(?!\d)", title or "")
+            )
             if llm_result.get("tmdb_id"):
                 note["llm"].update({
                     "tmdb_id": llm_result.get("tmdb_id"),
@@ -394,7 +400,7 @@ class LLMMetaParser(object):
     @classmethod
     def __build_search_queries(cls, title, subtitle=None):
         query_set = []
-        raw_title = str(title or "").strip()
+        raw_title = promote_bracket_title(str(title or "").strip())
         core_query = cls.__extract_core_title_query(raw_title)
         if core_query:
             query_set.append(core_query)
@@ -625,7 +631,10 @@ class LLMMetaParser(object):
                 raw_results = search.multi(params)
 
             candidates = []
-            for item in (raw_results or [])[:self._search_max_results]:
+            for item in (raw_results or []):
+                genres = getattr(item, "genre_ids", None) or []
+                if mtype_hint == MediaType.ANIME and 16 not in genres:
+                    continue
                 name = self.__clean_text(
                     getattr(item, "title", None) or getattr(item, "name", None),
                     max_len=120
@@ -644,13 +653,16 @@ class LLMMetaParser(object):
                         item_type = "tv"
                 candidate = {
                     "id": getattr(item, "id", None),
-                    "name": name
+                    "name": name,
+                    "genre_ids": genres
                 }
                 if year:
                     candidate["year"] = year
                 if item_type:
                     candidate["type"] = item_type
                 candidates.append(candidate)
+                if len(candidates) >= self._search_max_results:
+                    break
             return candidates
         except TMDbException as err:
             log.debug("【Meta】TMDB候选检索失败：%s" % str(err))

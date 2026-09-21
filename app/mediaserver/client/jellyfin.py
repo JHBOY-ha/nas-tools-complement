@@ -321,7 +321,7 @@ class Jellyfin(_IMediaClient):
             log.error("【Jellyfin】合并媒体库季集失败：%s" % str(err))
             return None
 
-    def get_no_exists_episodes(self, meta_info, season, total_num):
+    def get_no_exists_episodes(self, meta_info, season, total_num, episode_numbers=None):
         """
         根据标题、年份、季、总集数，查询Jellyfin中缺少哪几集
         :param meta_info: 已识别的需要查询的媒体信息
@@ -334,7 +334,8 @@ class Jellyfin(_IMediaClient):
         exists_episodes = self.__get_jellyfin_tv_episodes(meta_info.title, meta_info.year, meta_info.tmdb_id, season)
         if not isinstance(exists_episodes, list):
             return None
-        total_episodes = [episode for episode in range(1, total_num + 1)]
+        total_episodes = (list(episode_numbers) if episode_numbers is not None
+                          else list(range(1, total_num + 1)))
         return list(set(total_episodes).difference(set(exists_episodes)))
 
     def get_image_by_id(self, item_id, image_type):

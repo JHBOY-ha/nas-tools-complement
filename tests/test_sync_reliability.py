@@ -5,6 +5,7 @@ Run with: python -m unittest tests.test_sync_reliability
 """
 import ast
 import copy
+import difflib
 import json
 import os
 import re
@@ -41,8 +42,10 @@ def load_class(path, name, methods, namespace):
 
 def env():
     return dict(os=os, re=re, time=time, uuid=uuid, json=json, traceback=traceback,
-                MediaType=MediaType, MatchMode=NS(NORMAL='normal'), EpisodeFormat=object,
+                MediaType=MediaType, Enum=Enum, MatchMode=NS(NORMAL='normal'), EpisodeFormat=object,
                 log=Mock(), ExceptionUtils=Mock(), lock=threading.Lock(), urlencode=urlencode,
+                Config=lambda: NS(get_config=lambda key: {}),
+                DEFAULT_EPISODE_MAPPINGS=[], DEFAULT_NAME_ALIASES={},
                 RmtMode=NS(LINK='link', MOVE='move', RCLONE='rclone', MINIO='minio'),
                 SyncType=NS(MON='monitor'), RMT_MEDIAEXT=['.mkv'], RMT_FAVTYPE='Favorites')
 
@@ -52,8 +55,43 @@ class RecognitionTests(unittest.TestCase):
         self.ns = env()
         cls = load_class('app/media/media.py', 'Media', [
             '__search_media_with_name', '__extract_llm_tmdb_target', '__resolve_tmdb_mtype',
-            'get_media_info_on_files', 'get_cache_info', '__make_cache_key', '_valid_media_identity', '__search_tv_by_name'], self.ns)
+            'get_media_info_on_files', 'get_cache_info', '__make_cache_key', '_valid_media_identity', '_prepare_media_identity', '_apply_episode_mapping', '__search_tv_by_name'], self.ns)
         self.media = cls()
+
+    def test_explicit_work_mapping_is_verified_and_not_applied_twice(self):
+        rules = [{'tmdb_id': 65942, 'source_season': 4, 'source_begin': 1,
+                  'source_end': 19, 'target_season': 1, 'offset': 66}]
+        self.ns['Config'] = lambda: NS(get_config=lambda key: {'episode_mappings': rules})
+        meta = NS(type=MediaType.ANIME, begin_season=4, begin_episode=14, note={})
+        meta.get_episode_list = lambda: [meta.begin_episode]
+        meta.get_season_list = lambda: [meta.begin_season]
+        info = {'id': 65942, 'media_type': MediaType.TV,
+                'genres': [{'id': 16}], 'seasons': [{'season_number': 1}]}
+        self.media.get_tmdb_tv_season_detail = Mock(return_value={'episodes': [{'episode_number': 80}]})
+        self.assertTrue(self.media._prepare_media_identity(meta, info))
+        self.assertEqual((1, 80), (meta.begin_season, meta.begin_episode))
+        self.assertTrue(self.media._prepare_media_identity(meta, info))
+        self.assertEqual((1, 80), (meta.begin_season, meta.begin_episode))
+
+    def test_mapping_does_not_guess_when_tmdb_target_is_missing(self):
+        rules = [{'tmdb_id': 65942, 'source_season': 4, 'source_begin': 1,
+                  'source_end': 19, 'target_season': 1, 'offset': 66}]
+        self.ns['Config'] = lambda: NS(get_config=lambda key: {'episode_mappings': rules})
+        meta = NS(type=MediaType.ANIME, begin_season=4, begin_episode=14, note={},
+                  get_episode_list=lambda: [14], get_season_list=lambda: [4])
+        info = {'id': 65942, 'media_type': MediaType.TV, 'genres': [{'id': 16}]}
+        self.media.get_tmdb_tv_season_detail = Mock(return_value={})
+        self.assertFalse(self.media._prepare_media_identity(meta, info))
+        self.assertEqual((4, 14), (meta.begin_season, meta.begin_episode))
+
+    def test_rejected_inferred_year_can_retry_in_strict_mode(self):
+        self.media._rmt_match_mode = 'strict'
+        self.media._Media__search_tmdb = Mock(side_effect=[{}, {'id': 309974}])
+        meta = NS(type=MediaType.ANIME, year='2025', begin_season=1,
+                  note={'llm': {'inferred_year': True}})
+        result = self.media._Media__search_media_with_name(meta, '透明之夜', strict=True)
+        self.assertEqual(309974, result['id'])
+        self.assertNotIn('first_media_year', self.media._Media__search_tmdb.call_args.kwargs)
 
     def test_anime_searches_tv_with_or_without_year(self):
         for year in ['2024', None]:
@@ -100,9 +138,18 @@ class RecognitionTests(unittest.TestCase):
         self.media.search.tv_shows.return_value = [
             {'id': 7030, 'name': '花样少男少女', 'genre_ids': [18]},
             {'id': 123, 'name': '花样少男少女', 'genre_ids': [16]}]
-        self.media._Media__compare_tmdb_names = lambda a, b: a == b
+        self.media._Media__compare_tmdb_names = lambda a, b, **kwargs: a == b
         found = self.media._Media__search_tv_by_name('花样少男少女', None, anime_only=True)
         self.assertEqual(123, found['id'])
+
+    def test_short_chinese_title_cannot_match_different_work_prefix(self):
+        ns = env()
+        ns.update(difflib=difflib, StringUtils=NS(
+            handler_special_chars=lambda s: s,
+            is_chinese=lambda s: bool(re.search('[\u4e00-\u9fff]', s))))
+        cls = load_class('app/media/media.py', 'Media', ['__compare_tmdb_names'], ns)
+        self.assertFalse(cls._Media__compare_tmdb_names('海贼王', '海贼王女'))
+        self.assertTrue(cls._Media__compare_tmdb_names('海贼王', '海贼王'))
 
     def test_movie_result_does_not_mutate_episode_identity(self):
         cls = load_class('app/media/meta/_base.py', 'MetaBase', ['set_tmdb_info'], self.ns)
@@ -324,6 +371,7 @@ class DownloadTests(unittest.TestCase):
         self.d.filetransfer.get_no_exists_medias.return_value = [1, 3]
         self.d.media = Mock()
         self.d.media.get_tmdb_info.return_value = {'id': 123}
+        self.d.media.get_tmdb_tv_season_detail.return_value = {'episodes': [{'episode_number': e} for e in [1, 2, 3]]}
         meta = NS(type=MediaType.ANIME, title='Anime', year=2024, tmdb_id=123,
                   begin_season=1, get_season_list=lambda: [1], get_episode_list=lambda: [2],
                   get_title_string=lambda: 'Anime', get_season_episode_string=lambda: 'S01E02')
@@ -331,9 +379,28 @@ class DownloadTests(unittest.TestCase):
         self.assertTrue(exists)
         self.assertEqual([3], missing[123][0]['episodes'])
 
+    def test_absolute_episode_uses_tmdb_numbers_not_season_count(self):
+        self.d.media = Mock()
+        self.d.media.get_tmdb_info.return_value = {'id': 37854, 'seasons': [{'season_number': 23}]}
+        numbers = list(range(1156, 1182))
+        self.d.media.get_tmdb_tv_season_detail.return_value = {
+            'episodes': [{'episode_number': ep} for ep in numbers]}
+        self.d.media.get_tmdb_season_episodes_num.return_value = 26
+        self.d.mediaserver = Mock()
+        self.d.mediaserver.get_no_exists_episodes.return_value = [1179]
+        self.d.filetransfer.get_no_exists_medias.return_value = [1179]
+        meta = NS(type=MediaType.ANIME, title='航海王', tmdb_id=37854, begin_season=23,
+                  get_season_list=lambda: [23], get_episode_list=lambda: [1179],
+                  get_title_string=lambda: '航海王', get_season_episode_string=lambda: 'S23E1179')
+        exists, missing, _ = self.d.check_exists_medias(meta)
+        self.assertFalse(exists)
+        self.assertEqual([1179], missing[37854][0]['episodes'])
+        self.assertEqual(numbers, self.d.mediaserver.get_no_exists_episodes.call_args.kwargs['episode_numbers'])
+
     def test_out_of_range_and_missing_season_are_unknown(self):
         self.d.media = Mock()
         self.d.media.get_tmdb_info.return_value = {'id': 245842}
+        self.d.media.get_tmdb_tv_season_detail.return_value = {'episodes': [{'episode_number': e} for e in range(1, 13)]}
         self.d.mediaserver = Mock()
         meta = NS(type=MediaType.ANIME, tmdb_id=245842, begin_season=1,
                   get_season_list=lambda: [1], get_episode_list=lambda: list(range(13, 25)),
@@ -423,10 +490,42 @@ class HardlinkTests(unittest.TestCase):
         self.mode = MediaType.ANIME  # Enum-shaped transfer mode; no app imports needed.
         self.ns['RmtMode'].LINK = self.mode
         cls = load_class('app/filetransfer.py', 'FileTransfer', [
-            '__transfer_file', '__transfer_origin_file', '__get_best_target_path', '_existing_media_files'], self.ns)
+            '__transfer_file', '__transfer_origin_file', '__get_best_target_path', '_existing_media_files', 'transfer_media'], self.ns)
         self.transfer = cls()
         self.transfer.dbhelper = Mock()
         self.transfer._FileTransfer__transfer_subtitles = Mock(return_value=0)
+
+    def test_history_failure_retries_same_hardlink_without_overwriting(self):
+        self.ns['Subtitle'] = Mock()
+        t = self.transfer
+        t.progress, t.message, t.threadhelper = Mock(), Mock(), Mock()
+        t._filesize_cover = t._refresh_mediaserver = t._scraper_flag = t._movie_category_flag = False
+        t.check_ignore = lambda file_list: (file_list, '')
+        t._existing_media_files = Mock(return_value=[])
+        t.media = Mock()
+        t.dbhelper.insert_transfer_history.side_effect = [False, True]
+        t.dbhelper.insert_transfer_blacklist.return_value = True
+        t._FileTransfer__transfer_command = Mock()
+        meta = NS(tmdb_id=1, type=MediaType.MOVIE, category='', title='Film', year='2026',
+                  en_name='Film', cn_name='', begin_season=None, begin_episode=None,
+                  imdb_id=None, set_tmdb_info=Mock(), tmdb_info={'id': 1},
+                  get_title_string=lambda: 'Film (2026)')
+        with tempfile.TemporaryDirectory() as folder:
+            source, target = Path(folder) / 'source.mkv', Path(folder) / 'target.mkv'
+            source.write_bytes(b'published content')
+            os.link(source, target)
+            t.media.get_media_info_on_files.return_value = {str(source): meta}
+            t._FileTransfer__is_media_exists = Mock(return_value=(True, folder, True, str(target)))
+            kwargs = dict(in_from='manual', in_path=str(source), files=[str(source)],
+                          rmt_mode=self.mode, target_dir=folder)
+            self.assertFalse(t.transfer_media(**kwargs)[0])
+            t.dbhelper.insert_transfer_blacklist.assert_not_called()
+            t.message.send_transfer_movie_message.assert_not_called()
+            t.threadhelper.start_thread.assert_not_called()
+            self.assertTrue(t.transfer_media(**kwargs)[0])
+            self.assertEqual(source.stat().st_ino, target.stat().st_ino)
+            t._FileTransfer__transfer_command.assert_not_called()
+            t.dbhelper.insert_transfer_blacklist.assert_called_once_with(str(source))
 
     def test_failed_replacement_preserves_old_media(self):
         with tempfile.TemporaryDirectory() as folder:

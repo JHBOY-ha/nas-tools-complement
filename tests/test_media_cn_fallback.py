@@ -2,7 +2,7 @@
 
 import os
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from app.media import Media
 from app.media.meta import MetaInfo
@@ -23,6 +23,13 @@ class MediaCnFallbackTest(TestCase):
 
     def setUp(self) -> None:
         self.media = Media()
+        # These tests stub all search calls; no real TMDB key is required.
+        patcher = patch.object(self.media, "tmdb", True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        cache_patcher = patch.object(self.media, "meta", Mock())
+        cache_patcher.start()
+        self.addCleanup(cache_patcher.stop)
 
     def test_extract_cn_fallback_name(self):
         meta_info = MetaInfo(self._SAMPLE_TITLE)

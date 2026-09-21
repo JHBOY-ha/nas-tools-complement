@@ -5,6 +5,7 @@ import zhconv
 import anitopy
 from app.media.meta._base import MetaBase
 from app.media.meta.release_groups import ReleaseGroupsMatcher
+from app.media.meta.title_utils import promote_bracket_title
 from app.utils import StringUtils, ExceptionUtils
 from app.utils.types import MediaType
 
@@ -59,7 +60,7 @@ class MetaAnime(MetaBase):
                 anime_season = anitopy_info.get("anime_season")
                 if not anime_season and name:
                     roman_match = re.search(
-                        r"(?i)(?<![A-Z])\b(I{2,3}|IV|V?I{1,3}|IX|X)\b"
+                        r"(?i)(?<![A-Z])\b(II|III|IV|VI|VII|VIII|IX)\b"
                         r"\s*[-–—]\s*\d{1,4}(?=\D|$)",
                         title
                     )
@@ -218,6 +219,9 @@ class MetaAnime(MetaBase):
             return title
         # 所有【】换成[]
         title = title.replace("【", "[").replace("】", "]").strip()
+        promoted = promote_bracket_title(title)
+        if promoted != title:
+            return promoted
         # 截掉xx番剧漫
         match = re.search(r"新番|月?番|[日美国][漫剧]", title)
         if match and match.span()[1] < len(title) - 1:

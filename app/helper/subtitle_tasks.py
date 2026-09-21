@@ -2754,37 +2754,42 @@ class SubtitleTaskManager:
                     for task_id in delete_ids
                 }
             if now - self._last_persistent_cache_cleanup >= 3600:
-                cache_cutoff = now - _PROBE_CACHE_RETENTION_DAYS * 86400
-                state_cutoff = now - _AUDIT_STATE_RETENTION_DAYS * 86400
-                cache_changed = self._db.query(SUBTITLEPROBECACHE).filter(
-                    SUBTITLEPROBECACHE.UPDATED_AT < cache_cutoff
-                ).delete(synchronize_session=False)
-                cache_overflow = [
-                    row[0] for row in self._db.query(SUBTITLEPROBECACHE.ID).order_by(
-                        SUBTITLEPROBECACHE.UPDATED_AT.desc()
-                    ).offset(_PROBE_CACHE_MAX_ROWS).all()
-                ]
-                if cache_overflow:
-                    cache_changed += self._db.query(SUBTITLEPROBECACHE).filter(
-                        SUBTITLEPROBECACHE.ID.in_(cache_overflow)
+                try:
+                    cache_cutoff = now - _PROBE_CACHE_RETENTION_DAYS * 86400
+                    state_cutoff = now - _AUDIT_STATE_RETENTION_DAYS * 86400
+                    cache_changed = self._db.query(SUBTITLEPROBECACHE).filter(
+                        SUBTITLEPROBECACHE.UPDATED_AT < cache_cutoff
                     ).delete(synchronize_session=False)
-                state_changed = self._db.query(SUBTITLEAUDITSTATE).filter(
-                    SUBTITLEAUDITSTATE.UPDATED_AT < state_cutoff
-                ).delete(synchronize_session=False)
-                state_overflow = [
-                    row[0] for row in self._db.query(SUBTITLEAUDITSTATE.ID).order_by(
-                        SUBTITLEAUDITSTATE.UPDATED_AT.desc()
-                    ).offset(_AUDIT_STATE_MAX_ROWS).all()
-                ]
-                if state_overflow:
-                    state_changed += self._db.query(SUBTITLEAUDITSTATE).filter(
-                        SUBTITLEAUDITSTATE.ID.in_(state_overflow)
+                    cache_overflow = [
+                        row[0] for row in self._db.query(SUBTITLEPROBECACHE.ID).order_by(
+                            SUBTITLEPROBECACHE.UPDATED_AT.desc()
+                        ).offset(_PROBE_CACHE_MAX_ROWS).all()
+                    ]
+                    if cache_overflow:
+                        cache_changed += self._db.query(SUBTITLEPROBECACHE).filter(
+                            SUBTITLEPROBECACHE.ID.in_(cache_overflow)
+                        ).delete(synchronize_session=False)
+                    state_changed = self._db.query(SUBTITLEAUDITSTATE).filter(
+                        SUBTITLEAUDITSTATE.UPDATED_AT < state_cutoff
                     ).delete(synchronize_session=False)
-                if cache_changed or state_changed:
+                    state_overflow = [
+                        row[0] for row in self._db.query(SUBTITLEAUDITSTATE.ID).order_by(
+                            SUBTITLEAUDITSTATE.UPDATED_AT.desc()
+                        ).offset(_AUDIT_STATE_MAX_ROWS).all()
+                    ]
+                    if state_overflow:
+                        state_changed += self._db.query(SUBTITLEAUDITSTATE).filter(
+                            SUBTITLEAUDITSTATE.ID.in_(state_overflow)
+                        ).delete(synchronize_session=False)
+                    # DELETE starts a SQLite write transaction even when it matches
+                    # zero rows. Always finish it before the worker goes idle.
                     self._db.commit()
-                if state_changed:
-                    self._invalidate_audit_snapshot_cache()
-                self._last_persistent_cache_cleanup = now
+                    if state_changed:
+                        self._invalidate_audit_snapshot_cache()
+                    self._last_persistent_cache_cleanup = now
+                except Exception:
+                    self._db.rollback()
+                    raise
             active_ids = {
                 str(row[0]) for row in self._db.query(SUBTITLETASK.ID).filter(
                     SUBTITLETASK.TYPE == "upload",

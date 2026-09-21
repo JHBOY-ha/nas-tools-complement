@@ -189,7 +189,7 @@ class MediaServer:
 
     def get_no_exists_episodes(self, meta_info,
                                season_number,
-                               episode_count):
+                               episode_count, episode_numbers=None):
         """
         根据标题、年份、季、总集数，查询媒体服务器中缺少哪几集
         :param meta_info: 已识别的需要查询的媒体信息
@@ -201,7 +201,7 @@ class MediaServer:
             return None
         return self.server.get_no_exists_episodes(meta_info,
                                                   season_number,
-                                                  episode_count)
+                                                  episode_count, episode_numbers=episode_numbers)
 
     def get_movies(self, title, year=None):
         """
