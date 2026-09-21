@@ -1,11 +1,13 @@
+{% set subtitle_config = Config.subtitle or {} %}
 <div class="container-xl">
   <!-- Page title -->
   <div class="page-header d-print-none">
     <div class="row align-items-center">
       <div class="col">
         <h2 class="page-title">
-          字幕
+          字幕设置
         </h2>
+        <div class="text-muted mt-1">统一配置在线字幕源与自动字幕下载器</div>
       </div>
     </div>
   </div>
@@ -15,9 +17,8 @@
   <div class="container-xl">
     <div class="d-grid gap-3 grid-normal-card">
       <a class="card card-link-pop p-3" href="#" data-bs-toggle="modal" data-bs-target="#modal-online-subtitles">
-        <div class="card-body text-center"><div class="card-title">在线字幕</div><div class="text-muted">迅雷 · Assrt 名称检索与下载</div></div>
+        <div class="card-body text-center"><div class="card-title">在线字幕（迅雷 / Assrt）</div><div class="text-muted">迅雷无需配置 · Assrt {{ "已配置 Token" if (subtitle_config.get("assrt") or {}).get("token") else "未配置 Token" }}</div></div>
       </a>
-      {% if ChromeOk %}
       <a class="card card-link-pop p-0" href="#" data-bs-toggle="modal" data-bs-target="#modal-opensubtitles">
         <div class="card-cover card-cover-blurred text-center">
           <span class="avatar avatar-xl avatar-thumb avatar-rounded"
@@ -26,11 +27,10 @@
         </div>
         <div class="card-body text-center">
           <div class="card-title mb-1">OpenSubtitles</div>
-          <div class="text-muted">{% if Config.subtitle %}{% if Config.subtitle.server == "opensubtitles" %}<span
+          <div class="text-muted">{% if subtitle_config %}{% if subtitle_config.server == "opensubtitles" %}<span
                   class="badge bg-green" title="已开启"></span> 正在使用{% endif %}{% endif %}</div>
         </div>
       </a>
-      {% endif %}
       <a class="card card-link-pop p-0" href="#" data-bs-toggle="modal"
          data-bs-target="#modal-chinesesubfinder">
         <div class="card-cover card-cover-blurred text-center bg-lime">
@@ -40,7 +40,7 @@
         </div>
         <div class="card-body text-center">
           <div class="card-title mb-1">ChineseSubFinder</div>
-          <div class="text-muted">{% if Config.subtitle %}{% if Config.subtitle.server == "chinesesubfinder" %}<span
+          <div class="text-muted">{% if subtitle_config %}{% if subtitle_config.server == "chinesesubfinder" %}<span
                   class="badge bg-green" title="已开启"></span> 正在使用{% endif %}{% endif %}</div>
         </div>
       </a>
@@ -56,12 +56,13 @@
         <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
       </div>
       <div class="modal-body">
+        {% if not ChromeOk %}<div class="alert alert-warning">当前浏览器组件不可用，OpenSubtitles 下载需要先配置浏览器组件；迅雷与 Assrt 不受影响。</div>{% endif %}
         <div class="row">
           <div class="col">
             <div class="mb-3">
               <label class="form-check form-switch">
                 <input class="form-check-input" type="checkbox" id="subtitle.opensubtitles.enable" {% if
-                  Config.subtitle.opensubtitles and Config.subtitle.opensubtitles.enable %}checked{% endif %}>
+                  subtitle_config.opensubtitles and subtitle_config.opensubtitles.enable %}checked{% endif %}>
                 <span class="form-check-label">开启opensubtitles.org字幕下载 <span class="form-help"
                                                                                    title="需要确保网络能正常连通www.opensubtitles.org"
                                                                                    data-bs-toggle="tooltip">?</span></span>
@@ -94,7 +95,7 @@
                                                                   title="配置IP地址和端口，如为https则需要增加https://前缀"
                                                                   data-bs-toggle="tooltip">?</span></label>
               <input type="text"
-                     value="{% if Config.subtitle %}{% if Config.subtitle.chinesesubfinder %}{{ Config.subtitle.chinesesubfinder.host or '' }}{% endif %}{% endif %}"
+                     value="{% if subtitle_config %}{% if subtitle_config.chinesesubfinder %}{{ subtitle_config.chinesesubfinder.host or '' }}{% endif %}{% endif %}"
                      id="subtitle.chinesesubfinder.host" class="form-control" placeholder="http://127.0.0.1:19035">
             </div>
           </div>
@@ -104,7 +105,7 @@
                                                                title="在ChineseSubFinder->配置中心->实验室->API Key处生成"
                                                                data-bs-toggle="tooltip">?</span></label>
               <input type="text"
-                     value="{% if Config.subtitle %}{% if Config.subtitle.chinesesubfinder %}{{ Config.subtitle.chinesesubfinder.api_key or '' }}{% endif %}{% endif %}"
+                     value="{% if subtitle_config %}{% if subtitle_config.chinesesubfinder %}{{ subtitle_config.chinesesubfinder.api_key or '' }}{% endif %}{% endif %}"
                      id="subtitle.chinesesubfinder.api_key" class="form-control">
             </div>
           </div>
@@ -116,7 +117,7 @@
                                                        title="NASTool本地媒体库的路径，如为Docker安装则为映射路径，如NASTool与ChineseSubFinder的媒体目录路径一致则不用配置"
                                                        data-bs-toggle="tooltip">?</span></label>
               <input type="text"
-                     value="{% if Config.subtitle %}{% if Config.subtitle.chinesesubfinder %}{{ Config.subtitle.chinesesubfinder.local_path or '' }}{% endif %}{% endif %}"
+                     value="{% if subtitle_config %}{% if subtitle_config.chinesesubfinder %}{{ subtitle_config.chinesesubfinder.local_path or '' }}{% endif %}{% endif %}"
                      id="subtitle.chinesesubfinder.local_path" class="form-control filetree-folders-only"
                      placeholder="本地映射路径" autocomplete="off">
             </div>
@@ -127,7 +128,7 @@
                                                        title="ChineseSubFinder的媒体目录映射路径，会用此路径替换掉本地路径后传递给ChineseSubFinder下载字幕，如NASTool与ChineseSubFinder的媒体目录路径一致则不用配置"
                                                        data-bs-toggle="tooltip">?</span></label>
               <input type="text"
-                     value="{% if Config.subtitle %}{% if Config.subtitle.chinesesubfinder %}{{ Config.subtitle.chinesesubfinder.remote_path or '' }}{% endif %}{% endif %}"
+                     value="{% if subtitle_config %}{% if subtitle_config.chinesesubfinder %}{{ subtitle_config.chinesesubfinder.remote_path or '' }}{% endif %}{% endif %}"
                      id="subtitle.chinesesubfinder.remote_path" class="form-control" placeholder="远程映射路径"
                      autocomplete="off">
             </div>
@@ -170,8 +171,8 @@
     <div class="modal-body">
       <p>迅雷无需配置。Assrt 按影片名称检索，需要 <a href="https://assrt.net/usercp.php" target="_blank" rel="noopener noreferrer">Assrt API Token</a>。</p>
       <label for="subtitle.assrt.token" class="form-label">Assrt API Token</label>
-      <input id="subtitle.assrt.token" type="password" autocomplete="new-password" class="form-control" value="{{ ((Config.subtitle or {}).get('assrt') or {}).get('token') or '' }}">
+      <input id="subtitle.assrt.token" type="password" autocomplete="new-password" class="form-control" value="{{ ((subtitle_config or {}).get('assrt') or {}).get('token') or '' }}">
     </div>
-    <div class="modal-footer"><button type="button" class="btn btn-primary" onclick="ajax_post('update_config', input_select_GetVal('modal-online-subtitles'), function(ret) { if (ret.code === 0) { $('#modal-online-subtitles').modal('hide'); } else { show_fail_modal(ret.msg || '保存失败'); } });">保存</button></div>
+    <div class="modal-footer"><button type="button" class="btn btn-primary" onclick="ajax_post('update_config', input_select_GetVal('modal-online-subtitles'), function(ret) { if (ret.code === 0) { $('#modal-online-subtitles').modal('hide'); window_history_refresh(); } else { show_fail_modal(ret.msg || '保存失败'); } });">保存</button></div>
   </div></div>
 </div>

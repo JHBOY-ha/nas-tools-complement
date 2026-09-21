@@ -220,7 +220,7 @@ class OnlineSubtitles:
                 warnings.append("迅雷检索失败，请稍后重试")
         if provider in ("all", "assrt"):
             if not self.token:
-                warnings.append("Assrt 未配置 API Token，请在设置 → 字幕 → 在线字幕中配置")
+                warnings.append("Assrt 未配置 API Token，请在设置 → 字幕设置 → 在线字幕中配置")
             else:
                 try:
                     data = self._json("https://api.assrt.net/v1/sub/search",

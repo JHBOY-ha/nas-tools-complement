@@ -27,6 +27,7 @@
               <div class="card-subtitle mt-1">筛选媒体后，可上传字幕或按分类检测影视服务器识别情况</div>
             </div>
             <div class="card-actions">
+              <button class="btn" type="button" onclick="navmenu('subtitle')">字幕设置</button>
               <button class="btn btn-outline-primary" type="button" onclick="run_library_subtitle_audit()">
                 {{ SVG.check() }}
                 检测外挂字幕
@@ -368,7 +369,7 @@
           <button id="library_online_search" class="btn btn-primary" type="submit">检索字幕</button>
         </form>
         <div class="text-muted small mt-2">默认包含媒体名、原名、年份和季集；可修改或删除关键词，按回车或“检索字幕”重新搜索。剧集始终限定当前季集。</div>
-        <div class="text-muted small mt-2">按片名、年份和当前季集校验结果；文件特征匹配优先。字幕包仅列出明确匹配本集的文件。Assrt 需在设置 → 字幕中配置 Token。</div>
+        <div class="text-muted small mt-2">按片名、年份和当前季集校验结果；文件特征匹配优先。字幕包仅列出明确匹配本集的文件。Assrt 需在“设置 → 字幕设置”中配置 Token。</div>
         <div id="library_online_results" class="mt-3" aria-live="polite"></div>
       </div>
     </div>
