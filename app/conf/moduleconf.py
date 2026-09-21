@@ -560,7 +560,7 @@ class ModuleConf(object):
         "webservice.fanart.tv",
         "api.telegram.org",
         "qyapi.weixin.qq.com",
-        "www.opensubtitles.org"
+        "api.opensubtitles.com"
     ]
 
     # 动漫相关网络测试对象

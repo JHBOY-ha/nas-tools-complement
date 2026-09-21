@@ -189,6 +189,16 @@ body, .page {
     gap: 0.5rem;
 }
 
+/* 字幕库任务入口共用任务中心的触控高度，宽度继承同一 btn 内边距和图标规则。 */
+.lit-library-task-action {
+    min-height: 2.75rem;
+}
+
+/* 文件管理任务入口沿用默认 btn 尺寸，与转移目录一致；覆盖任务中心动态注入的最小高度。 */
+.btn.mediafile-task-action {
+    min-height: 0;
+}
+
 .lit-library-result-bar {
     min-height: 2rem;
     display: flex;
@@ -644,4 +654,14 @@ body, .page {
     .lit-library-help-status-grid {
         grid-template-columns: 1fr;
     }
+}
+
+/* 字幕帮助继承基础设置 form-help 的尺寸与配色，仅补充弹性布局和键盘焦点。 */
+.subtitle-help {
+    flex-shrink: 0;
+}
+
+.subtitle-help:focus-visible {
+    outline: 2px solid var(--tblr-primary);
+    outline-offset: 2px;
 }

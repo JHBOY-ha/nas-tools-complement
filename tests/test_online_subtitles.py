@@ -262,28 +262,31 @@ class OnlineSubtitleRouteTest(unittest.TestCase):
         self.assertEqual(payload['path'], '/library/Show.S02E03.mkv')
         self.assertEqual(payload['item']['target'], {'season': 2, 'episode': 3})
 
-    def test_download_reuses_validated_upload_and_refreshes_library(self):
+    def test_download_uses_bounded_upload_queue_and_path_authorization(self):
         service = Mock()
         service.files.return_value = ('subtitle.srt', b'1\n00:00:01,000 --> 00:00:02,000\nHello\n')
-        subtitle = Mock()
-        subtitle.upload_subtitle.return_value = (True, 'saved', {'synced': True})
-        library = Mock()
-        server = Mock()
-        server.refresh_root_library_by_type.return_value = True
+        manager = Mock()
+        manager.submit_upload.return_value = ({'task_id': 'task-1'}, False)
         self.ns.update(_online_subtitle_service=lambda: service,
                        _online_subtitle_media_path=lambda path: path,
-                       Subtitle=lambda: subtitle, MediaLibrary=library,
-                       MediaServer=lambda: server, Config=lambda: types.SimpleNamespace(get_config=lambda key: {'media_server': 'jellyfin'}))
+                       _subtitle_tasks=lambda: manager,
+                       _get_all_media_library_root_paths=lambda: ['/library'],
+                       _path_authorization_snapshot=lambda path, roots: {'real_path': path},
+                       _subtitle_task_owner=lambda: 'user',
+                       _subtitle_task_response=lambda task, reused, message: {'code': 0, 'task_id': task['task_id']},
+                       Config=lambda: types.SimpleNamespace(get_config=lambda key: {'media_server': 'jellyfin'}))
         ticket = self.ns['_online_subtitle_signer']().dumps({'user': 'user', 'path': '/library/movie.mkv', 'item': {}})
         with self.app.test_request_context(json={'ticket': ticket}):
             result = self.ns['library_online_subtitle_download']()
-        self.assertEqual(result['code'], 0)
-        args, kwargs = subtitle.upload_subtitle.call_args
-        self.assertEqual(args[1], '/library/movie.mkv')
-        self.assertEqual(kwargs['target_media_file'], '/library/movie.mkv')
-        self.assertEqual(kwargs['server_type'], 'jellyfin')
-        library.invalidate_subtitle_directory_cache.assert_called_once_with('/library/movie.mkv')
-        server.refresh_root_library_by_type.assert_called_once_with('jellyfin')
+        self.assertEqual(result, {'code': 0, 'task_id': 'task-1'})
+        kwargs = manager.submit_upload.call_args.kwargs
+        self.assertEqual(kwargs['payload']['canonical_media_file'], '/library/movie.mkv')
+        self.assertEqual(kwargs['payload']['path_authorization']['target']['real_path'], '/library/movie.mkv')
+        self.assertEqual(kwargs['server'], 'jellyfin')
+        self.assertEqual(kwargs['files'][0].filename, 'subtitle.srt')
+        self.assertTrue(kwargs['request_id'].startswith('online-'))
+        manager.acquire_upload_admission.assert_called_once()
+        manager.release_upload_admission.assert_called_once()
 
     def test_media_path_rejects_symlink_outside_library(self):
         with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as outside:

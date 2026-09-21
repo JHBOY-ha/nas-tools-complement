@@ -3,6 +3,7 @@ from app.utils.types import MediaServerType
 
 import log
 import json
+import os
 from config import Config
 from app.mediaserver.client._base import _IMediaClient
 from plexapi.myplex import MyPlexAccount
@@ -170,6 +171,77 @@ class Plex(_IMediaClient):
             return False
         return self._plex.library.update()
 
+    def refresh_subtitle_target(self, server_item_id=None,
+                                parent_server_item_id=None,
+                                library_id=None, media_path=None):
+        """刷新 Plex 精确项目；项目不可用时仅刷新可信 section 下的目标目录。"""
+        if not self._plex:
+            return {"status": "failed", "scope": "none", "message": "Plex 未连接"}
+        item_ids = []
+        if server_item_id:
+            item_ids.append((server_item_id, "item"))
+        if parent_server_item_id and str(parent_server_item_id) != str(server_item_id or ""):
+            item_ids.append((parent_server_item_id, "parent"))
+        for item_id, scope in item_ids:
+            try:
+                item = self._plex.fetchItem(item_id)
+                if item and hasattr(item, "refresh"):
+                    item.refresh()
+                    return {
+                        "status": "refreshed", "scope": scope,
+                        "item_id": item_id,
+                        "message": "已刷新 Plex 项目" if scope == "item" else "已刷新 Plex 父剧集"
+                    }
+            except Exception as e:
+                ExceptionUtils.exception_traceback(e)
+
+        if not library_id or not media_path:
+            return {
+                "status": "skipped", "scope": "none",
+                "message": "缺少可信 Plex section 或目标路径，已跳过刷新"
+            }
+        target_dir = os.path.dirname(os.path.abspath(os.path.normpath(media_path)))
+        try:
+            section = self._plex.library.sectionByID(library_id)
+            locations = [
+                os.path.abspath(os.path.normpath(path))
+                for path in (getattr(section, "locations", None) or []) if path
+            ]
+            mapped = False
+            for root in locations:
+                try:
+                    if os.path.normcase(os.path.commonpath([target_dir, root])) \
+                            == os.path.normcase(root):
+                        mapped = True
+                        break
+                except (OSError, ValueError, TypeError):
+                    # Multi-location Plex sections may span Windows drives.
+                    # An incompatible root must not hide a later valid one.
+                    continue
+            if not section or not mapped:
+                return {
+                    "status": "skipped", "scope": "path",
+                    "message": "目标目录不在已验证的 Plex section 映射内"
+                }
+            section.update(path=target_dir)
+            return {
+                "status": "refreshed", "scope": "path",
+                "library_id": library_id, "path": target_dir,
+                "message": "已刷新 Plex section 的目标父目录"
+            }
+        except (OSError, ValueError) as e:
+            ExceptionUtils.exception_traceback(e)
+            return {
+                "status": "skipped", "scope": "path",
+                "message": "无法验证 Plex section 路径映射"
+            }
+        except Exception as e:
+            ExceptionUtils.exception_traceback(e)
+            return {
+                "status": "failed", "scope": "path",
+                "message": "Plex 目标目录刷新失败"
+            }
+
     def get_libraries(self):
         """
         获取媒体服务器所有媒体库列表
@@ -218,6 +290,35 @@ class Plex(_IMediaClient):
         except Exception as err:
             ExceptionUtils.exception_traceback(err)
         yield {}
+
+    def get_episodes(self, series_id):
+        """返回带真实 ratingKey、父剧集和 section 标识的 Plex 剧集。"""
+        if not series_id or not self._plex:
+            return []
+        episodes = []
+        try:
+            series = self._plex.fetchItem(series_id)
+            for episode in series.episodes() if series else []:
+                item_path = self.__item_path(episode)
+                item_id = getattr(episode, "ratingKey", None) or getattr(episode, "key", None)
+                parent_id = getattr(episode, "grandparentRatingKey", None) or series_id
+                episodes.append({
+                    "id": item_id,
+                    "server_item_id": item_id,
+                    "series_id": parent_id,
+                    "parent_server_item_id": parent_id,
+                    "library": getattr(episode, "librarySectionID", None),
+                    "library_id": getattr(episode, "librarySectionID", None),
+                    "type": getattr(episode, "type", "episode"),
+                    "title": getattr(episode, "title", ""),
+                    "season": getattr(episode, "seasonNumber", None),
+                    "episode": getattr(episode, "index", None),
+                    "path": item_path,
+                    "media_streams": []
+                })
+        except Exception as e:
+            ExceptionUtils.exception_traceback(e)
+        return episodes
 
     @staticmethod
     def __item_path(item):

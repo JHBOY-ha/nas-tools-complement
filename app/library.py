@@ -13,6 +13,7 @@ from app.db.media_db import MediaDb
 from app.helper.db_helper import DbHelper
 from app.helper.subtitle_health import SubtitleHealth
 from app.helper.online_subtitles import OnlineSubtitles
+from app.helper.subtitle_media_status import SubtitleMediaStatusStore
 from app.media.category import Category
 from app.mediaserver import MediaServer
 from app.utils import ExceptionUtils, PathUtils
@@ -27,6 +28,10 @@ class MediaLibrary:
     _subtitle_dir_cache_lock = threading.RLock()
     _subtitle_dir_cache_ttl = 30
     _subtitle_dir_cache_limit = 4096
+    _poster_cache = {}
+    _poster_cache_lock = threading.RLock()
+    _poster_success_ttl = 3600
+    _poster_failure_ttl = 300
     _chinese_sub_re = re.compile(
         r"(^|[.\-_\[\( ])(zh[-_]?(cn|hans|chs|sg|sc|tw|hant|cht|hk)|"
         r"zho|chi|chs|cht|cn|sc|tc|简|简中|简体|繁|繁中|繁体|中文|中文字幕)"
@@ -44,14 +49,21 @@ class MediaLibrary:
         self.dbhelper = DbHelper()
         self.category = Category()
         self.media_server = MediaServer()
+        self.subtitle_status_store = SubtitleMediaStatusStore()
 
     def list_items(self, data=None):
         """
         查询首页媒体库展示数据
         """
         data = data or {}
+        requested_server = str(data.get("server") or "").strip()
         current_server_type = self.media_server.get_type()
-        server_type = current_server_type.value if current_server_type else Config().get_config('media').get('media_server')
+        server_type = requested_server or (
+            current_server_type.value if current_server_type
+            else Config().get_config('media').get('media_server')
+        )
+        if str(server_type or "").strip().lower() not in ["emby", "jellyfin", "plex"]:
+            return {"code": -1, "msg": "影视服务器配置无效"}
         media_type = data.get("type") or "all"
         category = data.get("category") or ""
         subtitle = data.get("subtitle") or "all"
@@ -68,12 +80,13 @@ class MediaLibrary:
         rows = self.mediadb.list_items(server_type=server_type)
         transfer_histories = self.dbhelper.get_transfer_histories_with_dest()
         transfer_history_index = self.__build_transfer_history_index(transfer_histories)
-        audit_snapshots = self.__latest_audit_snapshots(server_type)
-        movie_audit_snapshot = audit_snapshots["movie"]
         items = []
         categories = {"movie": set(), "tv": set(), "anime": set()}
         for row in rows:
-            item = self.__build_item(row, transfer_histories=transfer_history_index, include_status=False)
+            item = self.__build_item(
+                row, transfer_histories=transfer_history_index,
+                include_status=False, verify_paths=False
+            )
             if not item:
                 continue
             if item["media_type"] in categories:
@@ -86,24 +99,36 @@ class MediaLibrary:
                 continue
             items.append(item)
 
+        # Default browsing is page-first: SQLite subtitle state is fetched only
+        # for the visible paths.  Filters/sorts expand the target set solely to
+        # already business-filtered candidates and load only the needed state.
+        candidate_paths = self.__item_media_paths(items)
+        needs_candidate_status = subtitle != "all" or sort_by in ["internal", "external"]
+        needs_candidate_audit = sort_by in ["external", "audit"]
+        status_snapshots = self.__status_snapshots_for_paths(
+            server_type, candidate_paths
+        ) if needs_candidate_status else {}
+        audit_snapshots = self.__latest_audit_snapshots(
+            server_type, candidate_paths
+        ) if needs_candidate_audit else {"movie": {}, "tv": {}, "anime": {}}
+
         if subtitle != "all":
             enriched_items = []
             for item in items:
-                self.__fill_subtitle_summary(
-                    item,
-                    allow_ffprobe=False,
-                    audit_snapshot=movie_audit_snapshot
+                self.__fill_snapshot_subtitle_summary(
+                    item, status_snapshots, (audit_snapshots.get("movie") or {})
                 )
                 if subtitle == "missing" and item["subtitle_status"] != "missing_chinese":
                     continue
-                if subtitle == "ok" and item["subtitle_status"] == "missing_chinese":
+                if subtitle == "ok" and item["subtitle_status"] not in [
+                        "has_chinese_external", "has_chinese_internal"]:
                     continue
                 enriched_items.append(item)
             items = enriched_items
 
         if sort_by != "default":
             for item in items:
-                self.__fill_sort_metrics(item, audit_snapshots)
+                self.__fill_sort_metrics(item, audit_snapshots, status_snapshots)
             items.sort(key=lambda item: (
                 str(item.get("title") or item.get("original_title") or "").lower(),
                 str(item.get("year") or ""),
@@ -118,16 +143,20 @@ class MediaLibrary:
         start = (page - 1) * page_size
         end = start + page_size
         page_items = items[start:end]
+        page_paths = self.__item_media_paths(page_items)
+        if not needs_candidate_status:
+            status_snapshots = self.__status_snapshots_for_paths(server_type, page_paths)
+        if not needs_candidate_audit:
+            audit_snapshots = self.__latest_audit_snapshots(server_type, page_paths)
+        movie_audit_snapshot = audit_snapshots.get("movie") or {}
         for item in page_items:
-            if not item.get("subtitle_status"):
-                self.__fill_subtitle_summary(
-                    item,
-                    allow_ffprobe=False,
-                    audit_snapshot=movie_audit_snapshot
-                )
+            self.__fill_snapshot_subtitle_summary(
+                item, status_snapshots, movie_audit_snapshot
+            )
             for key in ["_sort_internal", "_sort_external", "_sort_audit"]:
                 item.pop(key, None)
             item.pop("media_streams", None)
+            item.pop("media_streams_known", None)
             item.pop("linked_episodes", None)
         return {
             "code": 0,
@@ -147,8 +176,14 @@ class MediaLibrary:
         item_id = data.get("item_id")
         if not item_id:
             return {"code": -1, "msg": "缺少媒体项目ID"}
+        requested_server = str(data.get("server") or "").strip()
         current_server_type = self.media_server.get_type()
-        server_type = current_server_type.value if current_server_type else Config().get_config('media').get('media_server')
+        server_type = requested_server or (
+            current_server_type.value if current_server_type
+            else Config().get_config('media').get('media_server')
+        )
+        if str(server_type or "").strip().lower() not in ["emby", "jellyfin", "plex"]:
+            return {"code": -1, "msg": "影视服务器配置无效"}
         row = None
         for media_item in self.mediadb.list_items(server_type=server_type):
             if str(media_item.ITEM_ID) == str(item_id):
@@ -158,16 +193,36 @@ class MediaLibrary:
             return {"code": -1, "msg": "未找到媒体库同步项目"}
         media_type, _ = self.classify_path(row.PATH, row.ITEM_TYPE)
         matches = self.__find_transfer_matches(row, media_type, self.dbhelper.get_transfer_histories_with_dest())
-        episodes = self.__series_history_items(matches)
+        server_episodes = self.__get_server_episodes(server_type, item_id)
+        episodes = self.__series_history_items(
+            matches,
+            server_episodes=server_episodes,
+            parent_server_item_id=row.ITEM_ID,
+            library_id=row.LIBRARY
+        )
         if not episodes:
-            episodes = self.media_server.get_episodes(item_id) or []
+            episodes = server_episodes
         ret_items = []
         for episode in episodes:
             media_path = episode.get("path") or ""
             season_number, episode_number = self.resolve_episode_numbers(episode)
-            status = self.detect_subtitle_status(media_path, episode.get("media_streams") or [])
+            snapshot = self.__status_store().get(server_type, media_path)
+            status = self.__status_from_snapshot(
+                snapshot, episode.get("media_streams") or [],
+                streams_known=episode.get(
+                    "media_streams_known", "media_streams" in episode
+                )
+            )
+            server_item_id = episode.get("server_item_id") or episode.get("id")
+            parent_server_item_id = episode.get("parent_server_item_id") \
+                or episode.get("series_id") or row.ITEM_ID
+            library_id = episode.get("library_id") or episode.get("library") or row.LIBRARY
             ret_items.append({
-                "id": episode.get("id"),
+                "id": server_item_id,
+                "history_id": episode.get("history_id"),
+                "server_item_id": server_item_id,
+                "parent_server_item_id": parent_server_item_id,
+                "library_id": library_id,
                 "title": episode.get("title") or "",
                 "season": season_number,
                 "episode": episode_number,
@@ -176,14 +231,30 @@ class MediaLibrary:
                 "subtitle_status": status.get("status"),
                 "subtitle_label": status.get("label"),
                 "subtitle_badge": status.get("badge"),
-                "can_upload": bool(media_path and os.path.isfile(media_path))
+                "subtitle_status_source": status.get("source") or "",
+                "subtitle_status_checked_at": status.get("checked_at") or "",
+                "can_upload": bool(media_path and (not snapshot or snapshot.get("media_exists") is not False))
             })
         return {"code": 0, "items": ret_items, "total": len(ret_items)}
 
-    def audit_external_subtitles(self, category, subcategory=None):
-        """按媒体分类检测外挂字幕能否被当前影视服务器识别。"""
+    def audit_external_subtitles(self, category, subcategory=None, server_type=None,
+                                 mode="linked", deep_confirmed=False,
+                                 cancel_check=None, limits=None,
+                                 progress_callback=None, cache_get=None,
+                                 cache_put=None, heavy_operation=None,
+                                 persist_history=True):
+        """按媒体分类检测外挂字幕能否被指定影视服务器识别。
+
+        默认只从 ``TRANSFER_HISTORY`` 取得已链接目标，按目录一次枚举；深度
+        扫描必须显式选择并确认。缺少转移历史访问器时失败关闭，绝不隐式深扫。
+        """
         media_config = Config().get_config('media') or {}
-        server_type = str(media_config.get('media_server') or "emby").lower()
+        server_type = str(server_type or media_config.get('media_server') or "emby").lower()
+        mode = str(mode or "linked").lower()
+        if mode not in ["linked", "deep"]:
+            return {"code": -1, "msg": "字幕检测范围无效"}
+        if mode == "deep" and not deep_confirmed:
+            return {"code": -1, "msg": "深度目录扫描需要明确确认", "confirmation_required": True}
         category = str(category or "").lower()
         subcategory = str(subcategory or "").strip()
         category_config = {
@@ -204,26 +275,68 @@ class MediaLibrary:
             path = str(path or "").strip()
             if path and path not in roots:
                 roots.append(path)
-        if not roots:
+        if mode == "deep" and not roots:
             return {"code": -1, "msg": f"全局设置中未配置{category_name}媒体库目录"}
         if subcategory:
             valid_subcategories = set(self.__category_names(category))
             if subcategory not in valid_subcategories:
                 return {"code": -1, "msg": f"{category_name}小分类无效或已从分类配置中删除"}
             roots = [os.path.join(root, subcategory) for root in roots]
-        result = SubtitleHealth.audit_roots(roots, server_type)
+
+        limits = limits or {}
+        issue_limit = self.__safe_limit(limits.get("issue_limit"), 200, 1, 1000)
+        subtitle_limit = self.__safe_limit(
+            limits.get("subtitle_limit") or limits.get("max_subtitles"), 10000, 1, 100000
+        )
+        time_limit = self.__safe_limit(
+            limits.get("time_limit_seconds") or limits.get("max_seconds"), 3600, 1, 86400
+        )
+        directory_limit = self.__safe_limit(
+            limits.get("directory_limit") or limits.get("max_directories"), 50000, 1, 500000
+        )
+        probe_timeout = self.__safe_limit(
+            limits.get("probe_timeout_seconds"), 10, 1, 600
+        )
+        if mode == "deep":
+            result = SubtitleHealth.audit_roots(
+                roots, server_type, issue_limit=issue_limit,
+                directory_limit=directory_limit, subtitle_limit=subtitle_limit,
+                time_limit_seconds=time_limit, probe_timeout_seconds=probe_timeout,
+                cancel_check=cancel_check,
+                progress_callback=progress_callback, cache_get=cache_get,
+                cache_put=cache_put, heavy_operation=heavy_operation
+            )
+        else:
+            if not hasattr(self, "dbhelper"):
+                return {"code": -1, "msg": "无法读取转移历史，已拒绝隐式目录扫描"}
+            linked_media = self.__linked_audit_media_files(category, subcategory)
+            result = SubtitleHealth.audit_linked_media(
+                linked_media, server_type, issue_limit=issue_limit,
+                directory_limit=directory_limit, subtitle_limit=subtitle_limit,
+                time_limit_seconds=time_limit, probe_timeout_seconds=probe_timeout,
+                cancel_check=cancel_check, progress_callback=progress_callback,
+                cache_get=cache_get, cache_put=cache_put,
+                heavy_operation=heavy_operation
+            )
         result["category"] = category
         result["category_name"] = category_name
         result["subcategory"] = subcategory
         result["scope_name"] = f"{category_name} / {subcategory}" if subcategory else f"全部{category_name}"
-        try:
-            result["history"] = self.__save_subtitle_audit(result)
-        except Exception as e:
-            ExceptionUtils.exception_traceback(e)
-            log.error("【MediaLibrary】保存字幕检测记录失败：%s" % str(e))
-            result["history"] = self.get_external_subtitle_audit_history().get("history") or []
-            result["history_warning"] = "检测完成，但保存检测记录失败"
-        result.pop("media_statuses", None)
+        if persist_history and not result.get("canceled") and result.get("code") == 0:
+            try:
+                result["history"] = self.__save_subtitle_audit(result)
+            except Exception as e:
+                ExceptionUtils.exception_traceback(e)
+                log.error("【MediaLibrary】保存字幕检测记录失败：%s" % str(e))
+                result["history"] = self.get_external_subtitle_audit_history().get("history") or []
+                result["history_warning"] = "检测完成，但保存检测记录失败"
+            self.__status_store().upsert_many(
+                server_type, result.get("media_snapshots") or [], source="audit"
+            )
+            # 旧同步接口已在此落库，不返回可能很大的状态映射；后台任务以
+            # persist_history=False 保留映射并在终态事务中统一提交。
+            result.pop("media_statuses", None)
+            result.pop("media_snapshots", None)
         return result
 
     def get_external_subtitle_audit_history(self):
@@ -232,15 +345,78 @@ class MediaLibrary:
         return {"code": 0, "history": store.get("history") or []}
 
     @classmethod
-    def update_external_subtitle_audit_status(cls, media_file, server_type):
+    def update_external_subtitle_snapshot(cls, media_file, server_type,
+                                          subtitle_files=None, complete=False,
+                                          media_exists=True):
+        """Update one media snapshot without enumerating its NAS directory.
+
+        ``complete`` is reserved for callers that just finished a full targeted
+        inspection.  Mutation fallbacks merge with the previous positive state
+        so a canceled task cannot erase an older Chinese-subtitle observation.
+        """
+        server_type = str(server_type or "emby").lower()
+        media_file = os.path.normpath(media_file or "")
+        if not media_file:
+            return {}
+        subtitle_files = [path for path in (subtitle_files or []) if path]
+        store = SubtitleMediaStatusStore()
+        previous = store.get(server_type, media_file) or {}
+        has_external = bool(subtitle_files) or (
+            not complete and bool(previous.get("has_external"))
+        )
+        has_chinese_external = any(
+            cls.__subtitle_filename_has_chinese(media_file, path)
+            for path in subtitle_files
+        ) or (not complete and bool(previous.get("has_chinese_external")))
+        snapshot = {
+            "media_path": media_file,
+            "media_exists": bool(media_exists),
+            "has_internal": previous.get("has_internal"),
+            "has_chinese_internal": previous.get("has_chinese_internal"),
+            "has_external": has_external,
+            "has_chinese_external": has_chinese_external,
+            "status": "has_chinese_external" if has_chinese_external else "external_checked",
+            "source": "post_process"
+        }
+        store.upsert_many(server_type, [snapshot], source="post_process")
+        return snapshot
+
+    @classmethod
+    def update_external_subtitle_audit_status(cls, media_file, server_type,
+                                              cancel_check=None,
+                                              probe_timeout_seconds=10,
+                                              heavy_operation=None,
+                                              known_subtitle_files=None):
         """二次处理后仅复检并更新单个电影的最新状态，不触发全库扫描。"""
         server_type = str(server_type or "emby").lower()
         media_file = os.path.normpath(media_file or "")
         if not media_file:
             return {}
-        results = SubtitleHealth.inspect_media_subtitles(media_file, server_type)
+        if cancel_check and cancel_check():
+            raise InterruptedError("媒体字幕状态复检已取消")
+        results = SubtitleHealth.inspect_media_subtitles(
+            media_file, server_type,
+            cancel_check=cancel_check,
+            probe_timeout_seconds=probe_timeout_seconds,
+            heavy_operation=heavy_operation
+        )
+        if cancel_check and cancel_check():
+            raise InterruptedError("媒体字幕状态复检已取消")
         aggregate = SubtitleHealth.aggregate_media_subtitles(results)
         checked_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        # This explicit post-processing check may touch exactly one media
+        # directory.  The library list later reads only this SQLite snapshot.
+        cls.update_external_subtitle_snapshot(
+            media_file, server_type,
+            subtitle_files=[
+                path for path in (
+                    [result.get("path") for result in results]
+                    + list(known_subtitle_files or [])
+                ) if path
+            ],
+            complete=True,
+            media_exists=os.path.isfile(media_file)
+        )
         key = os.path.normcase(media_file)
         with cls._subtitle_audit_lock:
             store = cls.__load_subtitle_audit_store()
@@ -269,16 +445,202 @@ class MediaLibrary:
             cls.__write_subtitle_audit_store(store)
         return aggregate
 
+    @classmethod
+    def __subtitle_filename_has_chinese(cls, media_file, subtitle_file):
+        """Classify a known subtitle path without reading its directory."""
+        subtitle_stem = os.path.splitext(os.path.basename(subtitle_file or ""))[0]
+        media_stem = os.path.splitext(os.path.basename(media_file or ""))[0]
+        if not subtitle_stem or not media_stem:
+            return False
+        if subtitle_stem.casefold() == media_stem.casefold():
+            # Preserve the library's historical behavior for an exact-name
+            # subtitle, which is treated as the media's primary subtitle.
+            return True
+        language_part = subtitle_stem[len(media_stem):] \
+            if subtitle_stem.casefold().startswith(media_stem.casefold()) else subtitle_stem
+        return bool(cls._chinese_sub_re.search(language_part))
+
     def get_external_subtitle_audit_categories(self):
         """返回当前分类 YAML 中配置的媒体小分类。"""
+        media_config = Config().get_config('media') or {}
+
+        def roots_for(key, fallback=None):
+            values = media_config.get(key) or (media_config.get(fallback) if fallback else []) or []
+            if isinstance(values, str):
+                values = [values]
+            return [os.path.normpath(str(value)) for value in values if str(value or "").strip()]
+
         return {
             "code": 0,
             "categories": {
                 "movie": self.__category_names("movie"),
                 "tv": self.__category_names("tv"),
                 "anime": self.__category_names("anime")
+            },
+            "roots": {
+                "movie": roots_for("movie_path"),
+                "tv": roots_for("tv_path"),
+                "anime": roots_for("anime_path", fallback="tv_path")
             }
         }
+
+    def validate_subtitle_refresh_context(self, media_path, server_type,
+                                          server_item_id=None,
+                                          parent_server_item_id=None,
+                                          library_id=None):
+        """用同步库、转移历史和真实剧集路径校验局部刷新上下文。
+
+        请求携带的 ID 只用于比对/缩小查询，绝不会原样透传。返回值中的 ID
+        全部来自媒体同步库或媒体服务器实时剧集响应。
+        """
+        server_type = str(server_type or "").strip().lower()
+        media_path = os.path.normpath(str(media_path or "").strip())
+        invalid = {
+            "valid": False,
+            "server": server_type,
+            "media_path": media_path,
+            "server_item_id": None,
+            "parent_server_item_id": None,
+            "library_id": None,
+            "reason": "无法将目标路径关联到已同步的媒体服务器项目"
+        }
+        if server_type not in ["emby", "jellyfin", "plex"] or not media_path:
+            invalid["reason"] = "媒体服务器或目标路径无效"
+            return invalid
+        if not os.path.isfile(media_path):
+            invalid["reason"] = "目标媒体文件不存在"
+            return invalid
+
+        claimed_item = str(server_item_id or "").strip()
+        claimed_parent = str(parent_server_item_id or "").strip()
+        claimed_library = str(library_id or "").strip()
+        normalized_path = os.path.normcase(os.path.abspath(media_path))
+        history_lookup = getattr(self.dbhelper, "get_transfer_histories_by_dest_full_path", None)
+        histories = (
+            history_lookup(media_path) if callable(history_lookup)
+            else self.dbhelper.get_transfer_histories_with_dest() or []
+        )
+        history_index = self.__build_transfer_history_index(histories)
+        find_items = getattr(self.mediadb, "find_items", None)
+        rows = []
+        if callable(find_items):
+            if claimed_parent:
+                rows = find_items(
+                    server_type=server_type, item_ids=[claimed_parent],
+                    library=claimed_library or None
+                )
+            elif claimed_item:
+                rows = find_items(
+                    server_type=server_type, item_ids=[claimed_item],
+                    library=claimed_library or None
+                )
+                # Episode IDs are not top-level media-sync rows.  Compatibility
+                # callers that omit the parent ID require the bounded fallback.
+                if not rows:
+                    rows = self.mediadb.list_items(server_type=server_type) or []
+            elif claimed_library:
+                rows = find_items(server_type=server_type, library=claimed_library)
+            else:
+                rows = find_items(server_type=server_type, path=media_path)
+                if not rows and histories:
+                    rows = self.mediadb.list_items(server_type=server_type) or []
+        else:
+            rows = self.mediadb.list_items(server_type=server_type) or []
+        for row in rows:
+            row_id = str(row.ITEM_ID or "")
+            row_library = str(row.LIBRARY or "")
+            item_type = str(row.ITEM_TYPE or "").lower()
+            is_series = item_type in ["series", "show"]
+            if claimed_parent and row_id != claimed_parent and is_series:
+                continue
+            if claimed_library and row_library != claimed_library:
+                continue
+
+            matched_histories = self.__find_transfer_matches(
+                row, "tv" if is_series else "movie", history_index
+            )
+            matching_history = None
+            for history in matched_histories:
+                target_file = self.__history_target_file(history)
+                if target_file and os.path.normcase(os.path.abspath(target_file)) == normalized_path:
+                    matching_history = history
+                    break
+            row_path_matches = bool(
+                row.PATH and os.path.normcase(os.path.abspath(os.path.normpath(row.PATH))) == normalized_path
+            )
+            if not is_series:
+                if not matching_history and not row_path_matches:
+                    continue
+                if claimed_item and claimed_item != row_id:
+                    invalid["reason"] = "媒体服务器项目 ID 与目标路径不匹配"
+                    return invalid
+                if claimed_parent:
+                    invalid["reason"] = "电影刷新不接受父剧集 ID"
+                    return invalid
+                return {
+                    "valid": True,
+                    "server": server_type,
+                    "media_type": "movie",
+                    "media_path": media_path,
+                    "server_item_id": row.ITEM_ID,
+                    "parent_server_item_id": None,
+                    "library_id": row.LIBRARY,
+                    "reason": "已通过媒体同步库和目标路径校验"
+                }
+
+            if not matching_history and not claimed_parent:
+                continue
+            server_episodes = self.__get_server_episodes(server_type, row.ITEM_ID)
+            expected_episode = None
+            expected_season_episode = str(
+                getattr(matching_history, "SEASON_EPISODE", "") or ""
+            ).upper()
+            for episode in server_episodes:
+                episode_path = str(episode.get("path") or "").strip()
+                episode_key = self.__season_episode(
+                    episode.get("season"), episode.get("episode")
+                ).upper()
+                if episode_path and os.path.normcase(os.path.abspath(episode_path)) == normalized_path:
+                    expected_episode = episode
+                    break
+                if matching_history and expected_season_episode and episode_key == expected_season_episode:
+                    expected_episode = episode
+            expected_item_id = (expected_episode or {}).get("server_item_id") \
+                or (expected_episode or {}).get("id")
+            if not matching_history and not expected_episode:
+                continue
+            if claimed_item and str(expected_item_id or "") != claimed_item:
+                invalid["reason"] = "剧集项目 ID 与目标路径不匹配或无法验证"
+                return invalid
+            if claimed_parent and claimed_parent != row_id:
+                invalid["reason"] = "父剧集 ID 与目标路径不匹配"
+                return invalid
+            return {
+                "valid": True,
+                "server": server_type,
+                "media_type": "series",
+                "media_path": media_path,
+                "server_item_id": expected_item_id,
+                "parent_server_item_id": row.ITEM_ID,
+                "library_id": row.LIBRARY,
+                "reason": "已通过转移历史、媒体同步库和剧集路径校验"
+            }
+        return invalid
+
+    def __linked_audit_media_files(self, category, subcategory=None):
+        """从转移历史流式构造可信目标媒体集合，不读取媒体根目录。"""
+        iterator = getattr(self.dbhelper, "iter_transfer_histories_with_dest", None)
+        histories = iterator() if callable(iterator) else self.dbhelper.get_transfer_histories_with_dest() or []
+        for history in histories:
+            if self.__history_media_type(getattr(history, "TYPE", "")) != category:
+                continue
+            if subcategory and str(getattr(history, "CATEGORY", "") or "").strip() != subcategory:
+                continue
+            media_file = self.__history_target_file(history)
+            if not media_file or os.path.splitext(media_file)[-1].lower() not in RMT_MEDIAEXT:
+                continue
+            media_file = os.path.normpath(media_file)
+            yield media_file
 
     def get_local_poster_file(self, item_id):
         """
@@ -288,13 +650,23 @@ class MediaLibrary:
             return ""
         current_server_type = self.media_server.get_type()
         server_type = current_server_type.value if current_server_type else Config().get_config('media').get('media_server')
-        transfer_histories = self.dbhelper.get_transfer_histories_with_dest()
-        for row in self.mediadb.list_items(server_type=server_type):
-            if str(row.ITEM_ID) != str(item_id):
-                continue
-            item = self.__build_item(row, transfer_histories=transfer_histories, include_status=False)
+        cache_key = (str(server_type or "").lower(), str(item_id))
+        now = time.time()
+        with self._poster_cache_lock:
+            cached = self._poster_cache.get(cache_key)
+            if cached and cached[0] > now:
+                return cached[1]
+        rows = self.mediadb.find_items(server_type=server_type, item_ids=[item_id])
+        for row in rows:
+            transfer_histories = self.dbhelper.get_transfer_histories_for_media(
+                tmdbid=row.TMDBID, title=row.TITLE, year=row.YEAR
+            )
+            item = self.__build_item(
+                row, transfer_histories=transfer_histories,
+                include_status=False, verify_paths=False
+            )
             if not item:
-                return ""
+                break
             search_dirs = []
             if item.get("target_path"):
                 search_dirs.append(os.path.dirname(item.get("target_path")))
@@ -303,10 +675,14 @@ class MediaLibrary:
             for search_dir in search_dirs:
                 poster_file = self.__find_local_poster(search_dir)
                 if poster_file:
+                    with self._poster_cache_lock:
+                        self._poster_cache[cache_key] = (now + self._poster_success_ttl, poster_file)
                     return poster_file
+        with self._poster_cache_lock:
+            self._poster_cache[cache_key] = (now + self._poster_failure_ttl, "")
         return ""
 
-    def __build_item(self, row, transfer_histories=None, include_status=True):
+    def __build_item(self, row, transfer_histories=None, include_status=True, verify_paths=True):
         item_json = self.__loads_json(row.JSON)
         media_path = row.PATH or item_json.get("Path") or ""
         media_type, category = self.classify_path(media_path, row.ITEM_TYPE)
@@ -325,16 +701,22 @@ class MediaLibrary:
             category = primary_history.CATEGORY or self.classify_path(target_path, row.ITEM_TYPE)[1]
             display_path = target_path
             if media_type == "movie":
-                target_path = target_path if target_path and os.path.isfile(target_path) else ""
+                target_path = target_path if target_path and (
+                    not verify_paths or os.path.isfile(target_path)
+                ) else ""
                 display_path = target_path
             elif primary_history.DEST_PATH:
                 display_path = primary_history.DEST_PATH
-        elif media_type == "movie" and media_path and os.path.isfile(media_path):
+        elif verify_paths and media_type == "movie" and media_path \
+                and os.path.isfile(media_path):
             target_path = media_path
 
         item = {
             "id": row.ITEM_ID,
+            "server_item_id": row.ITEM_ID,
+            "parent_server_item_id": "",
             "library": row.LIBRARY or "",
+            "library_id": row.LIBRARY or "",
             "item_type": row.ITEM_TYPE or "",
             "media_type": media_type,
             "media_type_name": {"movie": "电影", "tv": "电视剧", "anime": "动漫"}.get(media_type, "媒体"),
@@ -348,13 +730,20 @@ class MediaLibrary:
             "server_path": media_path,
             "target_path": target_path,
             "linked": linked,
-            "can_upload": bool(target_path and os.path.isfile(target_path)),
+            "can_upload": bool(target_path and (not verify_paths or os.path.isfile(target_path))),
             "poster_url": f"/library/image/{row.ITEM_ID}",
             "media_streams": item_json.get("MediaStreams") or [],
-            "linked_episodes": self.__series_history_items(matches) if media_type != "movie" else [],
+            "media_streams_known": "MediaStreams" in item_json,
+            "linked_episodes": self.__series_history_items(
+                matches,
+                parent_server_item_id=row.ITEM_ID,
+                library_id=row.LIBRARY
+            ) if media_type != "movie" else [],
             "subtitle_status": "",
             "subtitle_label": "",
             "subtitle_badge": "",
+            "subtitle_status_source": "",
+            "subtitle_status_checked_at": "",
             "subtitle_audit_status": "",
             "subtitle_audit_label": "",
             "subtitle_audit_badge": "",
@@ -365,6 +754,119 @@ class MediaLibrary:
         if include_status:
             self.__fill_subtitle_summary(item)
         return item
+
+    def __status_store(self):
+        store = getattr(self, "subtitle_status_store", None)
+        if store is None:
+            store = SubtitleMediaStatusStore()
+            self.subtitle_status_store = store
+        return store
+
+    @staticmethod
+    def __item_media_paths(items):
+        """Return de-duplicated media paths represented by candidate cards."""
+        paths = []
+        seen = set()
+        for item in items or []:
+            if item.get("media_type") == "movie":
+                item_paths = [item.get("target_path") or item.get("path")]
+            else:
+                item_paths = [
+                    episode.get("path")
+                    for episode in (item.get("linked_episodes") or [])
+                ]
+            for path in item_paths:
+                normalized = SubtitleMediaStatusStore.normalize_path(path)
+                if normalized and normalized not in seen:
+                    seen.add(normalized)
+                    paths.append(path)
+        return paths
+
+    def __status_snapshots_for_paths(self, server_type, media_paths):
+        """Use the bounded path API while tolerating legacy injected stores."""
+        store = self.__status_store()
+        try:
+            snapshots = store.list_for_paths(server_type, media_paths)
+            if isinstance(snapshots, dict):
+                return snapshots
+        except AttributeError:
+            pass
+        # Compatibility is limited to test/custom stores that predate the new
+        # interface; the built-in store always takes the targeted branch.
+        snapshots = store.list_for_server(server_type)
+        if not isinstance(snapshots, dict):
+            return {}
+        wanted = {
+            SubtitleMediaStatusStore.normalize_path(path)
+            for path in media_paths or [] if path
+        }
+        return {key: value for key, value in snapshots.items() if key in wanted}
+
+    def __fill_snapshot_subtitle_summary(self, item, snapshots, audit_snapshot=None):
+        """Fill UI state from synchronized metadata and SQLite only."""
+        if item.get("media_type") == "movie":
+            media_path = item.get("target_path") or item.get("path") or ""
+            snapshot = snapshots.get(SubtitleMediaStatusStore.normalize_path(media_path))
+            status = self.__status_from_snapshot(
+                snapshot, item.get("media_streams") or [],
+                streams_known=item.get("media_streams_known", False)
+            )
+            item["missing_count"] = 1 if status.get("status") == "missing_chinese" else 0
+        else:
+            episode_statuses = []
+            for episode in item.get("linked_episodes") or []:
+                media_path = episode.get("path") or ""
+                snapshot = snapshots.get(SubtitleMediaStatusStore.normalize_path(media_path))
+                episode_statuses.append(
+                    self.__status_from_snapshot(
+                        snapshot, episode.get("media_streams") or [],
+                        streams_known=episode.get("media_streams_known", False)
+                    )
+                )
+            missing_count = sum(
+                1 for status in episode_statuses
+                if status.get("status") == "missing_chinese"
+            )
+            item["missing_count"] = missing_count
+            status = self.__summary_series_status(episode_statuses, missing_count)
+            checked = [
+                value.get("checked_at") for value in episode_statuses
+                if value.get("checked_at")
+            ]
+            sources = {value.get("source") for value in episode_statuses if value.get("source")}
+            status["checked_at"] = max(checked) if checked else ""
+            status["source"] = sources.pop() if len(sources) == 1 else ("mixed" if sources else "")
+        item["subtitle_status"] = status.get("status")
+        item["subtitle_label"] = status.get("label")
+        item["subtitle_badge"] = status.get("badge")
+        item["subtitle_status_source"] = status.get("source") or ""
+        item["subtitle_status_checked_at"] = status.get("checked_at") or ""
+        if item.get("media_type") == "movie":
+            self.__fill_movie_audit_summary(item, audit_snapshot)
+        snapshot = snapshot if item.get("media_type") == "movie" else None
+        if snapshot and snapshot.get("media_exists") is False:
+            item["can_upload"] = False
+        return item
+
+    @classmethod
+    def __status_from_snapshot(cls, snapshot, media_streams=None, streams_known=True):
+        has_internal, has_chinese_internal = cls.__detect_streams(media_streams or [])
+        if snapshot and snapshot.get("has_chinese_external"):
+            status = ("has_chinese_external", "已有外挂中文字幕", "bg-green")
+        elif has_chinese_internal or (snapshot and snapshot.get("has_chinese_internal")):
+            status = ("has_chinese_internal", "已有内嵌中文字幕", "bg-azure")
+        elif snapshot and snapshot.get("media_exists") is True and (
+                streams_known or snapshot.get("has_chinese_internal") is False):
+            status = ("missing_chinese", "缺中文字幕", "bg-orange")
+        else:
+            status = ("unknown", "未检测", "bg-secondary")
+        return {
+            "status": status[0], "label": status[1], "badge": status[2],
+            "source": (snapshot or {}).get("source") or (
+                "media_server" if has_internal else ""
+            ),
+            "checked_at": (snapshot or {}).get("checked_at") or ""
+        }
 
     def __fill_subtitle_summary(self, item, allow_ffprobe=True, audit_snapshot=None):
         if item.get("media_type") == "movie":
@@ -411,12 +913,14 @@ class MediaLibrary:
         item["subtitle_audit_status"] = status
         item["subtitle_audit_label"] = label
         item["subtitle_audit_badge"] = badge
-        item["subtitle_audit_checked_at"] = audit_status.get("checked_at") \
-            or audit_snapshot.get("checked_at") or ""
+        # A category-level batch time must never make an untouched media card
+        # look freshly checked.  Old rows are backfilled from CONFIRMED_AT by
+        # the SQLite aggregation layer; truly unknown per-item times stay blank.
+        item["subtitle_audit_checked_at"] = audit_status.get("checked_at") or ""
         item["subtitle_audit_count"] = audit_status.get("subtitle_count") or 0
 
     @classmethod
-    def __fill_sort_metrics(cls, item, audit_snapshots):
+    def __fill_sort_metrics(cls, item, audit_snapshots, status_snapshots=None):
         media_type = item.get("media_type") or ""
         paths = []
         if media_type == "movie":
@@ -430,9 +934,17 @@ class MediaLibrary:
             ])
 
         has_internal, _ = cls.__detect_streams(item.get("media_streams") or [])
+        if not has_internal and media_type == "movie" and paths:
+            media_snapshot = (status_snapshots or {}).get(
+                SubtitleMediaStatusStore.normalize_path(paths[0])
+            ) or {}
+            has_internal = bool(media_snapshot.get("has_internal"))
         if not has_internal and media_type != "movie":
             has_internal = any(
                 cls.__detect_streams(episode.get("media_streams") or [])[0]
+                or bool(((status_snapshots or {}).get(
+                    SubtitleMediaStatusStore.normalize_path(episode.get("path"))
+                ) or {}).get("has_internal"))
                 for episode in (item.get("linked_episodes") or [])
             )
         snapshot = (audit_snapshots or {}).get(media_type) or {}
@@ -447,32 +959,50 @@ class MediaLibrary:
             if audit_status:
                 has_external = True
                 audit_ranks.append(audit_priority.get(audit_status, 0))
-            elif cls.has_external_subtitle(media_path):
-                has_external = True
+            media_snapshot = (status_snapshots or {}).get(
+                SubtitleMediaStatusStore.normalize_path(media_path)
+            ) or {}
+            has_external = has_external or bool(media_snapshot.get("has_external"))
         item["_sort_internal"] = 1 if has_internal else 0
         item["_sort_external"] = 1 if has_external else 0
         item["_sort_audit"] = max(audit_ranks) if audit_ranks else 1
 
     @classmethod
     def __latest_audit_snapshot(cls, category, server_type):
+        # Compatibility helper for the legacy audit-history API.  The library
+        # list itself calls the plural SQLite-only method below.
+        store = cls.__load_subtitle_audit_store()
+        snapshot = (store.get("latest") or {}).get(category) or {}
+        if str(snapshot.get("server") or "").lower() == str(server_type or "").lower():
+            return snapshot
         return cls.__latest_audit_snapshots(server_type).get(category) or {}
 
     @classmethod
-    def __latest_audit_snapshots(cls, server_type):
-        store = cls.__load_subtitle_audit_store()
-        snapshots = {}
-        for category in ["movie", "tv", "anime"]:
-            snapshot = (store.get("latest") or {}).get(category) or {}
-            if str(snapshot.get("server") or "").lower() == str(server_type or "").lower():
-                snapshots[category] = snapshot
-            else:
-                snapshots[category] = {}
-        return snapshots
+    def __latest_audit_snapshots(cls, server_type, media_paths=None):
+        try:
+            from app.helper.subtitle_tasks import get_subtitle_task_manager
+            sqlite_snapshots = get_subtitle_task_manager().latest_audit_snapshots(
+                server_type, media_paths=media_paths
+            )
+            return {
+                category: sqlite_snapshots.get(category) or {}
+                for category in ["movie", "tv", "anime"]
+            }
+        except Exception:
+            # Library rendering must remain database-only.  Legacy JSON is
+            # migrated by the task manager lifecycle, never read by this page.
+            return {"movie": {}, "tv": {}, "anime": {}}
 
     @classmethod
     def __save_subtitle_audit(cls, result):
         checked_at = datetime.now().astimezone().isoformat(timespec="seconds")
         category = result.get("category") or ""
+        coverage_complete = result.get("coverage_complete")
+        if coverage_complete is None:
+            coverage_complete = not bool(
+                result.get("partial") or result.get("scan_errors")
+                or result.get("inaccessible_roots") or result.get("canceled")
+            )
         record = {
             "checked_at": checked_at,
             "category": category,
@@ -488,6 +1018,12 @@ class MediaLibrary:
             "inaccessible_roots": result.get("inaccessible_roots") or [],
             "scan_errors": result.get("scan_errors") or []
         }
+        record.update({
+            "mode": result.get("mode") or "deep",
+            "coverage_complete": bool(coverage_complete),
+            "stop_reason": result.get("stop_reason") or "",
+            "metrics": result.get("metrics") or {}
+        })
         with cls._subtitle_audit_lock:
             store = cls.__load_subtitle_audit_store()
             latest = store.get("latest") or {}
@@ -496,19 +1032,20 @@ class MediaLibrary:
                 media_statuses = dict(previous.get("media_statuses") or {})
             else:
                 media_statuses = {}
-            inaccessible = {
-                os.path.normcase(os.path.normpath(path))
-                for path in (result.get("inaccessible_roots") or [])
-            }
-            scanned_roots = [
-                root for root in (result.get("roots") or [])
-                if os.path.normcase(os.path.normpath(root)) not in inaccessible
-            ]
-            scan_error_paths = result.get("scan_error_paths") or []
-            for media_path in list(media_statuses.keys()):
-                if cls.__path_in_roots(media_path, scanned_roots) \
-                        and not cls.__path_in_roots(media_path, scan_error_paths):
-                    media_statuses.pop(media_path, None)
+            # 只有完整覆盖才替换本范围状态。受限、取消或任一目录错误时只 upsert，
+            # 避免把未实际复检的旧问题误删。
+            if coverage_complete:
+                inaccessible = {
+                    os.path.normcase(os.path.normpath(path))
+                    for path in (result.get("inaccessible_roots") or [])
+                }
+                scanned_roots = [
+                    root for root in (result.get("roots") or [])
+                    if os.path.normcase(os.path.normpath(root)) not in inaccessible
+                ]
+                for media_path in list(media_statuses.keys()):
+                    if cls.__path_in_roots(media_path, scanned_roots):
+                        media_statuses.pop(media_path, None)
             for media_path, media_status in (result.get("media_statuses") or {}).items():
                 media_status = dict(media_status or {})
                 media_status["checked_at"] = checked_at
@@ -658,21 +1195,44 @@ class MediaLibrary:
             return ""
         return os.path.join(history.DEST_PATH, history.DEST_FILENAME)
 
-    def __series_history_items(self, histories):
+    def __series_history_items(self, histories, server_episodes=None,
+                               parent_server_item_id=None, library_id=None):
+        """把转移记录映射到真实服务器剧集；TRANSFER_HISTORY.ID 仅作 history_id。"""
+        path_index = {}
+        season_episode_index = {}
+        for episode in server_episodes or []:
+            episode_path = str(episode.get("path") or "").strip()
+            if episode_path:
+                path_index[os.path.normcase(os.path.normpath(episode_path))] = episode
+            episode_key = self.__season_episode(episode.get("season"), episode.get("episode"))
+            if episode_key:
+                season_episode_index.setdefault(episode_key.upper(), episode)
         items = []
         for history in histories or []:
             media_path = self.__history_target_file(history)
             if not media_path:
                 continue
             season_episode = history.SEASON_EPISODE or ""
+            server_episode = path_index.get(os.path.normcase(os.path.normpath(media_path)))
+            if not server_episode and season_episode:
+                server_episode = season_episode_index.get(str(season_episode).upper())
+            server_episode = server_episode or {}
+            server_item_id = server_episode.get("server_item_id") or server_episode.get("id")
             items.append({
-                "id": history.ID,
+                "id": server_item_id,
+                "history_id": history.ID,
+                "server_item_id": server_item_id,
+                "parent_server_item_id": server_episode.get("parent_server_item_id")
+                or server_episode.get("series_id") or parent_server_item_id,
+                "library_id": server_episode.get("library_id")
+                or server_episode.get("library") or library_id,
                 "title": history.DEST_FILENAME or history.TITLE or "",
                 "season": self.__parse_season_episode(season_episode)[0],
                 "episode": self.__parse_season_episode(season_episode)[1],
                 "season_episode": season_episode,
                 "path": media_path,
-                "media_streams": []
+                "media_streams": server_episode.get("media_streams") or [],
+                "media_streams_known": bool(server_episode) and "media_streams" in server_episode
             })
         return items
 
@@ -858,6 +1418,36 @@ class MediaLibrary:
                 return root_path
         return ""
 
+    def __get_server_episodes(self, server_type, series_id):
+        """Read episodes from the server selected by this request.
+
+        Production ``MediaServer`` exposes ``get_episodes_by_type``.  The
+        guarded legacy fallback keeps older integrations/tests working only
+        when their current server is compatible with the requested server;
+        it must never silently query a different configured global server.
+        """
+        requested = str(getattr(server_type, "value", server_type) or "").strip().lower()
+        if requested not in ["emby", "jellyfin", "plex"]:
+            return []
+        by_type = getattr(self.media_server, "get_episodes_by_type", None)
+        if callable(by_type):
+            return by_type(requested, series_id) or []
+
+        get_server = getattr(self.media_server, "get_server_by_type", None)
+        if callable(get_server):
+            selected = get_server(requested)
+            if selected and callable(getattr(selected, "get_episodes", None)):
+                return selected.get_episodes(series_id) or []
+            return []
+
+        current_getter = getattr(self.media_server, "get_type", None)
+        current = current_getter() if callable(current_getter) else None
+        current = str(getattr(current, "value", current) or "").strip().lower()
+        if current and current != requested:
+            return []
+        legacy = getattr(self.media_server, "get_episodes", None)
+        return legacy(series_id) or [] if callable(legacy) else []
+
     @staticmethod
     def __media_paths(media_type):
         media = Config().get_config('media') or {}
@@ -965,6 +1555,14 @@ class MediaLibrary:
                     if value >= (0 if key == "season" else 1):
                         values[key] = value
         return values["season"], values["episode"]
+
+    @staticmethod
+    def __safe_limit(value, default, minimum, maximum):
+        try:
+            value = int(value) if value not in [None, ""] else int(default)
+        except (TypeError, ValueError):
+            value = int(default)
+        return min(max(value, minimum), maximum)
 
     @staticmethod
     def __season_episode(season, episode):
