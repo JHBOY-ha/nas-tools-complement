@@ -167,7 +167,7 @@ class MediaLibrary:
             ret_items.append({
                 "id": episode.get("id"),
                 "title": episode.get("title") or "",
-                "season": episode.get("season") or "",
+                "season": episode.get("season") if episode.get("season") is not None else "",
                 "episode": episode.get("episode") or "",
                 "season_episode": self.__season_episode(episode.get("season"), episode.get("episode")),
                 "path": media_path,

@@ -292,6 +292,10 @@
         <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
       </div>
       <div class="modal-body">
+        <div class="row g-2 mb-3">
+          <div class="col-6"><label class="form-label" for="library_episode_season">选择季</label><select id="library_episode_season" class="form-select" onchange="filter_library_episodes(true)"></select></div>
+          <div class="col-6"><label class="form-label" for="library_episode_number">选择集</label><select id="library_episode_number" class="form-select" onchange="filter_library_episodes(false)"></select></div>
+        </div>
         <div id="index_library_episodes_body" class="divide-y"></div>
       </div>
     </div>
@@ -355,13 +359,14 @@
     <div class="modal-content">
       <div class="modal-header"><h5 class="modal-title">在线字幕</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button></div>
       <div class="modal-body">
-        <div id="library_online_media" class="text-muted text-break mb-3"></div>
+        <div id="library_online_media" class="fw-bold text-break mb-1"></div>
+        <div id="library_online_target_path" class="text-muted small text-break mb-3"></div>
         <form class="d-flex flex-wrap gap-2" onsubmit="event.preventDefault(); search_library_online_subtitles();">
-          <input id="library_online_keyword" class="form-control flex-fill" aria-label="字幕检索名称" placeholder="影片名称，剧集可加 S01E01" maxlength="200" required>
+          <input id="library_online_keyword" class="form-control flex-fill" aria-label="字幕检索名称" placeholder="影片或剧集名称，可改用原名检索" maxlength="200" required>
           <select id="library_online_provider" class="form-select w-auto" aria-label="字幕来源"><option value="all">全部来源</option><option value="thunder">迅雷</option><option value="assrt">Assrt</option></select>
           <button id="library_online_search" class="btn btn-primary" type="submit">检索字幕</button>
         </form>
-        <div class="text-muted small mt-2">迅雷优先展示文件特征匹配结果；Assrt 需在设置 → 字幕中配置 Token。保存前请核对语言与版本。</div>
+        <div class="text-muted small mt-2">按片名、年份和当前季集校验结果；文件特征匹配优先。字幕包仅列出明确匹配本集的文件。Assrt 需在设置 → 字幕中配置 Token。</div>
         <div id="library_online_results" class="mt-3" aria-live="polite"></div>
       </div>
     </div>

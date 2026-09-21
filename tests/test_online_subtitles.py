@@ -29,17 +29,17 @@ class OnlineSubtitleTest(unittest.TestCase):
 
     def test_thunder_deduplicates_and_prioritizes_hash_match(self):
         service = OnlineSubtitles()
-        entries = [dict(name='A', url='https://example.com/a', ext='srt', languages=['简体'], cid='OTHER'),
+        entries = [dict(name='电影.srt', url='https://example.com/a', ext='srt', languages=['简体'], cid='OTHER'),
                    dict(name='B', url='https://example.com/b', ext='.ASS', languages=['繁体'], cid='match')]
         with patch.object(service, 'cid', return_value='MATCH'), patch.object(service, '_json', return_value={'code': 0, 'data': entries + entries}):
             results, warnings = service.search('电影', '/media.mkv', 'thunder')
-        self.assertEqual([item['name'] for item in results], ['B', 'A'])
+        self.assertEqual([item['name'] for item in results], ['B', '电影.srt'])
         self.assertTrue(results[0]['hash_match'])
         self.assertFalse(warnings)
 
     def test_provider_failure_does_not_hide_other_results(self):
         service = OnlineSubtitles('secret')
-        with patch.object(service, 'cid', return_value=''), patch.object(service, '_json', side_effect=[ValueError(), {'status': 0, 'sub': {'subs': [{'id': 42, 'native_name': '电影字幕'}]}}]):
+        with patch.object(service, 'cid', return_value=''), patch.object(service, '_json', side_effect=[ValueError(), {'status': 0, 'sub': {'subs': [{'id': 42, 'native_name': '电影.srt'}]}}]):
             results, warnings = service.search('电影', '/media.mkv')
         self.assertEqual(results[0]['remote_id'], '42')
         self.assertEqual(len(warnings), 1)
@@ -104,6 +104,73 @@ class OnlineSubtitleTest(unittest.TestCase):
                 OnlineSubtitles('SECRET')._json('https://api.assrt.net', {})
             self.assertNotIn('SECRET', str(context.exception))
 
+    def test_movie_search_removes_other_films_sequels_and_wrong_year(self):
+        service = OnlineSubtitles()
+        names = ['Alien.1979.srt', 'Resident.Alien.1979.srt', 'Alien.Covenant.1979.srt',
+                 'Alien.2.1979.srt', 'Alien.2000.srt', 'Other.1979.srt', 'Alien.S01E01.srt']
+        entries = [dict(name=name, url='https://example.com/' + str(i), ext='srt') for i, name in enumerate(names)]
+        with patch.object(service, 'cid', return_value=''), patch.object(service, '_json', return_value={'code': 0, 'data': entries}):
+            items, warnings = service.search('Alien', '/Alien.mkv', 'thunder', {'year': '1979'})
+        self.assertEqual([item['name'] for item in items], ['Alien.1979.srt'])
+        self.assertIn('6', warnings[0])
+
+    def test_episode_query_and_strict_season_episode_filter(self):
+        service = OnlineSubtitles()
+        names = ['Show.S01E02.srt', 'Other.S01E02.srt', 'Show.S01E03.srt',
+                 'Show.S02E02.srt', 'Show.E02.srt', 'Show.S01E01-E03.srt',
+                 'Show.1x02.srt', 'Show.S01E02E03.srt', 'Show.S01E020.srt']
+        entries = [dict(name=name, url='https://example.com/' + str(i), ext='srt') for i, name in enumerate(names)]
+        with patch.object(service, 'cid', return_value=''), patch.object(service, '_json', return_value={'code': 0, 'data': entries}) as request:
+            items, _ = service.search('Show', '/Show.S01E02.mkv', 'thunder', {'media_type': 'episode', 'season': 1, 'episode': 2})
+        self.assertEqual(request.call_args.args[1]['name'], 'Show S01E02')
+        self.assertEqual([item['name'] for item in items], ['Show.S01E02.srt', 'Show.1x02.srt'])
+        self.assertEqual(items[0]['target']['episode'], 2)
+
+    def test_original_title_and_chinese_episode_names(self):
+        target = OnlineSubtitles.search_target('中文剧名', '/Show.mkv', {'original_title': 'The Show', 'media_type': 'episode', 'season': 1, 'episode': 2})
+        for name in ('The.Show.S01E02.ass', '中文剧名 第一季 第二集.srt', '中文剧名第一季第二集.srt'):
+            self.assertEqual(OnlineSubtitles.match_result({'name': name}, target), '剧名与季集匹配')
+        self.assertEqual(OnlineSubtitles.match_result({'name': '中文剧名 第二季 第二集.srt'}, target), '')
+
+    def test_specific_episode_archive_hides_and_rejects_other_members(self):
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, 'w') as archive:
+            for name in ['Show.S01E01.srt', 'Show.S01E02.ass', 'S02/Show.E02.srt', 'Other.S01E02.srt', 'E02.srt', 'unknown.srt']:
+                archive.writestr(name, b'subtitle')
+        item = dict(provider='thunder', url='https://example.com', name='Show.S01.Complete.zip', format='srt', target={'titles': ['Show'], 'season': 1, 'episode': 2})
+        service = OnlineSubtitles()
+        with patch.object(service, '_download', return_value=stream.getvalue()):
+            members, _ = service.files(item)
+            self.assertEqual(members, ['Show.S01E02.ass', 'E02.srt'])
+            with self.assertRaises(ValueError):
+                service.files(item, 'Show.S01E01.srt')
+            self.assertEqual(service.files(item, 'E02.srt')[1], b'subtitle')
+
+    def test_assrt_season_pack_and_detail_episode_validation(self):
+        service = OnlineSubtitles('token')
+        search = {'status': 0, 'sub': {'subs': [{'id': 1, 'native_name': 'Show.S01.Complete', 'subtype': 'ZIP'},
+                                               {'id': 2, 'native_name': 'Show.S02.Complete', 'subtype': 'ZIP'}]}}
+        with patch.object(service, '_json', return_value=search):
+            items, _ = service.search('Show', '/Show.S01E02.mkv', 'assrt')
+        self.assertEqual(len(items), 1)
+        self.assertIn('字幕包', items[0]['match_label'])
+        details = {'status': 0, 'sub': {'subs': [{'filename': 'Show.S01E03.srt', 'url': 'https://example.com/sub'}]}}
+        with patch.object(service, '_json', return_value=details), patch.object(service, '_download', return_value=b'subtitle'):
+            with self.assertRaises(ValueError):
+                service.files(items[0])
+
+    def test_inconsistent_or_missing_episode_metadata_is_rejected(self):
+        with self.assertRaises(ValueError):
+            OnlineSubtitles.search_target('Show', '/Show.S01E02.mkv', {'season': 1, 'episode': 3})
+        with self.assertRaises(ValueError):
+            OnlineSubtitles.search_target('Show', '/Show.mkv', {'media_type': 'episode'})
+        target = OnlineSubtitles.search_target('Show', '/Show.S00E02.mkv', {'season': 0, 'episode': 2})
+        self.assertEqual(target['season'], 0)
+
+    def test_numeric_movie_title_is_preserved(self):
+        self.assertEqual(OnlineSubtitles._query_title('1984'), '1984')
+        self.assertEqual(OnlineSubtitles._query_title('1917'), '1917')
+
 
 class OnlineSubtitleRouteTest(unittest.TestCase):
     def setUp(self):
@@ -146,6 +213,21 @@ class OnlineSubtitleRouteTest(unittest.TestCase):
         payload = self.ns['_online_subtitle_signer']().loads(result['items'][0]['ticket'])
         self.assertEqual(payload['path'], '/library/movie.mkv')
         self.assertEqual(payload['user'], 'user')
+
+    def test_episode_context_reaches_search_and_is_bound_to_ticket(self):
+        media = dict(title='Show', media_type='episode', season=2, episode=3)
+        item = dict(name='Show.S02E03.srt', provider='thunder', format='srt', language='中文',
+                    hash_match=False, target={'season': 2, 'episode': 3}, match_label='剧名与季集匹配')
+        service = Mock()
+        service.search.return_value = ([item], [])
+        self.ns['_online_subtitle_service'] = lambda: service
+        self.ns['_online_subtitle_media_path'] = lambda value: value
+        with self.app.test_request_context(json={'keyword': 'Show', 'media_path': '/library/Show.S02E03.mkv', 'provider': 'thunder', 'media': media}):
+            result = self.ns['library_online_subtitle_search']()
+        service.search.assert_called_once_with('Show', '/library/Show.S02E03.mkv', 'thunder', media)
+        payload = self.ns['_online_subtitle_signer']().loads(result['items'][0]['ticket'])
+        self.assertEqual(payload['path'], '/library/Show.S02E03.mkv')
+        self.assertEqual(payload['item']['target'], {'season': 2, 'episode': 3})
 
     def test_download_reuses_validated_upload_and_refreshes_library(self):
         service = Mock()

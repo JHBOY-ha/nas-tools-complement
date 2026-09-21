@@ -1159,10 +1159,11 @@ def library_online_subtitle_search():
     try:
         data = request.get_json(silent=True) or {}
         path = _online_subtitle_media_path(data.get("media_path"))
-        items, warnings = _online_subtitle_service().search(data.get("keyword"), path, data.get("provider") or "all")
+        items, warnings = _online_subtitle_service().search(data.get("keyword"), path, data.get("provider") or "all", data.get("media") or {})
         results = []
         for item in items:
             result = {key: item[key] for key in ("name", "provider", "format", "language", "hash_match")}
+            result["match_label"] = item.get("match_label") or ""
             result["ticket"] = _online_subtitle_signer().dumps({"item": item, "path": path, "user": str(current_user.get_id())})
             results.append(result)
         return {"code": 0, "items": results, "warnings": warnings}
