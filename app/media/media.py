@@ -1029,6 +1029,8 @@ class Media:
             genres = info.get("genre_ids") or [g.get("id") for g in info.get("genres", [])]
             if 16 not in genres:
                 return self._valid_media_identity(meta_info, info)
+        release_season = getattr(meta_info, "begin_season", None)
+        release_episodes = self.__episode_list_of(meta_info)
         try:
             self._apply_episode_mapping(meta_info, info)
         except (ValueError, TypeError, KeyError) as error:
@@ -1036,7 +1038,92 @@ class Media:
             return False
         if not (getattr(meta_info, "note", None) or {}).get("episode_mapping"):
             self._apply_llm_season(meta_info, info)
+        if not self.__verify_remapped_episodes(meta_info, info,
+                                               release_season=release_season,
+                                               release_episodes=release_episodes):
+            return False
         return self._valid_media_identity(meta_info, info)
+
+    @staticmethod
+    def __episode_list_of(meta_info):
+        getter = getattr(meta_info, "get_episode_list", None)
+        if not callable(getter):
+            return []
+        try:
+            return list(getter() or [])
+        except Exception:
+            return []
+
+    def __verify_remapped_episodes(self, meta_info, info, release_season=None, release_episodes=None):
+        """
+        发布季标记与最终 TMDB 季号不一致时，集号必须有明确依据（季集映射规则、LLM 给出的
+        目标季集号、或可验证的绝对集号换算），否则拒绝绑定并保留待重试。
+        """
+        if release_season is None or not release_episodes:
+            return True
+        season = getattr(meta_info, "begin_season", None)
+        if season is None or int(season) == int(release_season):
+            return True
+        note = getattr(meta_info, "note", None) or {}
+        if note.get("episode_mapping"):
+            return True
+        binding = note.get("season_binding") or {}
+        if binding.get("tmdb_episode") is not None:
+            return True
+        mapped = self.__convert_absolute_episodes(meta_info, info, release_episodes)
+        if mapped:
+            meta_info.begin_episode = mapped[0]
+            meta_info.end_episode = mapped[-1] if len(mapped) > 1 else None
+            meta_info.total_episodes = len(mapped)
+            updated = dict(meta_info.note or {})
+            updated["absolute_episode_mapping"] = {
+                "tmdb_id": info.get("id"),
+                "target_season": meta_info.begin_season,
+                "source_episodes": release_episodes,
+                "target_episodes": mapped
+            }
+            meta_info.note = updated
+            log.info("【Meta】按前季集数换算绝对集号：发布S%s %s -> TMDB S%s %s"
+                     % (str(release_season).rjust(2, "0"), release_episodes,
+                        str(meta_info.begin_season).rjust(2, "0"), mapped))
+            return True
+        log.warn("【Meta】发布季号%s与TMDB季号%s不一致且集号缺少依据，保留待重试：%s"
+                 % (release_season, season, meta_info.org_string))
+        log.warn("【Meta】如需固定该作品映射，可在 media.episode_mappings 增加：%s"
+                 % self.__suggest_episode_mapping(meta_info, info, release_season, release_episodes))
+        return False
+
+    def __convert_absolute_episodes(self, meta_info, info, episodes):
+        """
+        发布方按绝对集号编号、TMDB 按期分季时，用前几季集数之和换算并核对目标季集列表。
+        """
+        target_season = meta_info.begin_season
+        if target_season is None or int(target_season) <= 1:
+            return None
+        counts = {item.get("season_number"): item.get("episode_count")
+                  for item in (info.get("seasons") or [])}
+        prior_seasons = list(range(1, int(target_season)))
+        if not all(isinstance(counts.get(number), int) and counts.get(number) > 0
+                   for number in prior_seasons):
+            return None
+        offset = sum(counts[number] for number in prior_seasons)
+        if offset <= 0:
+            return None
+        mapped = [episode - offset for episode in episodes]
+        if any(episode < 1 for episode in mapped):
+            return None
+        detail = self.get_tmdb_tv_season_detail(info.get("id"), int(target_season)) or {}
+        valid = {item.get("episode_number") for item in detail.get("episodes", [])}
+        if not valid or not set(mapped).issubset(valid):
+            return None
+        return mapped
+
+    @staticmethod
+    def __suggest_episode_mapping(meta_info, info, release_season, episodes):
+        return ('{"tmdb_id": %s, "source_season": %s, "source_begin": %s, "source_end": %s, '
+                '"target_season": %s, "offset": 0}  # offset = 目标季集号 - 发布集号'
+                % (info.get("id"), release_season, min(episodes), max(episodes),
+                   meta_info.begin_season if meta_info.begin_season is not None else "?"))
 
     def _apply_llm_season(self, meta_info, info):
         """
@@ -1475,9 +1562,15 @@ class Media:
                     meta_info = MetaInfo(title=file_name, mtype=media_type,
                                          use_llm=not bool(download_context))
                     if not season and not episode_format:
+                        release_season = getattr(meta_info, "begin_season", None)
+                        release_episodes = self.__episode_list_of(meta_info)
                         self._apply_episode_mapping(meta_info, tmdb_info)
                         if not (getattr(meta_info, "note", None) or {}).get("episode_mapping"):
                             self._apply_llm_season(meta_info, tmdb_info)
+                        if not self.__verify_remapped_episodes(meta_info, tmdb_info,
+                                                               release_season=release_season,
+                                                               release_episodes=release_episodes):
+                            raise ValueError("发布季号与TMDB季号不一致且集号缺少依据：%s" % file_name)
                     if download_context and media_type != MediaType.MOVIE:
                         seasons = download_context.get("seasons") or []
                         episodes = download_context.get("episodes") or []

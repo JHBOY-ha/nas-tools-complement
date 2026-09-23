@@ -57,6 +57,8 @@ class RecognitionTests(unittest.TestCase):
             '__search_media_with_name', '__extract_llm_tmdb_target', '__resolve_tmdb_mtype',
             'get_media_info_on_files', 'get_cache_info', '__make_cache_key', '_valid_media_identity',
             '_prepare_media_identity', '_apply_episode_mapping', '_apply_llm_season',
+            '__verify_remapped_episodes', '__convert_absolute_episodes', '__suggest_episode_mapping',
+            '__episode_list_of',
             '__search_tv_by_name'], self.ns)
         self.media = cls()
 

@@ -24,6 +24,26 @@ class LlmSeasonBindingTest(TestCase):
         ]
     }
     _SEASON_6_EPISODES = {"episodes": [{"episode_number": 1}, {"episode_number": 2}]}
+    _REZERO_INFO = {
+        "id": 65942,
+        "media_type": MediaType.TV,
+        "name": "Re：从零开始的异世界生活",
+        "first_air_date": "2016-04-04",
+        "genres": [{"id": 16}],
+        "seasons": [
+            {"season_number": 0, "episode_count": 84},
+            {"season_number": 1, "episode_count": 85}
+        ]
+    }
+    _ONE_PIECE_INFO = {
+        "id": 37854,
+        "media_type": MediaType.TV,
+        "name": "海贼王",
+        "first_air_date": "1999-10-20",
+        "genres": [{"id": 16}],
+        "seasons": ([{"season_number": number, "episode_count": 50} for number in range(1, 23)]
+                    + [{"season_number": 23, "episode_count": 60}])
+    }
 
     @classmethod
     def setUpClass(cls):
@@ -54,6 +74,28 @@ class LlmSeasonBindingTest(TestCase):
         llm_note.update(overrides)
         meta_info.note = {"llm": llm_note}
         return meta_info
+
+    def _rezero_meta(self, **overrides):
+        meta_info = MetaInfo(
+            "[Nix-Raws] Re：从零开始的异世界生活 第四季 S04E18 [CR WEB-DL 1080p AVC AAC]",
+            use_llm=False)
+        llm_note = {
+            "tmdb_id": 65942,
+            "tmdb_season": 1,
+            "tmdb_season_name": "第 1 季",
+            "season_verified": True,
+            "season_evidence": "llm_only",
+            "release_season": 4
+        }
+        llm_note.update(overrides)
+        meta_info.note = {"llm": llm_note}
+        return meta_info
+
+    @staticmethod
+    def _no_episode_mapping_rules():
+        config = Mock()
+        config.get_config.side_effect = lambda key: {"episode_mappings": []} if key == "media" else {}
+        return patch("app.media.media.Config", return_value=config)
 
     def test_apply_llm_season_sets_verified_season(self):
         meta_info = self._meta_with_llm_season()
@@ -130,3 +172,69 @@ class LlmSeasonBindingTest(TestCase):
         self.assertTrue(valid)
         self.assertEqual(1, meta_info.begin_season)
         self.assertNotIn("season_binding", meta_info.note)
+
+    def test_remapped_season_without_episode_evidence_is_rejected(self):
+        meta_info = self._rezero_meta()
+        season_detail = {"episodes": [{"episode_number": number} for number in range(1, 86)]}
+
+        with self._no_episode_mapping_rules(), \
+                patch.object(self.media, "get_tmdb_tv_season_detail", return_value=season_detail):
+            valid = self.media._prepare_media_identity(meta_info, self._REZERO_INFO)
+
+        self.assertFalse(valid)
+        self.assertEqual(18, meta_info.begin_episode)
+
+    def test_remapped_season_with_verified_llm_episode_is_kept(self):
+        meta_info = self._rezero_meta(tmdb_episode=84)
+        season_detail = {"episodes": [{"episode_number": number} for number in range(1, 86)]}
+
+        with self._no_episode_mapping_rules(), \
+                patch.object(self.media, "get_tmdb_tv_season_detail", return_value=season_detail):
+            valid = self.media._prepare_media_identity(meta_info, self._REZERO_INFO)
+
+        self.assertTrue(valid)
+        self.assertEqual(1, meta_info.begin_season)
+        self.assertEqual(84, meta_info.begin_episode)
+
+    def test_absolute_episode_conversion_is_applied(self):
+        meta_info = MetaInfo("[Group] One Piece S01E1156 [1080p AVC]", use_llm=False)
+        meta_info.note = {"llm": {
+            "tmdb_id": 37854,
+            "tmdb_season": 23,
+            "tmdb_season_name": "第 23 季",
+            "season_verified": True,
+            "season_evidence": "season_name",
+            "release_season": 1
+        }}
+        season_detail = {"episodes": [{"episode_number": number} for number in range(1, 61)]}
+
+        with self._no_episode_mapping_rules(), \
+                patch.object(self.media, "get_tmdb_tv_season_detail", return_value=season_detail):
+            valid = self.media._prepare_media_identity(meta_info, self._ONE_PIECE_INFO)
+
+        self.assertTrue(valid)
+        self.assertEqual(23, meta_info.begin_season)
+        self.assertEqual(56, meta_info.begin_episode)
+        self.assertEqual([56], meta_info.note["absolute_episode_mapping"]["target_episodes"])
+
+    def test_same_season_needs_no_episode_evidence(self):
+        meta_info = MetaInfo("[Group] Some Show S02E05 [1080p AVC]", use_llm=False)
+        meta_info.note = {"llm": {
+            "tmdb_id": 999,
+            "tmdb_season": 2,
+            "season_verified": True,
+            "season_evidence": "llm_only",
+            "release_season": 2
+        }}
+        info = {"id": 999, "media_type": MediaType.TV, "genres": [{"id": 16}],
+                "seasons": [{"season_number": 1, "episode_count": 12},
+                            {"season_number": 2, "episode_count": 12}]}
+        season_detail = {"episodes": [{"episode_number": number} for number in range(1, 13)]}
+
+        with self._no_episode_mapping_rules(), \
+                patch.object(self.media, "get_tmdb_tv_season_detail", return_value=season_detail):
+            valid = self.media._prepare_media_identity(meta_info, info)
+
+        self.assertTrue(valid)
+        self.assertEqual(2, meta_info.begin_season)
+        self.assertEqual(5, meta_info.begin_episode)
