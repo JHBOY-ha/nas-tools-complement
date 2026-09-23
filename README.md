@@ -216,7 +216,7 @@ Python 中 `"" in ".sql"` 返回 `True`，导致无扩展名文件被错误包�
 | `app/media/meta/__init__.py` | 导出 LLM 模块入口 |
 | `app/media/media.py` | 支持读取 LLM 直出 `tmdb_id` 并优先按 ID 查询 TMDB |
 | `check_config.py` | 增加 `llm` 配置迁移、默认值补齐与参数校验 |
-| `web/templates/setting/basic.html` | 新增 LLM 设置项（开关/模式/base_url/api_key/model/阈值/检索增强）与连接测试入口 |
+| `web/templates/setting/basic.html` | 新增 LLM 设置项（开关/模式/base_url/api_key/model/检索增强）与连接测试入口 |
 | `config/config.yaml` | 增加 `llm` 模板配置区（空占位） |
 | `tests/test_meta_llm_parser.py` | 新增/扩展 LLM 解析与异常回退测试 |
 | `tests/run.py` | 纳入 LLM 测试集 |
@@ -224,7 +224,7 @@ Python 中 `"" in ".sql"` 返回 `True`，导致无扩展名文件被错误包�
 **功能改进：**
 
 1. 新增 **LLM 媒体识别增强**，可在规则识别链路上补齐或覆盖字段，输出结构与原有识别字段保持兼容。
-2. 支持三种识别策略：`rule_first`（规则优先）、`llm_first`（LLM优先）、`hybrid`（按字段置信度阈值混合）。
+2. 支持两种识别策略：`conservative`（保守，默认）与 `balanced`（平衡）。保守＝规则识别出的字段一律保留、LLM 只补空；平衡＝片名允许 LLM 覆盖，其余字段仍只补空。作品与季集身份（TMDB ID、季号、集号）不受模式影响，走候选校验与季集映射；旧值 `rule_first`／`fallback` 迁移为保守，`llm_first`／`primary`／`hybrid` 迁移为平衡，`confidence_threshold` 已废弃。
 3. 支持第三方 **OpenAI 协议兼容接口**（`base_url + api_key + model`），设置页可直接保存并“测试连接”。
 4. API 配置建议优先使用 DeepSeek 等开放平台（OpenAI 协议），示例：`base_url=https://api.deepseek.com/v1`、`model=deepseek-chat`。
 5. 新增检索增强上下文：在 LLM 解析前可先检索 TMDB与Bangumi 候选，并作为 `external_candidates` 提供给模型参考。
@@ -233,6 +233,9 @@ Python 中 `"" in ".sql"` 返回 `True`，导致无扩展名文件被错误包�
 8. 新增稳定性兜底：LLM 超时、异常、非法 JSON 时不影响原流程，自动回落规则识别。
 9. 新增可观测性：日志增加 LLM 原始返回、检索候选数量、直出 TMDBID 记录，便于排查识别问题。
 10. 配置迁移兼容旧版本：旧 `config.yaml` 自动补全 `llm` 字段。
+11. 检索增强候选携带季列表（`seasons`：季号/季名/首播年份/集数）、别名与 IMDb/TVDB 外链，LLM 据此一次性选定作品与季集；季号必须在该作品季列表内，集号必须存在于目标季集列表，否则不采用。
+12. 同名候选处理：标题里有年份时，年份对得上的候选排在前面（只重排不过滤，避免发布年份与首播年份不同的剧集被筛掉）；同名候选里若存在带 IMDb/TVDB 外链的正式条目，丢弃无外链的疑似重复条目并记录日志。
+13. 检索回退：规则解析名与 LLM 译名都会作为检索词尝试，避免某一侧译名失配导致识别失败。
 
 </details>
 

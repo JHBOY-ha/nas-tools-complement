@@ -19,7 +19,15 @@ class LLMMetaParser(object):
     """
     基于 OpenAI 兼容接口的媒体识别增强器
     """
-    _allowed_modes = {"rule_first", "llm_first", "hybrid"}
+    _allowed_modes = {"conservative", "balanced"}
+    # 旧模式名迁移：保守＝原来的规则优先，平衡＝原来的 LLM 优先/混合
+    _legacy_modes = {
+        "rule_first": "conservative",
+        "fallback": "conservative",
+        "llm_first": "balanced",
+        "primary": "balanced",
+        "hybrid": "balanced",
+    }
     _llm_fields = [
         "type",
         "cn_name",
@@ -44,14 +52,13 @@ class LLMMetaParser(object):
         self._client = None
         self._client_config = {}
         self._enabled = False
-        self._mode = "rule_first"
+        self._mode = "conservative"
         self._base_url = ""
         self._api_key = ""
         self._model = ""
         self._timeout = 20
         self._max_tokens = 1024
         self._thinking = ""
-        self._confidence_threshold = 0.75
         self._search_context_enable = False
         self._search_max_results = 3
         self._search_timeout = 8
@@ -65,9 +72,10 @@ class LLMMetaParser(object):
         self._enabled = StringUtils.to_bool(
             config.get("enable", config.get("enabled")), False
         )
-        mode = str(config.get("mode") or "rule_first").strip().lower()
+        mode = str(config.get("mode") or "conservative").strip().lower()
+        mode = self._legacy_modes.get(mode, mode)
         if mode not in self._allowed_modes:
-            mode = "rule_first"
+            mode = "conservative"
         self._mode = mode
         self._base_url = str(config.get("base_url") or config.get("api_base") or "").strip()
         self._api_key = str(config.get("api_key") or "").strip()
@@ -75,9 +83,6 @@ class LLMMetaParser(object):
         self._timeout = self.__parse_int(config.get("timeout"), min_val=1, default=20)
         self._max_tokens = self.__parse_int(config.get("max_tokens"), min_val=1, default=1024)
         self._thinking = config.get("thinking") or ""
-        self._confidence_threshold = self.__parse_float(
-            config.get("confidence_threshold"), min_val=0, max_val=1, default=0.75
-        )
         self._search_context_enable = StringUtils.to_bool(
             config.get("search_context_enable"), False
         )
@@ -229,12 +234,18 @@ class LLMMetaParser(object):
         if llm_result:
             original_year = meta_info.year
             original_season = meta_info.begin_season
+            rule_names = [name for name in (meta_info.cn_name, meta_info.en_name) if name]
             self.__apply_result(meta_info, llm_result)
             note["llm"].update({
                 "applied": True,
                 "confidence": llm_result.get("confidence", 0),
                 "field_confidence": llm_result.get("field_confidence", {})
             })
+            llm_names = [name for name in (llm_result.get("cn_name"), llm_result.get("en_name")) if name]
+            if rule_names:
+                note["llm"]["rule_names"] = rule_names
+            if llm_names:
+                note["llm"]["llm_names"] = llm_names
             note["llm"]["inferred_year"] = bool(
                 not original_year and meta_info.year
                 and not re.search(r"(?<!\d)(?:19|20)\d{2}(?!\d)", title or "")
@@ -302,18 +313,13 @@ class LLMMetaParser(object):
             setattr(meta_info, field, value)
 
     def __should_apply(self, field, current_value, llm_result):
-        if self._mode == "llm_first":
+        """
+        保守：规则识别出的字段一律保留，LLM 只补空。
+        平衡：片名允许 LLM 覆盖（识别的检索词会两个名字都试），其余字段仍然只补空。
+        """
+        if self._mode == "balanced" and field in ("cn_name", "en_name"):
             return True
-        if self._mode == "rule_first":
-            return self.__is_empty(current_value)
-
-        # hybrid：空值直接补齐，非空值按置信度覆盖
-        if self.__is_empty(current_value):
-            return True
-        field_confidence = llm_result.get("field_confidence", {}).get(field)
-        if field_confidence is None:
-            field_confidence = llm_result.get("confidence", 0)
-        return field_confidence >= self._confidence_threshold
+        return self.__is_empty(current_value)
 
     def __normalize_result(self, parsed):
         result = {}

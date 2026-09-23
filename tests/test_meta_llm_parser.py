@@ -134,7 +134,7 @@ class LLMMetaParserTest(TestCase):
         self._parser_state = dict(self.parser.__dict__)
         self.addCleanup(self._restore_parser)
         self.parser._enabled = True
-        self.parser._mode = "rule_first"
+        self.parser._mode = "conservative"
         self.parser._base_url = "https://api.openai.com/v1"
         self.parser._api_key = "test-key"
         self.parser._model = "gpt-4o-mini"
@@ -142,7 +142,6 @@ class LLMMetaParserTest(TestCase):
         self.parser._max_tokens = 1024
         self.parser._thinking = ""
         self.parser._client_config = {}
-        self.parser._confidence_threshold = 0.75
         self.parser._client = None
         self.parser._parse_cache = {}
 
@@ -157,8 +156,8 @@ class LLMMetaParserTest(TestCase):
         self.assertEqual({}, result)
         mock_client.assert_not_called()
 
-    def test_merge_rule_first_only_fill_missing(self):
-        self.parser._mode = "rule_first"
+    def test_merge_conservative_only_fill_missing(self):
+        self.parser._mode = "conservative"
         meta_info = MetaInfo("Dune 2023 1080p", use_llm=False)
         meta_info.year = "2023"
         self.assertIsNone(meta_info.resource_effect)
@@ -180,7 +179,7 @@ class LLMMetaParserTest(TestCase):
         self.assertTrue(meta_info.note.get("llm", {}).get("applied"))
 
     def test_verified_candidate_corrects_default_type_but_respects_hint(self):
-        self.parser._mode = "rule_first"
+        self.parser._mode = "conservative"
         result = {"type": MediaType.ANIME, "tmdb_type": "tv", "tmdb_id": 123,
                   "candidate_verified": True, "confidence": .95}
         for hint, expected in [(None, MediaType.ANIME), (MediaType.MOVIE, MediaType.MOVIE)]:
@@ -189,48 +188,40 @@ class LLMMetaParserTest(TestCase):
                 self.parser.merge_into(meta, meta.org_string, mtype_hint=hint)
             self.assertEqual(expected, meta.type)
 
-    def test_merge_llm_first_override_existing(self):
-        self.parser._mode = "llm_first"
+    def test_merge_balanced_overrides_name_only(self):
+        self.parser._mode = "balanced"
         meta_info = MetaInfo("Dune 2023 1080p", use_llm=False)
         meta_info.year = "2023"
         meta_info.resource_pix = "1080p"
+        meta_info.en_name = "Wrong Name"
 
         llm_result = {
             "type": MediaType.MOVIE,
+            "en_name": "Dune",
             "year": "2024",
             "resource_pix": "2160p",
-            "confidence": 0.95,
-            "field_confidence": {"year": 0.95, "resource_pix": 0.95}
+            "confidence": 0.95
         }
 
         with patch.object(self.parser, "parse", return_value=llm_result):
             self.parser.merge_into(meta_info=meta_info, title=meta_info.org_string)
 
-        self.assertEqual("2024", meta_info.year)
-        self.assertEqual("2160p", meta_info.resource_pix)
-
-    def test_merge_hybrid_with_confidence_threshold(self):
-        self.parser._mode = "hybrid"
-        self.parser._confidence_threshold = 0.8
-        meta_info = MetaInfo("Some Show S01E01 1080p", use_llm=False)
-        meta_info.resource_pix = "1080p"
-
-        llm_result = {
-            "type": MediaType.TV,
-            "resource_pix": "2160p",
-            "resource_type": "WEB-DL",
-            "confidence": 0.7,
-            "field_confidence": {
-                "resource_pix": 0.6,
-                "resource_type": 0.95
-            }
-        }
-
-        with patch.object(self.parser, "parse", return_value=llm_result):
-            self.parser.merge_into(meta_info=meta_info, title=meta_info.org_string)
-
+        self.assertEqual("Dune", meta_info.en_name)
+        self.assertEqual("2023", meta_info.year)
         self.assertEqual("1080p", meta_info.resource_pix)
-        self.assertEqual("WEB-DL", meta_info.resource_type)
+        self.assertEqual(["Wrong Name"], meta_info.note["llm"]["rule_names"])
+        self.assertEqual(["Dune"], meta_info.note["llm"]["llm_names"])
+
+    def test_legacy_mode_names_are_migrated(self):
+        cases = [("rule_first", "conservative"), ("fallback", "conservative"),
+                 ("llm_first", "balanced"), ("primary", "balanced"),
+                 ("hybrid", "balanced"), ("bogus", "conservative"), (None, "conservative")]
+
+        for value, expected in cases:
+            with patch("app.media.meta.llm_parser.Config") as config_cls:
+                config_cls.return_value.get_config.return_value = {"enable": True, "mode": value}
+                self.parser.init_config()
+            self.assertEqual(expected, self.parser._mode, "mode=%s" % value)
 
     def test_parse_invalid_json_should_fallback(self):
         mock_client = Mock()

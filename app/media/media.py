@@ -1176,7 +1176,14 @@ class Media:
         if not file_media_info and allow_aliases:
             aliases = dict(DEFAULT_NAME_ALIASES)
             aliases.update((Config().get_config("media") or {}).get("name_aliases") or {})
-            for name in [aliases.get(query_name), getattr(meta_info, "en_name", None)]:
+            # 规则名与 LLM 名都作为检索词试一次，避免某一侧译名失配导致整条识别失败
+            llm_note = (getattr(meta_info, "note", None) or {}).get("llm") or {}
+            fallback_names = [aliases.get(query_name), getattr(meta_info, "en_name", None)]
+            for key in ("rule_names", "llm_names"):
+                names = llm_note.get(key)
+                if isinstance(names, list):
+                    fallback_names.extend(names)
+            for name in fallback_names:
                 if name and not self.__is_same_search_name(query_name, name):
                     file_media_info = self.__search_media_with_name(
                         meta_info, name, strict=strict, allow_aliases=False)
