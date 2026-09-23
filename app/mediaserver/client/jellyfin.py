@@ -400,7 +400,11 @@ class Jellyfin(_IMediaClient):
         return False
 
     def __refresh_jellyfin_item_by_id(self, item_id):
-        """调用 Jellyfin 单项目 Refresh API，绝不回退全库。"""
+        """调用 Jellyfin 单项目 Refresh API，绝不回退全库。
+
+        Jellyfin 12 起不再接受查询参数形式的 api_key，必须带 Authorization 头，
+        因此复用带认证头的请求客户端，与其它 Jellyfin 调用保持一致。
+        """
         if not item_id or not self._host or not self._apikey:
             return False
         req_url = (
@@ -409,8 +413,12 @@ class Jellyfin(_IMediaClient):
             "&ReplaceAllImages=false&api_key=%s"
         ) % (self._host, item_id, self._apikey)
         try:
-            res = RequestUtils().post_res(req_url)
-            return bool(res)
+            res = self.__request_utils().post_res(req_url)
+            if res:
+                return True
+            log.error(f"【{self.server_type}】Items/{item_id}/Refresh 返回 "
+                      f"{getattr(res, 'status_code', '无响应')}，局部刷新失败")
+            return False
         except Exception as e:
             ExceptionUtils.exception_traceback(e)
             log.error(f"【{self.server_type}】连接Items/Id/Refresh出错：" + str(e))
