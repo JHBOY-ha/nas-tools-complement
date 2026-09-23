@@ -518,3 +518,63 @@ class LLMMetaParserTest(TestCase):
         self.assertEqual(6, llm_note.get("tmdb_season"))
         self.assertEqual("飙马野郎篇", llm_note.get("tmdb_season_name"))
         self.assertEqual(1, llm_note.get("tmdb_episode"))
+
+    def test_extract_year_hint_skips_monthly_release_label(self):
+        extract = self.parser._LLMMetaParser__extract_year_hint
+
+        self.assertEqual("2019", extract("Some Show (2019) 1080p"))
+        self.assertEqual("2024", extract("[Group] Some Show 2024 S02E03 [WEB-DL]"))
+        self.assertIsNone(extract("[Group] Some Show 2026年7月番 [1080p]"))
+        self.assertIsNone(extract("[Group] Some Show [1080p]", None))
+
+    def test_prioritize_candidates_puts_matching_year_first(self):
+        class _Item:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        old_version = _Item(id=11, name="Dune", release_date="1984-12-14")
+        new_version = _Item(id=22, name="Dune", release_date="2021-10-22")
+        other = _Item(id=33, name="Dune Prophecy", first_air_date="2024-11-17")
+
+        ordered = self.parser._LLMMetaParser__prioritize_raw_by_year(
+            [old_version, new_version, other], "2021")
+
+        self.assertEqual([22, 11, 33], [item.id for item in ordered])
+        self.assertEqual([old_version, new_version, other],
+                         self.parser._LLMMetaParser__prioritize_raw_by_year(
+                             [old_version, new_version, other], None))
+
+    def test_tmdb_candidates_prioritize_matching_year(self):
+        class _Item:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        old_version = _Item(id=11, name="Dune", release_date="1984-12-14", genre_ids=[878])
+        new_version = _Item(id=22, name="Dune", release_date="2021-10-22", genre_ids=[878])
+        search = Mock()
+        search.movies.return_value = [old_version, new_version]
+        config = Mock()
+        config.get_config.side_effect = lambda key: (
+            {"rmt_tmdbkey": "test-key", "tmdb_domain": "api.tmdb.org"} if key == "app" else {}
+        )
+        config.get_proxies.return_value = None
+
+        with patch("app.media.meta.llm_parser.Config", return_value=config), \
+                patch("app.media.meta.llm_parser.TMDb"), \
+                patch("app.media.meta.llm_parser.Search", return_value=search):
+            candidates = self.parser._LLMMetaParser__search_tmdb_candidates(
+                query="Dune", mtype_hint=MediaType.MOVIE, year="2021")
+
+        self.assertTrue(candidates)
+        self.assertEqual(22, candidates[0]["id"])
+        self.assertEqual("2021", candidates[0]["year"])
+
+    def test_normalize_result_keeps_pick_reason(self):
+        result = self.parser._LLMMetaParser__normalize_result({
+            "type": "movie",
+            "tmdb_id": 22,
+            "tmdb_type": "movie",
+            "tmdb_pick_reason": "片名一致且标题年份2021与候选year相符"
+        })
+
+        self.assertEqual("片名一致且标题年份2021与候选year相符", result.get("tmdb_pick_reason"))

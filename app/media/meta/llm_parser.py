@@ -138,7 +138,7 @@ class LLMMetaParser(object):
                 "字段仅允许："
                 "type,cn_name,en_name,year,begin_season,end_season,begin_episode,end_episode,"
                 "part,resource_type,resource_effect,resource_pix,resource_team,video_encode,audio_encode,"
-                "tmdb_id,tmdb_type,tmdb_season,tmdb_season_name,tmdb_episode。"
+                "tmdb_id,tmdb_type,tmdb_season,tmdb_season_name,tmdb_episode,tmdb_pick_reason。"
                 "其中 type 只允许 movie/tv/anime；tmdb_type 只允许 movie/tv。"
                 "季集号规则："
                 "1) begin_season 只填标题/副标题里明确出现的季标记（如 S01、Season 1、第1季、第二季）对应的数字，标题写第几季就填几，不要换算成 TMDB 的季号。"
@@ -151,6 +151,10 @@ class LLMMetaParser(object):
                 "3) 标题或副标题里出现篇章名/arc 名且与某季 name 语义一致时（例如“飙马野郎”对应“飙马野郎篇”、“Steel Ball Run”对应“STEEL BALL RUN”），采用该季并把该季显示的季名回填到 tmdb_season_name。"
                 "4) 标题季标记与候选证据冲突时以候选证据为准；找不到任何证据时保持 begin_season 原值，不要改。"
                 "5) tmdb_episode 填该季内部的集号，用于发布方按放送季编号而 TMDB 合并成单季的情况（如发布版“第4季第18集”在 TMDB 是第1季第84集）；能确定才填，不确定就省略。"
+                "候选选择规则（external_candidates.tmdb 有多项时）："
+                "1) 优先选片名或别名与标题完全对应的一项；出现同名作品时，用标题/副标题里的年份与候选 year 对齐后再选。"
+                "2) 年份也对不出时，用类型（电影/剧集/动画）以及候选 aliases 与发布信息（制作组、字幕组、来源站）的吻合度判断；仍无法确定就省略 tmdb_id，不要随便挑一个。"
+                "3) 选定后把依据写进 tmdb_pick_reason（一句话，如“片名一致且标题年份2024与候选year相符”）。"
                 "年份规则："
                 "1) 仅在出现明确四位年份时填写 year（1900-2100），例如 '(2022)'、' 2022 '。"
                 "2) '2022年7月番'、'7月新番'、'04月新番' 这类“年+月/仅月”发布时间标签，不作为 year。"
@@ -166,7 +170,7 @@ class LLMMetaParser(object):
                 "5) 不确定就留空，不要猜测。"
                 "你可能会收到 external_candidates 字段，包含 TMDB/Bangumi 检索候选，仅供参考。"
                 "external_candidates.tmdb 的每一项包含 id、name、type、year、aliases(别名) 与 seasons(该剧各季列表，n=季号、name=季名、year=首播年份、eps=集数)。"
-                "如果你能从 external_candidates.tmdb 明确匹配到目标，可额外返回 tmdb_id(整数)、tmdb_type(movie/tv) 以及 tmdb_season、tmdb_season_name、tmdb_episode。"
+                "如果你能从 external_candidates.tmdb 明确匹配到目标，可额外返回 tmdb_id(整数)、tmdb_type(movie/tv) 以及 tmdb_season、tmdb_season_name、tmdb_episode、tmdb_pick_reason。"
                 "不要返回其他字段。"
             )
             user_prompt = (
@@ -244,6 +248,10 @@ class LLMMetaParser(object):
                     "【Meta】LLM直出TMDB候选：id=%s, type=%s"
                     % (llm_result.get("tmdb_id"), llm_result.get("tmdb_type") or "")
                 )
+                pick_reason = self.__clean_text(llm_result.get("tmdb_pick_reason"), max_len=120)
+                if pick_reason:
+                    note["llm"]["pick_reason"] = pick_reason
+                    log.info("【Meta】LLM候选选择依据：%s" % pick_reason)
             release_season = self.__parse_int(llm_result.get("release_season", original_season),
                                               min_val=0, max_val=999)
             if release_season is not None:
@@ -386,6 +394,9 @@ class LLMMetaParser(object):
         tmdb_season_name = self.__clean_text(parsed.get("tmdb_season_name"), max_len=60)
         if tmdb_season_name:
             result["tmdb_season_name"] = tmdb_season_name
+        tmdb_pick_reason = self.__clean_text(parsed.get("tmdb_pick_reason"), max_len=120)
+        if tmdb_pick_reason:
+            result["tmdb_pick_reason"] = tmdb_pick_reason
         return result
 
     def __build_external_candidates(self, title, subtitle=None, mtype_hint=None):
@@ -395,10 +406,11 @@ class LLMMetaParser(object):
         if not query_list:
             return "", {}
         query = query_list[0]
+        year_hint = self.__extract_year_hint(title, subtitle)
 
         payload = {}
         tmdb_candidates = self.__search_candidates_by_queries(
-            search_func=lambda q: self.__search_tmdb_candidates(query=q, mtype_hint=mtype_hint),
+            search_func=lambda q: self.__search_tmdb_candidates(query=q, mtype_hint=mtype_hint, year=year_hint),
             query_list=query_list
         )
         bangumi_candidates = self.__search_candidates_by_queries(
@@ -412,9 +424,10 @@ class LLMMetaParser(object):
             payload["bangumi"] = bangumi_candidates
 
         log.info(
-            "【Meta】LLM检索增强候选：query=%s, tmdb=%s, bangumi=%s"
+            "【Meta】LLM检索增强候选：query=%s, 年份=%s, tmdb=%s, bangumi=%s"
             % (
                 self.__shorten_text(query, 80),
+                year_hint or "无",
                 len(tmdb_candidates),
                 len(bangumi_candidates)
             )
@@ -931,7 +944,7 @@ class LLMMetaParser(object):
             "result": deepcopy(result or {})
         }
 
-    def __search_tmdb_candidates(self, query, mtype_hint=None):
+    def __search_tmdb_candidates(self, query, mtype_hint=None, year=None):
         app_conf = Config().get_config("app") or {}
         tmdb_key = str(app_conf.get("rmt_tmdbkey") or "").strip()
         if not tmdb_key:
@@ -957,11 +970,19 @@ class LLMMetaParser(object):
             else:
                 raw_results = search.multi(params)
 
-            candidates = []
+            raw_items = []
             for item in (raw_results or []):
                 genres = getattr(item, "genre_ids", None) or []
                 if mtype_hint == MediaType.ANIME and 16 not in genres:
                     continue
+                raw_items.append(item)
+            # 同名作品（原版/翻拍/同名剧集）优先把年份对得上的候选排前面，交给LLM判断；
+            # 这里只重排不做过滤，避免发布年份与首播年份不同的剧集被筛掉。
+            raw_items = self.__prioritize_raw_by_year(raw_items, year)
+
+            candidates = []
+            for item in raw_items:
+                genres = getattr(item, "genre_ids", None) or []
                 name = self.__clean_text(
                     getattr(item, "title", None) or getattr(item, "name", None),
                     max_len=120
@@ -971,7 +992,7 @@ class LLMMetaParser(object):
                 release_date = str(
                     getattr(item, "release_date", "") or getattr(item, "first_air_date", "")
                 ).strip()
-                year = release_date[:4] if len(release_date) >= 4 and release_date[:4].isdigit() else ""
+                candidate_year = release_date[:4] if len(release_date) >= 4 and release_date[:4].isdigit() else ""
                 item_type = self.__clean_text(getattr(item, "media_type", ""), max_len=20).lower()
                 if not item_type:
                     if mtype_hint == MediaType.MOVIE:
@@ -983,8 +1004,8 @@ class LLMMetaParser(object):
                     "name": name,
                     "genre_ids": genres
                 }
-                if year:
-                    candidate["year"] = year
+                if candidate_year:
+                    candidate["year"] = candidate_year
                 if item_type:
                     candidate["type"] = item_type
                 if item_type == "tv" and candidate["id"]:
@@ -999,6 +1020,35 @@ class LLMMetaParser(object):
         except Exception as err:
             log.debug("【Meta】TMDB候选检索异常：%s" % str(err))
             return []
+
+    @staticmethod
+    def __raw_release_year(item):
+        date = str(getattr(item, "release_date", "") or getattr(item, "first_air_date", "") or "").strip()
+        return date[:4] if len(date) >= 4 and date[:4].isdigit() else ""
+
+    @classmethod
+    def __prioritize_raw_by_year(cls, items, year):
+        if not year or not items:
+            return items
+        target = str(year)
+        matched = [item for item in items if cls.__raw_release_year(item) == target]
+        if not matched:
+            return items
+        matched_ids = {id(item) for item in matched}
+        return matched + [item for item in items if id(item) not in matched_ids]
+
+    @classmethod
+    def __extract_year_hint(cls, title, subtitle=None):
+        """
+        从标题里取用于候选排序的年份；"2026年7月番"这类放送月份标签不算年份。
+        """
+        text = " ".join([str(title or ""), str(subtitle or "")])
+        for match in re.finditer(r"(?<!\d)(19\d{2}|20\d{2})(?!\d)", text):
+            tail = text[match.end():match.end() + 4]
+            if re.match(r"\s*年\s*\d{1,2}\s*月", tail):
+                continue
+            return match.group(1)
+        return None
 
     def __search_bangumi_candidates(self, query):
         try:
