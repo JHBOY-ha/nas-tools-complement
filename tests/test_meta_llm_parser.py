@@ -578,3 +578,74 @@ class LLMMetaParserTest(TestCase):
         })
 
         self.assertEqual("片名一致且标题年份2021与候选year相符", result.get("tmdb_pick_reason"))
+
+    def test_candidate_extra_carries_external_ids_and_votes(self):
+        detail = {
+            "seasons": [{"season_number": 1, "name": "第 1 季",
+                         "air_date": "2016-04-04", "episode_count": 25}],
+            "alternative_titles": {"results": [{"iso_3166_1": "CN", "title": "Re：从零开始的异世界生活"}]},
+            "external_ids": {"imdb_id": "tt5607616", "tvdb_id": 305089},
+            "vote_count": 787
+        }
+        tv = Mock()
+        tv.details.return_value = detail
+
+        with patch("app.media.meta.llm_parser.TV", return_value=tv) as tv_cls:
+            extra = self.parser._LLMMetaParser__fetch_tv_candidate_extra(65942)
+
+        self.assertEqual("tt5607616", extra.get("imdb"))
+        self.assertEqual(305089, extra.get("tvdb"))
+        self.assertEqual(787, extra.get("votes"))
+        self.assertEqual([{"n": 1, "name": "第 1 季", "year": "2016", "eps": 25}], extra.get("seasons"))
+        self.assertEqual("alternative_titles,external_ids",
+                         tv_cls.return_value.details.call_args.kwargs.get("append_to_response"))
+
+    def test_duplicate_candidates_without_external_ids_are_dropped(self):
+        official = {"id": 65942, "name": "Re：从零开始的异世界生活", "type": "tv",
+                    "imdb": "tt5607616", "tvdb": 305089, "votes": 787}
+        duplicate = {"id": 336222, "name": "Re：从零开始的异世界生活", "type": "tv"}
+        other = {"id": 1234, "name": "别的剧", "type": "tv"}
+
+        kept = self.parser._LLMMetaParser__filter_duplicate_candidates(
+            [official, duplicate, other])
+
+        self.assertEqual([65942, 1234], [item["id"] for item in kept])
+
+    def test_duplicate_candidates_with_year_suffix_are_grouped(self):
+        official = {"id": 65942, "name": "Re：从零开始的异世界生活", "type": "tv",
+                    "imdb": "tt5607616", "votes": 787}
+        duplicate = {"id": 336222, "name": "Re：从零开始的异世界生活（2016）", "type": "tv"}
+        ova = {"id": 532321, "name": "Re：从零开始的异世界生活 雪之回忆", "type": "tv"}
+
+        kept = self.parser._LLMMetaParser__filter_duplicate_candidates(
+            [official, duplicate, ova])
+
+        self.assertEqual([65942, 532321], [item["id"] for item in kept])
+
+    def test_search_candidates_prefer_authoritative_duplicate(self):
+        class _Item:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        official = _Item(id=65942, name="Re：从零开始的异世界生活", first_air_date="2016-04-04",
+                         media_type="tv", genre_ids=[16])
+        duplicate = _Item(id=336222, name="Re：从零开始的异世界生活", first_air_date="2016-04-03",
+                          media_type="tv", genre_ids=[16])
+        search = Mock()
+        search.tv_shows.return_value = [official, duplicate]
+        config = Mock()
+        config.get_config.side_effect = lambda key: (
+            {"rmt_tmdbkey": "test-key", "tmdb_domain": "api.tmdb.org"} if key == "app" else {}
+        )
+        config.get_proxies.return_value = None
+        extras = {65942: {"imdb": "tt5607616", "votes": 787}, 336222: {}}
+
+        with patch("app.media.meta.llm_parser.Config", return_value=config), \
+                patch("app.media.meta.llm_parser.TMDb"), \
+                patch("app.media.meta.llm_parser.Search", return_value=search), \
+                patch.object(self.parser, "_LLMMetaParser__fetch_tv_candidate_extra",
+                             side_effect=lambda tmdb_id: extras.get(tmdb_id, {})):
+            candidates = self.parser._LLMMetaParser__search_tmdb_candidates(
+                query="Re Zero", mtype_hint=MediaType.TV)
+
+        self.assertEqual([65942], [item["id"] for item in candidates])

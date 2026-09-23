@@ -153,8 +153,9 @@ class LLMMetaParser(object):
                 "5) tmdb_episode 填该季内部的集号，用于发布方按放送季编号而 TMDB 合并成单季的情况（如发布版“第4季第18集”在 TMDB 是第1季第84集）；能确定才填，不确定就省略。"
                 "候选选择规则（external_candidates.tmdb 有多项时）："
                 "1) 优先选片名或别名与标题完全对应的一项；出现同名作品时，用标题/副标题里的年份与候选 year 对齐后再选。"
-                "2) 年份也对不出时，用类型（电影/剧集/动画）以及候选 aliases 与发布信息（制作组、字幕组、来源站）的吻合度判断；仍无法确定就省略 tmdb_id，不要随便挑一个。"
-                "3) 选定后把依据写进 tmdb_pick_reason（一句话，如“片名一致且标题年份2024与候选year相符”）。"
+                "2) 同名条目优先选带 imdb 或 tvdb 外链、votes 更高的那一项：那是 TMDB 的正式条目；没有外链的条目多是用户自建的重复条目（随时可能被合并删除），即使它的季结构看起来更贴合发布编号也不要选它。"
+                "3) 年份和外链都对不出时，用类型（电影/剧集/动画）以及候选 aliases 与发布信息（制作组、字幕组、来源站）的吻合度判断；仍无法确定就省略 tmdb_id，不要随便挑一个。"
+                "4) 选定后把依据写进 tmdb_pick_reason（一句话，如“片名一致且标题年份2024与候选year相符”）。"
                 "年份规则："
                 "1) 仅在出现明确四位年份时填写 year（1900-2100），例如 '(2022)'、' 2022 '。"
                 "2) '2022年7月番'、'7月新番'、'04月新番' 这类“年+月/仅月”发布时间标签，不作为 year。"
@@ -169,7 +170,7 @@ class LLMMetaParser(object):
                 "4) resource_type/resource_effect/video_encode/audio_encode 仅在 title/subtitle 明确出现对应关键词时填写，不得猜测或借 external_candidates 脑补。"
                 "5) 不确定就留空，不要猜测。"
                 "你可能会收到 external_candidates 字段，包含 TMDB/Bangumi 检索候选，仅供参考。"
-                "external_candidates.tmdb 的每一项包含 id、name、type、year、aliases(别名) 与 seasons(该剧各季列表，n=季号、name=季名、year=首播年份、eps=集数)。"
+                "external_candidates.tmdb 的每一项包含 id、name、type、year、aliases(别名)、imdb/tvdb(外链，缺省表示没有)、votes(投票数) 与 seasons(该剧各季列表，n=季号、name=季名、year=首播年份、eps=集数)。"
                 "如果你能从 external_candidates.tmdb 明确匹配到目标，可额外返回 tmdb_id(整数)、tmdb_type(movie/tv) 以及 tmdb_season、tmdb_season_name、tmdb_episode、tmdb_pick_reason。"
                 "不要返回其他字段。"
             )
@@ -501,12 +502,12 @@ class LLMMetaParser(object):
 
     def __fetch_tv_candidate_extra(self, tmdb_id):
         """
-        取单个电视剧候选的季列表与别名（一次 TMDB 请求，结果走请求缓存）。
+        取单个电视剧候选的季列表、别名与外部链接（一次 TMDB 请求，结果走请求缓存）。
         """
         if not tmdb_id:
             return {}
         try:
-            detail = TV().details(tmdb_id, append_to_response="alternative_titles")
+            detail = TV().details(tmdb_id, append_to_response="alternative_titles,external_ids")
         except Exception as err:
             log.debug("【Meta】TMDB候选季信息获取失败：%s" % str(err))
             return {}
@@ -542,6 +543,17 @@ class LLMMetaParser(object):
             extra["seasons"] = seasons
         if aliases:
             extra["aliases"] = aliases[:8]
+        external = detail.get("external_ids")
+        if external:
+            imdb_id = self.__clean_text(external.get("imdb_id"), max_len=30)
+            if imdb_id:
+                extra["imdb"] = imdb_id
+            tvdb_id = self.__parse_int(external.get("tvdb_id"), min_val=1, max_val=99999999)
+            if tvdb_id is not None:
+                extra["tvdb"] = tvdb_id
+        votes = self.__parse_int(detail.get("vote_count"), min_val=0, max_val=9999999)
+        if votes is not None:
+            extra["votes"] = votes
         return extra
 
     def __verify_candidate_binding(self, result, candidate_payload, title, subtitle=None):
@@ -981,45 +993,107 @@ class LLMMetaParser(object):
             raw_items = self.__prioritize_raw_by_year(raw_items, year)
 
             candidates = []
-            for item in raw_items:
-                genres = getattr(item, "genre_ids", None) or []
-                name = self.__clean_text(
-                    getattr(item, "title", None) or getattr(item, "name", None),
-                    max_len=120
-                )
-                if not name:
-                    continue
-                release_date = str(
-                    getattr(item, "release_date", "") or getattr(item, "first_air_date", "")
-                ).strip()
-                candidate_year = release_date[:4] if len(release_date) >= 4 and release_date[:4].isdigit() else ""
-                item_type = self.__clean_text(getattr(item, "media_type", ""), max_len=20).lower()
-                if not item_type:
-                    if mtype_hint == MediaType.MOVIE:
-                        item_type = "movie"
-                    elif mtype_hint in [MediaType.TV, MediaType.ANIME]:
-                        item_type = "tv"
-                candidate = {
-                    "id": getattr(item, "id", None),
-                    "name": name,
-                    "genre_ids": genres
-                }
-                if candidate_year:
-                    candidate["year"] = candidate_year
-                if item_type:
-                    candidate["type"] = item_type
-                if item_type == "tv" and candidate["id"]:
-                    candidate.update(self.__fetch_tv_candidate_extra(candidate["id"]))
-                candidates.append(candidate)
-                if len(candidates) >= self._search_max_results:
-                    break
-            return candidates
+            index = 0
+            while index < len(raw_items) and len(candidates) < self._search_max_results:
+                candidate = self.__build_tmdb_candidate(raw_items[index], mtype_hint)
+                index += 1
+                if candidate:
+                    candidates.append(candidate)
+
+            # 同名重复条目：补看紧随其后的同名候选，拿到外链信息后再决定保留哪一条
+            if candidates:
+                built_names = {self.__candidate_group_key(item.get("name")) for item in candidates}
+                for item in raw_items[index:index + 3]:
+                    name = self.__clean_text(
+                        getattr(item, "title", None) or getattr(item, "name", None), max_len=120)
+                    if not name or self.__candidate_group_key(name) not in built_names:
+                        continue
+                    candidate = self.__build_tmdb_candidate(item, mtype_hint)
+                    if candidate:
+                        candidates.append(candidate)
+
+            candidates = self.__filter_duplicate_candidates(candidates)
+            return candidates[:self._search_max_results]
         except TMDbException as err:
             log.debug("【Meta】TMDB候选检索失败：%s" % str(err))
             return []
         except Exception as err:
             log.debug("【Meta】TMDB候选检索异常：%s" % str(err))
             return []
+
+    def __build_tmdb_candidate(self, item, mtype_hint=None):
+        genres = getattr(item, "genre_ids", None) or []
+        if mtype_hint == MediaType.ANIME and 16 not in genres:
+            return {}
+        name = self.__clean_text(
+            getattr(item, "title", None) or getattr(item, "name", None), max_len=120)
+        if not name:
+            return {}
+        release_date = str(
+            getattr(item, "release_date", "") or getattr(item, "first_air_date", "")
+        ).strip()
+        candidate_year = release_date[:4] if len(release_date) >= 4 and release_date[:4].isdigit() else ""
+        item_type = self.__clean_text(getattr(item, "media_type", ""), max_len=20).lower()
+        if not item_type:
+            if mtype_hint == MediaType.MOVIE:
+                item_type = "movie"
+            elif mtype_hint in [MediaType.TV, MediaType.ANIME]:
+                item_type = "tv"
+        candidate = {
+            "id": getattr(item, "id", None),
+            "name": name,
+            "genre_ids": genres
+        }
+        if candidate_year:
+            candidate["year"] = candidate_year
+        if item_type:
+            candidate["type"] = item_type
+        if item_type == "tv" and candidate["id"]:
+            candidate.update(self.__fetch_tv_candidate_extra(candidate["id"]))
+        return candidate
+
+    @staticmethod
+    def __candidate_authority(candidate):
+        """
+        候选的权威性：带 IMDb/TVDB 外链的是 TMDB 正式条目，重复条目通常一个外链都没有。
+        """
+        if not candidate:
+            return 0
+        return 1 if (candidate.get("imdb") or candidate.get("tvdb")) else 0
+
+    @classmethod
+    def __filter_duplicate_candidates(cls, candidates):
+        """
+        同名作品出现多条候选时，丢弃没有外链的疑似重复条目，保留正式条目。
+        """
+        if not candidates:
+            return candidates
+        grouped = {}
+        for candidate in candidates:
+            grouped.setdefault(cls.__candidate_group_key(candidate.get("name")), []).append(candidate)
+        kept = []
+        for candidate in candidates:
+            group = grouped.get(cls.__candidate_group_key(candidate.get("name"))) or []
+            if len(group) > 1 and not cls.__candidate_authority(candidate):
+                authoritative = [item for item in group if cls.__candidate_authority(item)]
+                if authoritative:
+                    log.warn(
+                        "【Meta】同名候选存在带外链的正式条目，忽略疑似重复条目：id=%s(%s) -> 保留 id=%s(%s)"
+                        % (candidate.get("id"), candidate.get("name"),
+                           authoritative[0].get("id"), authoritative[0].get("name"))
+                    )
+                    continue
+            kept.append(candidate)
+        return kept
+
+    @classmethod
+    def __candidate_group_key(cls, name):
+        """
+        用于判断候选是否同一作品的键：忽略大小写、标点，并去掉名称尾部的年份后缀
+        （重复条目常见写法是「作品名（2016）」）。
+        """
+        key = cls.__normalize_match_text(name)
+        return re.sub(r"(?:19|20)\d{2}$", "", key).strip()
 
     @staticmethod
     def __raw_release_year(item):
