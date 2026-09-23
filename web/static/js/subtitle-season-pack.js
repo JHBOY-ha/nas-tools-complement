@@ -1,4 +1,4 @@
-/* Season archives use the same bounded multipart intake and persistent task center. */
+/* Season packs upload either one ZIP or the subtitle files themselves. */
 (function (window, $) {
   "use strict";
   const root = document.getElementById("season-pack-modal");
@@ -23,7 +23,7 @@
     const season = $("#library_episode_season").val();
     const item = library_items_cache[library_current_series_id];
     if (!item || season === "" || season == null) {
-      show_fail_modal("请先选择具体的一季，再上传整季字幕包");
+      show_fail_modal("请先选择具体的一季，再上传整季字幕");
       return;
     }
     generation += 1;
@@ -35,7 +35,7 @@
     $("#season_pack_file").val("");
     $("#season_pack_align").val("none");
     $("#season_pack_rows").empty();
-    message("选择 ZIP/RAR 后预览匹配，可取消勾选不需要的字幕。");
+    message("选择字幕文件（可多选）或 ZIP 包后预览匹配，可取消勾选不需要的字幕。");
     busy(false);
     $("#index-library-episodes-modal").modal("hide");
     $("#season-pack-modal").modal("show");
@@ -49,12 +49,23 @@
   };
   window.upload_library_season_pack = function (submit) {
     if (request || !context || !isCurrent()) return;
-    const file = $("#season_pack_file")[0].files[0];
-    if (!file) { message("请选择 ZIP 或 RAR 字幕包", true); return; }
-    if (file.size > 250 * 1024 * 1024) { message("字幕包不能超过 250 MiB", true); return; }
+    const files = Array.prototype.slice.call($("#season_pack_file")[0].files || []);
+    if (!files.length) { message("请选择字幕文件或 ZIP 字幕包", true); return; }
+    if (files.some(function (file) { return /\.rar$/i.test(file.name || ""); })) {
+      message("RAR 包请先解压，再选择其中的字幕文件上传", true);
+      return;
+    }
+    const archives = files.filter(function (file) { return /\.zip$/i.test(file.name || ""); });
+    if (archives.length && files.length > 1) {
+      message("ZIP 包请单独上传，不能和字幕文件一起选择", true);
+      return;
+    }
+    if (!archives.length && files.length > 200) { message("一次最多上传 200 个字幕文件", true); return; }
+    const bytes = files.reduce(function (total, file) { return total + (file.size || 0); }, 0);
+    if (bytes > 250 * 1024 * 1024) { message("上传内容不能超过 250 MiB", true); return; }
     const data = new FormData();
     Object.keys(context).forEach(function (key) { data.append(key, context[key]); });
-    data.append("file", file);
+    files.forEach(function (file) { data.append("file", file); });
     data.append("align", $("#season_pack_align").val());
     data.append("upload_mode", submit ? "season_submit" : "season_preview");
     if (submit) {
@@ -68,10 +79,10 @@
     }
     const current = generation;
     busy(true);
-    message(submit ? "正在上传并提交后台任务…" : "正在读取字幕包并匹配剧集…");
+    message(submit ? "正在上传并提交后台任务…" : "正在读取字幕并匹配剧集…");
     request = SubtitleTasks.upload(data, {
       onUploadProgress: function (progress) {
-        if (current === generation) message(`字幕包上传中：${progress.percent || 0}%`);
+        if (current === generation) message(`上传中：${progress.percent || 0}%`);
       },
       onTerminal: function () { if (isCurrent()) load_library_items(library_page); }
     });

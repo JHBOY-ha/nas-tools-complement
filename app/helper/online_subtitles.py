@@ -324,11 +324,7 @@ class OnlineSubtitles:
         if zipfile.is_zipfile(stream):
             archive = zipfile.ZipFile(stream)
         elif content.startswith(b"Rar!"):
-            try:
-                import rarfile
-                archive = rarfile.RarFile(stream)
-            except ImportError:
-                raise ValueError("RAR 字幕包需要安装 rarfile 和 unrar") from None
+            raise ValueError("暂不支持 RAR 字幕包，请选择其他字幕结果")
         if archive is not None:
             with archive:
                 entries = [entry for entry in archive.infolist()

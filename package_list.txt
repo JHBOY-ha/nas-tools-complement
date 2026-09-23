@@ -17,4 +17,3 @@ chromium-chromedriver
 npm
 dumb-init
 ffmpeg
-libarchive-tools

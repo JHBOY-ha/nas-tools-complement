@@ -19,7 +19,14 @@ function $(key) {
 let pending, sent, calls = 0;
 class FormData {
   constructor() { this.fields = {}; }
-  append(k, v) { this.fields[k] = v; }
+  append(k, v) {
+    if (k in this.fields) {
+      if (!Array.isArray(this.fields[k])) this.fields[k] = [this.fields[k]];
+      this.fields[k].push(v);
+    } else {
+      this.fields[k] = v;
+    }
+  }
 }
 let root = {};
 const context = {console, FormData, document: {getElementById: () => root}, library_current_series_id: 'series',
@@ -39,12 +46,14 @@ const flush = () => new Promise(resolve => setImmediate(resolve));
   assert(context.error.includes('选择具体'));
   $('#library_episode_season').value = '2';
   api.open_library_season_pack();
-  $('#season_pack_file')[0] = {files: [{size: 1024, name: 'show.zip'}]};
+  $('#season_pack_file')[0] = {files: [{size: 1024, name: 'Show.S02E01.chs.srt'},
+                                       {size: 2048, name: 'Show.S02E02.chs.srt'}]};
   api.upload_library_season_pack(false);
   assert.equal(sent.upload_mode, 'season_preview');
   assert.equal(sent.item_id, 'series');
   assert.equal(sent.season, '2');
   assert.equal(sent.server, 'plex');
+  assert.equal(sent.file.length, 2, 'every selected subtitle file must be uploaded');
   api.upload_library_season_pack(false);
   assert.equal(calls, 1, 'duplicate requests must be blocked');
   pending.resolve({response: {plan_id: 'plan', rows: [
@@ -70,6 +79,11 @@ const flush = () => new Promise(resolve => setImmediate(resolve));
   await flush();
   assert.equal($('#season_pack_submit').disabled, true);
   assert($('#season_pack_message').textValue.includes('任务中心'));
+  $('#season_pack_file')[0] = {files: [{size: 10, name: 'pack.rar'}]};
+  api.upload_library_season_pack(false);
+  assert.equal(calls, 3, 'RAR packs must be rejected before uploading');
+  assert($('#season_pack_message').textValue.includes('RAR'));
+  $('#season_pack_file')[0] = {files: [{size: 1024, name: 'show.zip'}]};
   api.upload_library_season_pack(false);
   const before = $('#season_pack_rows').htmlValue;
   root = {};

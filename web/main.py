@@ -1500,7 +1500,7 @@ def library_online_subtitle_download():
     except Exception as error:
         if getattr(error, "status_code", None):
             return _subtitle_task_error(error)
-        return {"code": -1, "msg": "字幕下载或处理失败；RAR 字幕包需安装 unrar，请尝试其他字幕"}
+        return {"code": -1, "msg": "字幕下载或处理失败，请尝试其他字幕结果"}
     finally:
         if admitted and manager is not None:
             manager.release_upload_admission()
@@ -2480,14 +2480,14 @@ def _subtitle_task_response(task, reused=False, created_message="已加入字幕
 
 # 手动上传字幕：HTTP 只负责流式暂存和入队，规范化/对齐/发布/刷新均在后台执行。
 def _upload_season_pack(manager, policy, upload_files):
-    """Preview and commit a server-resolved season mapping using bounded intake."""
+    """Preview and commit a server-resolved season mapping from a ZIP or selected files."""
     import hashlib
     from contextlib import ExitStack
     from werkzeug.datastructures import FileStorage
-    from app.helper.subtitle_season_pack import open_pack, build_plan, MemberStream
+    from app.helper.subtitle_season_pack import open_season_source, build_plan
 
-    if len(upload_files) != 1:
-        return {"code": -1, "msg": "请选择一个 ZIP 或 RAR 字幕包"}, 400
+    if not upload_files:
+        return {"code": -1, "msg": "请选择 ZIP 字幕包或字幕文件"}, 400
     try:
         season = int(request.form.get("season", ""))
         if not 0 <= season <= 999:
@@ -2503,21 +2503,24 @@ def _upload_season_pack(manager, policy, upload_files):
     episodes = MediaLibrary().get_episodes({"item_id": request.form.get("item_id"), "server": server})
     if episodes.get("code") != 0:
         return episodes, 400
-    stream = upload_files[0].stream
-    stream.seek(0)
     digest = hashlib.sha256()
     total = 0
-    for chunk in iter(lambda: stream.read(64 * 1024), b""):
-        total += len(chunk)
-        if total > policy["batch_limit_mb"] * 1024 * 1024:
-            return {"code": -1, "msg": "字幕包超过单批总量限制"}, 413
-        digest.update(chunk)
-    with open_pack(stream, policy) as (archive, members):
+    for upload_file in upload_files:
+        stream = getattr(upload_file, "stream", upload_file)
+        stream.seek(0)
+        digest.update(str(getattr(upload_file, "filename", "") or "").encode("utf-8", "ignore") + b"\0")
+        for chunk in iter(lambda: stream.read(64 * 1024), b""):
+            total += len(chunk)
+            if total > policy["batch_limit_mb"] * 1024 * 1024:
+                return {"code": -1, "msg": "字幕文件总大小超过单批总量限制"}, 413
+            digest.update(chunk)
+        stream.seek(0)
+    with open_season_source(upload_files, policy) as (source, members):
         plan = build_plan(members, episodes.get("items") or [], season, digest.hexdigest())
         if request.form.get("upload_mode") == "season_preview":
             return dict(code=0, **plan)
         if request.form.get("plan_id") != plan["plan_id"]:
-            return {"code": -1, "msg": "字幕包或剧集信息发生变化，请重新预览匹配"}, 409
+            return {"code": -1, "msg": "字幕或剧集信息发生变化，请重新预览匹配"}, 409
         selected_values = json.loads(request.form.get("members") or "[]")
         if not isinstance(selected_values, list) or len(selected_values) > 200 or any(not isinstance(value, str) for value in selected_values):
             return {"code": -1, "msg": "字幕文件选择无效"}, 400
@@ -2552,7 +2555,7 @@ def _upload_season_pack(manager, policy, upload_files):
                     "path_authorization": {"source": authorization, "target": authorization}
                 }
                 entry = members[int(row["id"])][1]
-                reader = MemberStream(archive, entry)
+                reader = source.open(entry)
                 stack.callback(reader.close)
                 files.append(FileStorage(reader, filename=name))
             payload = dict(next(iter(targets.values())), season_targets=targets)

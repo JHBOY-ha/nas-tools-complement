@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 
 from werkzeug.datastructures import FileStorage, MultiDict
 from tests.test_subtitle_task_security import _UploadManager, _path_snapshot, processors
-from app.helper.subtitle_season_pack import build_plan, episode_key, open_pack
+from app.helper.subtitle_season_pack import build_plan, episode_key, open_pack, open_season_source
 
 SRT = b'1\n00:00:01,000 --> 00:00:02,000\nThis is the first English subtitle sentence.\n'
 POLICY = dict(batch_limit_mb=20, text_file_limit_mb=1, season_max_batch_items=100,
@@ -27,6 +27,21 @@ def pack(entries):
             archive.writestr(name, content)
     data.seek(0)
     return data
+
+
+def rar_pack(payload=SRT, name=b'S01E01.srt'):
+    """Build a minimal RAR 4.x archive holding one stored member."""
+    import struct
+    import zlib
+
+    def header(kind, flags, body=b''):
+        raw = struct.pack('<BHH', kind, flags, 7 + len(body)) + body
+        return struct.pack('<H', zlib.crc32(raw) & 65535) + raw
+
+    body = struct.pack('<IIBIIBBHI', len(payload), len(payload), 3,
+                       zlib.crc32(payload), 0, 20, 0x30, len(name), 0o100644) + name
+    return (b'Rar!\x1a\x07\x00' + header(0x73, 0, b'\0' * 6)
+            + header(0x74, 0x8000, body) + payload + header(0x7b, 0))
 
 
 class SeasonMatchingTest(unittest.TestCase):
@@ -68,23 +83,42 @@ class SeasonMatchingTest(unittest.TestCase):
                 with open_pack(pack(entries), POLICY):
                     pass
 
-    def test_rar_members_stream_without_extracting_paths(self):
-        import struct
-        import zlib
-        from app.helper.subtitle_season_pack import MemberStream
-        name = b'S01E01.srt'
-        def header(kind, flags, body=b''):
-            raw = struct.pack('<BHH', kind, flags, 7 + len(body)) + body
-            return struct.pack('<H', zlib.crc32(raw) & 65535) + raw
-        body = struct.pack('<IIBIIBBHI', len(SRT), len(SRT), 3, zlib.crc32(SRT),
-                           0, 20, 0x30, len(name), 0o100644) + name
-        data = (b'Rar!\x1a\x07\x00' + header(0x73, 0, b'\0' * 6)
-                + header(0x74, 0x8000, body) + SRT + header(0x7b, 0))
-        with open_pack(io.BytesIO(data), POLICY) as (archive, members):
-            self.assertEqual(members[0][0], 'S01E01.srt')
-            reader = MemberStream(archive, members[0][1])
-            self.assertEqual(reader.read(), SRT)
-            reader.close()
+    def test_rar_and_unknown_archives_are_rejected_with_a_conversion_hint(self):
+        for payload, hint in ((rar_pack(), '解压'), (b'not an archive', 'ZIP')):
+            with self.subTest(payload=payload[:6]), self.assertRaises(ValueError) as error:
+                with open_pack(io.BytesIO(payload), POLICY):
+                    pass
+            self.assertIn(hint, str(error.exception))
+
+    def test_multi_file_selection_matches_episodes_and_streams_once(self):
+        files = [FileStorage(io.BytesIO(SRT), filename='Show.S01E02.chs.srt'),
+                 FileStorage(io.BytesIO(SRT), filename='Show.S01E01.chs.srt')]
+        episodes = [dict(path='/show/E01.mkv', season=1, episode=1),
+                    dict(path='/show/E02.mkv', season=1, episode=2)]
+        with open_season_source(files, POLICY) as (source, members):
+            self.assertEqual([name for name, _ in members], ['Show.S01E02.chs.srt', 'Show.S01E01.chs.srt'])
+            plan = build_plan(members, episodes, 1, 'hash')
+            self.assertEqual([row['target']['path'] for row in plan['rows']], ['/show/E02.mkv', '/show/E01.mkv'])
+            for _, entry in members:
+                with source.open(entry) as reader:
+                    self.assertEqual(reader.read(), SRT)
+
+    def test_multi_file_selection_rejects_duplicates_formats_and_oversize(self):
+        cases = [([('E01.srt', SRT), ('e01.srt', SRT)], POLICY),
+                 ([('E01.rar', SRT)], POLICY),
+                 ([('E01.srt', SRT)], dict(POLICY, text_file_limit_mb=0)),
+                 ([('E01.srt', SRT), ('E02.srt', SRT)], dict(POLICY, batch_limit_mb=0))]
+        for entries, policy in cases:
+            with self.subTest(entries=str(entries)[:40]), self.assertRaises(ValueError):
+                with open_season_source([FileStorage(io.BytesIO(content), filename=name)
+                                         for name, content in entries], policy):
+                    pass
+
+    def test_single_zip_file_still_uses_the_archive_path(self):
+        with open_season_source([FileStorage(pack([('E01.srt', SRT)]), filename='show.zip')], POLICY) as (archive, members):
+            self.assertEqual(members[0][0], 'E01.srt')
+            with archive.open(members[0][1]) as reader:
+                self.assertEqual(reader.read(), SRT)
 
     def test_nested_folders_and_non_subtitle_files(self):
         with open_pack(pack([('Season 2/chs/E03.srt', SRT), ('readme.txt', b'note')]), POLICY) as (archive, members):
@@ -121,11 +155,13 @@ class SeasonRouteTest(unittest.TestCase):
             return {'task_id': 'season-task'}, False
         self.manager.submit_upload.side_effect = submit
 
-    def invoke(self, mode, **extra):
+    def invoke(self, mode, files=None, **extra):
         form = MultiDict(dict(upload_mode=mode, item_id='show', season='1', server='emby', request_id='same'))
         form.update(extra)
         self.scope['request'] = types.SimpleNamespace(form=form)
-        return self.call(self.manager, POLICY, [FileStorage(io.BytesIO(self.data), filename='show.zip')])
+        if files is None:
+            files = [FileStorage(io.BytesIO(self.data), filename='show.zip')]
+        return self.call(self.manager, POLICY, files)
 
     def test_preview_no_writes_then_confirm_server_resolved_targets(self):
         preview = self.invoke('season_preview')
@@ -154,6 +190,25 @@ class SeasonRouteTest(unittest.TestCase):
         with patch.dict(POLICY, season_max_batch_items=1):
             self.assertEqual(self.invoke('season_submit', plan_id=preview['plan_id'], members='["0","1"]')[1], 413)
         self.manager.submit_upload.assert_not_called()
+
+    def test_multi_file_upload_previews_and_submits_only_selected_files(self):
+        files = [FileStorage(io.BytesIO(SRT), filename='Show.S01E01.chs.srt'),
+                 FileStorage(io.BytesIO(SRT + b'extra'), filename='Show.S01E02.chs.srt'),
+                 FileStorage(io.BytesIO(SRT), filename='Show.S02E01.srt')]
+        preview = self.invoke('season_preview', files=files)
+        self.assertEqual([row['reason'] for row in preview['rows']],
+                         ['', '', '季编号与所选季不一致'])
+        selected = [row['id'] for row in preview['rows'] if row['target']]
+        self.assertEqual(len(selected), 2)
+        ret = self.invoke('season_submit', files, plan_id=preview['plan_id'], members=json.dumps(selected))
+        self.assertEqual(ret['code'], 0)
+        self.assertEqual(self.captured['contents'], [SRT, SRT + b'extra'])
+        self.assertEqual(sorted(file.filename for file in self.captured['files']),
+                         ['000-Show.S01E01.chs.srt', '001-Show.S01E02.chs.srt'])
+        # A modified payload must invalidate the preview instead of silently remapping.
+        changed = list(files[:1]) + [FileStorage(io.BytesIO(SRT), filename='Show.S01E02.chs.srt')]
+        self.assertEqual(self.invoke('season_submit', changed, plan_id=preview['plan_id'],
+                                     members=json.dumps(selected))[1], 409)
 
 
 class SeasonWorkerTest(unittest.TestCase):

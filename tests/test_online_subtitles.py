@@ -76,6 +76,15 @@ class OnlineSubtitleTest(unittest.TestCase):
         with patch.object(service, '_download', return_value=stream.getvalue()), self.assertRaises(ValueError):
             service.files(dict(provider='thunder', url='https://example.com', name='a', format='srt'))
 
+    def test_rar_pack_is_reported_as_unsupported(self):
+        from tests.test_subtitle_season_pack import rar_pack
+        service = OnlineSubtitles()
+        item = dict(provider='thunder', url='https://example.com', name='archive', format='srt')
+        with patch.object(service, '_download', return_value=rar_pack(b'first subtitle', name=b'Show.S01E01.srt')):
+            with self.assertRaises(ValueError) as error:
+                service.files(item)
+        self.assertIn('RAR', str(error.exception))
+
     def test_download_rejects_private_destination_and_redirect(self):
         with patch.object(module.socket, 'getaddrinfo', return_value=[(None, None, None, None, ('127.0.0.1', 80))]):
             with self.assertRaises(ValueError):

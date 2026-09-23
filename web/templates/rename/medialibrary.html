@@ -344,7 +344,7 @@
           <div class="col-6"><label class="form-label" for="library_episode_season">选择季</label><select id="library_episode_season" class="form-select" onchange="filter_library_episodes(true)"></select></div>
           <div class="col-6"><label class="form-label" for="library_episode_number">选择集</label><select id="library_episode_number" class="form-select" onchange="filter_library_episodes(false)"></select></div>
         </div>
-        <div class="mb-3"><button type="button" class="btn btn-outline-primary" onclick="open_library_season_pack()">上传整季字幕包</button></div>
+        <div class="mb-3"><button type="button" class="btn btn-outline-primary" onclick="open_library_season_pack()">上传整季字幕</button></div>
         <div id="index_library_episodes_body" class="divide-y"></div>
       </div>
     </div>
@@ -414,12 +414,12 @@
 </div>
 <div class="modal modal-blur fade" id="season-pack-modal" tabindex="-1" aria-hidden="true" data-bs-backdrop="static" data-bs-keyboard="false">
   <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable"><div class="modal-content">
-    <div class="modal-header"><h5 class="modal-title">上传整季字幕包</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button></div>
+    <div class="modal-header"><h5 class="modal-title">上传整季字幕</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button></div>
     <div class="modal-body">
       <div id="season_pack_title" class="fw-bold mb-3"></div>
-      <label class="form-label" for="season_pack_file">ZIP / RAR 字幕包</label>
-      <input id="season_pack_file" type="file" class="form-control mb-2" accept=".zip,.rar" onchange="reset_library_season_pack()">
-      <div class="form-hint mb-3">支持 SRT、ASS、SSA、VTT、SMI。按季集编号匹配；仅含集数的文件使用所选季。无法确认、多集文件或多个视频版本不自动分配。不会覆盖已有字幕。</div>
+      <label class="form-label" for="season_pack_file">字幕文件（可多选）或 ZIP 包</label>
+      <input id="season_pack_file" type="file" class="form-control mb-2" accept=".srt,.ass,.ssa,.vtt,.smi,.zip" multiple onchange="reset_library_season_pack()">
+      <div class="form-hint mb-3">支持 SRT、ASS、SSA、VTT、SMI 字幕文件与 ZIP 包（包内子目录同样识别）；RAR 请先解压，再多选其中的字幕文件。按季集编号匹配；仅含集数的文件使用所选季。无法确认、多集文件或多个视频版本不自动分配。不会覆盖已有字幕。</div>
       <label class="form-label" for="season_pack_align">字幕对齐模式</label>
       <select id="season_pack_align" class="form-select mb-3"><option value="none">不对齐</option><option value="auto">自动选择</option><option value="offset">仅整体偏移</option><option value="segmented">分段对齐</option><option value="llm">LLM 跨语言对齐（受单批数量限制）</option></select>
       <div id="season_pack_message" class="mb-3" role="status" aria-live="polite"></div>
