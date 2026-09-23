@@ -1034,7 +1034,62 @@ class Media:
         except (ValueError, TypeError, KeyError) as error:
             log.warn("【Meta】无法确认季集映射：%s" % error)
             return False
+        if not (getattr(meta_info, "note", None) or {}).get("episode_mapping"):
+            self._apply_llm_season(meta_info, info)
         return self._valid_media_identity(meta_info, info)
+
+    def _apply_llm_season(self, meta_info, info):
+        """
+        采用经校验的 LLM 季号：季号需存在于该作品的季列表，集号需存在于该季的集列表。
+        仅当作品级季集映射规则未命中时生效。
+        """
+        if not info or meta_info.type == MediaType.MOVIE:
+            return False
+        llm_note = {}
+        if isinstance(getattr(meta_info, "note", None), dict):
+            llm_note = meta_info.note.get("llm") or {}
+        if not isinstance(llm_note, dict) or not llm_note.get("season_verified"):
+            return False
+        season = llm_note.get("tmdb_season")
+        if season is None:
+            return False
+        if str(llm_note.get("tmdb_id")) != str(info.get("id")):
+            log.warn("【Meta】LLM季号与已识别作品不一致，暂不采用：%s" % season)
+            return False
+        detail = self.get_tmdb_tv_season_detail(info.get("id"), int(season)) or {}
+        valid_episodes = {ep.get("episode_number") for ep in detail.get("episodes", [])}
+        if not valid_episodes:
+            log.warn("【Meta】LLM季号%s缺少TMDB集列表，暂不采用" % season)
+            return False
+        episodes = meta_info.get_episode_list()
+        applied_episode = None
+        llm_episode = llm_note.get("tmdb_episode")
+        if llm_episode is not None and int(llm_episode) in valid_episodes:
+            applied_episode = int(llm_episode)
+            meta_info.begin_episode = applied_episode
+            meta_info.end_episode = None
+            meta_info.total_episodes = 1
+        elif episodes and not set(episodes).issubset(valid_episodes):
+            log.warn("【Meta】LLM季号已验证但集号%s不在该季集列表中，保留原集号" % episodes)
+        note = dict(meta_info.note or {})
+        note["season_binding"] = {
+            "tmdb_id": info.get("id"),
+            "tmdb_season": int(season),
+            "tmdb_season_name": llm_note.get("tmdb_season_name"),
+            "tmdb_episode": applied_episode,
+            "evidence": llm_note.get("season_evidence"),
+            "release_season": llm_note.get("release_season")
+        }
+        meta_info.note = note
+        meta_info.begin_season = int(season)
+        meta_info.end_season = None
+        meta_info.total_seasons = 1
+        log.info("【Meta】采用LLM判定的季号：S%s%s（依据：%s，标题季标记：%s）"
+                 % (str(season).rjust(2, "0"),
+                    "E%s" % applied_episode if applied_episode else "",
+                    llm_note.get("season_evidence") or "llm",
+                    llm_note.get("release_season")))
+        return True
 
     def __extract_llm_tmdb_target(self, meta_info, mtype_hint=None):
         if not meta_info:
@@ -1414,6 +1469,8 @@ class Media:
                                          use_llm=not bool(download_context))
                     if not season and not episode_format:
                         self._apply_episode_mapping(meta_info, tmdb_info)
+                        if not (getattr(meta_info, "note", None) or {}).get("episode_mapping"):
+                            self._apply_llm_season(meta_info, tmdb_info)
                     if download_context and media_type != MediaType.MOVIE:
                         seasons = download_context.get("seasons") or []
                         episodes = download_context.get("episodes") or []

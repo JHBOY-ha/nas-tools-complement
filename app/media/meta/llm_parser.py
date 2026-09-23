@@ -5,7 +5,7 @@ from copy import deepcopy
 from urllib.parse import quote
 
 import log
-from app.media.tmdbv3api import TMDb, Search, TMDbException
+from app.media.tmdbv3api import TMDb, Search, TV, TMDbException
 from app.media.meta.title_utils import promote_bracket_title
 from app.utils import ExceptionUtils, RequestUtils, StringUtils
 from app.utils.llm_client import LLMClient
@@ -127,7 +127,7 @@ class LLMMetaParser(object):
                     hint = "anime"
                 else:
                     hint = "tv"
-            external_candidates = self.__build_external_candidates(
+            external_candidates, candidate_payload = self.__build_external_candidates(
                 title=title,
                 subtitle=subtitle,
                 mtype_hint=mtype_hint
@@ -137,13 +137,20 @@ class LLMMetaParser(object):
                 "请严格返回 JSON 对象，不要输出任何额外文本。"
                 "字段仅允许："
                 "type,cn_name,en_name,year,begin_season,end_season,begin_episode,end_episode,"
-                "part,resource_type,resource_effect,resource_pix,resource_team,video_encode,audio_encode。"
-                "其中 type 只允许 movie/tv/anime。"
+                "part,resource_type,resource_effect,resource_pix,resource_team,video_encode,audio_encode,"
+                "tmdb_id,tmdb_type,tmdb_season,tmdb_season_name,tmdb_episode。"
+                "其中 type 只允许 movie/tv/anime；tmdb_type 只允许 movie/tv。"
                 "季集号规则："
-                "1) 只有出现明确季标记时才填写 season（如 S01、Season 1、第1季、第二季）。"
+                "1) begin_season 只填标题/副标题里明确出现的季标记（如 S01、Season 1、第1季、第二季）对应的数字，标题写第几季就填几，不要换算成 TMDB 的季号。"
                 "2) 含“月”字的时间表达（如 7月新番、04月新番、2022年7月番）是月份信息，不是季数，禁止据此填写 season。"
                 "3) 如果标题是“片名 + 单个数字”且没有明确季标记（例如“西部世界 12”），该数字优先视为单集，填写 begin_episode=12，不要推断多季或区间。"
                 "4) 只有原文明确出现区间（如 S01-S02、E01-E03、第1-3集）才填写 end_season/end_episode；单点值不要补 end 字段。"
+                "TMDB 季号规则（仅在给出 external_candidates.tmdb 的 seasons 时判断）："
+                "1) tmdb_season 只能取自候选 seasons 里的 n，不得自造；判断不出就省略。"
+                "2) 发布方写的季号与 TMDB 分季经常不一致：发布版“第4季”可能对应 TMDB 第1季，多季也可能被 TMDB 合并成第1季。要结合 seasons 的 name(季名/篇章名)、year(首播年份)、eps(集数) 判断标题实际对应哪一季，不要照抄标题里的季标记。"
+                "3) 标题或副标题里出现篇章名/arc 名且与某季 name 语义一致时（例如“飙马野郎”对应“飙马野郎篇”、“Steel Ball Run”对应“STEEL BALL RUN”），采用该季并把该季显示的季名回填到 tmdb_season_name。"
+                "4) 标题季标记与候选证据冲突时以候选证据为准；找不到任何证据时保持 begin_season 原值，不要改。"
+                "5) tmdb_episode 填该季内部的集号，用于发布方按放送季编号而 TMDB 合并成单季的情况（如发布版“第4季第18集”在 TMDB 是第1季第84集）；能确定才填，不确定就省略。"
                 "年份规则："
                 "1) 仅在出现明确四位年份时填写 year（1900-2100），例如 '(2022)'、' 2022 '。"
                 "2) '2022年7月番'、'7月新番'、'04月新番' 这类“年+月/仅月”发布时间标签，不作为 year。"
@@ -158,7 +165,8 @@ class LLMMetaParser(object):
                 "4) resource_type/resource_effect/video_encode/audio_encode 仅在 title/subtitle 明确出现对应关键词时填写，不得猜测或借 external_candidates 脑补。"
                 "5) 不确定就留空，不要猜测。"
                 "你可能会收到 external_candidates 字段，包含 TMDB/Bangumi 检索候选，仅供参考。"
-                "如果你能从 external_candidates.tmdb 明确匹配到目标，可额外返回 tmdb_id(整数) 和 tmdb_type(movie/tv)。"
+                "external_candidates.tmdb 的每一项包含 id、name、type、year、aliases(别名) 与 seasons(该剧各季列表，n=季号、name=季名、year=首播年份、eps=集数)。"
+                "如果你能从 external_candidates.tmdb 明确匹配到目标，可额外返回 tmdb_id(整数)、tmdb_type(movie/tv) 以及 tmdb_season、tmdb_season_name、tmdb_episode。"
                 "不要返回其他字段。"
             )
             user_prompt = (
@@ -184,16 +192,11 @@ class LLMMetaParser(object):
                 self.__set_cached_parse_result(cache_key, {})
                 return {}
             result = self.__normalize_result(parsed)
-            # ID必须实际出现在此次提供的TMDB候选中，且作品类型一致。
-            try:
-                candidates = json.loads(external_candidates) if external_candidates else {}
-                result["candidate_verified"] = any(
-                    str(item.get("id")) == str(result.get("tmdb_id"))
-                    and item.get("type", item.get("media_type")) == result.get("tmdb_type")
-                    for item in candidates.get("tmdb", [])
-                )
-            except (ValueError, TypeError, AttributeError):
-                result["candidate_verified"] = False
+            # 逐层核对：候选存在性、季号存在性、季名证据一致性。
+            result.update(self.__verify_candidate_binding(result=result,
+                                                          candidate_payload=candidate_payload,
+                                                          title=title,
+                                                          subtitle=subtitle))
             self.__set_cached_parse_result(cache_key, result)
             return result
         except Exception as err:
@@ -220,6 +223,7 @@ class LLMMetaParser(object):
 
         if llm_result:
             original_year = meta_info.year
+            original_season = meta_info.begin_season
             self.__apply_result(meta_info, llm_result)
             note["llm"].update({
                 "applied": True,
@@ -240,6 +244,27 @@ class LLMMetaParser(object):
                     "【Meta】LLM直出TMDB候选：id=%s, type=%s"
                     % (llm_result.get("tmdb_id"), llm_result.get("tmdb_type") or "")
                 )
+            release_season = self.__parse_int(llm_result.get("release_season", original_season),
+                                              min_val=0, max_val=999)
+            if release_season is not None:
+                note["llm"]["release_season"] = release_season
+            if llm_result.get("season_verified"):
+                note["llm"].update({
+                    "tmdb_season": llm_result.get("tmdb_season"),
+                    "tmdb_season_name": llm_result.get("tmdb_season_name"),
+                    "tmdb_episode": llm_result.get("tmdb_episode"),
+                    "season_verified": True,
+                    "season_evidence": llm_result.get("season_evidence")
+                })
+                log.info(
+                    "【Meta】LLM季号通过校验：TMDB季=%s(%s), 依据=%s, 标题季标记=%s"
+                    % (llm_result.get("tmdb_season"),
+                       llm_result.get("tmdb_season_name") or "",
+                       llm_result.get("season_evidence") or "",
+                       self.__clean_text(release_season, max_len=10) or "无")
+                )
+            elif llm_result.get("tmdb_season") is not None:
+                log.warn("【Meta】LLM季号未通过校验，忽略：%s" % llm_result.get("tmdb_season"))
 
         meta_info.note = note
 
@@ -352,14 +377,23 @@ class LLMMetaParser(object):
                     tmdb_type = "tv"
             if tmdb_type:
                 result["tmdb_type"] = tmdb_type
+        tmdb_season = self.__parse_int(parsed.get("tmdb_season"), min_val=0, max_val=999)
+        if tmdb_season is not None:
+            result["tmdb_season"] = tmdb_season
+        tmdb_episode = self.__parse_int(parsed.get("tmdb_episode"), min_val=1, max_val=99999)
+        if tmdb_episode is not None:
+            result["tmdb_episode"] = tmdb_episode
+        tmdb_season_name = self.__clean_text(parsed.get("tmdb_season_name"), max_len=60)
+        if tmdb_season_name:
+            result["tmdb_season_name"] = tmdb_season_name
         return result
 
     def __build_external_candidates(self, title, subtitle=None, mtype_hint=None):
         if not self._search_context_enable:
-            return ""
+            return "", {}
         query_list = self.__build_search_queries(title=title, subtitle=subtitle)
         if not query_list:
-            return ""
+            return "", {}
         query = query_list[0]
 
         payload = {}
@@ -386,8 +420,247 @@ class LLMMetaParser(object):
             )
         )
         if not payload:
+            return "", {}
+        season_total = sum(len(item.get("seasons") or []) for item in tmdb_candidates)
+        log.info("【Meta】LLM候选季列表：候选=%s, 季条目=%s" % (len(tmdb_candidates), season_total))
+        return self.__serialize_candidate_payload(payload), payload
+
+    @classmethod
+    def __serialize_candidate_payload(cls, payload, budget=6000):
+        """
+        在预算内序列化候选信息：保证输出始终是合法 JSON，优先保留 id/季列表，逐级丢弃别名、年份、
+        Bangumi 候选等次要信息，最后才裁剪候选数量。
+        """
+        compact = deepcopy(payload)
+        text = json.dumps(compact, ensure_ascii=False)
+        if len(text) <= budget:
+            return text
+
+        # 1) 丢弃别名（对季号判断贡献最低）
+        for item in compact.get("tmdb") or []:
+            item.pop("aliases", None)
+        text = json.dumps(compact, ensure_ascii=False)
+        if len(text) <= budget:
+            return text
+
+        # 2) 丢弃 Bangumi 候选
+        compact.pop("bangumi", None)
+        text = json.dumps(compact, ensure_ascii=False)
+        if len(text) <= budget:
+            return text
+
+        # 3) 季列表瘦身：只保留季号与截断的季名
+        for item in compact.get("tmdb") or []:
+            seasons = []
+            for season in item.get("seasons") or []:
+                slim = {"n": season.get("n")}
+                name = str(season.get("name") or "")[:12]
+                if name:
+                    slim["name"] = name
+                seasons.append(slim)
+            if seasons:
+                item["seasons"] = seasons
+        text = json.dumps(compact, ensure_ascii=False)
+        if len(text) <= budget:
+            return text
+
+        # 4) 只保留季号
+        for item in compact.get("tmdb") or []:
+            if item.get("seasons"):
+                item["seasons"] = [{"n": season.get("n")} for season in item["seasons"]]
+        text = json.dumps(compact, ensure_ascii=False)
+        if len(text) <= budget:
+            return text
+
+        # 5) 只有首个候选保留季列表
+        for item in (compact.get("tmdb") or [])[1:]:
+            item.pop("seasons", None)
+        text = json.dumps(compact, ensure_ascii=False)
+        if len(text) <= budget:
+            return text
+
+        # 6) 末位裁剪候选，仍保留 JSON 结构完整
+        candidates = compact.get("tmdb") or []
+        while len(candidates) > 1 and len(text) > budget:
+            candidates.pop()
+            text = json.dumps(compact, ensure_ascii=False)
+        return text
+
+    def __fetch_tv_candidate_extra(self, tmdb_id):
+        """
+        取单个电视剧候选的季列表与别名（一次 TMDB 请求，结果走请求缓存）。
+        """
+        if not tmdb_id:
+            return {}
+        try:
+            detail = TV().details(tmdb_id, append_to_response="alternative_titles")
+        except Exception as err:
+            log.debug("【Meta】TMDB候选季信息获取失败：%s" % str(err))
+            return {}
+        if not detail:
+            return {}
+        seasons = []
+        for item in detail.get("seasons") or []:
+            number = self.__parse_int(item.get("n", item.get("season_number")), min_val=0, max_val=999)
+            if number is None:
+                continue
+            season = {"n": number}
+            name = self.__clean_text(item.get("name"), max_len=40)
+            if name:
+                season["name"] = name
+            air_date = str(item.get("air_date") or "").strip()
+            if len(air_date) >= 4 and air_date[:4].isdigit():
+                season["year"] = air_date[:4]
+            episode_count = self.__parse_int(item.get("episode_count"), min_val=0, max_val=99999)
+            if episode_count is not None:
+                season["eps"] = episode_count
+            seasons.append(season)
+        aliases = []
+        titles = detail.get("alternative_titles")
+        for item in (titles.get("results") if titles else None) or []:
+            country = str(item.get("iso_3166_1") or "").upper()
+            if country not in ("CN", "HK", "TW", "JP", "US"):
+                continue
+            alias = self.__clean_text(item.get("title"), max_len=60)
+            if alias and alias not in aliases:
+                aliases.append(alias)
+        extra = {}
+        if seasons:
+            extra["seasons"] = seasons
+        if aliases:
+            extra["aliases"] = aliases[:8]
+        return extra
+
+    def __verify_candidate_binding(self, result, candidate_payload, title, subtitle=None):
+        """
+        核对 LLM 给出的 TMDB 作品与季号：候选必须真实存在，季号必须在该候选的季列表内，
+        标题季标记与候选季名证据冲突时以季名为准；拿不出证据时保留标题季标记。
+        """
+        verified = {"candidate_verified": False, "season_verified": False}
+        if not result or not isinstance(candidate_payload, dict):
+            return verified
+        tmdb_id = result.get("tmdb_id")
+        if not tmdb_id:
+            return verified
+        tmdb_type = str(result.get("tmdb_type") or "").lower()
+        candidate = None
+        for item in candidate_payload.get("tmdb") or []:
+            if str(item.get("id")) != str(tmdb_id):
+                continue
+            item_type = str(item.get("type") or item.get("media_type") or "").lower()
+            if tmdb_type and item_type and item_type != tmdb_type:
+                continue
+            candidate = item
+            break
+        if not candidate:
+            return verified
+        verified["candidate_verified"] = True
+
+        seasons = {}
+        for item in candidate.get("seasons") or []:
+            number = self.__parse_int(item.get("n"), min_val=0, max_val=999)
+            if number is not None:
+                seasons[number] = item
+        release_season = self.__extract_release_season(title, subtitle)
+        if release_season is not None:
+            verified["release_season"] = release_season
+        season = self.__parse_int(result.get("tmdb_season"), min_val=0, max_val=999)
+        if season is None:
+            return verified
+        if season not in seasons:
+            log.warn("【Meta】LLM季号不在候选季列表中，忽略：%s" % result.get("tmdb_season"))
+            return verified
+
+        evidence_text = " ".join([
+            str(title or ""),
+            str(subtitle or ""),
+            str(result.get("cn_name") or ""),
+            str(result.get("en_name") or "")
+        ])
+        name_matched = self.__match_seasons_by_name(evidence_text, seasons)
+        evidence = "llm_only"
+        if name_matched:
+            if season in name_matched:
+                evidence = "season_name"
+            elif len(name_matched) == 1:
+                log.warn("【Meta】LLM季号与TMDB季名证据不符，按季名修正：%s -> %s"
+                         % (result.get("tmdb_season"), name_matched[0]))
+                season = name_matched[0]
+                evidence = "season_name_override"
+        if season not in seasons:
+            return verified
+        if release_season is not None and season != release_season and evidence == "llm_only":
+            log.warn("【Meta】LLM季号%s与标题季标记%s冲突且缺少季名证据，保留标题季标记"
+                     % (season, release_season))
+            return verified
+        verified["season_verified"] = True
+        verified["tmdb_season"] = season
+        verified["season_evidence"] = evidence
+        season_name = self.__clean_text(result.get("tmdb_season_name"), max_len=60)
+        if not season_name:
+            season_name = self.__clean_text(seasons.get(season, {}).get("name"), max_len=60)
+        if season_name:
+            verified["tmdb_season_name"] = season_name
+        return verified
+
+    @classmethod
+    def __match_seasons_by_name(cls, text, seasons):
+        """
+        用季名（篇章名/arc 名）反向匹配标题文本，返回命中的季号列表。
+        """
+        normalized_text = cls.__normalize_match_text(text)
+        if not normalized_text:
+            return []
+        matched = []
+        for number, season in seasons.items():
+            name = cls.__normalize_match_text(season.get("name") or "")
+            if not name:
+                continue
+            for suffix in ("season", "specials", "special", "part", "篇", "編", "编", "章", "季"):
+                if name.endswith(suffix) and len(name) > len(suffix) + 1:
+                    name = name[: -len(suffix)]
+            if len(name) < 2 or name.isdigit():
+                continue
+            if name in normalized_text:
+                matched.append(number)
+        return matched
+
+    @staticmethod
+    def __normalize_match_text(text):
+        if not text:
             return ""
-        return self.__shorten_text(json.dumps(payload, ensure_ascii=False), 3000)
+        text = str(text).lower()
+        text = re.sub(r"[\s._\-\[\]\(\)\{\}【】（）「」:：·・/\\|,，+&]+", "", text)
+        return text
+
+    @classmethod
+    def __extract_release_season(cls, title, subtitle=None):
+        """
+        取标题里明确写出的发布季号（S02、Season 2、第2季），取不到返回 None。
+        """
+        text = " ".join([str(title or ""), str(subtitle or "")])
+        if not text.strip():
+            return None
+        patterns = [
+            r"(?<![A-Za-z0-9])S(\d{1,2})(?!\d)",
+            r"(?i)\bSeason[ ._-]*(\d{1,2})\b",
+            r"第\s*(\d{1,2})\s*[季部]",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if not match:
+                continue
+            number = cls.__parse_int(match.group(1), min_val=0, max_val=999)
+            if number is not None:
+                return number
+        match = re.search(r"第\s*([一二三四五六七八九十两]+)\s*[季部]", text)
+        if match:
+            try:
+                import cn2an
+                return int(cn2an.cn2an(match.group(1), mode="smart"))
+            except Exception:
+                return None
+        return None
 
     @classmethod
     def __build_search_query(cls, title, subtitle=None):
@@ -430,12 +703,66 @@ class LLMMetaParser(object):
                 reduced_candidates.append(reduced)
         query_set.extend(reduced_candidates)
 
+        # 纯方括号命名的发布资源（如 [组名][作品名][01][1080p HEVC]）在剥离尾部括号后会丢失片名，
+        # 这里回退到"最像标题的括号段"，避免整条识别链路拿不到检索词。
+        bracket_query = cls.__extract_bracket_title_query(raw_title)
+        if bracket_query:
+            query_set.append(bracket_query)
+
         # 去重并保持顺序
         query_list = []
         for query in query_set:
             if query and query not in query_list:
                 query_list.append(query)
         return query_list[:6]
+
+    @classmethod
+    def __extract_bracket_title_query(cls, raw_title):
+        text = promote_bracket_title(str(raw_title or "").strip())
+        best_query = ""
+        best_score = 0
+        for first, second in re.findall(r"\[([^\]]+)]|【([^】]+)】", text):
+            block = (first or second or "").strip()
+            if cls.__is_release_meta_block(block):
+                continue
+            query = cls.__normalize_query_for_search(block)
+            if not query:
+                continue
+            score = len(query)
+            if " " in block:
+                score += 10
+            if re.search(r"[a-z]", block):
+                score += 5
+            if score > best_score:
+                best_query, best_score = query, score
+        return best_query
+
+    @classmethod
+    def __is_release_meta_block(cls, block):
+        """
+        判断括号段是否只是发布/技术信息（集号、画质、编码、字幕语言、发布组等）。
+        """
+        text = str(block or "").strip()
+        if not text or len(text) < 3:
+            return True
+        if re.fullmatch(r"[\d\s._\-]+", text):
+            return True
+        if re.search(r"(?i)\b\d{3,4}[pi]\b|\b\d{1,2}\s*bit\b", text):
+            return True
+        if re.search(
+                r"(?i)\b(?:HEVC|AVC|H\.?26[45]|X26[45]|AV1|VP9|AAC|AC3|EAC3|DDP?|TRUEHD|DTS(?:-?HD)?|"
+                r"LPCM|FLAC|ATMOS|WEB[- ]?DL|WEB[- ]?RIP|BLU-?RAY|BDRIP|REMUX|HDTV|UHD|HDR|DOVI|SDR|"
+                r"MKV|MP4|AVI|CHS|CHT|BIG5|JPSC)\b",
+                text):
+            return True
+        if re.search(r"字幕|简繁|内封|内嵌|外挂|中字|双语|繁体|简体|生肉|熟肉|音轨|配音|国配|粤语", text):
+            return True
+        # 发布组标记：常见后缀词，或全大写带分隔符的组名
+        if re.search(r"(?i)(?:raws|fansub|subs?|team|group|studio|house|压制|发布)\s*$", text):
+            return True
+        if re.fullmatch(r"[A-Z0-9]+(?:[-_.][A-Z0-9]+)+", text):
+            return True
+        return False
 
     @classmethod
     def __normalize_query_for_search(cls, text):
@@ -618,7 +945,7 @@ class LLMMetaParser(object):
                 tmdb.domain = app_conf.get("tmdb_domain")
             tmdb.cache = True
             tmdb.api_key = tmdb_key
-            tmdb.language = "zh"
+            tmdb.language = "zh-CN"
             tmdb.proxies = Config().get_proxies()
 
             search = Search()
@@ -660,6 +987,8 @@ class LLMMetaParser(object):
                     candidate["year"] = year
                 if item_type:
                     candidate["type"] = item_type
+                if item_type == "tv" and candidate["id"]:
+                    candidate.update(self.__fetch_tv_candidate_extra(candidate["id"]))
                 candidates.append(candidate)
                 if len(candidates) >= self._search_max_results:
                     break

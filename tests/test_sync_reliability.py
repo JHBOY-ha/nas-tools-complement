@@ -55,7 +55,9 @@ class RecognitionTests(unittest.TestCase):
         self.ns = env()
         cls = load_class('app/media/media.py', 'Media', [
             '__search_media_with_name', '__extract_llm_tmdb_target', '__resolve_tmdb_mtype',
-            'get_media_info_on_files', 'get_cache_info', '__make_cache_key', '_valid_media_identity', '_prepare_media_identity', '_apply_episode_mapping', '__search_tv_by_name'], self.ns)
+            'get_media_info_on_files', 'get_cache_info', '__make_cache_key', '_valid_media_identity',
+            '_prepare_media_identity', '_apply_episode_mapping', '_apply_llm_season',
+            '__search_tv_by_name'], self.ns)
         self.media = cls()
 
     def test_explicit_work_mapping_is_verified_and_not_applied_twice(self):

@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+import json
 import os
 import sys
 import types
@@ -307,20 +308,22 @@ class LLMMetaParserTest(TestCase):
     def test_parse_with_search_context_should_attach_external_candidates(self):
         self.parser._search_context_enable = True
         mock_client = Mock()
-        mock_client.complete_text.return_value = "{\"type\":\"movie\"}"
+        mock_client.complete_text.return_value = "{\"type\":\"movie\",\"tmdb_id\":11,\"tmdb_type\":\"movie\"}"
+        candidate_payload = {"tmdb": [{"id": 11, "name": "Dune", "type": "movie"}]}
 
         with patch.object(self.parser, "_LLMMetaParser__is_client_ready", return_value=True), \
                 patch.object(self.parser, "_LLMMetaParser__get_client", return_value=mock_client), \
                 patch.object(
                     self.parser,
                     "_LLMMetaParser__build_external_candidates",
-                    return_value="{\"tmdb\":[{\"id\":11,\"name\":\"Dune\",\"type\":\"movie\"}]}"
+                    return_value=(json.dumps(candidate_payload), candidate_payload)
                 ):
-            self.parser.parse(title="Dune 2021", subtitle="", mtype_hint=MediaType.MOVIE)
+            result = self.parser.parse(title="Dune 2021", subtitle="", mtype_hint=MediaType.MOVIE)
 
         call_kwargs = mock_client.complete_text.call_args.kwargs
         user_prompt = call_kwargs.get("user_prompt", "")
         self.assertIn("external_candidates", user_prompt)
+        self.assertTrue(result.get("candidate_verified"))
 
     def test_parse_should_extract_tmdb_id(self):
         result = self.parser._LLMMetaParser__normalize_result({
@@ -383,3 +386,135 @@ class LLMMetaParserTest(TestCase):
         self.assertTrue(queries)
         self.assertEqual("金装的薇尔梅", queries[0])
         self.assertNotIn("金装的薇尔梅 01", queries)
+
+    def test_build_search_queries_for_fully_bracketed_release_name(self):
+        queries = self.parser._LLMMetaParser__build_search_queries(
+            "[UHA-WINGS][JoJo's Bizarre Adventure Steel Ball Run][01][1080p HEVC][CHS_JP&CHT_JP].mkv"
+        )
+
+        self.assertEqual(["JoJo's Bizarre Adventure Steel Ball Run"], queries)
+
+    def test_build_search_queries_skips_release_group_bracket(self):
+        queries = self.parser._LLMMetaParser__build_search_queries(
+            "[幻樱字幕组][鬼灭之刃][01][1080p HEVC][简繁内封]"
+        )
+
+        self.assertIn("鬼灭之刃", queries)
+        self.assertNotIn("幻樱字幕组", queries)
+
+    def test_candidate_payload_serialization_keeps_valid_json_within_budget(self):
+        payload = {
+            "tmdb": [
+                {"id": 45790, "name": "JOJO的奇妙冒险", "type": "tv", "year": "2012",
+                 "aliases": ["JoJo alias %d" % index for index in range(20)],
+                 "seasons": [{"n": number, "name": "飙马野郎篇%d" % number,
+                              "year": "2026", "eps": 12} for number in range(1, 21)]},
+                {"id": 226688, "name": "其他候选", "type": "tv",
+                 "seasons": [{"n": 1, "name": "第 1 季", "eps": 12}]}
+            ],
+            "bangumi": [{"id": index, "name_cn": "候选名称" * 20} for index in range(20)]
+        }
+
+        text = self.parser._LLMMetaParser__serialize_candidate_payload(payload, budget=900)
+        parsed = json.loads(text)
+
+        self.assertTrue(parsed.get("tmdb"))
+        self.assertIn("seasons", parsed["tmdb"][0])
+        self.assertLessEqual(len(text), 900)
+
+    def test_verify_season_binding_uses_season_name_evidence(self):
+        payload = {"tmdb": [{
+            "id": 45790, "name": "JOJO的奇妙冒险", "type": "tv",
+            "seasons": [
+                {"n": 1, "name": "幻影之血和战斗潮流篇", "year": "2012", "eps": 26},
+                {"n": 6, "name": "飙马野郎篇", "year": "2026", "eps": 12}
+            ]
+        }]}
+        title = ("[UHA-WINGS][JoJo's Bizarre Adventure Steel Ball Run][01]"
+                 "[1080p HEVC][CHS_JP&CHT_JP].mkv")
+
+        verified = self.parser._LLMMetaParser__verify_candidate_binding(
+            {"tmdb_id": 45790, "tmdb_type": "tv", "tmdb_season": 6,
+             "cn_name": "JoJo的奇妙冒险 飙马野郎"},
+            payload, title)
+
+        self.assertTrue(verified.get("season_verified"))
+        self.assertEqual(6, verified.get("tmdb_season"))
+        self.assertEqual("season_name", verified.get("season_evidence"))
+        self.assertEqual("飙马野郎篇", verified.get("tmdb_season_name"))
+
+    def test_verify_season_binding_overrides_wrong_llm_season(self):
+        payload = {"tmdb": [{
+            "id": 45790, "name": "JOJO的奇妙冒险", "type": "tv",
+            "seasons": [
+                {"n": 1, "name": "幻影之血和战斗潮流篇", "year": "2012", "eps": 26},
+                {"n": 6, "name": "飙马野郎篇", "year": "2026", "eps": 12}
+            ]
+        }]}
+        title = ("[UHA-WINGS][JoJo's Bizarre Adventure Steel Ball Run][01]"
+                 "[1080p HEVC][CHS_JP&CHT_JP].mkv")
+
+        verified = self.parser._LLMMetaParser__verify_candidate_binding(
+            {"tmdb_id": 45790, "tmdb_type": "tv", "tmdb_season": 1,
+             "cn_name": "JoJo的奇妙冒险 飙马野郎"},
+            payload, title)
+
+        self.assertTrue(verified.get("season_verified"))
+        self.assertEqual(6, verified.get("tmdb_season"))
+        self.assertEqual("season_name_override", verified.get("season_evidence"))
+
+    def test_verify_season_binding_rejects_season_outside_candidates(self):
+        payload = {"tmdb": [{
+            "id": 65942, "name": "Re：从零开始的异世界生活", "type": "tv",
+            "seasons": [{"n": 0, "name": "特别篇", "eps": 84},
+                        {"n": 1, "name": "第 1 季", "eps": 85}]
+        }]}
+
+        verified = self.parser._LLMMetaParser__verify_candidate_binding(
+            {"tmdb_id": 65942, "tmdb_type": "tv", "tmdb_season": 4},
+            payload, "[Nix-Raws] Re Zero kara Hajimeru Isekai Seikatsu S04E18 [WEB-DL 1080p]")
+
+        self.assertTrue(verified.get("candidate_verified"))
+        self.assertFalse(verified.get("season_verified"))
+
+    def test_verify_season_binding_keeps_release_marker_without_evidence(self):
+        payload = {"tmdb": [{
+            "id": 65942, "name": "Re：从零开始的异世界生活", "type": "tv",
+            "seasons": [{"n": 0, "name": "特别篇", "eps": 84},
+                        {"n": 1, "name": "第 1 季", "eps": 85}]
+        }]}
+
+        verified = self.parser._LLMMetaParser__verify_candidate_binding(
+            {"tmdb_id": 65942, "tmdb_type": "tv", "tmdb_season": 1},
+            payload, "[Nix-Raws] Re Zero kara Hajimeru Isekai Seikatsu S04E18 [WEB-DL 1080p]")
+
+        self.assertFalse(verified.get("season_verified"))
+        self.assertEqual(4, verified.get("release_season"))
+
+    def test_merge_should_write_verified_season_to_note(self):
+        meta_info = MetaInfo(
+            "[UHA-WINGS][JoJo's Bizarre Adventure Steel Ball Run][01][1080p HEVC].mkv",
+            use_llm=False)
+        llm_result = {
+            "type": MediaType.ANIME,
+            "cn_name": "JoJo的奇妙冒险 飙马野郎",
+            "tmdb_id": 45790,
+            "tmdb_type": "tv",
+            "tmdb_season": 6,
+            "tmdb_season_name": "飙马野郎篇",
+            "tmdb_episode": 1,
+            "candidate_verified": True,
+            "season_verified": True,
+            "season_evidence": "season_name",
+            "confidence": 0.9,
+            "field_confidence": {}
+        }
+
+        with patch.object(self.parser, "parse", return_value=llm_result):
+            self.parser.merge_into(meta_info=meta_info, title=meta_info.org_string)
+
+        llm_note = meta_info.note.get("llm", {})
+        self.assertTrue(llm_note.get("season_verified"))
+        self.assertEqual(6, llm_note.get("tmdb_season"))
+        self.assertEqual("飙马野郎篇", llm_note.get("tmdb_season_name"))
+        self.assertEqual(1, llm_note.get("tmdb_episode"))
