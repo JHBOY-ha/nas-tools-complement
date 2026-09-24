@@ -27,6 +27,8 @@ class MetaVideo(MetaBase):
     _episode_re = r"EP?(\d{2,4})|^EP?(\d{1,4})$|S\d{1,2}EP?(\d{1,4})$"
     _part_re = r"(^PART[0-9ABI]{0,2}$|^CD[0-9]{0,2}$|^DVD[0-9]{0,2}$|^DISK[0-9]{0,2}$|^DISC[0-9]{0,2}$)"
     _roman_numerals = r"^(?=[MDCLXVI])M*(C[MD]|D?C{0,3})(X[CL]|L?X{0,3})(I[XV]|V?I{0,3})$"
+    _roman_season_map = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5,
+                         "VI": 6, "VII": 7, "VIII": 8, "IX": 9, "X": 10}
     _source_re = r"^BLURAY$|^HDTV$|^UHDTV$|^HDDVD$|^WEBRIP$|^DVDRIP$|^BDRIP$|^BLU$|^WEB$|^BD$|^HDRip$"
     _effect_re = r"^REMUX$|^UHD$|^SDR$|^HDR\d*$|^DOLBY$|^DOVI$|^DV$|^3D$|^REPACK$"
     _resources_type_re = r"%s|%s" % (_source_re, _effect_re)
@@ -174,6 +176,10 @@ class MetaVideo(MetaBase):
             return
         # 拼写季集标记交给对应解析器；前置 Episode 后仍可继续读取标题。
         if token.upper() in ("SEASON", "EPISODE"):
+            return
+        if re.fullmatch(r"\d{1,2}x\d{1,3}", token, re.IGNORECASE):
+            # 1x03 是完整季集标记，不参与英文片名拼接。
+            self._stop_name_flag = True
             return
         if token in self._name_se_words:
             self._last_token_type = 'name_se_words'
@@ -324,6 +330,15 @@ class MetaVideo(MetaBase):
                     self.resource_pix = re_res.group(1).lower()
 
     def __init_season(self, token):
+        roman = re.fullmatch(r"第(II|III|IV|VI|VII|VIII|IX|I|V|X)季", token, re.IGNORECASE)
+        if roman:
+            # 只接受带「第…季」的有效罗马枚举，片名中的 X 保持原样。
+            self.begin_season = self._roman_season_map[roman.group(1).upper()]
+            self.total_seasons = 1
+            self.type = MediaType.TV
+            self._last_token_type = "season"
+            self._continue_flag = False
+            return
         re_res = re.findall(r"%s" % self._season_re, token, re.IGNORECASE)
         if re_res:
             self._last_token_type = "season"
@@ -371,6 +386,23 @@ class MetaVideo(MetaBase):
             self._last_token_type = "SEASON"
 
     def __init_episode(self, token):
+        numbered = re.fullmatch(r"(\d{1,2})x(\d{1,3})", token, re.IGNORECASE)
+        if numbered:
+            # 两组捕获分别是季与集，不经过普通集号正则的首捕获组循环。
+            self.begin_season = int(numbered.group(1))
+            self.total_seasons = 1
+            self.begin_episode = int(numbered.group(2))
+            self.total_episodes = 1
+            self.type = MediaType.TV
+            self._continue_flag = False
+            return
+        total = re.fullmatch(r"共(\d{1,4})[集话話]", token)
+        if total:
+            # 总集数是电视剧证据，不代表当前文件的集号。
+            self.total_episodes = int(total.group(1))
+            self.type = MediaType.TV
+            self._continue_flag = False
+            return
         re_res = re.findall(r"%s" % self._episode_re, token, re.IGNORECASE)
         if re_res:
             self._last_token_type = "episode"

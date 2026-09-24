@@ -180,6 +180,29 @@ class FractionalEpisodeTest(unittest.TestCase):
             episodes.assert_not_called()
 
 
+class ExplicitEpisodeFormsTest(unittest.TestCase):
+    def test_x_separated_season_episode(self):
+        meta = MetaInfo("Doctor Who 2005 1x03 1080p", use_llm=False)
+        self.assertEqual((1, 3), (meta.begin_season, meta.begin_episode))
+        self.assertEqual("Doctor Who", meta.en_name)
+        self.assertEqual(MediaType.TV, meta.type)
+
+    def test_total_count_and_roman_season(self):
+        meta = MetaInfo("某剧 共24集 1080p", use_llm=False)
+        self.assertEqual(MediaType.TV, meta.type)
+        self.assertEqual(24, meta.total_episodes)
+        self.assertIsNone(meta.begin_episode)
+        roman = MetaInfo("某某动漫 第II季 [1080p]", use_llm=False)
+        self.assertEqual(2, roman.begin_season)
+        self.assertEqual(MediaType.TV, roman.type)
+        self.assertIn("某某", roman.get_name())
+        movie = MetaInfo("The Matrix Collection 合集 1999", use_llm=False)
+        self.assertEqual(MediaType.MOVIE, movie.type)
+        beyblade = MetaInfo("[jibaketa] Beyblade X - 127 [WEB 1080p AVC AAC]", use_llm=False)
+        self.assertIn("X", beyblade.en_name)
+        self.assertNotEqual(10, beyblade.begin_season)
+
+
 class TransferGuardTest(unittest.TestCase):
     def test_skipped_file_is_not_moved_even_with_unknown_dir(self):
         with tempfile.TemporaryDirectory() as root:
