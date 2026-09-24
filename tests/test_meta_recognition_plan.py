@@ -83,6 +83,17 @@ class RoutingTest(unittest.TestCase):
         self.assertEqual(10, anime.begin_episode)
         self.assertEqual(MediaType.TV, anime.type)
 
+    def test_marker_words_in_movie_titles(self):
+        # 普通片名单词不能因与英文季集标记同名而被删除。
+        for title, name in (("Season of the Witch 2011.mkv", "Season Of The Witch"),
+                            ("The Final Season 2007.mkv", "The Final Season"),
+                            ("Episode of Love 2015.mkv", "Episode Of Love")):
+            with self.subTest(title=title):
+                meta = MetaInfo(title, use_llm=False)
+                self.assertEqual(name, meta.en_name)
+                self.assertEqual(MediaType.MOVIE, meta.type)
+                self.assertIsNone(meta.begin_episode)
+
     def test_written_season_and_episode(self):
         for name, season, expected_name in (
                 ("Game of Thrones Season 4 1080p BluRay", 4, "Game Of Thrones"),
@@ -103,6 +114,9 @@ class FractionalEpisodeTest(unittest.TestCase):
                           ("[Group] 某某 [07.5][1080p].mkv", "07.5"),
                           ("[Group] 某某 [01.25][1080p].mkv", "01.25"),
                           ("Show E01.5.mkv", "01.5"),
+                          ("Show EP01.5.mkv", "01.5"),
+                          ("Show S01E01.5.mkv", "01.5"),
+                          ("Show S02EP01.25.mkv", "01.25"),
                           ("Show - 01.5.mkv", "01.5")):
             with self.subTest(name=name):
                 meta = MetaInfo(name, use_llm=False)
@@ -249,6 +263,34 @@ class TransferGuardTest(unittest.TestCase):
                     move.assert_not_called()
                     with open(path, "rb") as source:
                         self.assertEqual(b"source", source.read())
+
+    def test_fractional_mapping_is_not_overwritten_by_download_context(self):
+        media = Media.__new__(Media)
+        media.tmdb = object()
+        info = {"id": 42, "name": "Show", "media_type": MediaType.TV,
+                "seasons": [{"season_number": 0}, {"season_number": 1}]}
+        rule = {"tmdb_id": 42, "source_episode": "01.5", "source_season": 1,
+                "target_season": 0, "target_episode": 3, "episode_title": "Bonus Story"}
+        with tempfile.TemporaryDirectory() as root:
+            for filename in ("Show S01E01.5.mkv", "Show [01.5].mkv"):
+                path = os.path.join(root, filename)
+                open(path, "wb").close()
+                with patch("app.media.media.Config") as config, \
+                        patch.object(media, "get_tmdb_season_episodes", return_value=[
+                            {"season_number": 0, "episode_number": 3, "name": "Bonus Story"}]):
+                    selected_rule = dict(rule)
+                    if "S01" not in filename:
+                        selected_rule.pop("source_season")
+                    config.return_value.get_config.return_value = {"fractional_episode_mappings": [selected_rule]}
+                    for seasons, episodes, skipped in (([1], [], True), ([0], [4], True),
+                                                       ([0], [3], False), ([], [], False)):
+                        with self.subTest(filename=filename, seasons=seasons, episodes=episodes):
+                            meta = media.get_media_info_on_files(
+                                [path], tmdb_info=info, media_type=MediaType.TV,
+                                download_context={"seasons": seasons, "episodes": episodes})[path]
+                            # 冲突保留跳过结果，防止后续按成功整理处理；一致时保留正式编号。
+                            self.assertEqual((0, 3), (meta.begin_season, meta.begin_episode))
+                            self.assertEqual(skipped, bool(meta.skip_reason))
 
     def test_manual_fractional_mapping_and_unconfirmed_skip(self):
         media = Media.__new__(Media)

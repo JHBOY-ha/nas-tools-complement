@@ -34,14 +34,17 @@ def protect_fractional_episode(title):
     patterns = (
         # 单位数字 [5.1] 常表示声道；裸方括号须有两位整数部分。
         (r"[\[【](\d{2,3}\.\d{1,2})[\]】]", "bracket"),
-        (r"(?i)(?<![A-Z0-9])E(\d{1,3}\.\d{1,2})(?![\d.A-Z])", "episode_marker"),
+        (r"(?i)(?<![A-Z0-9])(?P<season>S\d{1,2})?EP?(?P<decimal>\d{1,3}\.\d{1,2})(?![\d.A-Z])", "episode_marker"),
         (r"\s+-\s+(\d{2,3}\.\d{1,2})(?![\d.])", "separator"),
     )
     for pattern, source in patterns:
         match = re.search(pattern, stem)
         if match:
-            cleaned = stem[:match.start()] + " " + stem[match.end():]
-            return cleaned + extension, {"raw": match.group(1), "source": source,
+            # 组合 SxxExx.xx 保留发布季，仅移除小数集，供限定季的映射使用。
+            season = match.groupdict().get("season") or ""
+            raw = match.group("decimal") if source == "episode_marker" else match.group(1)
+            cleaned = stem[:match.start()] + season + " " + stem[match.end():]
+            return cleaned + extension, {"raw": raw, "source": source,
                                          "status": "unconfirmed"}
     return title, None
 

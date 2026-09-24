@@ -1674,10 +1674,17 @@ class Media:
                     if download_context and media_type != MediaType.MOVIE:
                         seasons = download_context.get("seasons") or []
                         episodes = download_context.get("episodes") or []
+                        # 已验证的小数集使用正式编号；上下文只能校验，不能再次改写。
+                        if fractional and ((seasons and meta_info.begin_season not in seasons)
+                                           or (episodes and meta_info.begin_episode not in episodes)):
+                            meta_info.skip_reason = "小数集正式季集映射与RSS下载任务冲突"
+                            return_media_infos[file_path] = meta_info
+                            log.info("【Meta】%s 跳过：%s" % (file_path, meta_info.skip_reason))
+                            continue
                         explicit_season = re.search(r"(?i)(?:S|Season[ ._-]*)(\d{1,2})(?=[E ._\-]|$)", file_name)
                         if explicit_season and seasons and meta_info.begin_season not in seasons:
                             raise ValueError("文件季号与RSS下载任务冲突：%s" % file_name)
-                        if len(seasons) == 1 and not explicit_season:
+                        if len(seasons) == 1 and not explicit_season and not fractional:
                             meta_info.begin_season = seasons[0]
                         file_episodes = meta_info.get_episode_list()
                         if file_episodes and episodes and not set(file_episodes).issubset(set(episodes)):

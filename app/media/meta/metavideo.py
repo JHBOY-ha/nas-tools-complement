@@ -41,7 +41,7 @@ class MetaVideo(MetaBase):
                         r"|[第\s共]+[0-9一二三四五六七八九十\-\s]+[集话話]" \
                         r"|连载|日剧|美剧|电视剧|动画片|动漫|欧美|西德|日韩|超高清|高清|蓝光|翡翠台|梦幻天堂·龙网|★?\d*月?新番" \
                         r"|最终季|合集|[多中国英葡法俄日韩德意西印泰台港粤双文语简繁体特效内封官译外挂]+字幕|版本|出品|台版|港版|\w+字幕组" \
-                        r"|未删减版|UNCUT$|UNRATE$|WITH EXTRAS$|RERIP$|SUBBED$|PROPER$|REPACK$|SEASON$|EPISODE$|Complete$|Extended$|Extended Version$" \
+                        r"|未删减版|UNCUT$|UNRATE$|WITH EXTRAS$|RERIP$|SUBBED$|PROPER$|REPACK$|Complete$|Extended$|Extended Version$" \
                         r"|S\d{2}\s*-\s*S\d{2}|S\d{2}|\s+S\d{1,2}|EP?\d{2,4}\s*-\s*EP?\d{2,4}|EP?\d{2,4}|\s+EP?\d{1,4}" \
                         r"|CD[\s.]*[1-9]|DVD[\s.]*[1-9]|DISK[\s.]*[1-9]|DISC[\s.]*[1-9]" \
                         r"|[248]K|\d{3,4}[PIX]+" \
@@ -156,6 +156,14 @@ class MetaVideo(MetaBase):
                 name = None
         return self.normalize_release_version_suffix(name)
 
+    def __is_written_marker(self, token):
+        # 仅在下一 token 是有效编号时消费英文标记，保留真实片名中的单词。
+        limit = {"SEASON": 2, "EPISODE": 4}.get(token.upper())
+        following = self.tokens.cur()
+        return bool(limit and following and following.isdigit()
+                    and len(following) <= limit
+                    and not (len(following) == 4 and following.startswith(("19", "20"))))
+
     def __init_name(self, token):
         if not token:
             return
@@ -175,7 +183,7 @@ class MetaVideo(MetaBase):
             self._stop_name_flag = True
             return
         # 拼写季集标记交给对应解析器；前置 Episode 后仍可继续读取标题。
-        if token.upper() in ("SEASON", "EPISODE"):
+        if self.__is_written_marker(token):
             return
         if re.fullmatch(r"\d{1,2}x\d{1,3}", token, re.IGNORECASE):
             # 1x03 是完整季集标记，不参与英文片名拼接。
@@ -382,7 +390,7 @@ class MetaVideo(MetaBase):
                 self._stop_name_flag = True
                 self._continue_flag = False
                 self.type = MediaType.TV
-        elif token.upper() == "SEASON" and self.begin_season is None:
+        elif token.upper() == "SEASON" and self.begin_season is None and self.__is_written_marker(token):
             self._last_token_type = "SEASON"
 
     def __init_episode(self, token):
@@ -469,7 +477,7 @@ class MetaVideo(MetaBase):
                 self._continue_flag = False
                 self._stop_name_flag = bool(self.get_name())
                 self.type = MediaType.TV
-        elif token.upper() == "EPISODE":
+        elif token.upper() == "EPISODE" and self.__is_written_marker(token):
             self._last_token_type = "EPISODE"
 
     def __init_resource_type(self, token):
