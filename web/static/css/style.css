@@ -370,6 +370,7 @@ body, .page {
         flex-direction: column;
     }
 
+    .lit-library-toolbar > form,
     .lit-library-toolbar > .dropdown,
     .lit-library-filter-trigger {
         width: 100%;

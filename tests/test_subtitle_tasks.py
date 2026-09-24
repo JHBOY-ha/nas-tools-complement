@@ -3,6 +3,7 @@ import datetime
 import hashlib
 import json
 import os
+import sqlite3
 import tempfile
 import threading
 import time
@@ -87,6 +88,26 @@ class SubtitleTaskManagerTest(TestCase):
     def tearDown(self):
         self.manager.shutdown(wait=True)
         self.temp.cleanup()
+
+    def test_empty_cleanup_releases_writer_for_other_connections(self):
+        # StaticPool/in-memory SQLite hides this bug because all users share
+        # one physical connection. Exercise the real two-connection case.
+        path = os.path.join(self.temp.name, "writer-lock.db")
+        db = _MemoryDb()
+        db.engine.dispose()
+        db.engine = create_engine("sqlite:///" + path)
+        db._session = scoped_session(sessionmaker(bind=db.engine, expire_on_commit=False))
+        db.init_db()
+        manager = SubtitleTaskManager(db=db, staging_root=os.path.join(self.temp.name, "lock-staging"))
+        try:
+            manager.cleanup()
+            with sqlite3.connect(path, timeout=0.1) as other:
+                # A write matching zero rows still needs the writer lock.
+                other.execute("DELETE FROM SUBTITLE_PROBE_CACHE WHERE ID = -1")
+                other.commit()
+        finally:
+            db._session.remove()
+            db.engine.dispose()
 
     def payload(self):
         link_stat = os.lstat(self.media)

@@ -491,7 +491,7 @@ const navbar_list = [
         `,
       },
       {
-        name: "字幕",
+        name: "字幕设置",
         page: "subtitle",
         icon: html`
           <!-- https://tabler-icons.io/static/tabler-icons/icons-png/badge-cc.png -->

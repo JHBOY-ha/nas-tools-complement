@@ -881,11 +881,17 @@ class Downloader:
                             log.info("【Downloader】%s 第%s季 不存在" % (meta_info.get_title_string(), season))
                             message_list.append("%s 第%s季 不存在" % (meta_info.get_title_string(), season))
                             return None, no_exists, message_list
-                        if search_episode and any(e < 1 or e > episode_num for e in search_episode):
+                        detail = self.media.get_tmdb_tv_season_detail(meta_info.tmdb_id, season)
+                        episode_numbers = sorted({e["episode_number"] for e in (detail or {}).get("episodes", [])
+                                                  if isinstance(e.get("episode_number"), int)})
+                        if not episode_numbers:
+                            return None, no_exists, ["TMDB季集详情暂不可用，保留待重试"]
+                        if search_episode and not set(search_episode).issubset(episode_numbers):
                             message_list.append("请求集数超出TMDB季集范围，需核对季号或绝对集数")
                             log.warn("【Downloader】%s" % message_list[-1])
                             return None, no_exists, message_list
-                        total_seasons.append({"season_number": season, "episode_count": episode_num})
+                        total_seasons.append({"season_number": season, "episode_count": len(episode_numbers),
+                                              "episode_numbers": episode_numbers})
                         log.info(
                             "【Downloader】%s 第%s季 共有 %s 集" % (meta_info.get_title_string(), season, episode_num))
                 else:
@@ -906,13 +912,22 @@ class Downloader:
                         episode_count = season.get("episode_count")
                         if season_number is None or not episode_count:
                             continue
+                        episode_numbers = season.get("episode_numbers")
+                        if episode_numbers is None:
+                            detail = self.media.get_tmdb_tv_season_detail(meta_info.tmdb_id, season_number)
+                            episode_numbers = sorted({e["episode_number"] for e in (detail or {}).get("episodes", [])
+                                                      if isinstance(e.get("episode_number"), int)})
+                            if not episode_numbers:
+                                return None, no_exists, ["TMDB季集详情暂不可用，保留待重试"]
+                            episode_count = len(episode_numbers)
                         # 检查Emby
                         no_exists_episodes = self.mediaserver.get_no_exists_episodes(meta_info,
                                                                                      season_number,
-                                                                                     episode_count)
+                                                                                     episode_count,
+                                                                                     episode_numbers=episode_numbers)
                         # 任一来源已有该集即可证明存在；空结果不等于无需检查其它盘。
                         local_missing = self.filetransfer.get_no_exists_medias(
-                            meta_info, season_number, episode_count)
+                            meta_info, season_number, episode_count, episode_numbers=episode_numbers)
                         if no_exists_episodes is None:
                             no_exists_episodes = local_missing
                         else:
@@ -926,7 +941,8 @@ class Downloader:
                             # 缺失集提示文本
                             exists_tvs_str = "、".join(["%s" % tv for tv in no_exists_episodes])
                             # 存入总缺失集
-                            if len(no_exists_episodes) >= episode_count:
+                            if (len(no_exists_episodes) >= episode_count
+                                    and episode_numbers == list(range(1, episode_count + 1))):
                                 no_item = {"season": season_number, "episodes": [], "total_episodes": episode_count}
                                 log.info(
                                     "【Downloader】%s 第%s季 缺失 %s 集" % (

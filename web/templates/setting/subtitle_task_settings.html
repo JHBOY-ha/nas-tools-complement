@@ -84,6 +84,13 @@
               </div>
               <div class="col-12 col-md-6 col-xl-4">
                 <div class="d-flex align-items-center gap-1 mb-2">
+                  <label class="form-label mb-0" for="subtitle_task_season_max_batch_items">整季字幕包数量</label>
+                  {{ policy_help("subtitle_task_season_max_batch_items_help", "整季字幕包数量说明", "整季字幕包单次允许的文本字幕数量，仍受单批总量和处理时间限制。默认 100；范围 1–200。LLM 对齐仍受 LLM 单批数量限制。") }}
+                </div>
+                <input class="form-control" type="number" id="subtitle_task_season_max_batch_items" data-policy-key="season_max_batch_items" min="1" max="200" aria-describedby="subtitle_task_season_max_batch_items_help" required>
+              </div>
+              <div class="col-12 col-md-6 col-xl-4">
+                <div class="d-flex align-items-center gap-1 mb-2">
                   <label class="form-label mb-0" for="subtitle_task_llm_max_batch_items">LLM 对齐单批数量</label>
                   {{ policy_help("subtitle_task_llm_max_batch_items_help", "LLM 对齐单批数量说明", "选择 LLM 对齐时，一次上传允许的字幕数量，不得超过普通单批字幕数量。默认 5；范围 1–5。") }}
                 </div>

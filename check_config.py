@@ -225,12 +225,11 @@ def update_config():
     # LLM识别配置初始化
     llm_defaults = {
         'enable': False,
-        'mode': 'rule_first',
+        'mode': 'conservative',
         'base_url': 'https://api.openai.com/v1',
         'api_key': '',
         'model': 'gpt-4o-mini',
         'timeout': 20,
-        'confidence_threshold': 0.75,
         'search_context_enable': False,
         'search_max_results': 3,
         'search_timeout': 8
@@ -241,7 +240,7 @@ def update_config():
         overwrite_cofig = True
     else:
         # 兼容旧配置字段
-        for obsolete_key in ["provider", "anthropic_version"]:
+        for obsolete_key in ["provider", "anthropic_version", "confidence_threshold"]:
             if obsolete_key in llm_config:
                 llm_config.pop(obsolete_key, None)
                 overwrite_cofig = True
@@ -252,19 +251,19 @@ def update_config():
             llm_config["base_url"] = llm_config.get("api_base")
             overwrite_cofig = True
         legacy_mode = str(llm_config.get("mode") or "").strip().lower()
-        if legacy_mode == "fallback":
-            llm_config["mode"] = "rule_first"
+        if legacy_mode in ("fallback", "rule_first"):
+            llm_config["mode"] = "conservative"
             overwrite_cofig = True
-        elif legacy_mode == "primary":
-            llm_config["mode"] = "llm_first"
+        elif legacy_mode in ("primary", "llm_first", "hybrid"):
+            llm_config["mode"] = "balanced"
             overwrite_cofig = True
         for key, val in llm_defaults.items():
             if key not in llm_config:
                 llm_config[key] = val
                 overwrite_cofig = True
         llm_mode = str(llm_config.get("mode") or "").strip().lower()
-        if llm_mode not in ["rule_first", "llm_first", "hybrid"]:
-            llm_config["mode"] = "rule_first"
+        if llm_mode not in ["conservative", "balanced"]:
+            llm_config["mode"] = "conservative"
             overwrite_cofig = True
         elif llm_mode != llm_config.get("mode"):
             llm_config["mode"] = llm_mode
@@ -279,17 +278,6 @@ def update_config():
         else:
             if llm_config.get("timeout") != timeout:
                 llm_config["timeout"] = timeout
-                overwrite_cofig = True
-        try:
-            confidence_threshold = float(llm_config.get("confidence_threshold"))
-            if confidence_threshold < 0 or confidence_threshold > 1:
-                raise ValueError("confidence_threshold must be in [0, 1]")
-        except Exception:
-            llm_config["confidence_threshold"] = llm_defaults["confidence_threshold"]
-            overwrite_cofig = True
-        else:
-            if llm_config.get("confidence_threshold") != confidence_threshold:
-                llm_config["confidence_threshold"] = confidence_threshold
                 overwrite_cofig = True
         search_context_enable = StringUtils.to_bool(
             llm_config.get("search_context_enable"),

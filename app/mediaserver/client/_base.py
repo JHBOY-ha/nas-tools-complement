@@ -50,7 +50,7 @@ class _IMediaClient(metaclass=ABCMeta):
         pass
 
     @abstractmethod
-    def get_no_exists_episodes(self, meta_info, season, total_num):
+    def get_no_exists_episodes(self, meta_info, season, total_num, episode_numbers=None):
         """
         根据标题、年份、季、总集数，查询缺少哪几集
         :param meta_info: 已识别的需要查询的媒体信息

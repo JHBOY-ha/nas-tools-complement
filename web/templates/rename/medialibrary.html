@@ -26,6 +26,7 @@
               <div class="card-subtitle mt-1">筛选媒体后，可上传字幕或按分类检测影视服务器识别情况</div>
             </div>
             <div class="card-actions">
+              <button class="btn" type="button" onclick="navmenu('subtitle')">字幕设置</button>
               <!-- 任务入口共用尺寸类，按钮和链接都继承任务中心的触控高度。 -->
               <button class="btn lit-library-task-action" type="button" data-subtitle-task-center
                       aria-label="打开字幕任务中心">
@@ -49,7 +50,12 @@
             </div>
           </div>
           <div class="card-body">
-            <div class="lit-library-toolbar">
+            <div class="lit-library-toolbar flex-wrap">
+              <form class="d-flex gap-2 flex-grow-1" role="search" onsubmit="event.preventDefault(); apply_library_filters();">
+                <input id="library_filter_keyword" type="search" class="form-control" aria-label="按媒体名搜索影片" placeholder="搜索媒体名、原名或年份" maxlength="200">
+                <button id="library_filter_keyword_clear" class="btn btn-icon" type="button" aria-label="清除搜索关键词" title="清除搜索关键词">{{ SVG.x() }}</button>
+                <button type="submit" class="btn btn-primary">搜索影片</button>
+              </form>
               <div class="dropdown">
                 <button class="btn btn-outline-primary lit-library-filter-trigger" id="library_filter_trigger"
                         type="button" data-bs-toggle="dropdown" data-bs-auto-close="outside"
@@ -107,16 +113,7 @@
                           <option value="asc">升序</option>
                         </select>
                       </div>
-                      <div class="col-12 col-sm-6 col-lg-4">
-                        <label class="form-label" for="library_filter_keyword">搜索</label>
-                        <div class="input-group">
-                          <input id="library_filter_keyword" type="search" class="form-control" placeholder="标题、原名、年份">
-                          <button id="library_filter_keyword_clear" class="btn btn-icon" type="button"
-                                  aria-label="清除搜索关键词" title="清除搜索关键词">
-                            {{ SVG.x() }}
-                          </button>
-                        </div>
-                      </div>
+
                     </div>
                   </div>
                   <div class="lit-library-filter-menu-footer">
@@ -343,6 +340,11 @@
         <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
       </div>
       <div class="modal-body">
+        <div class="row g-2 mb-3">
+          <div class="col-6"><label class="form-label" for="library_episode_season">选择季</label><select id="library_episode_season" class="form-select" onchange="filter_library_episodes(true)"></select></div>
+          <div class="col-6"><label class="form-label" for="library_episode_number">选择集</label><select id="library_episode_number" class="form-select" onchange="filter_library_episodes(false)"></select></div>
+        </div>
+        <div class="mb-3"><button type="button" class="btn btn-outline-primary" onclick="open_library_season_pack()">上传整季字幕</button></div>
         <div id="index_library_episodes_body" class="divide-y"></div>
       </div>
     </div>
@@ -410,9 +412,52 @@
     </div>
   </div>
 </div>
+<div class="modal modal-blur fade" id="season-pack-modal" tabindex="-1" aria-hidden="true" data-bs-backdrop="static" data-bs-keyboard="false">
+  <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable"><div class="modal-content">
+    <div class="modal-header"><h5 class="modal-title">上传整季字幕</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button></div>
+    <div class="modal-body">
+      <div id="season_pack_title" class="fw-bold mb-3"></div>
+      <label class="form-label" for="season_pack_file">字幕文件（可多选）或 ZIP 包</label>
+      <input id="season_pack_file" type="file" class="form-control mb-2" accept=".srt,.ass,.ssa,.vtt,.smi,.zip" multiple onchange="reset_library_season_pack()">
+      <div class="form-hint mb-3">支持 SRT、ASS、SSA、VTT、SMI 字幕文件与 ZIP 包（包内子目录同样识别）；RAR 请先解压，再多选其中的字幕文件。按季集编号匹配；仅含集数的文件使用所选季。无法确认、多集文件或多个视频版本不自动分配。不会覆盖已有字幕。</div>
+      <label class="form-label" for="season_pack_align">字幕对齐模式</label>
+      <select id="season_pack_align" class="form-select mb-3"><option value="none">不对齐</option><option value="auto">自动选择</option><option value="offset">仅整体偏移</option><option value="segmented">分段对齐</option><option value="llm">LLM 跨语言对齐（受单批数量限制）</option></select>
+      <div id="season_pack_message" class="mb-3" role="status" aria-live="polite"></div>
+      <div id="season_pack_rows"></div>
+    </div>
+    <div class="modal-footer">
+      <button type="button" class="btn me-auto" data-bs-dismiss="modal">关闭</button>
+      <button type="button" class="btn" onclick="SubtitleTasks.openCenter()">任务中心</button>
+      <button type="button" class="btn btn-outline-primary" onclick="upload_library_season_pack(false)">预览匹配</button>
+      <button type="button" id="season_pack_submit" class="btn btn-primary" onclick="upload_library_season_pack(true)" disabled>上传所选字幕</button>
+    </div>
+  </div></div>
+</div>
 <script type="text/javascript" src="../static/js/subtitle-tasks.js"></script>
 <script type="text/javascript" src="../static/js/media-library.js"></script>
+<script type="text/javascript" src="../static/js/subtitle-season-pack.js"></script>
 <script type="text/javascript">
   window.CURRENT_MEDIA_SERVER_TYPE = "{{ MediaServerType or 'emby' }}";
   init_media_library_page({page_size: 18, default_server: window.CURRENT_MEDIA_SERVER_TYPE});
 </script>
+
+<div class="modal modal-blur fade" id="library-online-subtitle-modal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header"><h5 class="modal-title">在线字幕</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button></div>
+      <div class="modal-body">
+        <div id="library_online_media" class="fw-bold text-break mb-1"></div>
+        <div id="library_online_target_path" class="text-muted small text-break mb-3"></div>
+        <form class="d-flex flex-wrap gap-2" onsubmit="event.preventDefault(); search_library_online_subtitles();">
+          <input id="library_online_keyword" class="form-control flex-fill" aria-label="字幕检索名称" placeholder="中文名 英文原名 年份，可自由编辑" maxlength="200" required>
+          <select id="library_online_provider" class="form-select w-auto" aria-label="字幕来源"><option value="all">全部来源</option><option value="thunder">迅雷</option><option value="assrt">Assrt</option></select>
+          <button class="btn" type="button" onclick="reset_library_online_keyword()">恢复默认词</button>
+          <button id="library_online_search" class="btn btn-primary" type="submit">检索字幕</button>
+        </form>
+        <div class="text-muted small mt-2">默认包含媒体名、原名、年份和季集；可修改或删除关键词，按回车或“检索字幕”重新搜索。剧集始终限定当前季集。</div>
+        <div class="text-muted small mt-2">按片名、年份和当前季集校验结果；文件特征匹配优先。字幕包仅列出明确匹配本集的文件。Assrt 需在“设置 → 字幕设置”中配置 Token。</div>
+        <div id="library_online_results" class="mt-3" aria-live="polite"></div>
+      </div>
+    </div>
+  </div>
+</div>

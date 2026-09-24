@@ -129,7 +129,7 @@ class Plex(_IMediaClient):
         return ret_movies
 
     # 根据标题、年份、季、总集数，查询Plex中缺少哪几集
-    def get_no_exists_episodes(self, meta_info, season, total_num):
+    def get_no_exists_episodes(self, meta_info, season, total_num, episode_numbers=None):
         """
         根据标题、年份、季、总集数，查询Plex中缺少哪几集
         :param meta_info: 已识别的需要查询的媒体信息
@@ -145,7 +145,8 @@ class Plex(_IMediaClient):
             for episode in video[0].episodes():
                 if episode.seasonNumber == season:
                     exists_episodes.append(episode.index)
-        total_episodes = [episode for episode in range(1, total_num + 1)]
+        total_episodes = (list(episode_numbers) if episode_numbers is not None
+                          else list(range(1, total_num + 1)))
         return list(set(total_episodes).difference(set(exists_episodes)))
 
     @staticmethod

@@ -422,7 +422,6 @@ class FileTransfer:
                 os.replace(temporary, new_file)
                 if old_file and old_file != new_file and os.path.isfile(old_file):
                     os.remove(old_file)
-                self.dbhelper.insert_transfer_blacklist(file_item)
                 return self.__transfer_subtitles(org_name=file_item, new_name=new_file, rmt_mode=rmt_mode)
             finally:
                 if os.path.lexists(temporary):
@@ -436,7 +435,6 @@ class FileTransfer:
                                           rmt_mode=rmt_mode)
         if retcode == 0:
             log.info("【Rmt】文件 %s %s完成" % (file_name, rmt_mode.value))
-            self.dbhelper.insert_transfer_blacklist(file_item)
         else:
             log.error("【Rmt】文件 %s %s失败，错误码 %s" % (file_name, rmt_mode.value, str(retcode)))
             return retcode
@@ -678,7 +676,10 @@ class FileTransfer:
                         already_exists = bool(wanted) and wanted.issubset(covered)
                     if already_exists:
                         log.info("【Rmt】%s 已在媒体库其他路径入库，跳过重复硬链接" % file_name)
-                        self.dbhelper.insert_transfer_blacklist(file_item)
+                        if self.dbhelper.insert_transfer_blacklist(file_item) is False:
+                            success_flag = False
+                            failed_count += 1
+                            error_message = "防重复处理记录写入失败，等待重试"
                         continue
                 # 当前文件大小
                 media.size = os.path.getsize(file_item)
@@ -718,7 +719,14 @@ class FileTransfer:
                         failed_count += 1
                         continue
                     # 文件存在
-                    if file_exist_flag:
+                    if (file_exist_flag and rmt_mode == RmtMode.LINK
+                            and os.path.samefile(file_item, ret_file_path)):
+                        # A previous attempt may have published the file but
+                        # failed to persist its history. Retry just that record.
+                        handler_flag = True
+                        new_file = ret_file_path
+                        ret_file_path = os.path.splitext(ret_file_path)[0]
+                    if file_exist_flag and not handler_flag:
                         exist_filenum = exist_filenum + 1
                         if rmt_mode != RmtMode.SOFTLINK:
                             if media.size > os.path.getsize(ret_file_path) and self._filesize_cover or udf_flag:
@@ -842,17 +850,30 @@ class FileTransfer:
                                  "episode": media.begin_episode,
                                  "bluray": True if bluray_disk_dir else False,
                                  "imdbid": media.imdb_id}
-                # 登记字幕下载
-                if subtitle_item not in download_subtitle_items:
-                    download_subtitle_items.append(subtitle_item)
                 # 转移历史记录
-                self.dbhelper.insert_transfer_history(
+                recorded = self.dbhelper.insert_transfer_history(
                     in_from=in_from,
                     rmt_mode=rmt_mode,
                     in_path=reg_path,
                     out_path=new_file if not bluray_disk_dir else None,
                     dest=dist_path,
                     media_info=media)
+                if recorded is not False:
+                    recorded = self.dbhelper.insert_transfer_blacklist(file_item)
+                if recorded is False:
+                    success_flag = False
+                    failed_count += 1
+                    alert_count += 1
+                    error_message = "文件已落盘，但转移记录写入失败，等待重试"
+                    log.error("【Rmt】%s：%s" % (error_message, file_item))
+                    if error_message not in alert_messages:
+                        alert_messages.append(error_message)
+                    if udf_flag:
+                        return __finish_transfer(False, error_message)
+                    continue
+                # Only enqueue follow-up work once the transfer is recorded.
+                if subtitle_item not in download_subtitle_items:
+                    download_subtitle_items.append(subtitle_item)
                 # 未识别手动识别或历史记录重新识别的批处理模式
                 if isinstance(episode[1], bool) and episode[1]:
                     # 未识别手动识别，更改未识别记录为已处理
@@ -1104,7 +1125,7 @@ class FileTransfer:
             result.append((path, row.SEASON_EPISODE))
         return result
 
-    def get_no_exists_medias(self, meta_info, season=None, total_num=None):
+    def get_no_exists_medias(self, meta_info, season=None, total_num=None, episode_numbers=None):
         """
         根据媒体库目录结构，判断媒体是否存在
         :param meta_info: 已识别的媒体信息
@@ -1142,7 +1163,8 @@ class FileTransfer:
                 dest_paths = self._tv_path
                 category_flag = self._tv_category_flag
             # 总需要的集
-            total_episodes = [episode for episode in range(1, total_num + 1)]
+            total_episodes = (list(episode_numbers) if episode_numbers is not None
+                          else list(range(1, total_num + 1)))
             # 已存在的集
             exists_episodes = []
             for _, season_episode in self._existing_media_files(meta_info):

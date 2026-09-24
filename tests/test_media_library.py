@@ -506,6 +506,64 @@ class MediaLibraryTest(TestCase):
             self.assertEqual(short_result["status"], "ok")
             self.assertEqual(region_result["status"], "warning")
 
+    def test_media_name_search_filters_before_pagination(self):
+        from unittest.mock import Mock
+        library = MediaLibrary.__new__(MediaLibrary)
+        library.media_server = Mock()
+        library.media_server.get_type.return_value = types.SimpleNamespace(value="emby")
+        library.mediadb = Mock()
+        library.mediadb.list_items.return_value = [1, 2, 3]
+        library.dbhelper = Mock()
+        library.dbhelper.get_transfer_histories_with_dest.return_value = []
+        items = {
+            1: dict(id="1", title="其他电影", original_title="Other", year="2020"),
+            2: dict(id="2", title="星际穿越", original_title="Interstellar", year="2014"),
+            3: dict(id="3", title="星际迷航", original_title="Star Trek", year="2009")
+        }
+        def build(row, **kwargs):
+            return dict(items[row], media_type="movie", category="电影", subtitle_status="unknown")
+        with patch.object(library, "_MediaLibrary__build_item", side_effect=build), \
+                patch.object(library, "_MediaLibrary__latest_audit_snapshots", return_value={"movie": {}}):
+            for keyword, expected in [("星际", 2), (" INTERSTELLAR ", 1), ("2014", 1), ("不存在", 0)]:
+                result = library.list_items({"keyword": keyword, "page_size": 1})
+                self.assertEqual(result["total"], expected)
+                self.assertEqual(len(result["items"]), min(expected, 1))
+            result = library.list_items({"keyword": "星际", "page_size": 1, "page": 2})
+            self.assertEqual(result["items"][0]["id"], "3")
+
+    def test_episode_numbers_fall_back_to_filename_and_season_directory(self):
+        cases = [
+            ({"season": "", "episode": "", "path": "/media/Season 4/Re：从零开始的异世界生活 - S04E17 - 第17集.mkv"}, (4, 17)),
+            ({"path": "/media/Season 4/第17集.mkv"}, (4, 17)),
+            ({"path": "/media/Season 0/Show.S00E02.mkv", "season": 0}, (0, 2)),
+            ({"season_episode": "S04 E17"}, (4, 17)),
+            ({"path": "/media/Show.S04E17.mkv", "season": 3, "episode": 2}, (3, 2)),
+            ({"path": "/media/unknown.mkv"}, ("", ""))
+        ]
+        for record, expected in cases:
+            with self.subTest(record=record):
+                self.assertEqual(MediaLibrary.resolve_episode_numbers(record), expected)
+
+    def test_get_episodes_returns_inferred_numbers_to_frontend(self):
+        from unittest.mock import Mock
+        library = MediaLibrary.__new__(MediaLibrary)
+        library.media_server = Mock()
+        library.media_server.get_type.return_value = types.SimpleNamespace(value="emby")
+        library.mediadb = Mock()
+        library.mediadb.list_items.return_value = [types.SimpleNamespace(ITEM_ID="show", PATH="/media/show", ITEM_TYPE="Series", LIBRARY="lib")]
+        library.dbhelper = Mock()
+        library.dbhelper.get_transfer_histories_with_dest.return_value = []
+        episodes = [{"path": "/media/Season 4/Re：从零开始的异世界生活 - S04E17 - 第17集.mkv", "season": "", "episode": ""}]
+        with patch.object(library, "classify_path", return_value=("anime", "")), \
+                patch.object(library, "_MediaLibrary__find_transfer_matches", return_value=[]), \
+                patch.object(library, "_MediaLibrary__series_history_items", return_value=episodes), \
+                patch.object(library, "_MediaLibrary__status_store", return_value=types.SimpleNamespace(get=lambda *args: None)), \
+                patch.object(library, "_MediaLibrary__get_server_episodes", return_value=[]):
+            result = library.get_episodes({"item_id": "show"})
+        self.assertEqual(result["code"], 0)
+        item = result["items"][0]
+        self.assertEqual((item["season"], item["episode"], item["season_episode"]), (4, 17, "S04E17"))
+
     def test_list_items_uses_media_server_enum_value_for_query(self):
         class _ServerType:
             value = "Jellyfin"

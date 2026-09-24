@@ -1,9 +1,10 @@
 var library_page = 1;
 var library_page_size = 18;
 var library_items_cache = {};
-var library_episodes_cache = [];
 var library_current_series_id = "";
 var library_current_series_title = "";
+var library_episodes_cache = [];
+var library_online_media = {};
 var library_poster_observer = null;
 var library_eager_poster_count = 6;
 var library_default_media_server = "emby";
@@ -685,6 +686,7 @@ function library_item_card(item, index) {
         </div>` : ""}
       </div>
       <div class="lit-library-card-footer">
+        ${is_movie ? `<button type="button" class="btn btn-sm btn-outline-primary w-100" ${movie_upload_disabled ? "disabled" : ""} onclick="open_library_online_movie(&quot;${item_id}&quot;)">在线字幕</button>` : ""}
         ${can_repair ? `<button type="button" class="btn btn-sm btn-outline-warning w-100"
           title="按全局影视服务器规则规范化现有外挂字幕"
           aria-label="二次处理 ${title} 的外挂字幕"
@@ -812,6 +814,8 @@ function open_library_episodes(item_id) {
   }
   library_current_series_id = item_id;
   library_current_series_title = item.title || "";
+  library_episodes_cache = [];
+  $("#library_episode_season,#library_episode_number").empty();
   $("#index_library_episodes_title").text(`${item.title || "剧集"} - 选择剧集`);
   $("#index_library_episodes_body").html('<div class="text-muted py-3">正在加载剧集...</div>');
   $("#index-library-episodes-modal").modal("show");
@@ -825,8 +829,46 @@ function open_library_episodes(item_id) {
       $("#index_library_episodes_body").html(`<div class="text-danger py-3">${library_escape_html(ret.msg || "剧集加载失败")}</div>`);
       return;
     }
-    render_library_episodes(ret.items || []);
+    if (library_current_series_id !== item_id) { return; }
+    library_episodes_cache = (ret.items || []).map(library_fill_episode_numbers);
+    const seasons = Array.from(new Set(library_episodes_cache.map(function (episode) { return String(episode.season); })))
+        .sort(function (a, b) { return Number(a) - Number(b); });
+    const season_select = $("#library_episode_season").empty().append($("<option>").val("").text("全部季"));
+    seasons.forEach(function (season) {
+      if (season !== "" && season !== "undefined") {
+        season_select.append($("<option>").val(season).text(`第 ${season} 季`));
+      }
+    });
+    filter_library_episodes(true);
   });
+}
+
+function library_fill_episode_numbers(episode) {
+  episode = Object.assign({}, episode);
+  const basename = String(episode.path || "").replace(/\\/g, "/").split("/").pop();
+  const match = basename.match(/(?:^|[^a-z0-9])S(\d{1,3})[ ._-]*E(\d{1,4})(?!\d)/i);
+  if (match) {
+    if (episode.season === "" || episode.season == null) { episode.season = Number(match[1]); }
+    if (episode.episode === "" || episode.episode == null) { episode.episode = Number(match[2]); }
+  }
+  if (episode.season !== "" && episode.season != null && episode.episode !== "" && episode.episode != null) {
+    episode.season_episode = `S${String(episode.season).padStart(2, "0")}E${String(episode.episode).padStart(2, "0")}`;
+  }
+  return episode;
+}
+
+function filter_library_episodes(reset_episode) {
+  const season = $("#library_episode_season").val();
+  if (reset_episode) {
+    const number_select = $("#library_episode_number").empty().append($("<option>").val("").text("全部集"));
+    const numbers = Array.from(new Set(library_episodes_cache.filter(function (episode) {
+      return !season || String(episode.season) === season;
+    }).map(function (episode) { return String(episode.episode); }))).sort(function (a, b) { return Number(a) - Number(b); });
+    numbers.forEach(function (number) {
+      if (number !== "" && number !== "undefined") { number_select.append($("<option>").val(number).text(`第 ${number} 集`)); }
+    });
+  }
+  render_library_episodes(library_episodes_cache);
 }
 
 function render_library_episodes(episodes) {
@@ -838,9 +880,13 @@ function render_library_episodes(episodes) {
   let html = "";
   episodes.forEach(function (episode, index) {
     const title = library_escape_html(episode.title || episode.season_episode || "未命名剧集");
+    const selected_season = $("#library_episode_season").val();
+    const selected_episode = $("#library_episode_number").val();
+    if ((selected_season && String(episode.season) !== selected_season)
+        || (selected_episode && String(episode.episode) !== selected_episode)) { return; }
     const path = library_escape_html(episode.path || "");
     const disabled = episode.can_upload ? "" : "disabled";
-    const button = `<button type="button" class="btn btn-sm btn-primary" ${disabled} onclick="open_library_episode_upload(${index})">上传字幕</button>`;
+    const button = `<button type="button" class="btn btn-sm btn-outline-primary me-2" ${disabled} onclick="open_library_online_episode(${index})">检索本集字幕</button><button type="button" class="btn btn-sm btn-primary" ${disabled} onclick="open_library_episode_upload(${index})">上传字幕</button>`;
     html += `
       <div class="py-3" data-episode-index="${index}">
         <input type="hidden" class="library-episode-path" value="${path}">
@@ -857,7 +903,7 @@ function render_library_episodes(episodes) {
         </div>
       </div>`;
   });
-  $("#index_library_episodes_body").html(html);
+  $("#index_library_episodes_body").html(html || '<p class="text-muted py-3">当前季集没有可用的媒体文件。</p>');
 }
 
 function open_library_episode_upload(index) {
@@ -1107,4 +1153,160 @@ function init_media_library_page(options) {
   update_library_sort_order_labels();
   update_library_filter_badge();
   load_library_items(1);
+}
+
+var library_online_path = "";
+var library_online_generation = 0;
+var library_online_results = [];
+var library_online_default_keyword = "";
+
+function open_library_online_movie(item_id) {
+  const item = library_items_cache[item_id];
+  if (item && item.target_path) {
+    open_library_online_subtitles(item.title || item.original_title, item.target_path, {
+      title: item.title, original_title: item.original_title, year: item.year, media_type: "movie"
+    });
+  }
+}
+
+function open_library_online_episode(index) {
+  const cached_episode = library_episodes_cache[index];
+  if (!cached_episode) { return; }
+  const episode = library_fill_episode_numbers(cached_episode);
+  const series = library_items_cache[library_current_series_id] || {};
+  if (!episode || !episode.path) { return; }
+  $("#index-library-episodes-modal").modal("hide");
+  open_library_online_subtitles(library_current_series_title, episode.path, {
+    title: library_current_series_title, original_title: series.original_title, year: series.year,
+    media_type: "episode", season: episode.season, episode: episode.episode
+  });
+}
+
+function library_online_keyword_for(media, fallback) {
+  const parts = [];
+  [media.title || fallback, media.original_title].forEach(function (value) {
+    const title = String(value || "").trim();
+    if (title && !parts.some(function (part) { return part.toLowerCase() === title.toLowerCase(); })) {
+      parts.push(title);
+    }
+  });
+  if (media.year) { parts.push(String(media.year)); }
+  if (media.media_type === "episode" && media.season !== "" && media.season != null
+      && media.episode !== "" && media.episode != null) {
+    parts.push(`S${String(media.season).padStart(2, "0")}E${String(media.episode).padStart(2, "0")}`);
+  }
+  return parts.join(" ");
+}
+
+function reset_library_online_keyword() {
+  $("#library_online_keyword").val(library_online_default_keyword);
+}
+
+function open_library_online_subtitles(name, path, media) {
+  library_online_path = path;
+  library_online_media = media || {};
+  const episode_label = library_online_media.media_type === "episode"
+      ? (library_online_media.season !== "" && library_online_media.season != null
+          && library_online_media.episode !== "" && library_online_media.episode != null
+          ? ` · 第 ${library_online_media.season} 季 第 ${library_online_media.episode} 集` : " · 季集未识别") : (library_online_media.year ? ` · ${library_online_media.year}` : "");
+  library_online_generation += 1;
+  library_online_results = [];
+  $("#library_online_media").text((name || "") + episode_label);
+  $("#library_online_target_path").text(`保存到：${path}`);
+  library_online_default_keyword = library_online_keyword_for(library_online_media, name);
+  reset_library_online_keyword();
+  $("#library_online_results").empty();
+  $("#library_online_search").prop("disabled", false);
+  $("#library-online-subtitle-modal").modal("show");
+  search_library_online_subtitles();
+}
+
+function search_library_online_subtitles() {
+  const keyword = String($("#library_online_keyword").val() || "").trim();
+  if (!keyword) { return; }
+  const generation = ++library_online_generation;
+  library_online_results = [];
+  $("#library_online_search").prop("disabled", true);
+  $("#library_online_results").text("正在检索在线字幕...");
+  $.ajax({
+    type: "POST", url: "/library/subtitle/search", contentType: "application/json", dataType: "json", timeout: 90000,
+    data: JSON.stringify({keyword: keyword, media_path: library_online_path, provider: $("#library_online_provider").val(), media: Object.assign({}, library_online_media, {query_edited: keyword !== library_online_default_keyword})}),
+    success: function (ret) {
+      if (generation !== library_online_generation) { return; }
+      if (ret.code !== 0) { $("#library_online_results").text(ret.msg || "检索失败"); return; }
+      library_online_results = ret.items || [];
+      let html = (ret.warnings || []).map(function (warning) {
+        return `<div class="alert alert-warning">${library_escape_html(warning)}</div>`;
+      }).join("");
+      if (!library_online_results.length) { html += '<p class="text-muted">当前字幕源未返回符合目标片名和季集的字幕。可精简为单一片名检索，或配置 Assrt 后重试；请核对目标文件的季集编号。</p>'; }
+      library_online_results.forEach(function (item, index) {
+        html += `<div class="border-bottom py-3">
+          <div class="fw-bold text-break">${library_escape_html(item.name)}</div>
+          <div class="text-muted small mb-2">${item.provider === "thunder" ? "迅雷" : "Assrt"} · ${library_escape_html(item.language || "未知语言")} · ${library_escape_html(item.format)}  · ${library_escape_html(item.match_label || '')}</div>
+          <div id="library_online_members_${index}"></div>
+          <button type="button" class="btn btn-sm btn-primary library-online-download" onclick="download_library_online_subtitle(${index}, this)">下载并保存</button>
+        </div>`;
+      });
+      $("#library_online_results").html(html);
+    },
+    error: function () {
+      if (generation === library_online_generation) { $("#library_online_results").text("检索请求失败或超时，请重试"); }
+    },
+    complete: function () {
+      if (generation === library_online_generation) { $("#library_online_search").prop("disabled", false); }
+    }
+  });
+}
+
+function download_library_online_subtitle(index, button) {
+  const item = library_online_results[index];
+  if (!item) { return; }
+  const generation = library_online_generation;
+  const payload = {ticket: item.ticket};
+  const member = $(`#library_online_member_${index}`);
+  if (member.length) { payload.member = member.val(); }
+  $(".library-online-download").prop("disabled", true);
+  $(button).text("处理中...");
+  $.ajax({
+    type: "POST", url: "/library/subtitle/download", contentType: "application/json", dataType: "json", timeout: 0,
+    data: JSON.stringify(payload),
+    success: function (ret) {
+      if (generation !== library_online_generation) { return; }
+      if (ret.code !== 0) { show_fail_modal(ret.msg || "下载失败"); return; }
+      if (ret.members) {
+        const select = $('<select class="form-select mb-2" aria-label="选择压缩包中的字幕文件">').attr("id", `library_online_member_${index}`);
+        ret.members.forEach(function (name) { select.append($("<option>").val(name).text(name)); });
+        $(`#library_online_members_${index}`).empty().append(select);
+        return;
+      }
+      if (ret.task_id) {
+        $(button).data("queued", true);
+        SubtitleTasks.watch(ret.task_id, {
+          onDone: function (task) {
+            load_library_items(library_page);
+            if (generation !== library_online_generation) { return; }
+            const saved = ["succeeded", "partial"].indexOf(task.status) !== -1;
+            $(button).data("queued", false).data("saved", saved).prop("disabled", saved)
+                .text(saved ? "已保存" : "下载并保存");
+            if (!saved) { show_fail_modal(task.error || "字幕处理未完成，请在任务中心查看详情"); }
+          }
+        });
+        SubtitleTasks.refreshList(true).catch(function () {});
+        show_success_modal(ret.msg || "字幕已加入处理队列");
+      } else {
+        show_success_modal(ret.msg || "字幕已保存");
+        load_library_items(library_page);
+        $(button).data("saved", true);
+      }
+    },
+    error: function () { show_fail_modal("字幕下载请求失败，请检查字幕库后重试"); },
+    complete: function () {
+      if (generation !== library_online_generation) { return; }
+      $(".library-online-download").each(function () {
+        $(this).prop("disabled", !!$(this).data("saved") || !!$(this).data("queued"));
+      });
+      $(button).prop("disabled", !!$(button).data("saved") || !!$(button).data("queued"))
+          .text($(button).data("queued") ? "后台处理中" : ($(button).data("saved") ? "已保存" : "下载并保存"));
+    }
+  });
 }

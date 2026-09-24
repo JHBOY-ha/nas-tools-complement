@@ -216,7 +216,7 @@ Python 中 `"" in ".sql"` 返回 `True`，导致无扩展名文件被错误包�
 | `app/media/meta/__init__.py` | 导出 LLM 模块入口 |
 | `app/media/media.py` | 支持读取 LLM 直出 `tmdb_id` 并优先按 ID 查询 TMDB |
 | `check_config.py` | 增加 `llm` 配置迁移、默认值补齐与参数校验 |
-| `web/templates/setting/basic.html` | 新增 LLM 设置项（开关/模式/base_url/api_key/model/阈值/检索增强）与连接测试入口 |
+| `web/templates/setting/basic.html` | 新增 LLM 设置项（开关/模式/base_url/api_key/model/检索增强）与连接测试入口 |
 | `config/config.yaml` | 增加 `llm` 模板配置区（空占位） |
 | `tests/test_meta_llm_parser.py` | 新增/扩展 LLM 解析与异常回退测试 |
 | `tests/run.py` | 纳入 LLM 测试集 |
@@ -224,7 +224,7 @@ Python 中 `"" in ".sql"` 返回 `True`，导致无扩展名文件被错误包�
 **功能改进：**
 
 1. 新增 **LLM 媒体识别增强**，可在规则识别链路上补齐或覆盖字段，输出结构与原有识别字段保持兼容。
-2. 支持三种识别策略：`rule_first`（规则优先）、`llm_first`（LLM优先）、`hybrid`（按字段置信度阈值混合）。
+2. 支持两种识别策略：`conservative`（保守，默认）与 `balanced`（平衡）。保守＝规则识别出的字段一律保留、LLM 只补空；平衡＝片名允许 LLM 覆盖，其余字段仍只补空。作品与季集身份（TMDB ID、季号、集号）不受模式影响，走候选校验与季集映射；旧值 `rule_first`／`fallback` 迁移为保守，`llm_first`／`primary`／`hybrid` 迁移为平衡，`confidence_threshold` 已废弃。
 3. 支持第三方 **OpenAI 协议兼容接口**（`base_url + api_key + model`），设置页可直接保存并“测试连接”。
 4. API 配置建议优先使用 DeepSeek 等开放平台（OpenAI 协议），示例：`base_url=https://api.deepseek.com/v1`、`model=deepseek-chat`。
 5. 新增检索增强上下文：在 LLM 解析前可先检索 TMDB与Bangumi 候选，并作为 `external_candidates` 提供给模型参考。
@@ -233,6 +233,10 @@ Python 中 `"" in ".sql"` 返回 `True`，导致无扩展名文件被错误包�
 8. 新增稳定性兜底：LLM 超时、异常、非法 JSON 时不影响原流程，自动回落规则识别。
 9. 新增可观测性：日志增加 LLM 原始返回、检索候选数量、直出 TMDBID 记录，便于排查识别问题。
 10. 配置迁移兼容旧版本：旧 `config.yaml` 自动补全 `llm` 字段。
+11. 检索增强候选携带季列表（`seasons`：季号/季名/首播年份/集数）、别名与 IMDb/TVDB 外链，LLM 据此一次性选定作品与季集；季号必须在该作品季列表内，集号必须存在于目标季集列表，否则不采用。
+12. 同名候选处理：标题里有年份时，年份对得上的候选排在前面（只重排不过滤，避免发布年份与首播年份不同的剧集被筛掉）；同名候选里若存在带 IMDb/TVDB 外链的正式条目，丢弃无外链的疑似重复条目并记录日志。
+13. 检索回退：规则解析名与 LLM 译名都会作为检索词尝试，避免某一侧译名失配导致识别失败。
+14. 集号硬约束：发布季标记与最终 TMDB 季号不一致时，集号必须有三者之一作为依据——作品级季集映射规则命中、LLM 给出且通过目标季集列表校验的集号、或可验证的绝对集号换算（前季集数之和换算并核对目标季集列表）；都不成立则拒绝绑定、保留待重试，并在日志中打印可直接粘贴到 `media.episode_mappings` 的规则模板。
 
 </details>
 
@@ -362,6 +366,16 @@ Python 中 `"" in ".sql"` 返回 `True`，导致无扩展名文件被错误包�
 ---
 
 ## 部署方式
+
+### 识别与转移可靠性修复（2026-09-22）
+
+字幕缓存清理即使删除 0 行也会结束写事务，异常时回滚，避免后台线程空闲时仍持有 SQLite 写锁。文件已硬链接但转移记录写入失败时，任务返回失败供目录同步重试；重试确认同一硬链接后补记历史，成功记录前不标记已处理。
+
+识别流程保留 TSDM 方括号片名，避免将 `Beyblade X` 中的 X 当作第十季；短中文片名不再因前缀相似绑定到另一作品。动画检索候选携带分类并排除非动画，LLM 推断年份与文件明确年份分开处理，名称检索失败时继续尝试英文名和明确别名。
+
+缺集检查使用 TMDB 季详情中的实际集号，包括海贼王的 `S23E1179`。内置映射仅覆盖已核实的作品与集数范围：TMDB 65942 的发布版第4季第1–19集映射到 S01E67–85；TMDB 37854 的发布版 S01E1156–1181 映射到 S23 同集号。每次映射还会核对 TMDB 目标集号；超范围或详情不可用时保留待重试。RSS 识别与下载后的文件识别共用这些规则。
+
+现有配置无需修改即可使用内置映射。可在 `media.name_aliases` 中添加或覆盖别名；设置 `media.episode_mappings` 会替换内置映射，空列表可禁用。每条规则包含 `tmdb_id`、`source_season`、`source_begin`、`source_end`、`target_season`、`offset`。规则定义见 `app/media/meta/recognition_rules.py`。更新代码不会自动移动历史错季文件或补写旧转移记录，历史数据需要单独核对修复。
 
 ### Docker 部署
 
@@ -631,8 +645,28 @@ docker pull jhboy/nastools-comp:2.10.2v1-amd64
    python3 app/filetransfer.py -m link -s /from/path -d /to/path
    ```
 
+### 字幕库在线字幕
+
+在字幕库顶部输入媒体名、原名或年份，点击“搜索影片”（或回车）查找已同步的媒体；搜索与类型、分类、字幕状态筛选可组合使用。
+
+电影卡片点击“在线字幕”，电视剧和动漫先“选择剧集”，按季、集筛选后点击对应集的“检索本集字幕”。检索框默认填入媒体名、英文原名（如有）、年份及季集，可手动修改或删除关键词，按回车或点击“检索字幕”搜索，也可点击“恢复默认词”。编辑后的检索词会原样传给迅雷或 Assrt（剧集未填写季集时自动补齐目标季集）；剧集以独立季集参数检索，并将下载结果绑定到选中的视频路径。检索结果会校验片名（含原名）、已知年份和季集，过滤无法确认的结果；缺少年份的电影结果会单独标注。迅雷无需配置，优先展示与本地视频 CID 匹配的字幕。Assrt 的 Token 在“设置 → 字幕设置 → 在线字幕”保存，也可配置 `subtitle.assrt.token`，不影响原有自动字幕下载器。
+
+选择结果后点击“下载并保存”；ZIP 字幕包会先列出文件供选择，剧集只列出明确匹配当前季集的字幕，无法确认或属于其他集的文件不能保存；RAR 结果暂不支持，请选择其他结果。单次下载和字幕包展开内容限制为 20 MB。下载后进入统一字幕任务队列，可在任务中心查看进度；后台完成格式与编码校验、保存到选中的媒体文件旁，并更新字幕状态和刷新媒体服务器。保留已有字幕，沿用任务设置中的队列、暂存和资源限制。下载结果有效期为 30 分钟，过期后重新搜索。媒体文件需位于已配置的媒体库目录内且可读取。
+
+在线检索协议和 CID 算法参考 [MeiamSubtitles](https://github.com/91270/MeiamSubtitles)，按 NASTool 的字幕库和上传流程重新实现；上游采用 Apache-2.0，许可见 `third_party/meiamsubtitles/LICENSE`。未接入已停止维护的旧 Shooter 接口。
+
 ## 鸣谢
 * 程序UI模板及图标来源于开源项目<a href="https://github.com/tabler/tabler">tabler</a>，此外项目中还使用到了开源模块：<a href="https://github.com/igorcmoura/anitopy" target="_blank">anitopy</a>、<a href="https://github.com/AnthonyBloomer/tmdbv3api" target="_blank">tmdbv3api</a>、<a href="https://github.com/pkkid/python-plexapi" target="_blank">python-plexapi</a>、<a href="https://github.com/rmartin16/qbittorrent-api">qbittorrent-api</a>、<a href="https://github.com/Trim21/transmission-rpc">transmission-rpc</a>等
 * 感谢 <a href="https://github.com/devome" target="_blank">nevinee</a> 完善docker构建
 * 感谢 <a href="https://github.com/tbc0309" target="_blank">tbc0309</a> 适配群晖套件
 * 感谢 PR 代码、完善WIKI、发布教程的所有大佬
+
+### 上传整季字幕
+
+在“字幕库 → 选择剧集”中选择具体的一季，点击“上传整季字幕包”，直接多选 SRT、ASS、SSA、VTT、SMI 字幕文件，或选择一个 ZIP 包，再点击“预览匹配”。上传和解包不依赖任何外部工具：RAR 请先解压，再多选其中的字幕文件。ZIP 支持包内子目录；不处理嵌套压缩包、加密包及图形字幕。
+
+参照 [ChineseSubFinder 的整季字幕按季集分组方式](https://github.com/ChineseSubFinder/ChineseSubFinder/blob/master/pkg/downloader/downloader_things.go)，按 S01E02、1x02、EP02、第2集、[02] 等文件名解析对应剧集；只含集数时使用当前所选季。缺集、跨季、集数范围、无法识别或同集多个视频版本的文件不自动分配。匹配范围固定为当前电视剧和所选季，请在预览中核对目标路径；同集的不同语言/版本可取消勾选。
+
+点击“上传所选字幕”后创建一个持久后台任务，按集保存到对应视频旁，逐集复核路径授权、更新字幕快照并局部刷新媒体服务器。字幕包不会按内部路径直接解压到媒体目录，已有字幕不覆盖。关闭页面后后台继续，可通过任务中心查看逐项结果或取消，重启后按检查点恢复。
+
+“任务设置 → 整季字幕包数量”默认允许 100 个文本字幕，最高 200 个；压缩包及展开内容仍受单批总量、文本单文件、暂存额度和任务时间限制。LLM 对齐仍受 LLM 单批数量限制。一次任务的目标必须处于同一存储卷，跨卷时分开勾选提交。
