@@ -67,3 +67,18 @@ class ExtraRecognitionTest(unittest.TestCase):
                     [path], tmdb_info=info, media_type=MediaType.TV)[path]
             self.assertIsNone(parsed.skip_reason)
             self.assertEqual(1, parsed.begin_episode)
+
+
+class RoutingTest(unittest.TestCase):
+    def test_movie_year_after_dash_and_anime_episode(self):
+        for name, year in (("Knives Out - 2019 1080p BluRay", "2019"),
+                           ("Coco - 2017", "2017"),
+                           ("Free Guy - 2021 WEB-DL", "2021")):
+            with self.subTest(name=name):
+                meta = MetaInfo(name, use_llm=False)
+                self.assertEqual(MediaType.MOVIE, meta.type)
+                self.assertEqual(year, meta.year)
+                self.assertEqual(name.split(" - ")[0].title(), meta.en_name)
+        anime = MetaInfo("刀剑神域 - 10 [1080p]", use_llm=False)
+        self.assertEqual(10, anime.begin_episode)
+        self.assertEqual(MediaType.TV, anime.type)
