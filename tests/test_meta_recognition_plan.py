@@ -95,3 +95,143 @@ class RoutingTest(unittest.TestCase):
         meta = MetaInfo("Episode 5 - Show Name 1080p", use_llm=False)
         self.assertEqual(5, meta.begin_episode)
         self.assertEqual("Show Name", meta.en_name)
+
+
+class FractionalEpisodeTest(unittest.TestCase):
+    def test_fractional_numbers_remain_unconfirmed(self):
+        for name, raw in (("[Group] 某某 [01.5][1080p].mkv", "01.5"),
+                          ("[Group] 某某 [07.5][1080p].mkv", "07.5"),
+                          ("[Group] 某某 [01.25][1080p].mkv", "01.25"),
+                          ("Show E01.5.mkv", "01.5"),
+                          ("Show - 01.5.mkv", "01.5")):
+            with self.subTest(name=name):
+                meta = MetaInfo(name, use_llm=False)
+                self.assertEqual(raw, meta.note["fractional_episode"]["raw"])
+                self.assertIsNone(meta.begin_episode)
+                self.assertIsNone(meta.end_episode)
+        first = MetaInfo("Show [01.5].mkv", use_llm=False)
+        second = MetaInfo("Other E03.mkv", use_llm=False)
+        self.assertNotIn("fractional_episode", second.note)
+        self.assertIsNot(first.note, second.note)
+
+    def test_codec_decimal_is_not_an_episode(self):
+        for name in ("The 355 2022 BluRay 1080p DTS-HD MA5.1 X265.10bit-BeiTai",
+                     "Show AAC5.1 1080p", "Show 1920.1080 1080p",
+                     "Thor Love and Thunder (2022) [1080p] [WEBRip] [5.1]"):
+            with self.subTest(name=name):
+                meta = MetaInfo(name, use_llm=False)
+                self.assertNotIn("fractional_episode", meta.note)
+
+    def test_confirmed_mapping_needs_matching_episode_evidence(self):
+        media = Media.__new__(Media)
+        info = {"id": 42, "media_type": MediaType.TV,
+                "seasons": [{"season_number": 0}, {"season_number": 1}]}
+        meta = MetaInfo("Show [01.5].mkv", use_llm=False)
+        rule = {"tmdb_id": 42, "source_episode": "01.5", "target_season": 0,
+                "target_episode": 3, "episode_title": "Bonus Story"}
+        with patch("app.media.media.Config") as config, \
+                patch.object(media, "get_tmdb_season_episodes", return_value=[
+                    {"season_number": 0, "episode_number": 3, "name": "Bonus Story"}]) as episodes:
+            config.return_value.get_config.return_value = {"fractional_episode_mappings": [rule]}
+            self.assertTrue(media._confirm_fractional_episode(meta, info))
+        episodes.assert_called_once_with(tmdbid=42, season=0)
+        self.assertEqual((0, 3), (meta.begin_season, meta.begin_episode))
+        self.assertEqual("Bonus Story", meta.note["episode_mapping"]["evidence"])
+
+        meta = MetaInfo("Show [01.5].mkv", use_llm=False)
+        with patch("app.media.media.Config") as config, \
+                patch.object(media, "get_tmdb_season_episodes", return_value=[
+                    {"season_number": 1, "episode_number": 4, "name": "Wrong Name"}]):
+            config.return_value.get_config.return_value = {"fractional_episode_mappings": [
+                dict(rule, target_season=1, target_episode=4)]}
+            self.assertFalse(media._confirm_fractional_episode(meta, info))
+        self.assertIsNone(meta.begin_episode)
+
+
+    def test_no_candidate_or_ambiguity_is_not_confirmation(self):
+        media = Media.__new__(Media)
+        meta = MetaInfo("Show [01.5] - Bonus Story.mkv", use_llm=False)
+        info = {"id": 42, "media_type": MediaType.TV,
+                "seasons": [{"season_number": 0}, {"season_number": 1}]}
+        with patch("app.media.media.Config") as config, \
+                patch.object(media, "get_tmdb_season_episodes", return_value=[
+                    {"episode_number": 1, "name": "Bonus Story"}]):
+            config.return_value.get_config.return_value = {}
+            self.assertFalse(media._confirm_fractional_episode(meta, info))
+        self.assertIsNone(meta.begin_episode)
+
+    def test_query_failure_and_ambiguous_config_leave_episode_unset(self):
+        media = Media.__new__(Media)
+        info = {"id": 42, "media_type": MediaType.TV,
+                "seasons": [{"season_number": 0}]}
+        rule = {"tmdb_id": 42, "source_episode": "01.5", "target_season": 0,
+                "target_episode": 3, "episode_title": "Bonus Story"}
+        with patch("app.media.media.Config") as config, \
+                patch.object(media, "get_tmdb_season_episodes", side_effect=RuntimeError("offline")):
+            config.return_value.get_config.return_value = {"fractional_episode_mappings": [rule]}
+            meta = MetaInfo("Show [01.5].mkv", use_llm=False)
+            self.assertFalse(media._confirm_fractional_episode(meta, info))
+            self.assertIsNone(meta.begin_episode)
+        with patch("app.media.media.Config") as config, \
+                patch.object(media, "get_tmdb_season_episodes") as episodes:
+            config.return_value.get_config.return_value = {"fractional_episode_mappings": [rule, rule]}
+            meta = MetaInfo("Show [01.5].mkv", use_llm=False)
+            self.assertFalse(media._confirm_fractional_episode(meta, info))
+            episodes.assert_not_called()
+
+
+class TransferGuardTest(unittest.TestCase):
+    def test_skipped_file_is_not_moved_even_with_unknown_dir(self):
+        with tempfile.TemporaryDirectory() as root:
+            for name in ("Show [PV01].mkv", "Show [01.5].mkv"):
+                with self.subTest(name=name):
+                    path = os.path.join(root, name)
+                    with open(path, "wb") as output:
+                        output.write(b"source")
+                    meta = MetaBase(name, fileflag=True)
+                    meta.skip_reason = "明确附加内容" if "PV" in name else "小数集待确认"
+                    transfer = FileTransfer.__new__(FileTransfer)
+                    transfer.media = MagicMock()
+                    transfer.media.get_media_info_on_files.return_value = {path: meta}
+                    transfer.progress = MagicMock()
+                    transfer.dbhelper = MagicMock()
+                    transfer._default_rmt_mode = RmtMode.COPY
+                    with patch.object(transfer, "check_ignore", return_value=([path], "")), \
+                            patch("app.filetransfer.PathUtils.get_bluray_dir", return_value=None), \
+                            patch.object(transfer, "_FileTransfer__transfer_file") as move:
+                        success, _ = transfer.transfer_media(
+                            in_from=SyncType.MAN, in_path=path, rmt_mode=RmtMode.COPY,
+                            unknown_dir=root)
+                    self.assertTrue(success)
+                    move.assert_not_called()
+                    with open(path, "rb") as source:
+                        self.assertEqual(b"source", source.read())
+
+    def test_manual_fractional_mapping_and_unconfirmed_skip(self):
+        media = Media.__new__(Media)
+        media.tmdb = object()
+        info = {"id": 42, "name": "Show", "media_type": MediaType.TV,
+                "seasons": [{"season_number": 0}, {"season_number": 1}]}
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "Show [01.5].mkv")
+            open(path, "wb").close()
+            with patch("app.media.media.Config") as config, \
+                    patch.object(media, "get_tmdb_season_episodes", return_value=[
+                        {"season_number": 1, "episode_number": 7, "name": "The Gap"}]), \
+                    patch.object(media, "save_rename_cache"):
+                config.return_value.get_config.return_value = {"fractional_episode_mappings": [
+                    {"tmdb_id": 42, "source_episode": "01.5", "target_season": 1,
+                     "target_episode": 7, "episode_title": "The Gap"}]}
+                confirmed = media.get_media_info_on_files(
+                    [path], tmdb_info=info, media_type=MediaType.TV)[path]
+                self.assertEqual((1, 7), (confirmed.begin_season, confirmed.begin_episode))
+                self.assertIsNone(confirmed.skip_reason)
+                config.return_value.get_config.return_value = {}
+                unconfirmed = media.get_media_info_on_files(
+                    [path], tmdb_info=info, media_type=MediaType.TV)[path]
+                self.assertTrue(unconfirmed.skip_reason)
+                self.assertIsNone(unconfirmed.begin_episode)
+
+
+if __name__ == "__main__":
+    unittest.main()

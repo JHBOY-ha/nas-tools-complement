@@ -1024,6 +1024,73 @@ class Media:
         meta_info.total_episodes = len(mapped)
         log.info("【Meta】已验证作品季集映射：%s" % note["episode_mapping"])
 
+    def _confirm_fractional_episode(self, meta_info, info):
+        """Bind a decimal release number only to one evidenced TMDB episode."""
+        fraction = (meta_info.note or {}).get("fractional_episode")
+        if not fraction or not info or info.get("media_type") != MediaType.TV or not info.get("id"):
+            return False
+
+        def normalized(value):
+            return re.sub(r"\W+", "", str(value or "").casefold())
+
+        season_numbers = {item.get("season_number") for item in info.get("seasons") or []}
+        rules = (Config().get_config("media") or {}).get("fractional_episode_mappings") or []
+        matching = [rule for rule in rules
+                    if str(rule.get("tmdb_id")) == str(info["id"])
+                    and str(rule.get("source_episode")) == fraction["raw"]
+                    and (rule.get("source_season") is None
+                         or rule.get("source_season") == meta_info.begin_season)]
+        candidates = []
+        try:
+            if len(matching) == 1:
+                rule = matching[0]
+                season = rule.get("target_season")
+                episode_number = rule.get("target_episode")
+                if season in season_numbers and isinstance(episode_number, int):
+                    for episode in self.get_tmdb_season_episodes(tmdbid=info["id"], season=season):
+                        if episode.get("episode_number") != episode_number:
+                            continue
+                        title_matches = (rule.get("episode_title") and
+                                         normalized(rule["episode_title"]) == normalized(episode.get("name")))
+                        date_matches = (rule.get("air_date") and
+                                        rule["air_date"] == episode.get("air_date"))
+                        if title_matches or date_matches:
+                            # 记录实际命中的证据，避免日期命中时误记不符的标题。
+                            evidence = rule["episode_title"] if title_matches else rule["air_date"]
+                            candidates.append((season, episode, evidence))
+            elif not matching:
+                # A release subtitle may identify one TMDB episode by exact title.
+                stem = os.path.splitext(os.path.basename(meta_info.org_string or ""))[0]
+                title_match = re.search(
+                    r"\d{1,3}\.\d{1,2}(?:[\]】])?\s*[-–—]\s*([^\[【(]+)", stem)
+                subtitle = normalized(title_match.group(1)) if title_match else ""
+                if subtitle:
+                    for season in season_numbers:
+                        if not isinstance(season, int):
+                            continue
+                        for episode in self.get_tmdb_season_episodes(tmdbid=info["id"], season=season):
+                            if (isinstance(episode.get("episode_number"), int)
+                                    and normalized(episode.get("name")) == subtitle):
+                                candidates.append((season, episode, episode.get("name")))
+        except Exception as err:
+            log.warn("【Meta】小数集 TMDB 确认失败：%s" % err)
+            return False
+
+        if len(candidates) != 1:
+            return False
+        season, episode, evidence = candidates[0]
+        meta_info.begin_season = episode.get("season_number", season)
+        meta_info.end_season = None
+        meta_info.total_seasons = 1
+        meta_info.begin_episode = episode["episode_number"]
+        meta_info.end_episode = None
+        meta_info.total_episodes = 1
+        fraction["status"] = "confirmed"
+        meta_info.note["episode_mapping"] = {
+            "source_episode": fraction["raw"], "target_season": meta_info.begin_season,
+            "target_episode": meta_info.begin_episode, "evidence": evidence}
+        return True
+
     def _prepare_media_identity(self, meta_info, info):
         # Reject a wrong adaptation before using its episode metadata.
         if meta_info.type == MediaType.ANIME and info:
@@ -1378,6 +1445,9 @@ class Media:
             file_media_info = None
         # 赋值TMDB信息并返回
         meta_info.set_tmdb_info(file_media_info)
+        if (meta_info.note or {}).get("fractional_episode"):
+            if not self._confirm_fractional_episode(meta_info, file_media_info):
+                meta_info.skip_reason = "小数集缺少唯一且可核验的 TMDB 单集映射"
         return meta_info
 
     def __insert_media_cache(self, media_key, file_media_info):
@@ -1507,6 +1577,9 @@ class Media:
                                                                          meta_info.begin_season)
                     if not meta_info.get_name() or not meta_info.type:
                         log.warn("【Rmt】%s 未识别出有效信息！" % meta_info.org_string)
+                        if (meta_info.note or {}).get("fractional_episode"):
+                            meta_info.skip_reason = "小数集未识别出作品，保留原文件"
+                            return_media_infos[file_path] = meta_info
                         continue
                     # 区配缓存及TMDB
                     media_key = self.__make_cache_key(meta_info)
@@ -1570,12 +1643,21 @@ class Media:
                         file_media_info = None
                     # 赋值TMDB信息
                     meta_info.set_tmdb_info(file_media_info)
+                    if (meta_info.note or {}).get("fractional_episode"):
+                        if not self._confirm_fractional_episode(meta_info, file_media_info):
+                            meta_info.skip_reason = "小数集缺少唯一且可核验的 TMDB 单集映射"
                 # 自带TMDB信息
                 else:
                     # 已绑定作品身份时不再让LLM根据缩写文件名改写类型和季集。
                     meta_info = MetaInfo(title=file_name, mtype=media_type,
                                          use_llm=not bool(download_context))
-                    if not season and not episode_format:
+                    fractional = (meta_info.note or {}).get("fractional_episode")
+                    if fractional and not self._confirm_fractional_episode(meta_info, tmdb_info):
+                        meta_info.skip_reason = "小数集缺少唯一且可核验的 TMDB 单集映射"
+                        return_media_infos[file_path] = meta_info
+                        log.info("【Meta】%s 跳过：%s" % (file_path, meta_info.skip_reason))
+                        continue
+                    if not fractional and not season and not episode_format:
                         release_season = getattr(meta_info, "begin_season", None)
                         release_episodes = self.__episode_list_of(meta_info)
                         self._apply_episode_mapping(meta_info, tmdb_info)
@@ -1614,9 +1696,9 @@ class Media:
                         if not meta_info.get_episode_list():
                             raise ValueError("下载文件缺少可验证集号：%s" % file_name)
                     meta_info.set_tmdb_info(tmdb_info)
-                    if season and meta_info.type != MediaType.MOVIE:
+                    if season and not fractional and meta_info.type != MediaType.MOVIE:
                         meta_info.begin_season = int(season)
-                    if episode_format:
+                    if episode_format and not fractional:
                         begin_ep, end_ep = episode_format.split_episode(file_name)
                         if begin_ep is not None:
                             meta_info.begin_episode = begin_ep
@@ -1626,6 +1708,8 @@ class Media:
                     if not download_context:
                         self.save_rename_cache(file_name, tmdb_info)
                 # 按文件路程存储
+                if getattr(meta_info, "skip_reason", None):
+                    log.info("【Meta】%s 跳过：%s" % (file_path, meta_info.skip_reason))
                 return_media_infos[file_path] = meta_info
             except Exception as err:
                 print(str(err))

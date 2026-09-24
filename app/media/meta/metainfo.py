@@ -23,6 +23,29 @@ def explicit_extra_reason(title):
             return "附加内容标签：%s" % block
     return None
 
+
+def protect_fractional_episode(title):
+    """Remove only explicit decimal episode markers before generic tokenization."""
+    if not title:
+        return title, None
+    stem, extension = os.path.splitext(title)
+    if extension.lower() not in RMT_MEDIAEXT:
+        stem, extension = title, ""
+    patterns = (
+        # 单位数字 [5.1] 常表示声道；裸方括号须有两位整数部分。
+        (r"[\[【](\d{2,3}\.\d{1,2})[\]】]", "bracket"),
+        (r"(?i)(?<![A-Z0-9])E(\d{1,3}\.\d{1,2})(?![\d.A-Z])", "episode_marker"),
+        (r"\s+-\s+(\d{2,3}\.\d{1,2})(?![\d.])", "separator"),
+    )
+    for pattern, source in patterns:
+        match = re.search(pattern, stem)
+        if match:
+            cleaned = stem[:match.start()] + " " + stem[match.end():]
+            return cleaned + extension, {"raw": match.group(1), "source": source,
+                                         "status": "unconfirmed"}
+    return title, None
+
+
 def MetaInfo(title, subtitle=None, mtype=None, use_llm=True):
     """
     媒体整理入口，根据名称和副标题，判断是哪种类型的识别，返回对应对象
@@ -39,6 +62,9 @@ def MetaInfo(title, subtitle=None, mtype=None, use_llm=True):
         meta_info = MetaBase(title, subtitle)
         meta_info.skip_reason = extra_reason
         return meta_info
+
+    original_title = title
+    title, fractional_episode = protect_fractional_episode(title)
 
     # 应用自定义识别词
     title, msg, used_info = WordsHelper().process(title)
@@ -64,7 +90,7 @@ def MetaInfo(title, subtitle=None, mtype=None, use_llm=True):
     meta_info.replaced_words = used_info.get("replaced")
     meta_info.offset_words = used_info.get("offset")
 
-    if use_llm:
+    if use_llm and not fractional_episode:
         # LLM增强识别（配置关闭或调用失败时会自动回落规则识别结果）
         meta_info = LLMMetaParser().merge_into(meta_info=meta_info,
                                                title=title,
@@ -74,6 +100,15 @@ def MetaInfo(title, subtitle=None, mtype=None, use_llm=True):
     # 外部强制指定类型优先
     if mtype:
         meta_info.type = mtype
+
+    if fractional_episode:
+        # 未确认小数集不得由 LLM 或普通整数解析补空、取整或变成区间。
+        meta_info.org_string = original_title
+        meta_info.begin_episode = None
+        meta_info.end_episode = None
+        meta_info.total_episodes = 0
+        meta_info.type = MediaType.TV if not mtype else mtype
+        meta_info.note["fractional_episode"] = fractional_episode
 
     return meta_info
 
