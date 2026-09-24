@@ -10,7 +10,8 @@ from lxml import etree
 
 import log
 from app.helper import MetaHelper
-from app.media.meta.metainfo import MetaInfo
+from app.media.meta.metainfo import MetaInfo, explicit_extra_reason
+from app.media.meta._base import MetaBase
 from app.media.meta.recognition_rules import DEFAULT_EPISODE_MAPPINGS, DEFAULT_NAME_ALIASES
 from app.media.tmdbv3api import TMDb, Search, Movie, TV, Person, Find, TMDbException, Discover, Trending, Episode, Genre
 from app.utils import PathUtils, EpisodeFormat, RequestUtils, NumberUtils, StringUtils, cacheman
@@ -1296,6 +1297,11 @@ class Media:
         :param append_to_response: 额外查询的信息
         :return: 带有TMDB信息的MetaInfo对象
         """
+        # 附加内容不能进入规则、LLM 或 TMDB 检索。
+        extra_reason = explicit_extra_reason(title)
+        if extra_reason:
+            log.info("【Meta】%s 跳过：%s" % (title, extra_reason))
+            return None
         if not self.tmdb:
             log.error("【Meta】TMDB API Key 未设置！")
             return None
@@ -1457,6 +1463,14 @@ class Media:
                 # 解析媒体名称
                 # 先用自己的名称
                 file_name = os.path.basename(file_path)
+                # 只检查当前文件；父目录或种子标题中的合集标记不传播到正片。
+                extra_reason = explicit_extra_reason(file_name)
+                if extra_reason:
+                    skipped = MetaBase(file_name, fileflag=True)
+                    skipped.skip_reason = extra_reason
+                    return_media_infos[file_path] = skipped
+                    log.info("【Meta】%s 跳过：%s" % (file_path, extra_reason))
+                    continue
                 parent_name = os.path.basename(os.path.dirname(file_path))
                 parent_parent_name = os.path.basename(PathUtils.get_parent_paths(file_path, 2))
                 # 过滤掉蓝光原盘目录下的子文件

@@ -133,7 +133,7 @@ class MetaBase(object):
     replaced_words = None
     offset_words = None
     # 备注字典
-    note = {}
+    note = None
     # 副标题解析
     _subtitle_flag = False
     _subtitle_season_re = r"[第\s]+([0-9一二三四五六七八九十S\-]+)\s*季"
@@ -142,6 +142,9 @@ class MetaBase(object):
     _subtitle_episode_all_re = r"([0-9一二三四五六七八九十]+)\s*集全|全\s*([0-9一二三四五六七八九十]+)\s*[集话話期]"
 
     def __init__(self, title, subtitle=None, fileflag=False):
+        # 备注与跳过状态必须属于本次解析，不能在文件之间共享。
+        self.note = {}
+        self.skip_reason = None
         self.category_handler = Category()
         self.fanart = Fanart()
         if not title:

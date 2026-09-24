@@ -613,6 +613,10 @@ class FileTransfer:
         # 处理识别后的每一个文件或单个文件夹
         for file_item, media in Medias.items():
             try:
+                # 跳过结果不得落入未识别目录，也不能执行重命名或转移。
+                if getattr(media, "skip_reason", None):
+                    log.info("【Rmt】%s 跳过：%s" % (file_item, media.skip_reason))
+                    continue
                 # 总数量
                 total_count = total_count + 1
 

@@ -4,11 +4,24 @@ import regex as re
 import log
 from app.helper import WordsHelper
 from app.media.meta.llm_parser import LLMMetaParser
+from app.media.meta._base import MetaBase
 from app.media.meta.metaanime import MetaAnime
 from app.media.meta.metavideo import MetaVideo
 from app.utils.types import MediaType
 from config import RMT_MEDIAEXT
 
+
+def explicit_extra_reason(title):
+    """Recognize only standalone bracketed extras in the file's own name."""
+    if not title:
+        return None
+    name = os.path.basename(title)
+    for block in re.findall(r"[\[【]([^\]】]+)[\]】]", name):
+        labels = re.split(r"\s*[&+＋]\s*", block.strip().upper())
+        if labels and all(re.fullmatch(r"(?:NCOP|NCED|ED|PV|SP)\d*", label)
+                          for label in labels):
+            return "附加内容标签：%s" % block
+    return None
 
 def MetaInfo(title, subtitle=None, mtype=None, use_llm=True):
     """
@@ -19,6 +32,13 @@ def MetaInfo(title, subtitle=None, mtype=None, use_llm=True):
     :param use_llm: 是否启用LLM增强识别
     :return: MetaAnime、MetaVideo
     """
+
+    # 在自定义词、规则和 LLM 处理前判断原始文件标签，保留括号上下文。
+    extra_reason = explicit_extra_reason(title)
+    if extra_reason:
+        meta_info = MetaBase(title, subtitle)
+        meta_info.skip_reason = extra_reason
+        return meta_info
 
     # 应用自定义识别词
     title, msg, used_info = WordsHelper().process(title)
