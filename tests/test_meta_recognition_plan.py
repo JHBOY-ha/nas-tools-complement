@@ -154,11 +154,30 @@ class FractionalEpisodeTest(unittest.TestCase):
         info = {"id": 42, "media_type": MediaType.TV,
                 "seasons": [{"season_number": 0}, {"season_number": 1}]}
         with patch("app.media.media.Config") as config, \
-                patch.object(media, "get_tmdb_season_episodes", return_value=[
-                    {"episode_number": 1, "name": "Bonus Story"}]):
+                patch.object(media, "get_tmdb_tv_season_detail", return_value={
+                    "episodes": [{"episode_number": 1, "name": "Bonus Story"}]}):
             config.return_value.get_config.return_value = {}
             self.assertFalse(media._confirm_fractional_episode(meta, info))
         self.assertIsNone(meta.begin_episode)
+
+        def incomplete_detail(tmdbid, season):
+            return {"episodes": [{"episode_number": 1, "name": "Bonus Story"}]} if season == 0 else {}
+
+        with patch("app.media.media.Config") as config, \
+                patch.object(media, "get_tmdb_tv_season_detail", side_effect=incomplete_detail):
+            config.return_value.get_config.return_value = {}
+            self.assertFalse(media._confirm_fractional_episode(meta, info))
+        self.assertIsNone(meta.begin_episode)
+
+        def unique_detail(tmdbid, season):
+            return {"episodes": [{"season_number": 0, "episode_number": 2,
+                                  "name": "Bonus Story"}]} if season == 0 else {"episodes": []}
+
+        with patch("app.media.media.Config") as config, \
+                patch.object(media, "get_tmdb_tv_season_detail", side_effect=unique_detail):
+            config.return_value.get_config.return_value = {}
+            self.assertTrue(media._confirm_fractional_episode(meta, info))
+        self.assertEqual((0, 2), (meta.begin_season, meta.begin_episode))
 
     def test_query_failure_and_ambiguous_config_leave_episode_unset(self):
         media = Media.__new__(Media)

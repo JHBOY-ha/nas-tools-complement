@@ -1068,7 +1068,11 @@ class Media:
                     for season in season_numbers:
                         if not isinstance(season, int):
                             continue
-                        for episode in self.get_tmdb_season_episodes(tmdbid=info["id"], season=season):
+                        # 全季唯一性要求每季都成功返回集列表；查询失败不能当成空季。
+                        detail = self.get_tmdb_tv_season_detail(tmdbid=info["id"], season=season)
+                        if not isinstance(detail, dict) or not isinstance(detail.get("episodes"), list):
+                            return False
+                        for episode in detail["episodes"]:
                             if (isinstance(episode.get("episode_number"), int)
                                     and normalized(episode.get("name")) == subtitle):
                                 candidates.append((season, episode, episode.get("name")))
