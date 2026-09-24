@@ -244,7 +244,8 @@ class TransferGuardTest(unittest.TestCase):
                         success, _ = transfer.transfer_media(
                             in_from=SyncType.MAN, in_path=path, rmt_mode=RmtMode.COPY,
                             unknown_dir=root)
-                    self.assertTrue(success)
+                    # 下载器只会在成功状态下执行移动模式的删种动作。
+                    self.assertFalse(success)
                     move.assert_not_called()
                     with open(path, "rb") as source:
                         self.assertEqual(b"source", source.read())

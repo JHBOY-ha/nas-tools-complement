@@ -616,6 +616,10 @@ class FileTransfer:
                 # 跳过结果不得落入未识别目录，也不能执行重命名或转移。
                 if getattr(media, "skip_reason", None):
                     log.info("【Rmt】%s 跳过：%s" % (file_item, media.skip_reason))
+                    # 下载器把成功结果作为移动模式删种依据，故跳过必须返回失败。
+                    success_flag = False
+                    failed_count += 1
+                    error_message = "跳过 %s：%s" % (os.path.basename(file_item), media.skip_reason)
                     continue
                 # 总数量
                 total_count = total_count + 1
