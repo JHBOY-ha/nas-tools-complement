@@ -172,6 +172,9 @@ class MetaVideo(MetaBase):
             self._continue_flag = False
             self._stop_name_flag = True
             return
+        # 拼写季集标记交给对应解析器；前置 Episode 后仍可继续读取标题。
+        if token.upper() in ("SEASON", "EPISODE"):
+            return
         if token in self._name_se_words:
             self._last_token_type = 'name_se_words'
             return
@@ -189,6 +192,8 @@ class MetaVideo(MetaBase):
             is_roman_digit = re.search(self._roman_numerals, token)
             # 阿拉伯数字或者罗马数字
             if token.isdigit() or is_roman_digit:
+                if self._last_token_type in ("SEASON", "EPISODE"):
+                    return
                 # 第季集后面的不要
                 if self._last_token_type == 'name_se_words':
                     return
@@ -430,7 +435,7 @@ class MetaVideo(MetaBase):
                 self.total_episodes = 1
                 self._last_token_type = "episode"
                 self._continue_flag = False
-                self._stop_name_flag = True
+                self._stop_name_flag = bool(self.get_name())
                 self.type = MediaType.TV
         elif token.upper() == "EPISODE":
             self._last_token_type = "EPISODE"

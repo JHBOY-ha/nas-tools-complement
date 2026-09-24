@@ -82,3 +82,16 @@ class RoutingTest(unittest.TestCase):
         anime = MetaInfo("刀剑神域 - 10 [1080p]", use_llm=False)
         self.assertEqual(10, anime.begin_episode)
         self.assertEqual(MediaType.TV, anime.type)
+
+    def test_written_season_and_episode(self):
+        for name, season, expected_name in (
+                ("Game of Thrones Season 4 1080p BluRay", 4, "Game Of Thrones"),
+                ("Show Season 2 720p HDTV", 2, "Show")):
+            with self.subTest(name=name):
+                meta = MetaInfo(name, use_llm=False)
+                self.assertEqual(MediaType.TV, meta.type)
+                self.assertEqual(season, meta.begin_season)
+                self.assertEqual(expected_name, meta.en_name)
+        meta = MetaInfo("Episode 5 - Show Name 1080p", use_llm=False)
+        self.assertEqual(5, meta.begin_episode)
+        self.assertEqual("Show Name", meta.en_name)
