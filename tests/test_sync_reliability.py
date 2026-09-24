@@ -46,8 +46,23 @@ def env():
                 log=Mock(), ExceptionUtils=Mock(), lock=threading.Lock(), urlencode=urlencode,
                 Config=lambda: NS(get_config=lambda key: {}),
                 DEFAULT_EPISODE_MAPPINGS=[], DEFAULT_NAME_ALIASES={},
+                ANIME_GENREIDS=['16'], is_fansub_release_name=is_fansub_release_name,
+                LLMMetaParser=lambda: NS(get_alias_candidates=lambda **kwargs: []),
                 RmtMode=NS(LINK='link', MOVE='move', RCLONE='rclone', MINIO='minio'),
                 SyncType=NS(MON='monitor'), RMT_MEDIAEXT=['.mkv'], RMT_FAVTYPE='Favorites')
+
+
+def is_fansub_release_name(name):
+    """与 app/media/meta/_base.py 同规则的简化实现，供 AST 桩环境使用。"""
+    if not name:
+        return False
+    match = re.match(r'^\s*\[(?![0-9]{3,4}[PIpi]\s*\])([^\]]{2,64})\]', str(name).strip())
+    if not match:
+        return False
+    rest = str(name).strip()[match.end():]
+    return bool(re.search(r'\[[^\]]*?(?:\d{3,4}[PIpi]|\d{3,4}\s*[X*]\s*\d{3,4}|BDRIP|BLURAY|BD|WEB-?DL'
+                          r'|WEBRIP|REMUX|HDTV|HEVC|H\.?26[45]|AVC|AAC|EAC3|FLAC|ASS|SRT|字幕|内封)[^\]]*?\]',
+                          rest, re.IGNORECASE))
 
 
 class RecognitionTests(unittest.TestCase):
@@ -56,6 +71,8 @@ class RecognitionTests(unittest.TestCase):
         cls = load_class('app/media/media.py', 'Media', [
             '__search_media_with_name', '__extract_llm_tmdb_target', '__resolve_tmdb_mtype',
             'get_media_info_on_files', 'get_cache_info', '__make_cache_key', '_valid_media_identity',
+            '__expect_anime_genre', '__get_genre_ids',
+            '__search_media_info', '__confirm_search_result', '__search_media_by_alias_candidates',
             '_prepare_media_identity', '_apply_episode_mapping', '_apply_llm_season',
             '__verify_remapped_episodes', '__convert_absolute_episodes', '__suggest_episode_mapping',
             '__episode_list_of',

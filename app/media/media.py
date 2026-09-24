@@ -10,6 +10,8 @@ from lxml import etree
 
 import log
 from app.helper import MetaHelper
+from app.media.meta._base import is_fansub_release_name
+from app.media.meta.llm_parser import LLMMetaParser
 from app.media.meta.metainfo import MetaInfo
 from app.media.meta.recognition_rules import DEFAULT_EPISODE_MAPPINGS, DEFAULT_NAME_ALIASES
 from app.media.tmdbv3api import TMDb, Search, Movie, TV, Person, Find, TMDbException, Discover, Trending, Episode, Genre
@@ -963,6 +965,33 @@ class Media:
         return None
 
     @staticmethod
+    def __expect_anime_genre(meta_info):
+        """
+        候选作品是否必须带“动画”分类。
+
+        类型已经是动漫时按动漫校验；否则在 LLM 明确判定是动漫、且发布名本身就是
+        字幕组风格的动漫发布名时同样按动漫校验。保守模式下 LLM 的类型不会覆盖规则
+        结果，如果没有这个判断，LLM 答不出中文名时就会绑定到同名真人剧/剧集。
+        """
+        if not meta_info:
+            return False
+        if meta_info.type == MediaType.ANIME:
+            return True
+        llm_note = (getattr(meta_info, "note", None) or {}).get("llm") or {}
+        if not isinstance(llm_note, dict) or llm_note.get("type_hint"):
+            return False
+        if llm_note.get("type") != MediaType.ANIME:
+            return False
+        return is_fansub_release_name(getattr(meta_info, "org_string", "") or "")
+
+    @staticmethod
+    def __get_genre_ids(info):
+        if not info:
+            return []
+        genres = info.get("genre_ids") or [g.get("id") for g in info.get("genres", [])]
+        return [str(genre).upper() for genre in genres or []]
+
+    @staticmethod
     def _valid_media_identity(meta_info, info):
         if not info:
             return False
@@ -972,10 +1001,9 @@ class Media:
                 and candidate_name != short_name):
             log.warn("【Meta】短片名仅与候选前缀相同，拒绝绑定另一作品")
             return False
-        if meta_info.type == MediaType.ANIME:
-            genres = info.get("genre_ids") or [g.get("id") for g in info.get("genres", [])]
-            if 16 not in genres:
-                log.warn("【Meta】动漫候选缺少动画分类，拒绝绑定")
+        if Media.__expect_anime_genre(meta_info):
+            if not set(Media.__get_genre_ids(info)).intersection(set(ANIME_GENREIDS)):
+                log.warn("【Meta】动漫候选缺少动画分类，拒绝绑定：%s" % candidate_name)
                 return False
         if info.get("media_type") == MediaType.TV and meta_info.begin_season is not None:
             seasons = {s.get("season_number") for s in info.get("seasons", [])}
@@ -1025,9 +1053,8 @@ class Media:
 
     def _prepare_media_identity(self, meta_info, info):
         # Reject a wrong adaptation before using its episode metadata.
-        if meta_info.type == MediaType.ANIME and info:
-            genres = info.get("genre_ids") or [g.get("id") for g in info.get("genres", [])]
-            if 16 not in genres:
+        if Media.__expect_anime_genre(meta_info) and info:
+            if not set(Media.__get_genre_ids(info)).intersection(set(ANIME_GENREIDS)):
                 return self._valid_media_identity(meta_info, info)
         release_season = getattr(meta_info, "begin_season", None)
         release_episodes = self.__episode_list_of(meta_info)
@@ -1278,6 +1305,123 @@ class Media:
                         break
         return file_media_info
 
+    def __confirm_search_result(self, meta_info, file_media_info,
+                                chinese=True, append_to_response=None):
+        """
+        补全候选作品的全量信息并校验作品身份；与发布名对不上时返回空，交给后续兜底检索。
+        """
+        if not file_media_info:
+            return {}
+        if not file_media_info.get("genres"):
+            file_media_info = self.get_tmdb_info(mtype=file_media_info.get("media_type"),
+                                                 tmdbid=file_media_info.get("id"),
+                                                 chinese=chinese,
+                                                 append_to_response=append_to_response)
+        if not file_media_info:
+            return {}
+        if not self._prepare_media_identity(meta_info, file_media_info):
+            log.warn("【Meta】%s 的TMDB候选与发布名不符，放弃候选：%s"
+                     % (getattr(meta_info, "org_string", "") or "",
+                        file_media_info.get("name") or file_media_info.get("title") or ""))
+            return {}
+        return file_media_info
+
+    def __search_media_by_alias_candidates(self, meta_info, strict=None,
+                                           chinese=True, append_to_response=None):
+        """
+        TMDB 名称检索没有结果（或候选身份不符）时，用 Bangumi 候选名再查一次 TMDB。
+
+        案例：zh-CN 下用 “Hundred” 搜不到《百武装战记》(66109)，只能搜到同名剧集；
+        Bangumi 候选里有中文名与原名，用它检索即可命中正确条目。
+        """
+        if not meta_info:
+            return {}
+        query_name = meta_info.get_name()
+        if not query_name:
+            return {}
+        try:
+            alias_names = LLMMetaParser().get_alias_candidates(
+                title=query_name, subtitle=getattr(meta_info, "subtitle", None))
+        except Exception as err:
+            log.debug("【Meta】外部候选名称检索失败：%s" % str(err))
+            return {}
+        for name in alias_names or []:
+            if not name or self.__is_same_search_name(query_name, name):
+                continue
+            file_media_info = self.__confirm_search_result(
+                meta_info,
+                self.__search_media_with_name(meta_info=meta_info, query_name=name,
+                                              strict=strict, allow_aliases=False),
+                chinese=chinese, append_to_response=append_to_response)
+            if file_media_info:
+                log.info("【Meta】%s 使用外部候选名识别：%s" % (query_name, name))
+                return file_media_info
+        return {}
+
+    def __search_media_info(self, meta_info, mtype_hint=None, strict=None,
+                            chinese=True, append_to_response=None):
+        """
+        按发布名检索作品：LLM 直出 ID → 名称检索 → 中文兜底 → 外部（Bangumi）候选名。
+        检索到的候选都会先校验作品身份，与发布名对不上的候选会被丢弃并继续兜底。
+        """
+        file_media_info = None
+        llm_tmdb_id, llm_tmdb_type = self.__extract_llm_tmdb_target(meta_info=meta_info,
+                                                                    mtype_hint=mtype_hint)
+        if llm_tmdb_id:
+            log.info("【Meta】尝试使用LLM直出TMDBID：%s ..." % llm_tmdb_id)
+            file_media_info = self.get_tmdb_info(mtype=llm_tmdb_type,
+                                                 tmdbid=llm_tmdb_id,
+                                                 chinese=chinese,
+                                                 append_to_response=append_to_response)
+            if file_media_info and not self._prepare_media_identity(meta_info, file_media_info):
+                file_media_info = None
+            if not file_media_info:
+                log.warn("【Meta】LLM直出TMDBID无效或未命中，回退名称检索：%s" % llm_tmdb_id)
+        main_query_name = meta_info.get_name()
+        if not file_media_info:
+            file_media_info = self.__confirm_search_result(
+                meta_info,
+                self.__search_media_with_name(meta_info=meta_info,
+                                              query_name=main_query_name,
+                                              strict=strict),
+                chinese=chinese,
+                append_to_response=append_to_response)
+        # 主检索失败或候选与发布名不符时，尝试使用中文名兜底检索
+        cn_fallback_name = None
+        if not file_media_info:
+            cn_fallback_name = self.__extract_cn_fallback_name(meta_info)
+            if cn_fallback_name and not self.__is_same_search_name(main_query_name, cn_fallback_name):
+                log.info("【Meta】%s 使用中文兜底识别：%s" % (main_query_name, cn_fallback_name))
+                file_media_info = self.__confirm_search_result(
+                    meta_info,
+                    self.__search_media_with_name(meta_info=meta_info,
+                                                  query_name=cn_fallback_name,
+                                                  strict=strict),
+                    chinese=chinese,
+                    append_to_response=append_to_response)
+                if file_media_info:
+                    meta_info.cn_name = cn_fallback_name
+            # 双重失败时默认展示中文名
+            if not file_media_info and cn_fallback_name:
+                meta_info.cn_name = cn_fallback_name
+                meta_info.en_name = None
+        # 仍没有结果时，用 Bangumi 候选名（中文名/原名）再查一次 TMDB
+        if not file_media_info:
+            file_media_info = self.__search_media_by_alias_candidates(
+                meta_info=meta_info,
+                strict=strict,
+                chinese=chinese,
+                append_to_response=append_to_response)
+        # 补充全量信息
+        if file_media_info and not file_media_info.get("genres"):
+            file_media_info = self.get_tmdb_info(mtype=file_media_info.get("media_type"),
+                                                 tmdbid=file_media_info.get("id"),
+                                                 chinese=chinese,
+                                                 append_to_response=append_to_response)
+        if file_media_info and not self._prepare_media_identity(meta_info, file_media_info):
+            file_media_info = None
+        return file_media_info or {}
+
     def get_media_info(self, title,
                        subtitle=None,
                        mtype=None,
@@ -1309,65 +1453,28 @@ class Media:
         if mtype:
             meta_info.type = mtype
         media_key = self.__make_cache_key(meta_info)
-        if not cache or not self.get_cache_info(meta_info).get("id"):
-            file_media_info = None
-            llm_tmdb_id, llm_tmdb_type = self.__extract_llm_tmdb_target(meta_info=meta_info, mtype_hint=mtype)
-            if llm_tmdb_id:
-                log.info("【Meta】尝试使用LLM直出TMDBID：%s ..." % llm_tmdb_id)
-                file_media_info = self.get_tmdb_info(mtype=llm_tmdb_type,
-                                                     tmdbid=llm_tmdb_id,
-                                                     chinese=chinese,
-                                                     append_to_response=append_to_response)
-                if file_media_info and not self._prepare_media_identity(meta_info, file_media_info):
-                    file_media_info = None
-                if not file_media_info:
-                    log.warn("【Meta】LLM直出TMDBID无效或未命中，回退名称检索：%s" % llm_tmdb_id)
-            main_query_name = meta_info.get_name()
-            if not file_media_info:
-                file_media_info = self.__search_media_with_name(meta_info=meta_info,
-                                                                query_name=main_query_name,
-                                                                strict=strict)
-            # 主检索失败时，尝试使用中文名兜底检索
-            cn_fallback_name = None
-            if not file_media_info:
-                cn_fallback_name = self.__extract_cn_fallback_name(meta_info)
-                if cn_fallback_name and not self.__is_same_search_name(main_query_name, cn_fallback_name):
-                    log.info("【Meta】%s 使用中文兜底识别：%s" % (main_query_name, cn_fallback_name))
-                    file_media_info = self.__search_media_with_name(meta_info=meta_info,
-                                                                    query_name=cn_fallback_name,
-                                                                    strict=strict)
-                    if file_media_info:
-                        meta_info.cn_name = cn_fallback_name
-                # 双重失败时默认展示中文名
-                if not file_media_info and cn_fallback_name:
-                    meta_info.cn_name = cn_fallback_name
-                    meta_info.en_name = None
-            # 补充全量信息
-            if file_media_info and not file_media_info.get("genres"):
-                file_media_info = self.get_tmdb_info(mtype=file_media_info.get("media_type"),
-                                                     tmdbid=file_media_info.get("id"),
-                                                     chinese=chinese,
-                                                     append_to_response=append_to_response)
+        file_media_info = None
+        cache_info = self.get_cache_info(meta_info) if cache else {}
+        if cache_info.get("id"):
+            # 使用缓存信息；缓存与发布名对不上时（早期同名作品绑错）丢弃缓存重新检索
+            file_media_info = self.get_tmdb_info(mtype=cache_info.get("type"),
+                                                 tmdbid=cache_info.get("id"),
+                                                 chinese=chinese,
+                                                 append_to_response=append_to_response)
             if file_media_info and not self._prepare_media_identity(meta_info, file_media_info):
+                log.warn("【Meta】历史识别缓存与发布名不符，忽略缓存并重新检索：%s" % cache_info.get("id"))
+                self.meta.delete_meta_data(media_key)
                 file_media_info = None
+        if not file_media_info:
+            file_media_info = self.__search_media_info(meta_info=meta_info,
+                                                       mtype_hint=mtype,
+                                                       strict=strict,
+                                                       chinese=chinese,
+                                                       append_to_response=append_to_response)
             # 保存到缓存
             if file_media_info:
                 self.__insert_media_cache(media_key=media_key,
                                           file_media_info=file_media_info)
-        else:
-            # 使用缓存信息
-            cache_info = self.get_cache_info(meta_info)
-            if cache_info.get("id"):
-                file_media_info = self.get_tmdb_info(mtype=cache_info.get("type"),
-                                                     tmdbid=cache_info.get("id"),
-                                                     chinese=chinese,
-                                                     append_to_response=append_to_response)
-            else:
-                file_media_info = None
-                cn_fallback_name = self.__extract_cn_fallback_name(meta_info)
-                if cn_fallback_name:
-                    meta_info.cn_name = cn_fallback_name
-                    meta_info.en_name = None
         if file_media_info and not self._prepare_media_identity(meta_info, file_media_info):
             file_media_info = None
         # 赋值TMDB信息并返回
@@ -1496,62 +1603,25 @@ class Media:
                         continue
                     # 区配缓存及TMDB
                     media_key = self.__make_cache_key(meta_info)
-                    if not self.get_cache_info(meta_info).get("id"):
-                        # 没有缓存数据
-                        file_media_info = None
-                        llm_tmdb_id, llm_tmdb_type = self.__extract_llm_tmdb_target(meta_info=meta_info)
-                        if llm_tmdb_id:
-                            log.info("【Meta】尝试使用LLM直出TMDBID：%s ..." % llm_tmdb_id)
-                            file_media_info = self.get_tmdb_info(mtype=llm_tmdb_type,
-                                                                 tmdbid=llm_tmdb_id,
-                                                                 chinese=chinese)
-                            if file_media_info and not self._prepare_media_identity(meta_info, file_media_info):
-                                file_media_info = None
-                            if not file_media_info:
-                                log.warn("【Meta】LLM直出TMDBID无效或未命中，回退名称检索：%s" % llm_tmdb_id)
-                        main_query_name = meta_info.get_name()
-                        if not file_media_info:
-                            file_media_info = self.__search_media_with_name(meta_info=meta_info,
-                                                                            query_name=main_query_name,
-                                                                            strict=None)
-                        cn_fallback_name = None
-                        if not file_media_info:
-                            cn_fallback_name = self.__extract_cn_fallback_name(meta_info)
-                            if cn_fallback_name and not self.__is_same_search_name(main_query_name, cn_fallback_name):
-                                log.info("【Meta】%s 使用中文兜底识别：%s" % (main_query_name, cn_fallback_name))
-                                file_media_info = self.__search_media_with_name(meta_info=meta_info,
-                                                                                query_name=cn_fallback_name,
-                                                                                strict=None)
-                                if file_media_info:
-                                    meta_info.cn_name = cn_fallback_name
-                            if not file_media_info and cn_fallback_name:
-                                meta_info.cn_name = cn_fallback_name
-                                meta_info.en_name = None
-                        # 补全TMDB信息
-                        if file_media_info and not file_media_info.get("genres"):
-                            file_media_info = self.get_tmdb_info(mtype=file_media_info.get("media_type"),
-                                                                 tmdbid=file_media_info.get("id"),
-                                                                 chinese=chinese)
+                    file_media_info = None
+                    cache_info = self.get_cache_info(meta_info)
+                    if cache_info.get("id"):
+                        # 使用缓存信息；缓存与发布名对不上时（早期同名作品绑错）丢弃缓存重新检索
+                        file_media_info = self.get_tmdb_info(mtype=cache_info.get("type"),
+                                                             tmdbid=cache_info.get("id"),
+                                                             chinese=chinese)
                         if file_media_info and not self._prepare_media_identity(meta_info, file_media_info):
+                            log.warn("【Meta】历史识别缓存与发布名不符，忽略缓存并重新检索：%s"
+                                     % cache_info.get("id"))
+                            self.meta.delete_meta_data(media_key)
                             file_media_info = None
+                    if not file_media_info:
+                        file_media_info = self.__search_media_info(meta_info=meta_info,
+                                                                   chinese=chinese)
                         # 保存到缓存
                         if file_media_info:
                             self.__insert_media_cache(media_key=media_key,
                                                       file_media_info=file_media_info)
-                    else:
-                        # 使用缓存信息
-                        cache_info = self.get_cache_info(meta_info)
-                        if cache_info.get("id"):
-                            file_media_info = self.get_tmdb_info(mtype=cache_info.get("type"),
-                                                                 tmdbid=cache_info.get("id"),
-                                                                 chinese=chinese)
-                        else:
-                            # 缓存为未识别
-                            file_media_info = None
-                            cn_fallback_name = self.__extract_cn_fallback_name(meta_info)
-                            if cn_fallback_name:
-                                meta_info.cn_name = cn_fallback_name
-                                meta_info.en_name = None
                     if file_media_info and not self._prepare_media_identity(meta_info, file_media_info):
                         file_media_info = None
                     # 赋值TMDB信息

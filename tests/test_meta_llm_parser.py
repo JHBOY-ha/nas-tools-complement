@@ -640,3 +640,50 @@ class LLMMetaParserTest(TestCase):
                 query="Re Zero", mtype_hint=MediaType.TV)
 
         self.assertEqual([65942], [item["id"] for item in candidates])
+
+    def test_year_hint_ignores_resolution_numbers(self):
+        extract = self.parser._LLMMetaParser__extract_year_hint
+
+        self.assertIsNone(extract(
+            "[SAIO-Raws] Hundred 10 [BD 1920x1080 HEVC-10bit OPUS ASSx2].mkv"))
+        self.assertIsNone(extract("Some Show 7月新番 1920x1080"))
+        self.assertIsNone(extract("Some Show 2026年7月番 1080p"))
+        self.assertEqual("2016", extract("[SAIO-Raws] Hundred (2016) [BD 1920x1080 HEVC-10bit]"))
+        self.assertEqual("2019", extract("Some Movie 3840x2160 2019"))
+
+    def test_merge_records_llm_type_verdict(self):
+        llm_result = {"type": MediaType.ANIME, "confidence": 0.9}
+
+        meta_info = MetaInfo("[SAIO-Raws] Hundred 10 [BD 1920x1080 HEVC-10bit].mkv", use_llm=False)
+        with patch.object(self.parser, "parse", return_value=llm_result):
+            self.parser.merge_into(meta_info=meta_info, title=meta_info.org_string)
+
+        self.assertEqual(MediaType.ANIME, meta_info.note.get("llm", {}).get("type"))
+        self.assertIsNone(meta_info.note.get("llm", {}).get("type_hint"))
+
+        hinted = MetaInfo("[SAIO-Raws] Hundred 10 [BD 1920x1080 HEVC-10bit].mkv", use_llm=False)
+        with patch.object(self.parser, "parse", return_value=llm_result):
+            self.parser.merge_into(meta_info=hinted, title=hinted.org_string,
+                                   mtype_hint=MediaType.TV)
+
+        self.assertEqual(MediaType.TV.value, hinted.note.get("llm", {}).get("type_hint"))
+
+    def test_alias_candidates_prefer_chinese_name_and_strip_episode(self):
+        self.parser._search_context_enable = True
+        bangumi = [{"id": 133403, "name": "ハンドレッド", "name_cn": "百武装战记"}]
+        with patch.object(self.parser, "_LLMMetaParser__search_bangumi_candidates",
+                          return_value=bangumi) as mock_search:
+            names = self.parser.get_alias_candidates("Hundred 10")
+
+        self.assertEqual(["百武装战记", "ハンドレッド"], names)
+        queried = [call.args[0] for call in mock_search.call_args_list]
+        self.assertIn("Hundred 10", queried)
+        self.assertIn("Hundred", queried)
+
+    def test_alias_candidates_disabled_without_search_context(self):
+        self.parser._search_context_enable = False
+        with patch.object(self.parser, "_LLMMetaParser__search_bangumi_candidates") as mock_search:
+            names = self.parser.get_alias_candidates("Hundred 10")
+
+        self.assertEqual([], names)
+        mock_search.assert_not_called()

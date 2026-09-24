@@ -3,6 +3,7 @@
 from unittest import TestCase
 
 from app.media.meta import MetaInfo
+from app.utils.types import MediaType
 from tests.cases.meta_cases import meta_cases
 
 
@@ -56,3 +57,26 @@ class MetaInfoTest(TestCase):
         self.assertIn("从零开始", meta.get_name())
         self.assertEqual(4, meta.begin_season)
         self.assertEqual(14, meta.begin_episode)
+
+    def test_fansub_episode_number_without_leading_zero(self):
+        for title, episode in [
+            ("[SAIO-Raws] Hundred 10 [BD 1920x1080 HEVC-10bit OPUS ASSx2].mkv", 10),
+            ("[SAIO-Raws] Hundred 11 [BD 1920x1080 HEVC-10bit OPUS ASSx2].mkv", 11),
+            ("[SAIO-Raws] Hundred 12 END [BD 1920x1080 HEVC-10bit OPUS ASSx2].mkv", 12),
+            ("[SAIO-Raws] Hundred 05 [BD 1920x1080 HEVC-10bit OPUS ASSx2].mkv", 5),
+        ]:
+            with self.subTest(title=title):
+                meta = MetaInfo(title, use_llm=False)
+                self.assertEqual(MediaType.TV, meta.type)
+                self.assertEqual("Hundred", meta.get_name())
+                self.assertEqual(episode, meta.begin_episode)
+
+    def test_movie_title_number_is_not_taken_as_episode(self):
+        for title in [
+            "Toy Story 4 [1080p].mkv",
+            "Ocean's 11 [1080p].mkv",
+        ]:
+            with self.subTest(title=title):
+                meta = MetaInfo(title, use_llm=False)
+                self.assertEqual(MediaType.MOVIE, meta.type)
+                self.assertIsNone(meta.begin_episode)

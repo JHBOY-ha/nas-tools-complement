@@ -7,6 +7,33 @@ from app.utils import StringUtils, ExceptionUtils
 from app.utils.types import MediaType
 
 
+# 字幕组/压制组发布名的开头组名块，如 “[SAIO-Raws] Hundred 10 [BD …]” 里的 [SAIO-Raws]
+_FANSUB_GROUP_RE = re.compile(r"^\s*\[(?![0-9]{3,4}[PIpi]\s*\])([^\]]{2,64})\]")
+# 组名之后的方括号元数据块：分辨率、来源、编码、音频、字幕、容器等
+_FANSUB_META_BLOCK_RE = re.compile(
+    r"\[[^\]]*?(?:\d{3,4}[PIpi]|\d{3,4}\s*[X*]\s*\d{3,4}|BDRIP|BLURAY|BD|WEB-?DL|WEBRIP|REMUX|HDTV|HEVC|H\.?26[45]|"
+    r"AVC|VP9|AV1|AAC|AC3|EAC3|DDP?|FLAC|TRUEHD|DTS|ASS|SRT|SUB|MKV|MP4|字幕|内封|简繁)[^\]]*?\]",
+    re.IGNORECASE
+)
+
+
+def is_fansub_release_name(title):
+    """
+    判断发布名是否字幕组/压制组风格的动漫发布名。
+
+    特征是开头有方括号组名块，后面还有方括号元数据块（分辨率/来源/编码/字幕等），例如：
+        [SAIO-Raws] Hundred 10 [BD 1920x1080 HEVC-10bit OPUS ASSx2].mkv
+    普通电影名（Toy Story 4 [1080p].mkv）没有开头的组名块，不在此列。
+    """
+    if not title:
+        return False
+    text = str(title).strip()
+    group = _FANSUB_GROUP_RE.match(text)
+    if not group:
+        return False
+    return bool(_FANSUB_META_BLOCK_RE.search(text[group.end():]))
+
+
 class MetaBase(object):
     """
     媒体信息基类

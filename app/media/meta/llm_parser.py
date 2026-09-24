@@ -228,7 +228,8 @@ class LLMMetaParser(object):
         note["llm"] = {
             "enabled": self._enabled,
             "mode": self._mode,
-            "applied": False
+            "applied": False,
+            "type_hint": mtype_hint.value if mtype_hint else None
         }
 
         if llm_result:
@@ -241,6 +242,10 @@ class LLMMetaParser(object):
                 "confidence": llm_result.get("confidence", 0),
                 "field_confidence": llm_result.get("field_confidence", {})
             })
+            if llm_result.get("type"):
+                # LLM 判定的类型单独记录：保守模式下它不会覆盖规则结果，
+                # 但候选校验需要用“LLM 认为是动漫”这个信号避免绑定同名真人剧。
+                note["llm"]["type"] = llm_result.get("type")
             llm_names = [name for name in (llm_result.get("cn_name"), llm_result.get("en_name")) if name]
             if rule_names:
                 note["llm"]["rule_names"] = rule_names
@@ -300,6 +305,37 @@ class LLMMetaParser(object):
             meta_info.type = mtype_hint
 
         return meta_info
+
+    def get_alias_candidates(self, title, subtitle=None, limit=6):
+        """
+        用 Bangumi 检索结果给出可以再查一次 TMDB 的候选名称（中文名优先）。
+
+        用于 TMDB 名称检索找不到作品、或找回的候选与作品身份冲突时的兜底：例如 zh-CN
+        下用 “Hundred” 搜不到《百武装战记》(66109)，只能搜到同名剧集，而 Bangumi
+        候选里有“百武装战记/ハンドレッド”，用它检索就能命中正确条目。
+        """
+        if not title or not self._search_context_enable:
+            return []
+        queries = self.__build_search_queries(title=title, subtitle=subtitle)
+        for query in list(queries):
+            # 片名尾部残留的集号（Hundred 10 / Hundred 12 END）不影响检索
+            reduced = re.sub(
+                r"\s+\d{1,3}(?:\s+(?:END|FINALE?|FINAL|COMPLETE))?\s*$", "", query,
+                flags=re.IGNORECASE
+            ).strip()
+            if reduced and reduced not in queries:
+                queries.append(reduced)
+
+        names = []
+        for query in queries[:4]:
+            for item in self.__search_bangumi_candidates(query):
+                for key in ("name_cn", "name"):
+                    name = self.__clean_text(item.get(key), max_len=120)
+                    if name and name not in names:
+                        names.append(name)
+            if len(names) >= limit:
+                break
+        return names[:limit]
 
     def __apply_result(self, meta_info, llm_result):
         for field in self._llm_fields:
@@ -1120,12 +1156,18 @@ class LLMMetaParser(object):
     @classmethod
     def __extract_year_hint(cls, title, subtitle=None):
         """
-        从标题里取用于候选排序的年份；"2026年7月番"这类放送月份标签不算年份。
+        从标题里取用于候选排序的年份；"2026年7月番"这类放送月份标签不算年份，
+        分辨率里的数字（1920x1080、2160p）也不算。
         """
         text = " ".join([str(title or ""), str(subtitle or "")])
         for match in re.finditer(r"(?<!\d)(19\d{2}|20\d{2})(?!\d)", text):
-            tail = text[match.end():match.end() + 4]
+            tail = text[match.end():match.end() + 6]
             if re.match(r"\s*年\s*\d{1,2}\s*月", tail):
+                continue
+            if re.match(r"\s*[Xx*×]\s*\d{3,4}", tail) \
+                    or re.search(r"\d{3,4}\s*[Xx*×]\s*$",
+                                 text[max(match.start() - 8, 0):match.start()]):
+                # 1920x1080 / 3840x2160 这类分辨率，不是年份
                 continue
             return match.group(1)
         return None

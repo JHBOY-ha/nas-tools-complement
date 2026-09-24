@@ -2,7 +2,7 @@ import os
 import re
 
 from config import RMT_MEDIAEXT
-from app.media.meta._base import MetaBase
+from app.media.meta._base import MetaBase, is_fansub_release_name
 from app.utils import StringUtils
 from app.utils.tokens import Tokens
 from app.utils.types import MediaType
@@ -196,6 +196,9 @@ class MetaVideo(MetaBase):
                     # 名字后面以 0 开头的不要，极有可能是集
                     if token.startswith('0'):
                         return
+                    # 字幕组风格发布名里，片名后的数字就是集号（10、11 这类没有前导零）
+                    if self.__init_trailing_episode(token):
+                        return
                     # 检查是否真正的数字
                     if token.isdigit():
                         try:
@@ -239,6 +242,51 @@ class MetaVideo(MetaBase):
                 else:
                     self.en_name = token
                 self._last_token_type = "enname"
+
+    def __init_trailing_episode(self, token):
+        """
+        识别字幕组风格发布名里“片名 + 集号”的写法。
+
+        旧逻辑只把 0 开头的数字交给 __init_episode，10 及以后（或没补零）的集号会被
+        拼进片名，得到 “Hundred 10” 这样的脏片名并且丢掉集号。这里只处理发布名同时
+        具备“开头组名块 + 数字后面紧跟元数据块”的情况，普通电影名（Toy Story 4）不受影响。
+        """
+        if not token.isdigit() or not 1 <= len(token) <= 3:
+            return False
+        if token.startswith("0"):
+            # 0 开头的数字交给后面的 __init_episode 处理
+            return False
+        if not is_fansub_release_name(self.org_string):
+            return False
+        next_token = self.tokens.cur()
+        if not next_token or not self.__is_release_meta_token(next_token):
+            return False
+        self.begin_episode = int(token)
+        self.end_episode = None
+        self.total_episodes = 1
+        self.type = MediaType.TV
+        self._last_token_type = "episode"
+        self._continue_flag = False
+        self._stop_name_flag = True
+        return True
+
+    @classmethod
+    def __is_release_meta_token(cls, token):
+        """
+        判断 token 是否是发布名里的元数据标记（分辨率/来源/编码/音频/字幕/容器/完结标记）。
+        """
+        if not token:
+            return False
+        upper = token.upper()
+        if upper in ("END", "FINALE", "FINAL", "COMPLETE"):
+            return True
+        if re.search(r"字幕|内封|外挂|简繁|简日|繁日|合集|完结", token):
+            return True
+        for pattern in (cls._resources_type_re, cls._resources_pix_re,
+                        cls._video_encode_re, cls._audio_encode_re):
+            if re.search(r"%s" % pattern, token, re.IGNORECASE):
+                return True
+        return bool(re.match(r"^(?:[A-Z]{2,5}(?:X\d)?|MKV|MP4|AVI|RMVB)$", token, re.IGNORECASE))
 
     def __init_part(self, token):
         if not self.get_name():
