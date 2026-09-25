@@ -66,6 +66,16 @@ def MetaInfo(title, subtitle=None, mtype=None, use_llm=True):
         meta_info.skip_reason = extra_reason
         return meta_info
 
+    # 明确选择电影时，纯数字是片名；未知类型仍兼容 0001.mkv 等剧集编号。
+    numeric_title, extension = os.path.splitext(title or "")
+    if extension.lower() not in RMT_MEDIAEXT:
+        numeric_title = title or ""
+    if mtype == MediaType.MOVIE and numeric_title.strip().isdigit():
+        meta_info = MetaBase(title, subtitle)
+        meta_info.en_name = numeric_title.strip()
+        meta_info.type = MediaType.MOVIE
+        return meta_info
+
     original_title = title
     title, fractional_episode = protect_fractional_episode(title)
 

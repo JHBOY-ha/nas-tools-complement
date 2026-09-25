@@ -69,6 +69,40 @@ class ExtraRecognitionTest(unittest.TestCase):
             self.assertEqual(1, parsed.begin_episode)
 
 
+class NumericMovieTest(unittest.TestCase):
+    def test_movie_slug_uses_numeric_api_id(self):
+        media = Media.__new__(Media)
+        media.tmdb = MagicMock()
+        info = {"id": 530915, "title": "1917", "release_date": "2019-12-25", "genres": []}
+        with patch.object(media, "_Media__get_tmdb_movie_detail", return_value=info) as detail:
+            result = media.get_tmdb_info(MediaType.MOVIE, "530915-1917")
+        detail.assert_called_once_with("530915", None)
+        self.assertEqual(530915, result["id"])
+
+    def test_numeric_movie_requires_explicit_identity(self):
+        for title in ("1917", "1917.mkv"):
+            meta = MetaInfo(title, mtype=MediaType.MOVIE, use_llm=False)
+            self.assertEqual("1917", meta.get_name())
+            self.assertIsNone(meta.begin_episode)
+        # 未绑定电影时仍保留已有纯数字剧集行为。
+        self.assertEqual(1, MetaInfo("0001.mkv", use_llm=False).begin_episode)
+
+    def test_bound_numeric_movie_attaches_details(self):
+        media = Media.__new__(Media)
+        media.tmdb = object()
+        info = {"id": 530915, "title": "1917", "release_date": "2019-12-25",
+                "media_type": MediaType.MOVIE}
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "1917.mkv")
+            open(path, "wb").close()
+            with patch.object(media, "save_rename_cache"):
+                meta = media.get_media_info_on_files([path], tmdb_info=info)[path]
+            self.assertEqual(530915, meta.tmdb_id)
+            self.assertEqual(MediaType.MOVIE, meta.type)
+            self.assertEqual("2019", meta.year)
+            self.assertIsNone(meta.begin_episode)
+
+
 class RoutingTest(unittest.TestCase):
     def test_movie_year_after_dash_and_anime_episode(self):
         for name, year in (("Knives Out - 2019 1080p BluRay", "2019"),

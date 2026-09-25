@@ -672,6 +672,10 @@ class Media:
         if not self.tmdb:
             log.error("【Meta】TMDB API Key 未设置！")
             return None
+        # 网页末段包含片名 slug；详情 API 只使用数值 ID，不能把片名拼入请求。
+        slug = re.fullmatch(r"([0-9]+)-[^/\s?#]+", str(tmdbid).strip())
+        if slug:
+            tmdbid = slug.group(1)
         if language:
             self.tmdb.language = language
         else:
@@ -1653,7 +1657,9 @@ class Media:
                 # 自带TMDB信息
                 else:
                     # 已绑定作品身份时不再让LLM根据缩写文件名改写类型和季集。
-                    meta_info = MetaInfo(title=file_name, mtype=media_type,
+                    # 已绑定身份提供类型，避免纯数字电影文件被作为电视剧集号解析。
+                    bound_type = tmdb_info.get("media_type") or media_type
+                    meta_info = MetaInfo(title=file_name, mtype=bound_type,
                                          use_llm=not bool(download_context))
                     fractional = (meta_info.note or {}).get("fractional_episode")
                     if fractional and not self._confirm_fractional_episode(meta_info, tmdb_info):
