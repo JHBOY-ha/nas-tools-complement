@@ -1,5 +1,9 @@
 # 项目方案
 
+## 内置 anitopy 的仓库归属
+
+- `third_party/anitopy` 的文件由主仓库直接跟踪，不是 Git 子模块；移除 `.gitmodules` 中过时的同名声明，避免 VS Code 将目录排除出主仓库后无法读取差异视图的 Git 原版本。保留源码与原有未提交修改。
+
 ## 字幕设置与任务资源限制
 
 - `web/templates/setting/subtitle.html` 只负责字幕服务配置；配置弹窗内仅保留并突出 OpenSubtitles API Consumers 快捷按钮，不另设重复的官网入口，首页卡片只打开配置。
@@ -36,6 +40,7 @@
 
 ## 剧集名称与季集识别方案（已实施）
 
+- 内置 `anitopy` 的集号规则兼容同一括号内的数字与完结标记，如 `[12 END]`、`[28 END]`、`[28END]`、`[12 FINAL]`，集号不写死，保留发布说明并沿用集号数值校验；不全局放宽独立数字判定，也不把所有动漫强制归为电视剧。`孤独摇滚` 示例通过规则解析得到第 12 集和电视剧类型，底层与 `MetaInfo` 均有离线回归覆盖。
 - 可追踪的使用说明见 `docs/meta-season-episode-recognition.md`；实现入口为 `app/media/meta/metainfo.py`、`app/media/media.py` 和 `app/filetransfer.py`。
 - 暂缓裸四位数字识别及其专属 TMDB 映射扩展，等待实际失败资源样本；保留已有明确集号格式兼容。
 - NCOP、ED、PV、SP 不再硬编码拦截；用户通过文件名转移忽略词 `media.ignored_files` 控制整理过滤，未配置时正常识别。独立名称识别不受转移忽略词影响，小数集保护保留。不自动修改用户配置。

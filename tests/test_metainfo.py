@@ -1,12 +1,26 @@
 # -*- coding: utf-8 -*-
 
 from unittest import TestCase
+from unittest.mock import patch
 
 from app.media.meta import MetaInfo
+from app.utils.types import MediaType
 from tests.cases.meta_cases import meta_cases
 
 
 class MetaInfoTest(TestCase):
+    def test_bocchi_final_episode_is_tv(self):
+        # Exercise the full rule parser without LLM or user word substitutions.
+        with patch('app.media.meta.metainfo.WordsHelper') as words:
+            words.return_value.process.side_effect = lambda title: (title, [], {})
+            for block, episode in (('[12 END]', 12), ('[28 END]', 28), ('[28END]', 28)):
+                with self.subTest(block=block):
+                    meta = MetaInfo('[DMG][BOCCHI_THE_ROCK!]%s[1080P][GB].mp4' % block,
+                                    use_llm=False)
+                    self.assertEqual('Bocchi The Rock!', meta.en_name)
+                    self.assertEqual(episode, meta.begin_episode)
+                    self.assertEqual(MediaType.TV, meta.type)
+
     def setUp(self) -> None:
         pass
 
