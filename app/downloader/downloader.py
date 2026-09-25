@@ -135,10 +135,19 @@ class Downloader:
 
         payload = {
             "tmdb_info": plain(dict(info, media_type=tmdb_type.name)),
+            # 当前创建的任务保存的是经 TMDB 映射后的正式编号。旧记录不猜测语义。
+            "numbering": "tmdb",
             "source_title": media_info.org_string,
             "seasons": media_info.get_season_list(),
             "episodes": media_info.get_episode_list()
         }
+        # A season pack may include verified specials outside its main TMDB season.
+        # Persist its release scope separately; never relax a single-episode task.
+        if tmdb_type == MediaType.TV and payload["seasons"] and not payload["episodes"]:
+            release = MetaInfo(media_info.org_string, mtype=MediaType.TV, use_llm=False)
+            if release.begin_season is not None and not release.get_episode_list():
+                payload["scope"] = "season_pack"
+                payload["release_seasons"] = release.get_season_list()
         context_id = uuid.uuid4().hex
         if not self.dbhelper.save_download_context(context_id, dl_type.value, payload):
             raise RuntimeError("保存下载识别信息失败，未添加下载任务")
@@ -178,12 +187,14 @@ class Downloader:
                     })
                 log.warn("【Downloader】旧下载任务无法查询 TMDB 详情，使用已验证的 RSS 元数据")
             context["tmdb_info"] = tmdb_info
+            context["task_key"] = "%s:%s" % (dl_type.value, task.get("id"))
             return context
         if len(context_tags) != 1:
             raise ValueError("下载任务有多个作品身份标记，需手动核对")
         payload = self.dbhelper.get_download_context(context_tags[0][12:], dl_type.value)
         if not payload:
             raise ValueError("下载任务的作品身份记录缺失，需手动核对")
+        payload["task_key"] = "%s:%s" % (dl_type.value, task.get("id"))
         payload["tmdb_info"]["media_type"] = MediaType[payload["tmdb_info"]["media_type"]]
         return payload
 

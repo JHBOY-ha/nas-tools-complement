@@ -1,3 +1,4 @@
+from app.media.meta.release_version import clean_cut_tokens
 import json
 import re
 import time
@@ -339,6 +340,9 @@ class LLMMetaParser(object):
             "audio_encode"
         ]:
             text = self.__clean_text(parsed.get(key))
+            # LLM 不能把剪辑版混入技术字段，也不能据此生成 cut。
+            if key in ("resource_type", "resource_effect", "video_encode"):
+                text = clean_cut_tokens(text)
             if text:
                 result[key] = text
 

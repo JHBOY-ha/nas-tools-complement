@@ -9,44 +9,8 @@ from app.media.meta.metaanime import MetaAnime
 from app.media.meta.metavideo import MetaVideo
 from app.utils.types import MediaType
 from config import RMT_MEDIAEXT
-
-
-def explicit_extra_reason(title):
-    """Recognize only standalone bracketed extras in the file's own name."""
-    if not title:
-        return None
-    name = os.path.basename(title)
-    for block in re.findall(r"[\[【]([^\]】]+)[\]】]", name):
-        labels = re.split(r"\s*[&+＋]\s*", block.strip().upper())
-        if labels and all(re.fullmatch(r"(?:NCOP|NCED|ED|PV|SP)\d*", label)
-                          for label in labels):
-            return "附加内容标签：%s" % block
-    return None
-
-
-def protect_fractional_episode(title):
-    """Remove only explicit decimal episode markers before generic tokenization."""
-    if not title:
-        return title, None
-    stem, extension = os.path.splitext(title)
-    if extension.lower() not in RMT_MEDIAEXT:
-        stem, extension = title, ""
-    patterns = (
-        # 单位数字 [5.1] 常表示声道；裸方括号须有两位整数部分。
-        (r"[\[【](\d{2,3}\.\d{1,2})[\]】]", "bracket"),
-        (r"(?i)(?<![A-Z0-9])(?P<season>S\d{1,2})?EP?(?P<decimal>\d{1,3}\.\d{1,2})(?![\d.A-Z])", "episode_marker"),
-        (r"\s+-\s+(\d{2,3}\.\d{1,2})(?![\d.])", "separator"),
-    )
-    for pattern, source in patterns:
-        match = re.search(pattern, stem)
-        if match:
-            # 组合 SxxExx.xx 保留发布季，仅移除小数集，供限定季的映射使用。
-            season = match.groupdict().get("season") or ""
-            raw = match.group("decimal") if source == "episode_marker" else match.group(1)
-            cleaned = stem[:match.start()] + season + " " + stem[match.end():]
-            return cleaned + extension, {"raw": raw, "source": source,
-                                         "status": "unconfirmed"}
-    return title, None
+from app.media.meta.fractional import protect_fractional_episode
+from app.media.meta.release_version import extract_cut
 
 
 def MetaInfo(title, subtitle=None, mtype=None, use_llm=True):
@@ -59,13 +23,7 @@ def MetaInfo(title, subtitle=None, mtype=None, use_llm=True):
     :return: MetaAnime、MetaVideo
     """
 
-    # 在自定义词、规则和 LLM 处理前判断原始文件标签，保留括号上下文。
-    extra_reason = explicit_extra_reason(title)
-    if extra_reason:
-        meta_info = MetaBase(title, subtitle)
-        meta_info.skip_reason = extra_reason
-        return meta_info
-
+    # 内容过滤由转移忽略词配置控制，解析器不按附加内容标签提前返回。
     # 明确选择电影时，纯数字是片名；未知类型仍兼容 0001.mkv 等剧集编号。
     numeric_title, extension = os.path.splitext(title or "")
     if extension.lower() not in RMT_MEDIAEXT:
@@ -78,6 +36,8 @@ def MetaInfo(title, subtitle=None, mtype=None, use_llm=True):
 
     original_title = title
     title, fractional_episode = protect_fractional_episode(title)
+    # 原名中的剪辑版先提取，避免标题清理丢失或与 edition 混合。
+    title, cut = extract_cut(title)
 
     # 应用自定义识别词
     title, msg, used_info = WordsHelper().process(title)
@@ -110,17 +70,20 @@ def MetaInfo(title, subtitle=None, mtype=None, use_llm=True):
                                                subtitle=subtitle,
                                                mtype_hint=mtype)
 
+    meta_info.cut = cut
+    meta_info.org_string = original_title
+
     # 外部强制指定类型优先
     if mtype:
         meta_info.type = mtype
 
     if fractional_episode:
         # 未确认小数集不得由 LLM 或普通整数解析补空、取整或变成区间。
-        meta_info.org_string = original_title
         meta_info.begin_episode = None
         meta_info.end_episode = None
         meta_info.total_episodes = 0
         meta_info.type = MediaType.TV if not mtype else mtype
+        fractional_episode["source_season"] = meta_info.begin_season
         meta_info.note["fractional_episode"] = fractional_episode
 
     return meta_info

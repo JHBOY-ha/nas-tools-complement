@@ -144,6 +144,8 @@ class MetaBase(object):
     def __init__(self, title, subtitle=None, fileflag=False):
         # 备注与跳过状态必须属于本次解析，不能在文件之间共享。
         self.note = {}
+        # 每次解析独立保存剪辑版本，不参与来源/效果过滤。
+        self.cut = None
         self.skip_reason = None
         self.category_handler = Category()
         self.fanart = Fanart()

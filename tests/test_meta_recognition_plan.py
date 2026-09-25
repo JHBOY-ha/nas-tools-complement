@@ -1,6 +1,7 @@
 """Regression cases for file-level media recognition and transfer guards."""
 
 import os
+import re
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
@@ -8,49 +9,54 @@ from unittest.mock import MagicMock, patch
 from app.filetransfer import FileTransfer
 from app.media.meta import MetaInfo
 from app.media.meta._base import MetaBase
-from app.media.meta.metainfo import explicit_extra_reason
 from app.media.media import Media
+from app.utils.episode_format import EpisodeFormat
 from app.utils.types import MediaType, RmtMode, SyncType
 
 
 class ExtraRecognitionTest(unittest.TestCase):
-    def test_explicit_file_tags_only(self):
-        for name in ("[Group] Show [NCOP][05].mkv", "Show [NCOP&ED][05].mkv",
-                     "Show [ED01].mkv", "Show [PV01].mkv", "Show [SP01].mkv"):
-            with self.subTest(name=name):
-                self.assertTrue(explicit_extra_reason(name))
-        for name in ("The Edited Life 2020.mkv", "Show-SP.mkv",
-                     "Show [01].mkv", "Show [01-12+SP]/Show [01].mkv"):
-            with self.subTest(name=name):
-                self.assertIsNone(explicit_extra_reason(os.path.basename(name)))
+    def test_extra_tags_do_not_block_parser_or_llm(self):
+        # 解析入口不决定内容是否转移，标签文件也经过正常识别流程。
+        for tag in ("NCOP", "NCOP&ED", "ED01", "PV01", "SP01"):
+            with self.subTest(tag=tag), \
+                    patch("app.media.meta.metainfo.LLMMetaParser") as llm:
+                llm.return_value.merge_into.side_effect = lambda **kwargs: kwargs["meta_info"]
+                meta = MetaInfo("Show S01E01 [%s].mkv" % tag)
+                self.assertIsNone(meta.skip_reason)
+                self.assertEqual(1, meta.begin_episode)
+                llm.return_value.merge_into.assert_called_once()
 
-    def test_extra_never_reaches_llm_or_tmdb(self):
-        with patch("app.media.meta.metainfo.WordsHelper") as words, \
-                patch("app.media.meta.metainfo.LLMMetaParser") as llm:
-            meta = MetaInfo("[Group] Show [ED01].mkv")
-        words.assert_not_called()
-        llm.assert_not_called()
-        self.assertTrue(meta.skip_reason)
-        self.assertIsNone(meta.begin_episode)
-
+    def test_extra_tags_reach_direct_and_file_recognition(self):
+        media = Media.__new__(Media)
+        media.tmdb = object()
+        # 在解析入口停止模拟查询，验证两个调用入口都不再按标签提前返回。
+        marker = RuntimeError("parser reached")
+        with patch("app.media.media.MetaInfo", side_effect=marker) as parser:
+            with self.assertRaisesRegex(RuntimeError, "parser reached"):
+                media.get_media_info("Show [NCOP].mkv")
+            parser.assert_called_once()
         with tempfile.TemporaryDirectory() as root:
             path = os.path.join(root, "Show [SP01].mkv")
             open(path, "wb").close()
-            media = Media.__new__(Media)
-            media.tmdb = object()
-            with patch("app.media.media.MetaInfo") as parser, \
-                    patch.object(media, "get_tmdb_info") as tmdb:
-                result = media.get_media_info_on_files([path])
-            parser.assert_not_called()
-            tmdb.assert_not_called()
-            self.assertTrue(result[path].skip_reason)
-        media = Media.__new__(Media)
-        media.tmdb = object()
-        with patch("app.media.media.MetaInfo") as parser, \
-                patch.object(media, "get_tmdb_info") as tmdb:
-            self.assertIsNone(media.get_media_info("Show [NCOP].mkv"))
-        parser.assert_not_called()
-        tmdb.assert_not_called()
+            with patch("app.media.media.MetaInfo", side_effect=marker) as parser, \
+                    patch("app.media.media.PathUtils.get_bluray_dir", return_value=None):
+                media.get_media_info_on_files([path])
+            parser.assert_called_once_with(title="Show [SP01].mkv")
+
+    def test_transfer_ignore_is_configurable_and_filename_only(self):
+        transfer = FileTransfer.__new__(FileTransfer)
+        transfer._ignored_paths = ""
+        ignored = ["/library/Show [%s].mkv" % tag
+                   for tag in ("NCOP", "NCOP&ED", "ED01", "PV01", "SP01")]
+        retained = ["/library/RED.mkv", "/library/Show-SP.mkv",
+                    "/library/Show [01-12+SP]/Show S01E01.mkv"]
+        # 未配置时不隐式过滤；规则仅作为用户可选配置出现在测试和文档中。
+        transfer._ignored_files = ""
+        self.assertEqual(ignored + retained, transfer.check_ignore(ignored + retained)[0])
+        transfer._ignored_files = re.compile(
+            r"(?i:[\[【]\s*(?:NCOP|NCED|ED|PV|SP)\d*"
+            r"(?:\s*[&+＋]\s*(?:NCOP|NCED|ED|PV|SP)\d*)*\s*[\]】])")
+        self.assertEqual(retained, transfer.check_ignore(ignored + retained)[0])
 
     def test_mixed_collection_directory_does_not_skip_main_episode(self):
         with tempfile.TemporaryDirectory() as root:
@@ -273,13 +279,13 @@ class ExplicitEpisodeFormsTest(unittest.TestCase):
 class TransferGuardTest(unittest.TestCase):
     def test_skipped_file_is_not_moved_even_with_unknown_dir(self):
         with tempfile.TemporaryDirectory() as root:
-            for name in ("Show [PV01].mkv", "Show [01.5].mkv"):
+            for name in ("Show [01.5].mkv",):
                 with self.subTest(name=name):
                     path = os.path.join(root, name)
                     with open(path, "wb") as output:
                         output.write(b"source")
                     meta = MetaBase(name, fileflag=True)
-                    meta.skip_reason = "明确附加内容" if "PV" in name else "小数集待确认"
+                    meta.skip_reason = "小数集待确认"
                     transfer = FileTransfer.__new__(FileTransfer)
                     transfer.media = MagicMock()
                     transfer.media.get_media_info_on_files.return_value = {path: meta}
@@ -350,6 +356,80 @@ class TransferGuardTest(unittest.TestCase):
                     [path], tmdb_info=info, media_type=MediaType.TV)[path]
                 self.assertTrue(unconfirmed.skip_reason)
                 self.assertIsNone(unconfirmed.begin_episode)
+
+
+class SeasonAndRangeRegressionTest(unittest.TestCase):
+    def test_rss_preserves_all_parsed_season_forms(self):
+        media = Media.__new__(Media)
+        media.tmdb = object()
+        info = {"id": 42, "name": "Show", "media_type": MediaType.TV,
+                "seasons": [{"season_number": n} for n in (1, 2, 3)]}
+        cases = (("Show 2x03.mkv", 2), ("某剧 第三季 第03集.mkv", 3),
+                 ("Show 第II季 E03.mkv", 2), ("Show S02E03.mkv", 2),
+                 ("[Group] Show II - 03 [1080p].mkv", 2))
+        with tempfile.TemporaryDirectory() as root:
+            for filename, season in cases:
+                path = os.path.join(root, filename)
+                open(path, "wb").close()
+                for target in (1, season):
+                    with self.subTest(filename=filename, target=target):
+                        result = media.get_media_info_on_files(
+                            [path], tmdb_info=info, media_type=MediaType.TV,
+                            download_context={"seasons": [target], "episodes": [3]})
+                        if target != season:
+                            self.assertNotIn(path, result)
+                        else:
+                            self.assertEqual((season, 3),
+                                             (result[path].begin_season, result[path].begin_episode))
+            # 真正没有季标记时，仍允许下载任务补充季号。
+            path = os.path.join(root, "Show E03.mkv")
+            open(path, "wb").close()
+            result = media.get_media_info_on_files(
+                [path], tmdb_info=info, media_type=MediaType.TV,
+                download_context={"seasons": [2], "episodes": [3]})
+            self.assertEqual(2, result[path].begin_season)
+
+    def test_empty_manual_format_runs_verified_mapping(self):
+        media = Media.__new__(Media)
+        media.tmdb = object()
+        info = {"id": 42, "name": "Show", "media_type": MediaType.TV,
+                "seasons": [{"season_number": 1}, {"season_number": 4}]}
+        rule = {"tmdb_id": 42, "source_season": 4, "source_begin": 1,
+                "source_end": 19, "target_season": 1, "offset": 66}
+        with tempfile.TemporaryDirectory() as root, \
+                patch("app.media.media.Config") as config, \
+                patch.object(media, "get_tmdb_tv_season_detail") as detail, \
+                patch.object(media, "save_rename_cache"):
+            path = os.path.join(root, "Show S04E01.mkv")
+            open(path, "wb").close()
+            config.return_value.get_config.return_value = {"episode_mappings": [rule]}
+            detail.return_value = {"episodes": [{"episode_number": 67}]}
+            result = media.get_media_info_on_files(
+                [path], tmdb_info=info, media_type=MediaType.TV,
+                season="", episode_format=EpisodeFormat(None))[path]
+            self.assertEqual((1, 67), (result.begin_season, result.begin_episode))
+            # TMDB 不存在目标集时，空规则不能绕过映射验证。
+            detail.return_value = {"episodes": []}
+            self.assertNotIn(path, media.get_media_info_on_files(
+                [path], tmdb_info=info, media_type=MediaType.TV,
+                episode_format=EpisodeFormat(None)))
+            # 用户实际指定集号时，继续尊重手动覆盖。
+            result = media.get_media_info_on_files(
+                [path], tmdb_info=info, media_type=MediaType.TV,
+                episode_format=EpisodeFormat(None, "8"))[path]
+            self.assertEqual((4, 8), (result.begin_season, result.begin_episode))
+
+    def test_explicit_multi_episode_ranges_survive_file_parsing(self):
+        for filename in ("Show S01E01-E03.mkv", "Show S01E01-03.mkv",
+                         "Show E01-E04.mkv", "Show S01EP01-EP04.mkv"):
+            with self.subTest(filename=filename):
+                meta = MetaInfo(filename, use_llm=False)
+                end = 3 if "03" in filename else 4
+                self.assertEqual(list(range(1, end + 1)), meta.get_episode_list())
+                self.assertEqual(end, meta.total_episodes)
+        # 不把无区间标记的资源数字放大成数百集。
+        meta = MetaInfo("Show S01E01 1080.mkv", use_llm=False)
+        self.assertEqual([1], meta.get_episode_list())
 
 
 if __name__ == "__main__":

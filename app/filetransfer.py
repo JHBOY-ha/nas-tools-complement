@@ -610,6 +610,8 @@ class FileTransfer:
         refresh_library_items = []
         # 需要下载字段的清单
         download_subtitle_items = []
+        # 先检测小数集目标冲突，避免批次内较大文件覆盖先写入的版本。
+        checked_roots = self._check_fractional_destinations(Medias, target_dir, rmt_mode)
         # 处理识别后的每一个文件或单个文件夹
         for file_item, media in Medias.items():
             try:
@@ -670,7 +672,8 @@ class FileTransfer:
                     else:
                         log.error("【Rmt】%s 无法识别媒体信息！" % file_name)
                     continue
-                # 不启用洗版/强制整理时，已有有效入库记录可阻止跨盘重复入库。
+                # 不启用洗版/强制整理时，按正式季集去重（包括已确认小数集）。
+                # 无历史记录的同 inode 重试仍由后续转移流程补写历史。
                 if rmt_mode == RmtMode.LINK and not udf_flag and not self._filesize_cover:
                     existing = self._existing_media_files(media)
                     already_exists = bool(existing) if media.type == MediaType.MOVIE else False
@@ -692,7 +695,9 @@ class FileTransfer:
                 # 当前文件大小
                 media.size = os.path.getsize(file_item)
                 # 目的目录，有输入target_dir时，往这个目录放
-                if target_dir:
+                if file_item in checked_roots:
+                    dist_path = checked_roots[file_item]
+                elif target_dir:
                     dist_path = target_dir
                 else:
                     dist_path = self.__get_best_target_path(mtype=media.type, in_path=file_item, size=media.size,
@@ -1284,6 +1289,49 @@ class FileTransfer:
                                        target_file=new_file,
                                        rmt_mode=sync_transfer_mode), ""
 
+    def _check_fractional_destinations(self, medias, target_dir, rmt_mode):
+        """Preflight decimal destinations before publishing any file in the batch."""
+        fractional = {path for path, meta in medias.items() if meta and not meta.skip_reason
+                      and (meta.note or {}).get("fractional_episode", {}).get("status") == "confirmed"}
+        if not fractional:
+            return {}
+        roots, destinations = {}, {}
+        for path, meta in medias.items():
+            if not meta or meta.skip_reason or not meta.tmdb_info:
+                continue
+            try:
+                root = target_dir or self.__get_best_target_path(
+                    mtype=meta.type, in_path=path, size=os.path.getsize(path), rmt_mode=rmt_mode)
+                if not root:
+                    raise ValueError("目标目录未确定")
+                roots[path] = root
+                _, _, exists, destination = self.__is_media_exists(root, meta)
+                if not destination:
+                    raise ValueError("无法生成目标文件名")
+                stem = os.path.splitext(destination)[0] if exists else destination
+                destinations.setdefault(os.path.normcase(os.path.abspath(stem)), []).append(path)
+                # 已存在的不同内容不能被小数集按体积覆盖；同一硬链接重试可通过。
+                if path in fractional and exists and not os.path.samefile(path, destination):
+                    meta.skip_reason = "小数集目标已存在不同文件，保留源文件"
+            except Exception as err:
+                if path in fractional:
+                    meta.skip_reason = "小数集目标校验失败：%s" % err
+        for paths in destinations.values():
+            if len(paths) < 2 or not fractional.intersection(paths):
+                continue
+            try:
+                if all(os.path.samefile(paths[0], other) for other in paths[1:]):
+                    continue
+            except OSError as err:
+                # Sources can disappear during preflight; fail this collision group only.
+                for path in paths:
+                    medias[path].skip_reason = "目标冲突校验失败，保留源文件：%s" % err
+                continue
+            # 整数文件仍可整理；同名小数文件全部跳过，避免先写入者获胜。
+            for path in fractional.intersection(paths):
+                medias[path].skip_reason = "小数集与本批其他文件目标冲突，保留源文件"
+        return roots
+
     def get_format_dict(self, media):
         """
         根据媒体信息，返回Format字典
@@ -1301,6 +1349,8 @@ class FileTransfer:
             "name": StringUtils.clear_file_name(media.get_name()),
             "year": media.year,
             "edition": media.get_edtion_string() or None,
+            # 独立剪辑版占位符；空值沿用可选字段的分隔符清理。
+            "cut": getattr(media, "cut", None) or None,
             "videoFormat": media.resource_pix,
             "releaseGroup": media.resource_team,
             "effect": media.resource_effect,

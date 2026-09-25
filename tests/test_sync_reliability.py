@@ -53,6 +53,9 @@ def env():
 class RecognitionTests(unittest.TestCase):
     def setUp(self):
         self.ns = env()
+        # 批次分类使用真实的小数集检测器。
+        from app.media.meta.fractional import protect_fractional_episode
+        self.ns["protect_fractional_episode"] = protect_fractional_episode
         cls = load_class('app/media/media.py', 'Media', [
             '__search_media_with_name', '__extract_llm_tmdb_target', '__resolve_tmdb_mtype',
             'get_media_info_on_files', 'get_cache_info', '__make_cache_key', '_valid_media_identity',
@@ -167,7 +170,11 @@ class RecognitionTests(unittest.TestCase):
         info = {'media_type': MediaType.TV, 'id': 456}
         if tmdb_seasons is not None:
             info['seasons'] = tmdb_seasons
-        meta = NS(type=MediaType.TV, begin_episode=parsed_episode, begin_season=1,
+        # 模拟解析器须区分明确 Sxx 和缺失季标记，不能总返回默认季 1。
+        season_match = re.search(r"S(\d+)E", name)
+        meta = NS(type=MediaType.TV, begin_episode=parsed_episode,
+                  begin_season=int(season_match[1]) if season_match else None,
+                  note={}, skip_reason=None, tmdb_info=info, tmdb_id=456,
                   set_tmdb_info=Mock())
         meta.get_episode_list = lambda: [meta.begin_episode] if meta.begin_episode else []
         self.ns['MetaInfo'] = Mock(return_value=meta)
@@ -187,7 +194,8 @@ class RecognitionTests(unittest.TestCase):
                                   get_bluray_dir=lambda p: None)
         self.media.tmdb = True
         self.media.save_rename_cache = Mock()
-        metas = [NS(type=MediaType.MOVIE, set_tmdb_info=Mock()) for _ in range(3)]
+        metas = [NS(type=MediaType.MOVIE, note={}, skip_reason=None, begin_season=None,
+                    get_episode_list=lambda: [], set_tmdb_info=Mock()) for _ in range(3)]
         self.ns['MetaInfo'] = Mock(side_effect=metas)
         with tempfile.TemporaryDirectory() as directory:
             paths = [str(Path(directory) / ('film%s.mkv' % i)) for i in range(3)]
@@ -494,7 +502,7 @@ class HardlinkTests(unittest.TestCase):
         self.mode = MediaType.ANIME  # Enum-shaped transfer mode; no app imports needed.
         self.ns['RmtMode'].LINK = self.mode
         cls = load_class('app/filetransfer.py', 'FileTransfer', [
-            '__transfer_file', '__transfer_origin_file', '__get_best_target_path', '_existing_media_files', 'transfer_media'], self.ns)
+            '__transfer_file', '__transfer_origin_file', '__get_best_target_path', '_existing_media_files', '_check_fractional_destinations', 'transfer_media'], self.ns)
         self.transfer = cls()
         self.transfer.dbhelper = Mock()
         self.transfer._FileTransfer__transfer_subtitles = Mock(return_value=0)
@@ -511,6 +519,7 @@ class HardlinkTests(unittest.TestCase):
         t.dbhelper.insert_transfer_blacklist.return_value = True
         t._FileTransfer__transfer_command = Mock()
         meta = NS(tmdb_id=1, type=MediaType.MOVIE, category='', title='Film', year='2026',
+                  note={}, skip_reason=None,
                   en_name='Film', cn_name='', begin_season=None, begin_episode=None,
                   imdb_id=None, set_tmdb_info=Mock(), tmdb_info={'id': 1},
                   get_title_string=lambda: 'Film (2026)')

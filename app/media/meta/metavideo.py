@@ -7,6 +7,7 @@ from app.utils import StringUtils
 from app.utils.tokens import Tokens
 from app.utils.types import MediaType
 from app.media.meta.release_groups import ReleaseGroupsMatcher
+from app.media.meta.release_version import LEGACY_CUT_NAME_PATTERN
 
 
 class MetaVideo(MetaBase):
@@ -30,7 +31,7 @@ class MetaVideo(MetaBase):
     _roman_season_map = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5,
                          "VI": 6, "VII": 7, "VIII": 8, "IX": 9, "X": 10}
     _source_re = r"^BLURAY$|^HDTV$|^UHDTV$|^HDDVD$|^WEBRIP$|^DVDRIP$|^BDRIP$|^BLU$|^WEB$|^BD$|^HDRip$"
-    _effect_re = r"^REMUX$|^UHD$|^SDR$|^HDR\d*$|^DOLBY$|^DOVI$|^DV$|^3D$|^REPACK$"
+    _effect_re = r"^HDR10PLUS$|^REMUX$|^UHD$|^SDR$|^HDR\d*$|^DOLBY$|^DOVI$|^DV$|^3D$|^REPACK$"
     _resources_type_re = r"%s|%s" % (_source_re, _effect_re)
     _name_no_begin_re = r"^\[.+?]"
     _name_no_chinese_re = r".*版|.*字幕"
@@ -41,7 +42,7 @@ class MetaVideo(MetaBase):
                         r"|[第\s共]+[0-9一二三四五六七八九十\-\s]+[集话話]" \
                         r"|连载|日剧|美剧|电视剧|动画片|动漫|欧美|西德|日韩|超高清|高清|蓝光|翡翠台|梦幻天堂·龙网|★?\d*月?新番" \
                         r"|最终季|合集|[多中国英葡法俄日韩德意西印泰台港粤双文语简繁体特效内封官译外挂]+字幕|版本|出品|台版|港版|\w+字幕组" \
-                        r"|未删减版|UNCUT$|UNRATE$|WITH EXTRAS$|RERIP$|SUBBED$|PROPER$|REPACK$|Complete$|Extended$|Extended Version$" \
+                        r"|WITH EXTRAS$|RERIP$|SUBBED$|PROPER$|REPACK$|Complete$" \
                         r"|S\d{2}\s*-\s*S\d{2}|S\d{2}|\s+S\d{1,2}|EP?\d{2,4}\s*-\s*EP?\d{2,4}|EP?\d{2,4}|\s+EP?\d{1,4}" \
                         r"|CD[\s.]*[1-9]|DVD[\s.]*[1-9]|DISK[\s.]*[1-9]|DISC[\s.]*[1-9]" \
                         r"|[248]K|\d{3,4}[PIX]+" \
@@ -74,6 +75,8 @@ class MetaVideo(MetaBase):
         # 把年月日去掉
         title = re.sub(r'\d{4}[\s._-]\d{1,2}[\s._-]\d{1,2}', "", title)
         # 拆分tokens
+        # Tokens 会拆掉 +；以可识别 token 保护 HDR10+，解析后恢复标记。
+        title = re.sub(r"(?i)(?<![A-Z0-9])HDR10\+(?![A-Z0-9])", "HDR10PLUS", title)
         tokens = Tokens(title)
         self.tokens = tokens
         # 解析名称、年份、季、集、资源类型、分辨率等
@@ -138,7 +141,8 @@ class MetaVideo(MetaBase):
     def __fix_name(self, name):
         if not name:
             return name
-        name = re.sub(r'%s' % self._name_nostring_re, '', name,
+        # Legacy cut cleanup shares the cut registry while keeping its original scope.
+        name = re.sub(self._name_nostring_re + '|' + LEGACY_CUT_NAME_PATTERN, '', name,
                       flags=re.IGNORECASE).strip()
         name = re.sub(r'\s+', ' ', name)
         if name.isdigit() \
@@ -393,6 +397,16 @@ class MetaVideo(MetaBase):
         elif token.upper() == "SEASON" and self.begin_season is None and self.__is_written_marker(token):
             self._last_token_type = "SEASON"
 
+    def __has_explicit_episode_range(self):
+        # 明确 E01-E03 / S01E01-03 的文件允许包含三集以上；
+        # 裸数字推断仍保留两集上限，避免分辨率等数字被吞入集号区间。
+        # Bare resolution values and four-digit endpoints require an explicit E/EP.
+        ambiguous = self.end_episode >= 1000 or self.end_episode in (240, 360, 480, 540, 576, 720)
+        endpoint = r"EP?" if ambiguous else r"(?:EP?)?"
+        return bool(re.search(
+            r"(?i)(?<![A-Z0-9])(?:S\d{1,2})?EP?0*%d\s*-\s*%s0*%d(?![A-Z0-9])"
+            % (self.begin_episode, endpoint, self.end_episode), self.org_string))
+
     def __init_episode(self, token):
         numbered = re.fullmatch(r"(\d{1,2})x(\d{1,3})", token, re.IGNORECASE)
         if numbered:
@@ -437,7 +451,8 @@ class MetaVideo(MetaBase):
                     if se > self.begin_episode:
                         self.end_episode = se
                         self.total_episodes = (self.end_episode - self.begin_episode) + 1
-                        if self.fileflag and self.total_episodes > 2:
+                        if (self.fileflag and self.total_episodes > 2
+                                and not self.__has_explicit_episode_range()):
                             self.end_episode = None
                             self.total_episodes = 1
         elif token.isdigit():
@@ -452,7 +467,8 @@ class MetaVideo(MetaBase):
                     and self._last_token_type == "episode":
                 self.end_episode = int(token)
                 self.total_episodes = (self.end_episode - self.begin_episode) + 1
-                if self.fileflag and self.total_episodes > 2:
+                if (self.fileflag and self.total_episodes > 2
+                        and not self.__has_explicit_episode_range()):
                     self.end_episode = None
                     self.total_episodes = 1
                 self._continue_flag = False
@@ -514,6 +530,8 @@ class MetaVideo(MetaBase):
             self._continue_flag = False
             self._stop_name_flag = True
             effect = effect_res.group(1)
+            if effect.upper() == "HDR10PLUS":
+                effect = "HDR10+"
             if effect not in self._effect:
                 self._effect.append(effect)
             self._last_token = effect.upper()
