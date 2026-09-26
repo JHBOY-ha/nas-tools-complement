@@ -311,13 +311,13 @@ class DownloadTests(unittest.TestCase):
         self.d.media = Mock()
         self.d.default_client.get_transfer_task.return_value = [{'path': '/mock/file', 'id': 'hash'}]
 
-    def test_failed_transfer_retries_without_organized_tag(self):
+    def test_failed_transfer_leaves_task_for_next_cycle(self):
         self.d.filetransfer.transfer_media.return_value = False, 'temporary lookup error'
         self.d.transfer()
         self.d.default_client.set_torrents_status.assert_not_called()
+        # 不再有退避状态，下一轮定时任务会重新尝试
         self.d.transfer()
-        self.assertEqual(1, self.d.filetransfer.transfer_media.call_count)
-        self.d._transfer_retries[('QB', 'hash')] = (1, 0)
+        self.assertEqual(2, self.d.filetransfer.transfer_media.call_count)
         self.d.filetransfer.transfer_media.return_value = True, ''
         self.d.transfer()
         self.d.default_client.set_torrents_status.assert_called_once()
@@ -485,20 +485,39 @@ class DownloadTests(unittest.TestCase):
 
 
 class QueueTests(unittest.TestCase):
-    def test_failed_queue_is_retained_and_io_runs_outside_lock(self):
+    def test_failed_transfer_drops_queue_and_records_unknown(self):
         ns = env()
         ns['PathUtils'] = NS(get_bluray_dir=lambda p: None)
-        cls = load_class('app/sync.py', 'Sync', ['transfer_mon_files'], ns)
+        cls = load_class('app/sync.py', 'Sync',
+                         ['transfer_mon_files', '__record_unknown_files'], ns)
         sync = cls()
+        sync.dbhelper = Mock()
+        sync.dbhelper.is_transfer_in_blacklist.return_value = False
+        sync.dbhelper.is_need_insert_transfer_unknown.return_value = True
         sync._synced_files = ['/mock/one.mkv']
-        sync._need_sync_paths = {'/mock': {'files': ['/mock/one.mkv']}}
+        sync._need_sync_paths = {'/mock': {'files': ['/mock/one.mkv'],
+                                           'target': '/library', 'syncmod': 'link'}}
         def transfer(**kwargs):
             self.assertFalse(ns['lock'].locked())
             return False, 'temporary error'
         sync.filetransfer = NS(transfer_media=transfer)
         sync.transfer_mon_files()
-        self.assertIn('/mock', sync._need_sync_paths)
-        sync._need_sync_paths['/mock']['retry_at'] = 0
+        # 失败不再保留重试，改为记入未识别队列等待手动识别
+        self.assertEqual({}, sync._need_sync_paths)
+        sync.dbhelper.insert_transfer_unknown.assert_called_once_with(
+            '/mock/one.mkv', '/library', 'link')
+        self.assertEqual(['/mock/one.mkv'], sync._synced_files)
+
+        # 已经成功入库过的文件不再登记
+        sync.dbhelper.reset_mock()
+        sync.dbhelper.is_transfer_in_blacklist.return_value = True
+        sync._need_sync_paths = {'/mock': {'files': ['/mock/one.mkv'],
+                                           'target': '/library', 'syncmod': 'link'}}
+        sync.transfer_mon_files()
+        sync.dbhelper.insert_transfer_unknown.assert_not_called()
+
+        # 成功时释放事件去重
+        sync._need_sync_paths = {'/mock': {'files': ['/mock/one.mkv']}}
         sync.filetransfer.transfer_media = lambda **kwargs: (True, '')
         sync.transfer_mon_files()
         self.assertEqual({}, sync._need_sync_paths)

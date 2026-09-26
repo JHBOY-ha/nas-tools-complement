@@ -1,7 +1,6 @@
 import os
 import threading
 import traceback
-import time
 
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
@@ -229,7 +228,7 @@ class Sync(object):
                         ext = os.path.splitext(name)[-1]
                         if ext.lower() not in RMT_MEDIAEXT:
                             return
-                    # 根目录与子目录使用相同的队列，失败后可重试。
+                    # 根目录与子目录使用相同的队列，由定时任务统一转移。
                     queue_path = event_path if is_root_path else from_dir
                     with lock:
                         item = self._need_sync_paths.setdefault(queue_path, {
@@ -251,16 +250,13 @@ class Sync(object):
         """
         批量转移文件，由定时服务定期调用执行
         """
-        # 锁只保护领取/回填队列，识别和磁盘操作不阻塞事件入队。
+        # 锁只保护领取队列，识别和磁盘操作不阻塞事件入队。
         with lock:
             pending = self._need_sync_paths
             self._need_sync_paths = {}
         for path, target_info in pending.items():
             files = target_info.get('files') or []
-            success = False
             try:
-                if time.monotonic() < target_info.get('retry_at', 0):
-                    continue
                 src_path = PathUtils.get_bluray_dir(path) or path
                 ret, ret_msg = self.filetransfer.transfer_media(
                     in_from=SyncType.MON, in_path=src_path,
@@ -268,28 +264,38 @@ class Sync(object):
                     target_dir=target_info.get('target'),
                     unknown_dir=target_info.get('unknown'),
                     rmt_mode=target_info.get('syncmod'))
-                success = bool(ret)
-                if not success:
-                    log.warn("【Sync】%s 转移失败，保留重试：%s" % (path, ret_msg))
+                if not ret:
+                    log.warn("【Sync】%s转移失败：%s" % (path, ret_msg))
+                    self.__record_unknown_files(files or [path], target_info)
+                    continue
+                # 成功后释放事件去重；失败的文件保留在 _synced_files 里，不再自动重试
+                with lock:
+                    for file in files:
+                        if file in self._synced_files:
+                            self._synced_files.remove(file)
             except Exception as err:
                 ExceptionUtils.exception_traceback(err)
-                log.error("【Sync】%s 转移异常，保留重试：%s" % (path, str(err)))
-            finally:
-                with lock:
-                    if success:
-                        for file in files:
-                            if file in self._synced_files:
-                                self._synced_files.remove(file)
-                    else:
-                        if time.monotonic() >= target_info.get('retry_at', 0):
-                            attempts = target_info.get('attempts', 0) + 1
-                            target_info['attempts'] = attempts
-                            target_info['retry_at'] = time.monotonic() + min(3600, 60 * 2 ** min(attempts - 1, 6))
-                        queued = self._need_sync_paths.get(path)
-                        if queued:
-                            queued['files'] = list(dict.fromkeys(files + queued['files']))
-                        else:
-                            self._need_sync_paths[path] = target_info
+                log.error("【Sync】%s转移异常：%s" % (path, str(err)))
+                self.__record_unknown_files(files or [path], target_info)
+
+    def __record_unknown_files(self, file_list, target_info):
+        """
+        转移失败的文件记入未识别队列，等待在“媒体整理-未识别”里手动识别
+        """
+        for file_path in file_list:
+            try:
+                # 已经成功入库过的文件不再重复登记
+                if self.dbhelper.is_transfer_in_blacklist(file_path):
+                    continue
+                if not self.dbhelper.is_need_insert_transfer_unknown(file_path):
+                    continue
+                self.dbhelper.insert_transfer_unknown(file_path,
+                                                      target_info.get('target'),
+                                                      target_info.get('syncmod'))
+                log.warn("【Sync】%s 已加入未识别，等待手动识别" % file_path)
+            except Exception as err:
+                ExceptionUtils.exception_traceback(err)
+                log.error("【Sync】%s记录未识别失败：%s" % (file_path, str(err)))
 
     def run_service(self):
         """

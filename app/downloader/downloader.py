@@ -1,5 +1,4 @@
 import os
-import time
 import uuid
 from threading import Lock
 
@@ -456,13 +455,7 @@ class Downloader:
                     log.info("【Downloader】开始转移下载文件...")
                 else:
                     return
-                if not hasattr(self, "_transfer_retries"):
-                    self._transfer_retries = {}
                 for task in trans_tasks:
-                    retry_key = (self._default_client_type.value, str(task.get("id")))
-                    attempts, retry_at = self._transfer_retries.get(retry_key, (0, 0))
-                    if time.monotonic() < retry_at:
-                        continue
                     try:
                         context = self._get_download_context(task, self._default_client_type)
                         done_flag, done_msg = self.filetransfer.transfer_media(
@@ -473,13 +466,8 @@ class Downloader:
                         ExceptionUtils.exception_traceback(err)
                         done_flag, done_msg = False, str(err)
                     if not done_flag:
-                        attempts += 1
-                        delay = min(3600, 60 * 2 ** min(attempts - 1, 6))
-                        self._transfer_retries[retry_key] = (attempts, time.monotonic() + delay)
-                        log.warn("【Downloader】%s 整理失败：%s，%s秒后重试" %
-                                 (task.get("path"), done_msg, delay))
+                        log.warn("【Downloader】%s 整理失败：%s" % (task.get("path"), done_msg))
                         continue
-                    self._transfer_retries.pop(retry_key, None)
                     if self._pt_rmt_mode in [RmtMode.MOVE, RmtMode.RCLONE, RmtMode.MINIO]:
                         log.warn("【Downloader】移动模式下删除种子文件：%s" % task.get("id"))
                         self.default_client.delete_torrents(delete_file=True, ids=task.get("id"))
