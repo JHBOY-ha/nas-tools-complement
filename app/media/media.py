@@ -13,6 +13,8 @@ from app.helper import MetaHelper
 from app.media.meta.metainfo import MetaInfo
 from app.media.meta._base import MetaBase
 from app.media.meta.fractional import episode_key, protect_fractional_episode, release_references
+from app.media.meta.special import extract_special, requires_confirmation
+from app.media.meta.special_resolver import SpecialResolver, identity
 from app.media.meta.recognition_rules import DEFAULT_EPISODE_MAPPINGS, DEFAULT_NAME_ALIASES
 from app.media.tmdbv3api import TMDb, Search, Movie, TV, Person, Find, TMDbException, Discover, Trending, Episode, Genre
 from app.utils import PathUtils, EpisodeFormat, RequestUtils, NumberUtils, StringUtils, cacheman
@@ -802,6 +804,12 @@ class Media:
         """
         if not meta_info:
             return {}
+        # Work-level caches contain no special-episode proof. Force RSS/indexer
+        # callers through full recognition instead of leaving a valid special
+        # permanently unconfirmed after the download evidence gate rejects it.
+        note = getattr(meta_info, "note", None) or {}
+        if any(note.get(key) for key in ("special_episode", "fractional_episode", "extra")):
+            return {}
         cached = self.meta.get_meta_data_by_key(self.__make_cache_key(meta_info))
         name = meta_info.get_name()
         cached_title = cached.get("title") or ""
@@ -1143,6 +1151,10 @@ class Media:
         meta_info.begin_episode, meta_info.end_episode = number, None
         meta_info.total_seasons = meta_info.total_episodes = 1
         fraction.update(status="confirmed", key=key)
+        if (meta_info.note or {}).get("special_episode"):
+            # Mixed OAD + decimal labels use the existing fractional evidence path.
+            meta_info.note["special_episode"].update(status="confirmed", provider="tmdb",
+                target_type="TV", target_id=info["id"], episode_id=ep.get("id"))
         fraction.pop("reason", None)
         meta_info.note["episode_mapping"] = {
             "source_episode": fraction["raw"], "source_season": source_season,
@@ -1433,6 +1445,8 @@ class Media:
             return None
         # 识别
         meta_info = MetaInfo(title, subtitle=subtitle, mtype=mtype)
+        if requires_confirmation(meta_info) and not (meta_info.note or {}).get("fractional_episode"):
+            return SpecialResolver(self).resolve(meta_info)
         if not meta_info.get_name() or not meta_info.type:
             log.warn("【Rmt】%s 未识别出有效信息！" % meta_info.org_string)
             return None
@@ -1579,11 +1593,15 @@ class Media:
         fractions = {path: protect_fractional_episode(os.path.basename(path))[1] for path in file_list}
         file_list = sorted(file_list, key=lambda path: bool(fractions[path]))
         fractional_cache = {}
+        # Special files are processed after normal files; only exact task keys share identity.
+        extra_enabled = ((Config().get_config("media") or {}).get("extras") or {}).get("enabled") is True
+        specials = {path: extract_special(os.path.basename(path), extra_enabled)[1] for path in file_list}
+        file_list = sorted(file_list, key=lambda path: bool(fractions[path] or specials[path]))
         task_identities = {}
         # 只按下载器提供的任务键分组，不能使用父目录或片名近似分组。
         for ctx in [download_context] + list((download_contexts or {}).values()):
             if ctx and ctx.get("task_key") and (ctx.get("tmdb_info") or {}).get("id"):
-                task_identities.setdefault(ctx["task_key"], set()).add(str(ctx["tmdb_info"]["id"]))
+                task_identities.setdefault(ctx["task_key"], set()).add(identity(ctx["tmdb_info"]))
         confirmed_tasks = {}
         default_info, default_type, default_context = tmdb_info, media_type, download_context
         # 遍历每个文件，看得出来的名称是不是不一样，不一样的先搜索媒体信息
@@ -1595,20 +1613,39 @@ class Media:
                     download_context = context
                     context_info = context.get("tmdb_info")
                     task_key = context.get("task_key")
-                    if fractions[file_path] and task_key and len(task_identities.get(task_key, set())) > 1:
+                    if (fractions[file_path] or specials[file_path]) and task_key and len(task_identities.get(task_key, set())) > 1:
                         raise ValueError("同一下载任务包含冲突作品身份")
-                    if (fractions[file_path] and tmdb_info and context_info
-                            and str(tmdb_info.get("id")) != str(context_info.get("id"))):
+                    if ((fractions[file_path] or specials[file_path]) and tmdb_info and context_info
+                            and identity(tmdb_info) != identity(context_info)):
                         raise ValueError("手动绑定与下载任务作品身份冲突")
                     tmdb_info = context_info or tmdb_info or confirmed_tasks.get(task_key)
                     if tmdb_info:
                         media_type = tmdb_info.get("media_type") or media_type
                 if not os.path.exists(file_path):
                     log.warn("【Meta】%s 不存在" % file_path)
+                    if fractions[file_path] or specials[file_path]:
+                        raise FileNotFoundError("特殊内容源文件已消失：%s" % file_path)
                     continue
                 # 解析媒体名称
                 # 先用自己的名称
                 file_name = os.path.basename(file_path)
+                if specials[file_path] and not fractions[file_path]:
+                    meta_info = MetaInfo(file_name, use_llm=not bool(download_context))
+                    manual = None
+                    # Existing manual controls are explicit target evidence, not a guess.
+                    if tmdb_info and not download_context:
+                        begin, end = episode_format.split_episode(file_name) if episode_format else (None, None)
+                        if tmdb_info.get("media_type") == MediaType.MOVIE:
+                            manual = {"media_type": "movie", "tmdb_id": tmdb_info["id"]}
+                        elif season is not None and begin is not None and (end is None or begin == end):
+                            manual = {"media_type": "tv", "tmdb_id": tmdb_info["id"],
+                                      "season": int(season), "episode": begin}
+                    # A task target constrains independently verified file evidence;
+                    # it must never act as a manual override for every task member.
+                    meta_info = SpecialResolver(self, fractional_cache).resolve(
+                        meta_info, bound=tmdb_info, context=download_context, manual=manual)
+                    return_media_infos[file_path] = meta_info
+                    continue
                 parent_name = os.path.basename(os.path.dirname(file_path))
                 parent_parent_name = os.path.basename(PathUtils.get_parent_paths(file_path, 2))
                 # 过滤掉蓝光原盘目录下的子文件
@@ -1818,12 +1855,16 @@ class Media:
                 if (context and context.get("task_key") and not fractions[file_path]
                         and meta_info.tmdb_info and not meta_info.skip_reason):
                     task_key = context["task_key"]
-                    task_identities.setdefault(task_key, set()).add(str(meta_info.tmdb_id))
+                    task_identities.setdefault(task_key, set()).add(identity(meta_info.tmdb_info))
                     confirmed_tasks[task_key] = meta_info.tmdb_info
             except Exception as err:
-                if fractions.get(file_path):
+                if fractions.get(file_path) or specials.get(file_path):
                     skipped = MetaBase(os.path.basename(file_path), fileflag=True)
-                    skipped.note["fractional_episode"] = fractions[file_path]
+                    if fractions.get(file_path):
+                        skipped.note["fractional_episode"] = fractions[file_path]
+                    else:
+                        special = specials[file_path]
+                        skipped.note["extra" if special["is_extra"] else "special_episode"] = special
                     skipped.skip_reason = "小数集识别失败，保留源文件：%s" % err
                     return_media_infos[file_path] = skipped
                 print(str(err))

@@ -9,6 +9,7 @@ from app.filetransfer import FileTransfer
 from app.helper import DbHelper, ThreadHelper, SubmoduleHelper
 from app.media import Media
 from app.media.meta import MetaInfo
+from app.media.meta.special import download_block_reason
 from app.mediaserver import MediaServer
 from app.message import Message
 from app.sites import Sites
@@ -148,6 +149,12 @@ class Downloader:
             if release.begin_season is not None and not release.get_episode_list():
                 payload["scope"] = "season_pack"
                 payload["release_seasons"] = release.get_season_list()
+        # Persist a verified target as a constraint, never as a per-file override.
+        special = (getattr(media_info, "note", None) or {}).get("special_episode")
+        if special and special.get("status") == "confirmed":
+            payload["special_target"] = {"media_type": tmdb_type.name, "tmdb_id": info["id"],
+                                         "season": media_info.begin_season,
+                                         "episode": media_info.begin_episode}
         context_id = uuid.uuid4().hex
         if not self.dbhelper.save_download_context(context_id, dl_type.value, payload):
             raise RuntimeError("保存下载识别信息失败，未添加下载任务")
@@ -265,6 +272,10 @@ class Downloader:
         :param torrent_file: 种子文件路径
         :return: 种子或状态，错误信息
         """
+        # Direct/manual downloads must obey the same evidence gate as batch RSS.
+        blocked = download_block_reason(media_info)
+        if blocked:
+            return None, blocked
         # 标题
         title = media_info.org_string
         # 详情页面
@@ -853,8 +864,12 @@ class Downloader:
         :param total_ep: 各季的总集数
         :return: 当前媒体是否缺失，各标题总的季集和缺失的季集，需要发送的消息
         """
-        if not no_exists:
+        if no_exists is None:
             no_exists = {}
+        # An unknown special is not a missing season; leave coverage untouched.
+        blocked = download_block_reason(meta_info)
+        if blocked:
+            return None, no_exists, [blocked]
         if not total_ep:
             total_ep = {}
         # 查找的季
@@ -1069,6 +1084,9 @@ class Downloader:
         """
         if not media_list:
             return []
+        # Filter before dedupe so an unresolved high-priority OVA cannot displace
+        # a valid season pack or clear its outstanding episodes in batch_download.
+        media_list = [item for item in media_list if not download_block_reason(item)]
 
         # 排序函数，标题、站点、资源类型、做种数量
         def get_sort_str(x):

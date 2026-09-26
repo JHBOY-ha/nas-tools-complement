@@ -16,8 +16,8 @@ from app.utils.types import MediaType, RmtMode, SyncType
 
 class ExtraRecognitionTest(unittest.TestCase):
     def test_extra_tags_do_not_block_parser_or_llm(self):
-        # 解析入口不决定内容是否转移，标签文件也经过正常识别流程。
-        for tag in ("NCOP", "NCOP&ED", "ED01", "PV01", "SP01"):
+        # Extras 默认关闭时仍正常识别；SP 改由特殊集证据确认测试覆盖。
+        for tag in ("NCOP", "NCOP&ED", "ED01", "PV01"):
             with self.subTest(tag=tag), \
                     patch("app.media.meta.metainfo.LLMMetaParser") as llm:
                 llm.return_value.merge_into.side_effect = lambda **kwargs: kwargs["meta_info"]
@@ -41,7 +41,7 @@ class ExtraRecognitionTest(unittest.TestCase):
             with patch("app.media.media.MetaInfo", side_effect=marker) as parser, \
                     patch("app.media.media.PathUtils.get_bluray_dir", return_value=None):
                 media.get_media_info_on_files([path])
-            parser.assert_called_once_with(title="Show [SP01].mkv")
+            parser.assert_called_once_with("Show [SP01].mkv", use_llm=True)
 
     def test_transfer_ignore_is_configurable_and_filename_only(self):
         transfer = FileTransfer.__new__(FileTransfer)

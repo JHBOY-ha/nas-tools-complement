@@ -15,6 +15,8 @@ from app.helper import DbHelper, ProgressHelper
 from app.helper import ThreadHelper
 from app.media import Media, Category, Scraper
 from app.media.meta import MetaInfo
+from app.media.meta.extra_transfer import EXTRA_FOLDERS, publish_extra
+from app.media.meta.special import extract_special
 from app.mediaserver import MediaServer
 from app.message import Message
 from app.subtitle import Subtitle
@@ -526,11 +528,21 @@ class FileTransfer:
                         # 未输入大小限制默认为配置大小限制
                         now_filesize = self._min_filesize if not str(min_filesize).isdigit() else int(
                             min_filesize) * 1024 * 1024
+                    # Explicit special clips can be smaller than the ordinary media limit.
+                    extras_enabled = ((Config().get_config("media") or {}).get("extras") or {}).get("enabled") is True
                     # 查找目录下的文件
                     file_list = PathUtils.get_dir_files(in_path=in_path,
                                                         episode_format=episode[0],
                                                         exts=RMT_MEDIAEXT,
-                                                        filesize=now_filesize)
+                                                        filesize=0)
+                    def eligible(path):
+                        try:
+                            return (os.path.getsize(path) >= now_filesize
+                                    or bool(extract_special(os.path.basename(path), extras_enabled)[1]))
+                        except OSError:
+                            # Let per-file recognition report a disappearing special.
+                            return True
+                    file_list = [path for path in file_list if eligible(path)]
                     log.debug("【Rmt】文件清单：" + str(file_list))
                     if len(file_list) == 0:
                         log.warn("【Rmt】%s 目录下未找到媒体文件，当前最小文件大小限制为 %s"
@@ -671,6 +683,21 @@ class FileTransfer:
                         self.__transfer_origin_file(file_item=file_item, target_dir=unknown_path, rmt_mode=rmt_mode)
                     else:
                         log.error("【Rmt】%s 无法识别媒体信息！" % file_name)
+                    continue
+                if (media.note or {}).get("extra"):
+                    # Extras bypass all regular-media history, scraping and subtitle work.
+                    extra = media.note["extra"]
+                    destination = extra["destination"]
+                    def record_extra():
+                        if self.dbhelper.insert_extra_transfer_history(
+                                file_item, destination, media, extra["category"], rmt_mode) is not True:
+                            return False
+                        return self.dbhelper.insert_transfer_blacklist(file_item) is not False
+                    publish_extra(file_item, destination, rmt_mode, self.__transfer_command, record_extra)
+                    refresh = {"type": media.type, "category": media.category, "title": media.title,
+                               "year": media.year, "target_path": extra["library_root"]}
+                    if refresh not in refresh_library_items:
+                        refresh_library_items.append(refresh)
                     continue
                 # 不启用洗版/强制整理时，按正式季集去重（包括已确认小数集）。
                 # 无历史记录的同 inode 重试仍由后续转移流程补写历史。
@@ -1289,10 +1316,51 @@ class FileTransfer:
                                        target_file=new_file,
                                        rmt_mode=sync_transfer_mode), ""
 
+    def _extra_destination(self, source, media, target_dir):
+        """Choose one verified parent directory, never every library or a source sibling."""
+        config = (Config().get_config("media") or {}).get("extras") or {}
+        profile = config.get("server_profile")
+        if config.get("enabled") is not True or profile not in EXTRA_FOLDERS:
+            raise ValueError("Extras 未启用或缺少有效 server_profile")
+        fields = self.get_format_dict(media)
+        template = self._movie_dir_rmt_format if media.type == MediaType.MOVIE else self._tv_dir_rmt_format
+        dirname = re.sub(r"[-_\s.]*None", "", template.format(**fields))
+        category = ((media.type == MediaType.MOVIE and self._movie_category_flag)
+                    or (media.type == MediaType.TV and self._tv_category_flag)
+                    or (media.type == MediaType.ANIME and self._anime_category_flag))
+        def parent(root):
+            return os.path.abspath(os.path.join(root, media.category, dirname) if category
+                                   else os.path.join(root, dirname))
+        if target_dir:
+            root, folder = os.path.abspath(target_dir), parent(target_dir)
+        else:
+            choices = set()
+            for row in self.dbhelper.get_media_transfer_history(media.tmdb_id, media.type):
+                if not row.DEST or not row.DEST_PATH or not row.DEST_FILENAME:
+                    continue
+                candidate = parent(row.DEST)
+                recorded = os.path.abspath(os.path.join(row.DEST_PATH, row.DEST_FILENAME))
+                if os.path.isfile(recorded) and os.path.commonpath([candidate, recorded]) == candidate:
+                    choices.add((os.path.abspath(row.DEST), candidate))
+            if len(choices) != 1:
+                raise ValueError("Extras 所属作品目标目录不唯一或尚未入库，请指定目标目录")
+            root, folder = next(iter(choices))
+        if not os.path.isdir(root) or os.path.commonpath([root, folder]) != root or folder == root:
+            raise ValueError("Extras 作品目录必须位于目标媒体库内")
+        category_dir = EXTRA_FOLDERS[profile][media.note["extra"]["category"]]
+        filename = StringUtils.clear_file_name(os.path.basename(source))
+        destination = os.path.abspath(os.path.join(folder, category_dir, filename))
+        # Prevent a pre-existing directory symlink from publishing outside the library.
+        if os.path.commonpath([os.path.realpath(root), os.path.realpath(os.path.dirname(destination))]) != os.path.realpath(root):
+            raise ValueError("Extras 目标路径越出媒体库")
+        return root, destination
+
     def _check_fractional_destinations(self, medias, target_dir, rmt_mode):
         """Preflight decimal destinations before publishing any file in the batch."""
+        # All evidence-bound content receives the same preflight collision protection.
         fractional = {path for path, meta in medias.items() if meta and not meta.skip_reason
-                      and (meta.note or {}).get("fractional_episode", {}).get("status") == "confirmed"}
+                      and any((meta.note or {}).get(key, {}).get("status") == "confirmed"
+                              for key in ("fractional_episode", "special_episode", "extra"))}
         if not fractional:
             return {}
         roots, destinations = {}, {}
@@ -1300,6 +1368,11 @@ class FileTransfer:
             if not meta or meta.skip_reason or not meta.tmdb_info:
                 continue
             try:
+                if (meta.note or {}).get("extra"):
+                    root, destination = self._extra_destination(path, meta, target_dir)
+                    meta.note["extra"].update(library_root=root, destination=destination)
+                    destinations.setdefault(os.path.normcase(os.path.abspath(os.path.splitext(destination)[0])), []).append(path)
+                    continue
                 root = target_dir or self.__get_best_target_path(
                     mtype=meta.type, in_path=path, size=os.path.getsize(path), rmt_mode=rmt_mode)
                 if not root:

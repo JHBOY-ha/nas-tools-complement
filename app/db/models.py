@@ -534,6 +534,19 @@ class TRANSFERHISTORY(Base):
         return {c.name: getattr(self, c.name) for c in self.__table__.columns}
 
 
+class EXTRATRANSFERHISTORY(Base):
+    """One row per published extra path; never included in episode coverage."""
+    __tablename__ = 'EXTRA_TRANSFER_HISTORY'
+
+    DEST_PATH = Column(Text, primary_key=True)
+    SOURCE_PATH = Column(Text, nullable=False)
+    PARENT_TYPE = Column(Text, nullable=False)
+    PARENT_ID = Column(Integer, nullable=False)
+    CATEGORY = Column(Text, nullable=False)
+    MODE = Column(Text, nullable=False)
+    COMPLETED_AT = Column(Text, nullable=False)
+
+
 class TRANSFERUNKNOWN(Base):
     __tablename__ = 'TRANSFER_UNKNOWN'
 

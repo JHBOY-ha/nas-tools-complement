@@ -216,6 +216,17 @@ class LLMMetaParser(object):
             self.__set_cached_parse_result(cache_key, {})
             return {}
 
+    def get_alias_candidates(self, title, subtitle=None):
+        """Expose existing Bangumi lookup as name hints, never authoritative IDs."""
+        if not self._search_context_enable or not title:
+            return []
+        names = []
+        for item in self.__search_bangumi_candidates(title):
+            for key in ("name_cn", "name"):
+                if item.get(key) and item[key] not in names:
+                    names.append(item[key])
+        return names
+
     def merge_into(self, meta_info, title, subtitle=None, mtype_hint=None):
         """
         将 LLM 识别结果与规则识别结果合并

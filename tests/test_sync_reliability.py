@@ -56,6 +56,11 @@ class RecognitionTests(unittest.TestCase):
         # 批次分类使用真实的小数集检测器。
         from app.media.meta.fractional import protect_fractional_episode
         self.ns["protect_fractional_episode"] = protect_fractional_episode
+        # New special classification is pure and safe in the AST harness.
+        from app.media.meta.special import extract_special
+        from app.media.meta.special_resolver import identity
+        self.ns["extract_special"] = extract_special
+        self.ns["identity"] = identity
         cls = load_class('app/media/media.py', 'Media', [
             '__search_media_with_name', '__extract_llm_tmdb_target', '__resolve_tmdb_mtype',
             'get_media_info_on_files', 'get_cache_info', '__make_cache_key', '_valid_media_identity',
@@ -289,6 +294,9 @@ class JellyfinTests(unittest.TestCase):
 class DownloadTests(unittest.TestCase):
     def setUp(self):
         self.ns = env()
+        # Exercise the production evidence gate in the isolated AST downloader.
+        from app.media.meta.special import download_block_reason
+        self.ns['download_block_reason'] = download_block_reason
         cls = load_class('app/downloader/downloader.py', 'Downloader',
                          ['transfer', '_get_download_context', '_create_download_context', 'check_exists_medias', 'get_monitored_download_contexts'], self.ns)
         self.d = cls()

@@ -63,3 +63,69 @@ Jellyfin 识别的是替换后的文件名：同一电影各版本在同目录�
 剪辑版也支持“片名＋完整剪辑短语＋年份＋资源信息”的发布格式，例如 `Rambo.Extended.Cut.2008.BluRay.1080p` 解析为片名 `Rambo`、年份 `2008`、`cut=Extended`。年份前仅接受明确完整短语或中文版本标签，须有有效片名前缀及年份后的资源标记；不全局删除片名里的 Cut/Extended，也不能保证所有歧义片名均可自动区分。
 
 审查补充：完整日期（如 `Show - 2022.08.01`）及整数集后的 `8bit/10bit/12bit/16bit`、分辨率标签不进入小数集确认。`S01E01-1080` 等四位裸数字终点保留为单集，`E01-03` 仍支持多集。新建整季任务另存发布季范围，仅该范围内已确认映射到 S00 的小数特别篇可越过主季约束；选集任务与旧上下文仍严格校验。已确认特别篇保留跨目录历史去重；预检源文件消失不会终止无关文件的处理。
+
+
+## 动漫特殊集与 Extras（2026-09-26）
+
+识别分为发布名解析、主体身份确认和具体内容确认三步。`OVA`、`OAD`、`SP`、`Special` 是发布标签，不是固定的媒体类型或正式集号。括号字段和明确发布分隔符可识别；不会全局删去片名中的 Special。`Ma10p` 等已知技术标签不进入片名，原名、发布编号、制作组和编码仍保留。
+
+主体身份优先使用明确绑定或精确下载任务；否则用清理后的片名和可选外部候选名称查询 TMDB，核对名称及动画分类。LLM/Bangumi 只提供名称提示，不能生成正式季集。特别篇先查 Season 0，再查全部季；标题或明确标签编号必须唯一，部分列表和证据冲突均保源。`OVA01` 不等于 `S00E01`，唯一一个特别篇也不能直接猜配。文件带明确 S00 编号则校验该集存在。
+
+独立 OVA 剧集按 TMDB `Video` 类型的自身编号核验；独立单集电影需唯一完整片名及明确年份、独立作品标题或人工绑定。无证据的 OVA 不会当作主体电影，也不会降级为 Extras。示例春物文件会解析出完整罗马字片名、`Kamigami&VCB-Studio`、1080p、X265、FLAC；作品确认后仍须核验具体 OVA，不能自动补 S00E01。
+
+所有自动映射输出使用 TMDB 默认季集顺序。Plex/Jellyfin/Emby 必须使用匹配的元数据顺序；本工具不自动改代理、TVDB/DVD/Absolute 顺序或特别篇播放时间线。现有用户命名模板继续生效。新整季任务可按明确发布季范围收纳已确认特别篇，旧任务和选集任务仍严格校验。
+
+### 人工映射配置
+
+以下 ID/集号仅说明配置结构，应替换为已核实的实际目标：
+
+```yaml
+media:
+  special_episode_mappings:
+    - source_type: tv
+      source_tmdb_id: 65676
+      kind: OVA
+      source_filename: "Show [OVA].mkv"
+      target:
+        media_type: tv
+        tmdb_id: 65676
+        season: 0
+        episode: 2
+```
+
+有编号时可用 `source_number: "1"`，有单集标题时可用 `source_title`，并可加 `source_season` 限定发布季。若无编号且无标题，必须填写完整 `source_filename`（包含扩展名）。全部已填写来源条件必须匹配。电影目标使用 `media_type: movie` 和 `tmdb_id`，不填写季集。重复规则、无效目标或人工指定与配置冲突均停止整理；所有映射仍验证目标实际存在。现有手动识别的明确作品及单集选择也会经过此校验。
+
+### 可选本地 Extras
+
+```yaml
+media:
+  extras:
+    enabled: true
+    server_profile: jellyfin  # jellyfin / plex / emby，启用时必填
+```
+
+默认关闭且不修改已保存配置。启用后，独立标签 NCOP/NCED/OP/ED 归普通附加内容，PV/TRAILER 归预告，INTERVIEW 归访谈，BEHIND THE SCENES 归幕后。忽略词优先，SP/OVA/OAD 仍走正式内容确认。第一版仅支持作品级视频 Extras，不自动分配到某一集，不开启主题音乐/背景视频功能。
+
+| 内容 | Jellyfin | Plex | Emby |
+| --- | --- | --- | --- |
+| 普通附加内容 | `other` | `Other` | `extras` |
+| 预告 | `trailers` | `Trailers` | `trailers` |
+| 访谈 | `interviews` | `Interviews` | `interviews` |
+| 幕后 | `behind the scenes` | `Behind The Scenes` | `behind the scenes` |
+
+目标为本次明确指定的库内作品目录，或该主体在正片历史中唯一有效的作品目录。多个库有同一作品、历史目录与当前模板不一致或无既有作品时，须指定目标目录，不凭源文件父目录猜测。文件名保留原发布名和标签，仅清理路径非法字符。明确附加内容可低于普通视频体积门槛，其余文件保持原过滤规则。
+
+支持本地硬链接、软链接、复制、移动；Rclone/Minio 模式不提供本地原子发布保障，返回错误并保源。目标同名不同文件不覆盖；同 inode 可重试。复制/移动遇到记录失败会保留源和 `.extra-pending` 暂存链接，后续相同源重试校验暂存内容再补写记录；移动在记录和成功黑名单均完成后才删源。不要将正在使用的暂存链接当作视频重新整理。
+
+并发整理对完整发布流程加锁，跨进程竞争时保源等待重试。目标旁的 `.extra-lock` 是持久锁文件，进程退出会自动释放系统锁，不应在运行中删除该文件。复制进程中断后，重试只会重建尚未发布的残缺暂存文件；已经与目标关联的暂存文件不会被覆盖。
+
+下载任务保存的特殊集目标仅用于约束，不能覆盖成员文件自己的编号或跳过 TMDB 核验。未确认的特殊集、小数集及本地 Extras 不参与正片下载、整季去重或缺集统计；已有缺集需求保持不变。TMDB 描述中的小数及范围（如 `OVA 1.5`、`OVA 1-OVA 2`）不作为整数发布编号证据。
+
+Extras 单独写 `EXTRA_TRANSFER_HISTORY`，不进入正片入库历史、缺集统计、正片自动字幕下载及 NFO 生成。批次未完全成功时返回失败，但正常文件继续。媒体库刷新复用既有开关；Plex 可能需要刷新整部作品，客户端 Extras 显示能力并不一致。本地未实际连接 NAS/Jellyfin/Plex/Emby，测试为离线 TMDB 样本与临时文件验证。
+
+官方规则依据：
+- [TMDB 动漫与 OVA 分类](https://www.themoviedb.org/bible/tv/59f743289251416e71000037)：附属 OVA、独立 OVA 剧集和单集电影需分别处理。
+- [TMDB 特别篇](https://www.themoviedb.org/bible/tv/59f73eb49251416e71000026)：特别季为 Season 0，但正式分配了普通季集号的内容仍保留原编号。
+- [Jellyfin 剧集与 Extras](https://jellyfin.org/docs/general/server/media/shows/)：目录与特别篇编号规则。
+- [Plex 剧集 Extras](https://support.plex.tv/articles/local-files-for-tv-show-trailers-and-extras/) 与 [编号顺序](https://support.plex.tv/articles/naming-and-organizing-your-tv-show-files/)。
+- [Emby TV Naming](https://emby.media/support/articles/TV-Naming.html)：Extras 与 Specials 的组织方式。
