@@ -13,6 +13,7 @@
 
 ## 字幕设置与任务资源限制
 
+- 在线字幕（迅雷 / Assrt）卡片使用迅雷官网 https://www.xunlei.com/about/ 引用的 https://www.xunlei.com/icons/logo.svg，保存为 `web/static/img/xunlei.svg`；复用相邻服务的封面布局，按原始比例完整显示，点击仍打开在线字幕配置弹窗，不依赖外站图片请求。
 - `web/templates/setting/subtitle.html` 只负责字幕服务配置；配置弹窗内仅保留并突出 OpenSubtitles API Consumers 快捷按钮，不另设重复的官网入口，首页卡片只打开配置。
 - `web/templates/setting/subtitle_task_settings.html` 为独立任务设置页，经登录保护的 `/subtitle_task_settings` 路由加载，兼容现有 `navmenu` 的 POST 加载及浏览器历史恢复。
 - `web/templates/rename/medialibrary.html` 在字幕库工具栏提供任务设置入口；“任务设置”与“任务中心”共用尺寸规则。
