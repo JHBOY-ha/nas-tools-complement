@@ -693,6 +693,7 @@ class FileTransfer:
                 if (media.note or {}).get("extra"):
                     # Extras bypass all regular-media history, scraping and subtitle work.
                     extra = media.note["extra"]
+                    self._recheck_extra_destination(file_item, media, target_dir)
                     destination = extra["destination"]
                     def record_extra():
                         if self.dbhelper.insert_extra_transfer_history(
@@ -1322,7 +1323,7 @@ class FileTransfer:
                                        target_file=new_file,
                                        rmt_mode=sync_transfer_mode), ""
 
-    def _extra_destination(self, source, media, target_dir):
+    def _extra_destination(self, source, media, target_dir, directory_cache=None, revalidate=False):
         """Choose one verified parent directory, never every library or a source sibling."""
         config = (Config().get_config("media") or {}).get("extras") or {}
         profile = config.get("server_profile")
@@ -1337,20 +1338,40 @@ class FileTransfer:
         def parent(root):
             return os.path.abspath(os.path.join(root, media.category, dirname) if category
                                    else os.path.join(root, dirname))
+        key = (media.type.name, str(media.tmdb_id), dirname, bool(category),
+               media.category if category else None)
+        cache = directory_cache if directory_cache is not None else {}
+        evidence = None
         if target_dir:
             root, folder = os.path.abspath(target_dir), parent(target_dir)
         else:
-            choices = set()
-            for row in self.dbhelper.get_media_transfer_history(media.tmdb_id, media.type):
-                if not row.DEST or not row.DEST_PATH or not row.DEST_FILENAME:
-                    continue
-                candidate = parent(row.DEST)
-                recorded = os.path.abspath(os.path.join(row.DEST_PATH, row.DEST_FILENAME))
-                if os.path.isfile(recorded) and os.path.commonpath([candidate, recorded]) == candidate:
-                    choices.add((os.path.abspath(row.DEST), candidate))
-            if len(choices) != 1:
-                raise ValueError("Extras 所属作品目标目录不唯一或尚未入库，请指定目标目录")
-            root, folder = next(iter(choices))
+            evidence = cache.get(key)
+            # Preflight shares one snapshot; publication rechecks its live witness.
+            if evidence and revalidate and (not os.path.isdir(evidence["root"])
+                                            or not os.path.isfile(evidence["witness"])):
+                cache.pop(key, None)
+                evidence = None
+            if evidence is None:
+                groups = {}
+                for row in self.dbhelper.get_media_transfer_history(media.tmdb_id, media.type):
+                    if not row.DEST or not row.DEST_PATH or not row.DEST_FILENAME:
+                        continue
+                    candidate = parent(row.DEST)
+                    recorded = os.path.abspath(os.path.join(row.DEST_PATH, row.DEST_FILENAME))
+                    if os.path.commonpath([candidate, recorded]) == candidate:
+                        groups.setdefault((os.path.abspath(row.DEST), candidate), []).append(recorded)
+                choices = []
+                for (candidate_root, candidate_folder), records in groups.items():
+                    # One live regular file proves this directory, but every other
+                    # candidate directory must still be checked for ambiguity.
+                    witness = next((record for record in records if os.path.isfile(record)), None)
+                    if witness:
+                        choices.append({"key": key, "root": candidate_root,
+                                        "folder": candidate_folder, "witness": witness})
+                if len(choices) != 1:
+                    raise ValueError("Extras 所属作品目标目录不唯一或尚未入库，请指定目标目录")
+                evidence = cache[key] = choices[0]
+            root, folder = evidence["root"], evidence["folder"]
         if not os.path.isdir(root) or os.path.commonpath([root, folder]) != root or folder == root:
             raise ValueError("Extras 作品目录必须位于目标媒体库内")
         category_dir = EXTRA_FOLDERS[profile][media.note["extra"]["category"]]
@@ -1359,7 +1380,19 @@ class FileTransfer:
         # Prevent a pre-existing directory symlink from publishing outside the library.
         if os.path.commonpath([os.path.realpath(root), os.path.realpath(os.path.dirname(destination))]) != os.path.realpath(root):
             raise ValueError("Extras 目标路径越出媒体库")
+        # Retain only the selected witness for publication; the batch cache is local.
+        media.note["extra"]["directory_evidence"] = evidence
         return root, destination
+
+    def _recheck_extra_destination(self, source, media, target_dir):
+        """Revalidate the witness and path without changing a preflight destination."""
+        extra = media.note["extra"]
+        evidence = extra.get("directory_evidence")
+        cache = {tuple(evidence["key"]): evidence} if evidence else {}
+        root, destination = self._extra_destination(source, media, target_dir, cache, revalidate=True)
+        # A moved library needs a new batch collision check, never silent rerouting.
+        if root != extra["library_root"] or destination != extra["destination"]:
+            raise ValueError("Extras 目标目录已变化，保留源文件等待重新预检")
 
     def _check_fractional_destinations(self, medias, target_dir, rmt_mode):
         """Preflight decimal destinations before publishing any file in the batch."""
@@ -1370,12 +1403,13 @@ class FileTransfer:
         if not fractional:
             return {}
         roots, destinations = {}, {}
+        extra_directories = {}  # Shared only by this preflight, never across batches.
         for path, meta in medias.items():
             if not meta or meta.skip_reason or not meta.tmdb_info:
                 continue
             try:
                 if (meta.note or {}).get("extra"):
-                    root, destination = self._extra_destination(path, meta, target_dir)
+                    root, destination = self._extra_destination(path, meta, target_dir, extra_directories)
                     meta.note["extra"].update(library_root=root, destination=destination)
                     destinations.setdefault(os.path.normcase(os.path.abspath(os.path.splitext(destination)[0])), []).append(path)
                     continue

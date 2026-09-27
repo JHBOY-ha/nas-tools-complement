@@ -1,6 +1,7 @@
 """Release labels describe content, not TMDB types or episode ordinals."""
 import os
 import re
+from functools import lru_cache
 
 import cn2an
 
@@ -121,6 +122,20 @@ def extract_special(title, include_extras=False):
 
 
 def special_references(text):
+    """Reuse bounded pure-text evidence, returning a fresh collection to callers."""
+    text = text or ""
+    # Oversized overviews are parsed in full without occupying the process cache.
+    parse = _cached_special_references if len(text) <= 2048 else _parse_special_references
+    return set(parse(text))
+
+
+@lru_cache(maxsize=2048)
+def _cached_special_references(text):
+    # Only immutable evidence is shared; resource-specific decisions are not cached.
+    return tuple(_parse_special_references(text))
+
+
+def _parse_special_references(text):
     """Only labelled references are evidence; generic integers are never ordinals."""
     result = set()
     # Consume ambiguous decimals/ranges as a whole so neither endpoint becomes an

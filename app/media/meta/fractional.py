@@ -1,6 +1,7 @@
 """Release decimal labels are evidence keys, never TMDB episode numbers."""
 import os
 import re
+from functools import lru_cache
 
 import cn2an
 from config import RMT_MEDIAEXT
@@ -135,6 +136,20 @@ def protect_fractional_episode(title):
 
 
 def release_references(text):
+    """Reuse bounded pure-text evidence, returning a fresh collection to callers."""
+    text = text or ""
+    # Oversized overviews are parsed in full without occupying the process cache.
+    parse = _cached_release_references if len(text) <= 2048 else _parse_release_references
+    return list(parse(text))
+
+
+@lru_cache(maxsize=2048)
+def _cached_release_references(text):
+    # Only immutable evidence is shared; resource-specific decisions are not cached.
+    return tuple(_parse_release_references(text))
+
+
+def _parse_release_references(text):
     """Read labelled release references only, not arbitrary decimals in prose."""
     text = text or ""
     # Mask every endpoint before the individual reference scan. Negative

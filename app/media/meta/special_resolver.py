@@ -94,6 +94,11 @@ class SpecialResolver:
             seasons = info.get("seasons")
         if not isinstance(seasons, list) or not seasons:
             raise ValueError("TMDB 季列表不完整")
+        # The season manifest is part of the key so changed counts are revalidated.
+        key = ("special", self.language, "validated_episodes", str(info["id"]),
+               tuple((repr(entry.get("season_number")), repr(entry.get("episode_count"))) for entry in seasons))
+        if key in self.cache:
+            return self.cache[key]
         result = []
         seen = set()
         for entry in sorted(seasons, key=lambda s: s.get("season_number", -1)):
@@ -113,7 +118,9 @@ class SpecialResolver:
                     raise ValueError("TMDB 集列表重复")
                 numbers.add(ep["episode_number"])
                 result.append((number, ep))
-        return result
+        # Publish only after every season and episode has passed validation.
+        self.cache[key] = tuple(result)
+        return self.cache[key]
 
     @staticmethod
     def validate_episode(info, season, ep):
