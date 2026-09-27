@@ -32,6 +32,7 @@ python3 -m tests.run_recognition tests.test_media_identity_matrix
 | 发布编号映射 | 明确作品规则、LLM 季绑定、失败回滚、缓存与 IMDb 命中后仍检查编号 | `test_llm_season_binding`、`test_media_cache_numbering`、`test_media_recognition_integrity` |
 | 特殊内容 | 小数集、OVA/OAD/SP/SPECIAL、S00、Extras、完整证据、重复/冲突/缺失数据、范围保护 | `test_fractional_versions`、`test_special_episodes`、`test_meta_multi_episode_guards` |
 | 特殊集二次确认 | 只读查询、正式链接、明确确认、文件变化、目标消失、单文件作用域与配置冲突；模拟接口浏览器交互 | `test_special_confirmation`、`test_special_confirmation_ui.js` |
+| 审查边界 | 自定义词先行、单次提取、真实搜索分页、标题归一化、无硬链接发布回退、竞争目标及失败记录 | `test_review_regressions` |
 | 下游处理 | RSS/搜索、下载选集、手动季集覆盖、任务冲突、保留源文件、目标碰撞、失败重试 | `test_media_cache_numbering`、`test_meta_parser_boundaries`、`test_sync_reliability`、`test_special_episodes` |
 
 文件名解析阶段的动漫常先得到电视剧类型；TMDB 电视剧详情中的动画分类才决定最终 `ANIME` 类型。动画电影仍属于 `MOVIE`。测试分别检查解析阶段和最终分类，不能用“文件名解析为 TV”直接判定动漫识别失败。

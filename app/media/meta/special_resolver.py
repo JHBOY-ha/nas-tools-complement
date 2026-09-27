@@ -45,10 +45,23 @@ class SpecialResolver:
     def search(self, names, year=None, anime=False):
         candidates = {}
         for name in dict.fromkeys(name for name in names if name):
-            items = self.cached(("search", name), lambda: self.media.get_tmdb_infos(title=name))
-            # A full page is not proof of an exhaustive, unique result.
-            if items is None or len(items) >= 20:
-                raise ValueError("作品候选查询失败或结果不完整")
+            items = []
+            seen_pages = set()
+            # Bound provider work, but never treat a truncated or repeating page as unique.
+            for page in range(1, 26):
+                batch = self.cached(("search", name, page),
+                                    lambda: self.media.get_tmdb_search_page(title=name, page=page))
+                if batch is None:
+                    raise ValueError("作品候选查询失败")
+                signature = tuple((str(i.get("media_type")), str(i.get("id"))) for i in batch)
+                if batch and signature in seen_pages:
+                    raise ValueError("作品候选分页重复，不能确认唯一性")
+                seen_pages.add(signature)
+                items.extend(batch)
+                if len(batch) < 20:
+                    break
+            else:
+                raise ValueError("作品候选过多，请使用更具体的片名或人工确认")
             for item in items:
                 kind = tmdb_type(item.get("media_type"))
                 if not kind or not item.get("id"):
@@ -187,6 +200,7 @@ class SpecialResolver:
             release_seasons = context.get("release_seasons") or seasons
             return (not episodes and (note.get("source_season") is None or not release_seasons
                                       or note["source_season"] in release_seasons))
+        # Compatibility for explicitly supplied/imported contexts; current downloader writes TMDB numbering.
         if context.get("numbering") == "release":
             return ((not seasons or note.get("source_season") in seasons)
                     and (not episodes or note.get("number") in {str(e) for e in episodes}))

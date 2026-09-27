@@ -1,3 +1,4 @@
+import copy
 import os.path
 import regex as re
 from anitopy.parser_number import is_valid_episode_number
@@ -15,7 +16,20 @@ from app.media.meta.release_version import extract_cut
 from app.media.meta.special import extract_special
 
 
-def MetaInfo(title, subtitle=None, mtype=None, use_llm=True):
+def prepare_title(title):
+    """Apply user rules before release extraction; reusable only within this batch."""
+    original = title
+    title, messages, used = WordsHelper().process(title)
+    for message in messages or []:
+        log.warn("【Meta】%s" % message)
+    title, fractional = protect_fractional_episode(title)
+    extras = ((Config().get_config("media") or {}).get("extras") or {}).get("enabled") is True
+    title, special = extract_special(title, include_extras=extras)
+    title, cut = extract_cut(title)
+    return dict(original=original, title=title, used=used, fractional=fractional, special=special, cut=cut)
+
+
+def MetaInfo(title, subtitle=None, mtype=None, use_llm=True, _prepared=None):
     """
     媒体整理入口，根据名称和副标题，判断是哪种类型的识别，返回对应对象
     :param title: 标题、种子名、文件名
@@ -25,33 +39,17 @@ def MetaInfo(title, subtitle=None, mtype=None, use_llm=True):
     :return: MetaAnime、MetaVideo
     """
 
-    # 内容过滤由转移忽略词配置控制，解析器不按附加内容标签提前返回。
-    # 明确选择电影时，纯数字是片名；未知类型仍兼容 0001.mkv 等剧集编号。
+    # Keep release evidence and rule provenance consistent with batch partitioning.
+    prepared = copy.deepcopy(_prepared) if _prepared is not None else prepare_title(title)
+    original_title, title = prepared["original"], prepared["title"]
+    fractional_episode, special, cut = prepared["fractional"], prepared["special"], prepared["cut"]
+    used_info = prepared["used"]
+    if subtitle:
+        subtitle, _, _ = WordsHelper().process(subtitle)
     numeric_title, extension = os.path.splitext(title or "")
     if extension.lower() not in RMT_MEDIAEXT:
         numeric_title = title or ""
-    if mtype == MediaType.MOVIE and numeric_title.strip().isdigit():
-        meta_info = MetaBase(title, subtitle)
-        meta_info.en_name = numeric_title.strip()
-        meta_info.type = MediaType.MOVIE
-        return meta_info
-
-    original_title = title
-    title, fractional_episode = protect_fractional_episode(title)
-    # Specials retain release evidence outside the generic integer parser.
-    extras_enabled = ((Config().get_config("media") or {}).get("extras") or {}).get("enabled") is True
-    title, special = extract_special(title, include_extras=extras_enabled)
-    # 原名中的剪辑版先提取，避免标题清理丢失或与 edition 混合。
-    title, cut = extract_cut(title)
-
-    # 应用自定义识别词
-    title, msg, used_info = WordsHelper().process(title)
-    if subtitle:
-        subtitle, _, _ = WordsHelper().process(subtitle)
-
-    if msg:
-        for msg_item in msg:
-            log.warn("【Meta】%s" % msg_item)
+    numeric_movie = mtype == MediaType.MOVIE and numeric_title.strip().isdigit()
 
     # 判断是否处理文件
     # File safeguards must apply equally to .mkv and .MKV release names.
@@ -60,7 +58,12 @@ def MetaInfo(title, subtitle=None, mtype=None, use_llm=True):
     else:
         fileflag = False
 
-    if special or mtype == MediaType.ANIME or is_anime(title):
+    if numeric_movie:
+        # Numeric movie titles still pass through user rules and common provenance assignment.
+        meta_info = MetaBase(title, subtitle)
+        meta_info.en_name = numeric_title.strip()
+        meta_info.type = MediaType.MOVIE
+    elif special or mtype == MediaType.ANIME or is_anime(title):
         meta_info = MetaAnime(title, subtitle, fileflag)
     else:
         meta_info = MetaVideo(title, subtitle, fileflag)
@@ -97,7 +100,7 @@ def MetaInfo(title, subtitle=None, mtype=None, use_llm=True):
         if codec:
             meta_info.video_encode = codec[1].upper()
 
-    if use_llm and not fractional_episode and not special:
+    if use_llm and not numeric_movie and not fractional_episode and not special:
         # LLM增强识别（配置关闭或调用失败时会自动回落规则识别结果）
         meta_info = LLMMetaParser().merge_into(meta_info=meta_info,
                                                title=title,

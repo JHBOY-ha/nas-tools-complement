@@ -141,3 +141,26 @@ class SpecialConfirmationTest(unittest.TestCase):
                 dict(tmdb_id=42, source_episode='11.5', target_season=0, target_episode=2)])
             self.assertFalse(media._confirm_fractional_episode(meta, info))
             self.assertIn('冲突', meta.note['fractional_episode']['reason'])
+
+    def test_confirmed_movie_reaches_real_resolver_without_episode_controls(self):
+        source = os.path.join(self.temp.name, 'Show [SP01].mkv')
+        os.rename(self.path, source)
+        self.path = source
+        self.db.get_unknown_path_by_id.return_value[0].PATH = source
+        movie = dict(id=42, title='Standalone Story', media_type=MediaType.MOVIE, release_date='2020-01-01')
+        self.media.get_tmdb_info.return_value = movie
+        real_media = Media.__new__(Media)
+        real_media.tmdb = object()
+        def transfer(**kwargs):
+            result = real_media.get_media_info_on_files([source], tmdb_info=kwargs['tmdb_info'],
+                season=kwargs['season'], episode_format=kwargs['episode'][0])[source]
+            self.assertFalse(result.skip_reason)
+            self.assertEqual(result.type, MediaType.MOVIE)
+            self.assertEqual(result.tmdb_id, 42)
+            self.assertIsNone(result.begin_episode)
+            return True, ''
+        self.transfer.transfer_media.side_effect = transfer
+        with patch.object(real_media, 'get_tmdb_info', return_value=movie):
+            payload = self.confirmation()
+            payload.update(type='movie', season=None, episode=None)
+            self.assertEqual(self.request(**payload)['retcode'], 0)

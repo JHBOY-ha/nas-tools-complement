@@ -15,7 +15,7 @@ from app.helper import DbHelper, ProgressHelper
 from app.helper import ThreadHelper
 from app.media import Media, Category, Scraper
 from app.media.meta import MetaInfo
-from app.media.meta.extra_transfer import EXTRA_FOLDERS, publish_extra
+from app.media.meta.extra_transfer import EXTRA_FOLDERS, publish_extra, publish_exclusive
 from app.media.meta.special import extract_special
 from app.mediaserver import MediaServer
 from app.message import Message
@@ -402,7 +402,7 @@ class FileTransfer:
             log.error("【Rmt】%s %s到unknown失败，错误码 %s" % (file_item, rmt_mode.value, retcode))
         return retcode
 
-    def __transfer_file(self, file_item, new_file, rmt_mode, over_flag=False, old_file=None):
+    def __transfer_file(self, file_item, new_file, rmt_mode, over_flag=False, old_file=None, protected=False):
         """
         转移一个文件，同时处理字幕
         :param file_item: 原文件路径
@@ -411,6 +411,10 @@ class FileTransfer:
         :param over_flag: 是否覆盖，为True时会先删除再转移
         """
         file_name = os.path.basename(file_item)
+        if protected:
+            # Recheck/publish atomically at the actual write, not only during batch preflight.
+            publish_exclusive(file_item, new_file, rmt_mode, self.__transfer_command, lambda: True)
+            return self.__transfer_subtitles(org_name=file_item, new_name=new_file, rmt_mode=rmt_mode)
         if not over_flag and os.path.exists(new_file):
             log.warn("【Rmt】文件已存在：%s" % new_file)
             return 0
@@ -640,6 +644,9 @@ class FileTransfer:
                     success_flag = False
                     failed_count += 1
                     error_message = "跳过 %s：%s" % (os.path.basename(file_item), media.skip_reason)
+                    # A retained source still needs a database ID for the confirmation dialog.
+                    if self.dbhelper.is_need_insert_transfer_unknown(file_item):
+                        self.dbhelper.insert_transfer_unknown(file_item, target_dir, rmt_mode)
                     continue
                 # 总数量
                 total_count = total_count + 1
@@ -753,6 +760,10 @@ class FileTransfer:
                 # 新文件后缀
                 file_ext = os.path.splitext(file_item)[-1]
                 new_file = ret_file_path
+                protected = any((media.note or {}).get(key, {}).get("status") == "confirmed"
+                                for key in ("fractional_episode", "special_episode"))
+                if protected and file_exist_flag and not os.path.samefile(file_item, ret_file_path):
+                    raise ValueError("特殊集目标已存在不同文件，保留源文件")
                 # 已存在的文件数量
                 exist_filenum = 0
                 handler_flag = False
@@ -784,7 +795,7 @@ class FileTransfer:
                                 ret = self.__transfer_file(file_item=file_item,
                                                            new_file=new_file,
                                                            rmt_mode=rmt_mode,
-                                                           over_flag=True, old_file=old_file)
+                                                           over_flag=True, old_file=old_file, protected=protected)
                                 if ret != 0:
                                     success_flag = False
                                     error_message = "文件转移失败，错误码 %s" % ret
@@ -864,7 +875,7 @@ class FileTransfer:
                         ret = self.__transfer_file(file_item=file_item,
                                                    new_file=new_file,
                                                    rmt_mode=rmt_mode,
-                                                   over_flag=False)
+                                                   over_flag=False, protected=protected)
                         if ret != 0:
                             success_flag = False
                             error_message = "文件转移失败，错误码 %s" % ret

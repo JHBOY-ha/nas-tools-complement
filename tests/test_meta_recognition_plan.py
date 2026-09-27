@@ -41,7 +41,9 @@ class ExtraRecognitionTest(unittest.TestCase):
             with patch("app.media.media.MetaInfo", side_effect=marker) as parser, \
                     patch("app.media.media.PathUtils.get_bluray_dir", return_value=None):
                 media.get_media_info_on_files([path])
-            parser.assert_called_once_with("Show [SP01].mkv", use_llm=True)
+            parser.assert_called_once()
+            self.assertEqual("Show [SP01].mkv", parser.call_args.args[0])
+            self.assertEqual("SP", parser.call_args.kwargs["_prepared"]["special"]["kind"])
 
     def test_transfer_ignore_is_configurable_and_filename_only(self):
         transfer = FileTransfer.__new__(FileTransfer)

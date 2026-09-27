@@ -1,4 +1,6 @@
 """Local extra publication: no overwrite, no episode history, recoverable retries."""
+import errno
+import json
 import filecmp
 import hashlib
 import os
@@ -6,6 +8,7 @@ from contextlib import contextmanager
 from threading import Lock
 
 from app.utils.types import RmtMode
+from app.utils.exclusive_publish import rename_exclusive
 
 _publish_lock = Lock()
 
@@ -50,8 +53,13 @@ EXTRA_FOLDERS = {
 
 def publish_extra(source, destination, mode, transfer, record):
     """Keep MOVE sources until both publication and persistence succeed."""
+    return publish_exclusive(source, destination, mode, transfer, record)
+
+
+def publish_exclusive(source, destination, mode, transfer, record):
+    """Shared protected publication for extras and evidence-bound episodes."""
     if mode not in (RmtMode.LINK, RmtMode.COPY, RmtMode.MOVE, RmtMode.SOFTLINK):
-        raise ValueError("Extras 仅支持本地硬链接、软链接、复制或移动")
+        raise ValueError("受保护内容仅支持本地硬链接、软链接、复制或移动，远程模式无法保证排他发布")
     destination = os.path.abspath(destination)
     os.makedirs(os.path.dirname(destination), exist_ok=True)
     with _lock_destination(destination):
@@ -64,12 +72,22 @@ def _publish_extra(source, destination, mode, transfer, record):
     fingerprint = "%s:%s:%s" % (os.path.abspath(source), stat.st_size, stat.st_mtime_ns)
     token = hashlib.sha256(fingerprint.encode()).hexdigest()[:20]
     pending = destination + "." + token + ".extra-pending"
+    receipt = pending + ".receipt"
+    source_identity = [stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns]
     if os.path.lexists(destination):
         same = os.path.samefile(source, destination)
         # A retained staging inode proves this exact source was published before a
         # database failure. Compare bytes for COPY/MOVE, never trust just the size.
         retry = (os.path.exists(pending) and os.path.samefile(pending, destination)
                  and filecmp.cmp(source, pending, shallow=False))
+        if not same and not retry and os.path.isfile(receipt):
+            # A no-replace rename consumes pending; its prewritten inode receipt survives crashes.
+            with open(receipt, encoding="utf-8") as handle:
+                saved = json.load(handle)
+            published = os.lstat(destination)
+            retry = (saved.get("source") == source_identity
+                     and saved.get("target") == [published.st_dev, published.st_ino, published.st_size, published.st_mtime_ns]
+                     and filecmp.cmp(source, destination, shallow=False))
         if not same and not retry:
             raise ValueError("Extras 目标已存在不同文件，保留源文件")
     else:
@@ -90,7 +108,19 @@ def _publish_extra(source, destination, mode, transfer, record):
                     os.unlink(pending)
                 raise OSError("Extras 暂存失败")
         # link is an atomic, exclusive publish, including for copies on this volume.
-        os.link(pending, destination, follow_symlinks=False)
+        try:
+            os.link(pending, destination, follow_symlinks=False)
+        except OSError as error:
+            if error.errno not in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS, errno.EXDEV, errno.EINVAL):
+                raise
+            staged = os.lstat(pending)
+            # Persist before rename so a crash after publication can be safely retried.
+            with open(receipt, "w", encoding="utf-8") as handle:
+                json.dump({"source": source_identity,
+                           "target": [staged.st_dev, staged.st_ino, staged.st_size, staged.st_mtime_ns]}, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            rename_exclusive(pending, destination)
     current = os.stat(source)
     if (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns) != (
             stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns):
@@ -101,3 +131,5 @@ def _publish_extra(source, destination, mode, transfer, record):
         os.unlink(source)
     if os.path.lexists(pending):
         os.unlink(pending)
+    if os.path.exists(receipt):
+        os.unlink(receipt)

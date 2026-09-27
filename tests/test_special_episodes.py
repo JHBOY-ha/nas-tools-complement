@@ -43,7 +43,7 @@ class SpecialRecognitionTest(unittest.TestCase):
         self.config = self.cfg.start()
         self.config.return_value.get_config.return_value = {}
         self.addCleanup(self.cfg.stop)
-        self.query = patch.object(self.media, 'get_tmdb_infos', return_value=[self.info]).start()
+        self.query = patch.object(self.media, 'get_tmdb_search_page', return_value=[self.info]).start()
         self.detail = patch.object(self.media, 'get_tmdb_info', return_value=self.info).start()
         self.season = patch.object(self.media, 'get_tmdb_tv_season_detail',
                                   side_effect=lambda tmdbid, season: {"episodes": self.episodes[season]}).start()
@@ -111,7 +111,7 @@ class SpecialRecognitionTest(unittest.TestCase):
         self.assertTrue(self.resolve(SAMPLE).skip_reason)
 
     def test_bangumi_aliases_are_revalidated_in_tmdb(self):
-        self.query.side_effect = lambda title: [self.info] if title == self.info['name'] else []
+        self.query.side_effect = lambda title, page=1: [self.info] if title == self.info['name'] else []
         with patch('app.media.meta.special_resolver.LLMMetaParser') as llm:
             llm.return_value.get_alias_candidates.return_value = [self.info['name']]
             meta = self.resolve('Unknown Show [OVA01].mkv')

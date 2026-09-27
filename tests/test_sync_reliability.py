@@ -58,6 +58,8 @@ class RecognitionTests(unittest.TestCase):
         # 批次分类使用真实的小数集检测器。
         from app.media.meta.fractional import protect_fractional_episode
         self.ns["protect_fractional_episode"] = protect_fractional_episode
+        from app.media.meta.metainfo import prepare_title
+        self.ns["prepare_title"] = prepare_title
         # New special classification is pure and safe in the AST harness.
         from app.media.meta.special import extract_special
         from app.media.meta.special_resolver import identity

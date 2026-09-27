@@ -11,10 +11,10 @@ from lxml import etree
 
 import log
 from app.helper import MetaHelper
-from app.media.meta.metainfo import MetaInfo
+from app.media.meta.metainfo import MetaInfo, prepare_title
 from app.media.meta._base import MetaBase
-from app.media.meta.fractional import episode_key, protect_fractional_episode, release_references
-from app.media.meta.special import extract_special, requires_confirmation
+from app.media.meta.fractional import episode_key, release_references
+from app.media.meta.special import normalized, requires_confirmation
 from app.media.meta.special_resolver import SpecialResolver, identity
 from app.media.meta.recognition_rules import DEFAULT_EPISODE_MAPPINGS, DEFAULT_NAME_ALIASES
 from app.media.tmdbv3api import TMDb, Search, Movie, TV, Person, Find, TMDbException, Discover, Trending, Episode, Genre
@@ -724,6 +724,21 @@ class Media:
                     tmdb_info['name'] = cn_title
         return tmdb_info
 
+    def get_tmdb_search_page(self, title, page=1):
+        """Fetch a real multi-search page, retaining non-media entries for completeness checks."""
+        if not self.tmdb or not title:
+            raise ValueError("TMDB 未配置或作品名称为空")
+        results = self.search.multi({"query": title, "page": page})
+        if results is None:
+            raise ValueError("TMDB 作品查询失败")
+        items = []
+        for result in results:
+            item = dict(result)
+            if item.get("media_type") in ("movie", "tv"):
+                item["media_type"] = MediaType.MOVIE if item["media_type"] == "movie" else MediaType.TV
+            items.append(item)
+        return items
+
     def get_tmdb_infos(self, title, year=None, mtype: MediaType = None, page=1):
         """
         查询名称中有关键字的所有的TMDB信息并返回
@@ -734,7 +749,9 @@ class Media:
         if not title:
             return []
         if not mtype and not year:
-            results = self.__search_multi_tmdbinfos(title)
+            # Multi-search pagination must reach TMDB rather than slice its first page.
+            return [item for item in self.get_tmdb_search_page(title, page)
+                    if item.get("media_type") in (MediaType.MOVIE, MediaType.TV)]
         else:
             if not mtype:
                 results = list(
@@ -1068,9 +1085,6 @@ class Media:
                     log.warn("【Meta】小数集 TMDB 查询失败：%s" % err)
                     cache[cache_key] = None
             return cache[cache_key]
-
-        def normalized(value):
-            return re.sub(r"\W+", "", str(value or "").casefold())
 
         def valid_episode(ep, season):
             return (hasattr(ep, "get") and type(ep.get("episode_number")) is int
@@ -1651,14 +1665,12 @@ class Media:
         # 不是list的转为list
         if not isinstance(file_list, list):
             file_list = [file_list]
-        # 稳定分区：整数文件先完成识别，小数文件随后确认；不依赖目录继承作品。
-        fractions = {path: protect_fractional_episode(os.path.basename(path))[1] for path in file_list}
-        file_list = sorted(file_list, key=lambda path: bool(fractions[path]))
+        # Prepare each filename once after user rules, then reuse evidence during parsing.
+        prepared = {path: prepare_title(os.path.basename(path)) for path in file_list}
+        fractions = {path: value["fractional"] for path, value in prepared.items()}
+        specials = {path: value["special"] for path, value in prepared.items()}
+        file_list = sorted(file_list, key=lambda path: (bool(fractions[path] or specials[path]), bool(fractions[path])))
         fractional_cache = {}
-        # Special files are processed after normal files; only exact task keys share identity.
-        extra_enabled = ((Config().get_config("media") or {}).get("extras") or {}).get("enabled") is True
-        specials = {path: extract_special(os.path.basename(path), extra_enabled)[1] for path in file_list}
-        file_list = sorted(file_list, key=lambda path: bool(fractions[path] or specials[path]))
         task_identities = {}
         # 只按下载器提供的任务键分组，不能使用父目录或片名近似分组。
         for ctx in [download_context] + list((download_contexts or {}).values()):
@@ -1692,7 +1704,7 @@ class Media:
                 # 先用自己的名称
                 file_name = os.path.basename(file_path)
                 if specials[file_path] and not fractions[file_path]:
-                    meta_info = MetaInfo(file_name, use_llm=not bool(download_context))
+                    meta_info = MetaInfo(file_name, use_llm=not bool(download_context), _prepared=prepared[file_path])
                     manual = None
                     # Existing manual controls are explicit target evidence, not a guess.
                     if tmdb_info and not download_context:
@@ -1718,7 +1730,7 @@ class Media:
                 # 没有自带TMDB信息
                 if not tmdb_info:
                     # 识别名称
-                    meta_info = MetaInfo(title=file_name, mtype=media_type)
+                    meta_info = MetaInfo(title=file_name, mtype=media_type, _prepared=prepared[file_path])
                     # 仅在主文件名未识别出有效名称时，才使用上级目录兜底；
                     # 避免因“年份缺失”触发目录名（如 动漫/video3）进入LLM，导致季数被误覆盖。
                     if not meta_info.get_name():
@@ -1828,7 +1840,7 @@ class Media:
                     # 已绑定身份提供类型，避免纯数字电影文件被作为电视剧集号解析。
                     bound_type = tmdb_info.get("media_type") or media_type
                     meta_info = MetaInfo(title=file_name, mtype=bound_type,
-                                         use_llm=not bool(download_context))
+                                         use_llm=not bool(download_context), _prepared=prepared[file_path])
                     fractional = (meta_info.note or {}).get("fractional_episode")
                     if fractional:
                         fractional["file_path"] = file_path
@@ -1865,6 +1877,7 @@ class Media:
                             check_season = (fractional.get("source_season") if numbering == "release"
                                             else meta_info.begin_season)
                             conflict = bool(seasons and check_season not in seasons)
+                            # Imported/caller-provided release contexts remain supported; new tasks use TMDB.
                             if numbering == "release":
                                 conflict = conflict or bool(episodes and fractional["key"] not in
                                     {episode_key(ep) for ep in episodes})
