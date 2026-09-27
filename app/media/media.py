@@ -1084,6 +1084,29 @@ class Media:
                     if str(rule.get("tmdb_id")) == str(info["id"])
                     and episode_key(rule.get("source_episode")) == key
                     and (rule.get("source_season") is None or rule.get("source_season") == source_season)]
+        # A web confirmation is scoped to the original file and revalidated against TMDB.
+        # Never place this transient selection in global configuration or identity caches.
+        confirmed = info.get("_file_episode_confirmation")
+        if confirmed:
+            if confirmed.get("path") != fraction.get("file_path"):
+                fraction["reason"] = "人工确认与源文件或已有映射冲突"
+                return False
+            target_season, target_episode = confirmed.get("season"), confirmed.get("episode")
+            if type(target_season) is not int or type(target_episode) is not int:
+                return False
+            if matching and (len(matching) != 1 or matching[0].get("target_season") != target_season
+                             or matching[0].get("target_episode") != target_episode):
+                fraction["reason"] = "人工确认与已有小数集映射冲突"
+                return False
+            detail = self.get_tmdb_tv_season_detail(info["id"], target_season) or {}
+            target = next((ep for ep in detail.get("episodes", [])
+                           if valid_episode(ep, target_season) and ep["episode_number"] == target_episode), None)
+            if not target or not (target.get("name") or target.get("air_date")):
+                fraction["reason"] = "人工确认的 TMDB 单集已失效"
+                return False
+            if not matching:
+                matching = [dict(target_season=target_season, target_episode=target_episode,
+                                 episode_title=target.get("name"), air_date=target.get("air_date"))]
         candidates = {}
         try:
             seasons = info.get("seasons")
@@ -1912,7 +1935,8 @@ class Media:
                         if not final_episodes or (episodes and not set(final_episodes).issubset(set(episodes))):
                             raise ValueError("手动集号与下载任务冲突：%s" % file_name)
                     # 加入缓存
-                    if not download_context:
+                    if not download_context and not tmdb_info.get("_file_episode_confirmation"):
+                        # File-scoped human evidence must not become a reusable identity-cache override.
                         self.save_rename_cache(file_name, tmdb_info)
                 # 按文件路程存储
                 if getattr(meta_info, "skip_reason", None):
