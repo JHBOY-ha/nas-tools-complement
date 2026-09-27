@@ -550,18 +550,11 @@ class RssChecker(object):
         if not taskinfo:
             return
         # 识别种子名称，开始检索TMDB
-        media_info = MetaInfo(title=title)
-        cache_info = self.media.get_cache_info(media_info)
-        if cache_info.get("id"):
-            # 有缓存，直接使用缓存
-            media_info.tmdb_id = cache_info.get("id")
-            media_info.type = cache_info.get("type")
-            media_info.title = cache_info.get("title")
-            media_info.year = cache_info.get("year")
-        else:
-            media_info = self.media.get_media_info(title=title)
-            if not media_info:
-                log.warn("【RssChecker】%s 识别媒体信息出错！" % title)
+        # 测试报文与实际 RSS 使用相同入口，命中作品缓存也不能跳过季集校验。
+        media_info = self.media.get_media_info(title=title)
+        if not media_info:
+            log.warn("【RssChecker】%s 识别媒体信息出错！" % title)
+            return
         # 检查是否匹配
         filter_args = {
             "include": taskinfo.get("include"),

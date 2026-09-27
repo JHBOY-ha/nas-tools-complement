@@ -43,10 +43,10 @@ class MetaVideo(MetaBase):
                         r"|连载|日剧|美剧|电视剧|动画片|动漫|欧美|西德|日韩|超高清|高清|蓝光|翡翠台|梦幻天堂·龙网|★?\d*月?新番" \
                         r"|最终季|合集|[多中国英葡法俄日韩德意西印泰台港粤双文语简繁体特效内封官译外挂]+字幕|版本|出品|台版|港版|\w+字幕组" \
                         r"|WITH EXTRAS$|RERIP$|SUBBED$|PROPER$|REPACK$|Complete$" \
-                        r"|S\d{2}\s*-\s*S\d{2}|S\d{2}|\s+S\d{1,2}|EP?\d{2,4}\s*-\s*EP?\d{2,4}|EP?\d{2,4}|\s+EP?\d{1,4}" \
                         r"|CD[\s.]*[1-9]|DVD[\s.]*[1-9]|DISK[\s.]*[1-9]|DISC[\s.]*[1-9]" \
                         r"|[248]K|\d{3,4}[PIX]+" \
                         r"|CD[\s.]*[1-9]|DVD[\s.]*[1-9]|DISK[\s.]*[1-9]|DISC[\s.]*[1-9]"
+    _name_nostring_re += "|" + MetaBase._season_episode_marker_re
     _resources_pix_re = r"^[SBUHD]*(\d{3,4}[PI]+)|\d{3,4}X(\d{3,4})"
     _resources_pix_re2 = r"(^[248]+K)"
     _video_encode_re = r"^[HX]26[45]$|^AVC$|^HEVC$|^VC\d?$|^MPEG\d?$|^Xvid$|^DivX$|^HDR\d*$"
@@ -57,10 +57,19 @@ class MetaVideo(MetaBase):
         if not title:
             return
         original_title = title
+        # Remove series totals before tokenization so ``12 集全`` cannot become E12.
+        title = re.sub(self._subtitle_episode_all_re, " ", title, flags=re.IGNORECASE)
+        # Isolated standard channel blocks are metadata: [2.0] after S01E01
+        # must not extend the episode range to E02 when tokenization splits '.'.
+        channel_re = r'[\[【]\s*(2\.[01]|5\.1|7\.1)\s*[\]】]'
+        channel_match = re.search(channel_re, title)
+        channel_hint = channel_match[1] if channel_match and title[:channel_match.start()].strip() else None
+        if channel_hint:
+            title = re.sub(channel_re, " ", title)
         self._source = ""
         self._effect = []
-        # 判断是否纯数字命名
-        if os.path.splitext(title)[-1] in RMT_MEDIAEXT \
+        # Numeric episode filenames retain the same meaning for uppercase suffixes.
+        if os.path.splitext(title)[-1].lower() in RMT_MEDIAEXT \
                 and os.path.splitext(title)[0].isdigit() \
                 and len(os.path.splitext(title)[0]) < 5:
             self.begin_episode = int(os.path.splitext(title)[0])
@@ -117,6 +126,11 @@ class MetaVideo(MetaBase):
             self.resource_effect = " ".join(self._effect)
         if self._source:
             self.resource_type = self._source.strip()
+        if channel_hint:
+            if not self.audio_encode:
+                self.audio_encode = channel_hint
+            elif not re.search(r'\d\.\d', self.audio_encode):
+                self.audio_encode = "%s %s" % (self.audio_encode, channel_hint)
         # 提取原盘DIY
         if self.resource_type and "BluRay" in self.resource_type:
             if (self.subtitle and re.findall(r'D[Ii]Y', self.subtitle)) \
@@ -245,16 +259,15 @@ class MetaVideo(MetaBase):
                     # 名字未出现前的第一个数字，记下来
                     if not self._unknown_name_str:
                         self._unknown_name_str = token
-            elif re.search(r"%s" % self._season_re, token, re.IGNORECASE) \
-                    or re.search(r"%s" % self._episode_re, token, re.IGNORECASE) \
+            elif re.search(self._season_episode_marker_re, token, re.IGNORECASE) \
                     or re.search(r"(%s)" % self._resources_type_re, token, re.IGNORECASE) \
                     or re.search(r"%s" % self._resources_pix_re, token, re.IGNORECASE):
                 # 季集等不要
                 self._stop_name_flag = True
                 return
             else:
-                # 后缀名不要
-                if ".%s".lower() % token in RMT_MEDIAEXT:
+                # A recognized media suffix is metadata regardless of letter case.
+                if (".%s" % token).lower() in RMT_MEDIAEXT:
                     return
                 # 英文或者英文+数字，拼装起来
                 if self.en_name:
@@ -351,7 +364,9 @@ class MetaVideo(MetaBase):
             self._last_token_type = "season"
             self._continue_flag = False
             return
-        re_res = re.findall(r"%s" % self._season_re, token, re.IGNORECASE)
+        # Validate the complete marker before applying the existing capture rules.
+        markers = " ".join(re.findall(self._season_episode_marker_re, token, re.IGNORECASE))
+        re_res = re.findall(r"%s" % self._season_re, markers, re.IGNORECASE)
         if re_res:
             self._last_token_type = "season"
             self.type = MediaType.TV
@@ -399,13 +414,26 @@ class MetaVideo(MetaBase):
 
     def __has_explicit_episode_range(self):
         # 明确 E01-E03 / S01E01-03 的文件允许包含三集以上；
-        # 裸数字推断仍保留两集上限，避免分辨率等数字被吞入集号区间。
+        # 裸数字只有完整、独立的连字符范围才放宽，零散数字继续保留两集上限。
         # Bare resolution values and four-digit endpoints require an explicit E/EP.
         ambiguous = self.end_episode >= 1000 or self.end_episode in (240, 360, 480, 540, 576, 720)
         endpoint = r"EP?" if ambiguous else r"(?:EP?)?"
-        return bool(re.search(
+        explicit = bool(re.search(
             r"(?i)(?<![A-Z0-9])(?:S\d{1,2})?EP?0*%d\s*-\s*%s0*%d(?![A-Z0-9])"
             % (self.begin_episode, endpoint, self.end_episode), self.org_string))
+        if explicit:
+            return True
+        # Match both already parsed endpoints; exclude years, resolutions, decimals
+        # and numeric fragments inside titles or technical tags.
+        if ambiguous or not self.get_name() or self.begin_episode < 1:
+            return False
+        for match in re.finditer(
+                r"(?<!\S)(\d{2,3})\s*-\s*(\d{2,3})"
+                r"(?=\s*(?:\[|【|\.(?:mkv|mp4|avi|ts|m2ts)$|$))",
+                self.org_string, re.IGNORECASE):
+            if (int(match[1]), int(match[2])) == (self.begin_episode, self.end_episode):
+                return True
+        return False
 
     def __init_episode(self, token):
         numbered = re.fullmatch(r"(\d{1,2})x(\d{1,3})", token, re.IGNORECASE)
@@ -425,7 +453,8 @@ class MetaVideo(MetaBase):
             self.type = MediaType.TV
             self._continue_flag = False
             return
-        re_res = re.findall(r"%s" % self._episode_re, token, re.IGNORECASE)
+        markers = " ".join(re.findall(self._season_episode_marker_re, token, re.IGNORECASE))
+        re_res = re.findall(r"%s" % self._episode_re, markers, re.IGNORECASE)
         if re_res:
             self._last_token_type = "episode"
             self._continue_flag = False
@@ -473,6 +502,16 @@ class MetaVideo(MetaBase):
                     self.total_episodes = 1
                 self._continue_flag = False
                 self.type = MediaType.TV
+            elif self._last_token_type == "EPISODE" \
+                    and self.begin_episode is None \
+                    and len(token) < 5:
+                # Written Episode markers outrank bare-number inference for every width.
+                self.begin_episode = int(token)
+                self.total_episodes = 1
+                self._last_token_type = "episode"
+                self._continue_flag = False
+                self._stop_name_flag = bool(self.get_name())
+                self.type = MediaType.TV
             elif self.begin_episode is None \
                     and 1 < len(token) < 4 \
                     and self._last_token_type != "year" \
@@ -483,15 +522,6 @@ class MetaVideo(MetaBase):
                 self._last_token_type = "episode"
                 self._continue_flag = False
                 self._stop_name_flag = True
-                self.type = MediaType.TV
-            elif self._last_token_type == "EPISODE" \
-                    and self.begin_episode is None \
-                    and len(token) < 5:
-                self.begin_episode = int(token)
-                self.total_episodes = 1
-                self._last_token_type = "episode"
-                self._continue_flag = False
-                self._stop_name_flag = bool(self.get_name())
                 self.type = MediaType.TV
         elif token.upper() == "EPISODE" and self.__is_written_marker(token):
             self._last_token_type = "EPISODE"

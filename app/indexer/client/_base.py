@@ -261,38 +261,44 @@ class _IIndexClient(metaclass=ABCMeta):
                 media_info = meta_info
             else:
                 # 0-识别并模糊匹配；1-识别并精确匹配
+                release_note = meta_info.note or {}
                 if meta_info.imdb_id \
                         and match_media.imdb_id \
-                        and str(meta_info.imdb_id) == str(match_media.imdb_id):
-                    # IMDBID匹配，合并媒体数据
+                        and str(meta_info.imdb_id) == str(match_media.imdb_id) \
+                        and not any(release_note.get(key) for key in
+                                    ("special_episode", "fractional_episode", "extra")):
+                    # IMDb 只确认作品身份，不能代替发布季集映射；特殊内容仍走完整确认入口。
+                    bound_info = match_media.tmdb_info
+                    if not bound_info or (meta_info.type != MediaType.MOVIE and not bound_info.get("seasons")):
+                        bound_info = self.media.get_tmdb_info(mtype=match_media.type,
+                                                              tmdbid=match_media.tmdb_id,
+                                                              chinese=False)
+                    if not bound_info or not self.media._prepare_media_identity(meta_info, bound_info):
+                        log.info(f"【{self.index_type}】{torrent_name} 的 IMDb 作品已匹配，但季集未通过校验")
+                        index_match_fail += 1
+                        continue
+                    meta_info.set_tmdb_info(bound_info)
                     media_info = self.media.merge_media_info(meta_info, match_media)
                 else:
-                    # 查询缓存
-                    cache_info = self.media.get_cache_info(meta_info)
-                    if match_media \
-                            and str(cache_info.get("id")) == str(match_media.tmdb_id):
-                        # 缓存匹配，合并媒体数据
-                        media_info = self.media.merge_media_info(meta_info, match_media)
-                    else:
-                        # 重新识别
-                        media_info = self.media.get_media_info(title=torrent_name, subtitle=description, chinese=False)
-                        if not media_info:
-                            log.warn(f"【{self.index_type}】{torrent_name} 识别媒体信息出错！")
-                            index_error += 1
-                            continue
-                        elif not media_info.tmdb_info:
-                            log.info(
-                                f"【{self.index_type}】{torrent_name} 识别为 {media_info.get_name()} 未匹配到媒体信息")
-                            index_match_fail += 1
-                            continue
-                        # TMDBID是否匹配
-                        if str(media_info.tmdb_id) != str(match_media.tmdb_id):
-                            log.info(
-                                f"【{self.index_type}】{torrent_name} 识别为 {media_info.type.value} {media_info.get_title_string()} 不匹配")
-                            index_match_fail += 1
-                            continue
-                        # 合并媒体数据
-                        media_info = self.media.merge_media_info(media_info, match_media)
+                    # 统一入口内部复用作品缓存，同时逐条验证发布编号与正式季集。
+                    media_info = self.media.get_media_info(title=torrent_name, subtitle=description, chinese=False)
+                    if not media_info:
+                        log.warn(f"【{self.index_type}】{torrent_name} 识别媒体信息出错！")
+                        index_error += 1
+                        continue
+                    elif not media_info.tmdb_info:
+                        log.info(
+                            f"【{self.index_type}】{torrent_name} 识别为 {media_info.get_name()} 未匹配到媒体信息")
+                        index_match_fail += 1
+                        continue
+                    # TMDBID是否匹配
+                    if str(media_info.tmdb_id) != str(match_media.tmdb_id):
+                        log.info(
+                            f"【{self.index_type}】{torrent_name} 识别为 {media_info.type.value} {media_info.get_title_string()} 不匹配")
+                        index_match_fail += 1
+                        continue
+                    # 合并媒体数据
+                    media_info = self.media.merge_media_info(media_info, match_media)
                 # 过滤类型
                 if filter_args.get("type"):
                     if (filter_args.get("type") == MediaType.TV and media_info.type == MediaType.MOVIE) \

@@ -493,6 +493,12 @@ class FileTransfer:
         # 开始进度
         self.progress.start('filetransfer')
 
+        # Report invalid manual input before scanning files or starting any transfer.
+        try:
+            season = EpisodeFormat.normalize_season(season)
+        except ValueError as error:
+            return __finish_transfer(False, str(error))
+
         episode = (None, False) if not episode else episode
         if not in_path:
             log.error("【Rmt】输入路径错误!")

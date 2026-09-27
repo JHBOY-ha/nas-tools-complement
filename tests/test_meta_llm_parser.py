@@ -2,106 +2,10 @@
 
 import json
 import os
-import sys
-import types
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
-if "parse" not in sys.modules:
-    parse_stub = types.ModuleType("parse")
-    parse_stub.parse = lambda *args, **kwargs: None
-    sys.modules["parse"] = parse_stub
-
-if "dateparser" not in sys.modules:
-    dateparser_stub = types.ModuleType("dateparser")
-    dateparser_stub.parse = lambda value: None
-    sys.modules["dateparser"] = dateparser_stub
-
-if "cn2an" not in sys.modules:
-    cn2an_stub = types.ModuleType("cn2an")
-    cn2an_stub.cn2an = lambda value, mode=None: int(value)
-    sys.modules["cn2an"] = cn2an_stub
-
-if "bencode" not in sys.modules:
-    bencode_stub = types.ModuleType("bencode")
-    bencode_stub.bdecode = lambda value: {}
-    sys.modules["bencode"] = bencode_stub
-
-if "cacheout" not in sys.modules:
-    cacheout_stub = types.ModuleType("cacheout")
-
-    class _Cache:
-        def __init__(self, *args, **kwargs):
-            self._values = {}
-
-        def get(self, key, default=None):
-            return self._values.get(key, default)
-
-        def set(self, key, value, *args, **kwargs):
-            self._values[key] = value
-
-        def delete(self, key):
-            self._values.pop(key, None)
-
-    class _CacheManager:
-        def __init__(self, *args, **kwargs):
-            pass
-
-    cacheout_stub.Cache = _Cache
-    cacheout_stub.LRUCache = _Cache
-    cacheout_stub.CacheManager = _CacheManager
-    sys.modules["cacheout"] = cacheout_stub
-
-if "pyquery" not in sys.modules:
-    pyquery_stub = types.ModuleType("pyquery")
-
-    class _PyQuery:
-        def __init__(self, *args, **kwargs):
-            pass
-
-    pyquery_stub.PyQuery = _PyQuery
-    sys.modules["pyquery"] = pyquery_stub
-
-if "zhconv" not in sys.modules:
-    zhconv_stub = types.ModuleType("zhconv")
-    zhconv_stub.convert = lambda value, locale=None: value
-    sys.modules["zhconv"] = zhconv_stub
-
-if "undetected_chromedriver" not in sys.modules:
-    uc_stub = types.ModuleType("undetected_chromedriver")
-    uc_stub.find_chrome_executable = lambda: None
-    uc_stub.ChromeOptions = object
-    uc_stub.Chrome = object
-    sys.modules["undetected_chromedriver"] = uc_stub
-
-if "webdriver_manager.chrome" not in sys.modules:
-    webdriver_manager_stub = types.ModuleType("webdriver_manager")
-    chrome_stub = types.ModuleType("webdriver_manager.chrome")
-
-    class _ChromeDriverManager:
-        def install(self):
-            return ""
-
-    chrome_stub.ChromeDriverManager = _ChromeDriverManager
-    sys.modules["webdriver_manager"] = webdriver_manager_stub
-    sys.modules["webdriver_manager.chrome"] = chrome_stub
-
-if "pyvirtualdisplay" not in sys.modules:
-    pyvirtualdisplay_stub = types.ModuleType("pyvirtualdisplay")
-
-    class _Display:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def start(self):
-            return self
-
-        def stop(self):
-            return None
-
-    pyvirtualdisplay_stub.Display = _Display
-    sys.modules["pyvirtualdisplay"] = pyvirtualdisplay_stub
-
+# 使用项目真实依赖；不能按导入顺序替换 cn2an/zhconv 等解析器，掩盖实际识别失败。
 from app.media.meta import MetaInfo
 from app.media.meta.llm_parser import LLMMetaParser
 from app.utils.types import MediaType

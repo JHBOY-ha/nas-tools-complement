@@ -1,5 +1,6 @@
 import os.path
 import regex as re
+from anitopy.parser_number import is_valid_episode_number
 
 import log
 from app.helper import WordsHelper
@@ -53,7 +54,8 @@ def MetaInfo(title, subtitle=None, mtype=None, use_llm=True):
             log.warn("【Meta】%s" % msg_item)
 
     # 判断是否处理文件
-    if title and os.path.splitext(title)[-1] in RMT_MEDIAEXT:
+    # File safeguards must apply equally to .mkv and .MKV release names.
+    if title and os.path.splitext(title)[-1].lower() in RMT_MEDIAEXT:
         fileflag = True
     else:
         fileflag = False
@@ -147,7 +149,25 @@ def is_anime(name):
     """
     if not name:
         return False
-    if re.search(r'【[+0-9XVPI-]+】\s*【', name, re.IGNORECASE):
+    # A complete completion block is stronger evidence than a following resource
+    # bracket. Share anitopy's number validation so years cannot become episodes.
+    for block in re.finditer(r'\[([^\[\]]+)]|【([^【】]+)】|\(([^()]+)\)', name):
+        content = next(part for part in block.groups() if part is not None)
+        completion = re.fullmatch(r'\s*(\d{1,4})[\s_]*(?:END|FINAL)\s*', content, re.IGNORECASE)
+        if completion and is_valid_episode_number(completion[1]):
+            return True
+        # Fansub packs explicitly label their episode range, independently of
+        # surrounding resolution fields such as [1920x1080].
+        tv_block = re.fullmatch(
+            r'\s*TV\s+(\d{1,4})(?:\s*-\s*(\d{1,4}))?'
+            r'(?:\s+(?:FIN|END|FINAL))?\s*', content, re.IGNORECASE)
+        if tv_block and all(is_valid_episode_number(number)
+                            for number in tv_block.groups() if number is not None):
+            return True
+    # The legacy numeric/Roman block alphabet also contains P, I and X. Exclude
+    # complete resolution fields without changing existing episode-block routes.
+    episode_block = r'(?!(?:\d{3,4}[PI]|\d{3,4}X\d{3,4})[\]】])[+0-9XVPI-]+'
+    if re.search(r'【%s】\s*【' % episode_block, name, re.IGNORECASE):
         return True
     # 带连字符的四位发行年份不作为动漫绝对集号。
     if re.search(r'\s+-\s+(?!(?:19|20)\d{2}(\s+|$))[\dv]{1,4}(\s+|$)', name, re.IGNORECASE):
@@ -155,6 +175,6 @@ def is_anime(name):
     if re.search(r"S\d{2}\s*-\s*S\d{2}|S\d{2}|\s+S\d{1,2}|EP?\d{2,4}\s*-\s*EP?\d{2,4}|EP?\d{2,4}|\s+EP?\d{1,4}", name,
                  re.IGNORECASE):
         return False
-    if re.search(r'\[[+0-9XVPI-]+]\s*\[', name, re.IGNORECASE):
+    if re.search(r'\[%s]\s*\[' % episode_block, name, re.IGNORECASE):
         return True
     return False

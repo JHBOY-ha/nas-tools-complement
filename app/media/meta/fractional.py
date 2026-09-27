@@ -15,6 +15,25 @@ _INTEGER_RESOURCE = re.compile(
     r"(?:8|10|12|16)bit|[248]k)(?=[ ._-]|$)")
 
 
+def _fractional_ranges(text):
+    """Consume a complete labelled range so neither endpoint becomes evidence."""
+    number = r"\d{1,4}(?:\.\d+[A-Za-z]?)?(?![A-Za-z0-9.])"
+    prefix = r"(?:(?:S\d{1,2})?EP?|Episode\s+|#\s*|第)"
+    # Bare four-digit years and common resolution numbers remain metadata; an
+    # explicit E/EP marker is required to treat those integers as an endpoint.
+    bare_number = r"(?!\d{4}(?![\d.])|(?:240|360|480|540|576|720)(?![\d.]))" + number
+    endpoint = r"(?:" + prefix + number + r"|" + bare_number + r")[集话話]?"
+    separator = r"(?:\s*(?:[-–—~～至到/+＋&,]|to\b|and\b)\s*|[ ._]+(?=(?:S\d{1,2})?EP?\d))"
+    # Bare numbers are only release fields inside brackets or after a release
+    # separator. This leaves film titles and decimals in ordinary prose alone.
+    lead = (r"(?:(?<![A-Za-z0-9])" + prefix +
+            r"|[\[【]\s*|\s+-\s+|Season\s+\d+\s*(?:Episode\s*)?"
+            r"|第[\d一二三四五六七八九十]+季\s*(?:第)?)")
+    pattern = lead + number + r"[集话話]?(?:" + separator + endpoint + r")+"
+    return [match for match in re.finditer(pattern, text or "", re.I)
+            if re.search(r"\d\.\d", match[0])]
+
+
 def episode_key(value):
     match = re.fullmatch(r"(\d+)\.(\d{1,2})([A-Za-z]?)", str(value or "").strip())
     if not match:
@@ -32,12 +51,29 @@ def protect_fractional_episode(title):
     # Mask full release dates while retaining offsets into the original filename.
     scan_stem = re.sub(r"(?<!\d)(?:19|20)\d{2}\.(?:0?[1-9]|1[0-2])\.(?:0?[1-9]|[12]\d|3[01])(?!\d)",
                        lambda match: " " * len(match[0]), stem)
+    # An explicit collection total is metadata even after a dotted integer
+    # episode (S01E02.12 集全); mask it before decimals can consume that boundary.
+    scan_stem = re.sub(r"(?<!\d)(?:全\s*\d{1,4}\s*[集话話]|\d{1,4}\s*[集话話]\s*全)",
+                       lambda match: " " * len(match[0]), scan_stem)
+    for match in _INTEGER_RESOURCE.finditer(scan_stem):
+        # Retain the integer endpoint itself, so E13.5-E14.1080p remains a
+        # protected mixed range while E01-E03.1080p stays an ordinary range.
+        start = match.start() + match[0].index(".")
+        scan_stem = scan_stem[:start] + " " * (match.end() - start) + scan_stem[match.end():]
+    ranges = _fractional_ranges(scan_stem)
+    if ranges:
+        # Keep raw non-scalar: the confirmation path also validates it with
+        # episode_key(), and must never confirm just one end of a merged file.
+        raw = stem[ranges[0].start():ranges[0].end()]
+        return title, {"raw": raw, "key": None, "source": "multiple",
+                       "status": "unconfirmed", "reason": "小数集包含多个编号或范围，保留待确认"}
     patterns = (
         (r"[\[【](?P<decimal>" + _LABEL + r")[\]】]", "bracket"),
         (r"(?<![A-Za-z0-9])(?P<season>S\d{1,2})?EP?(?P<decimal>" + _LABEL + r")" + _END, "episode_marker"),
         (r"第(?P<decimal>" + _LABEL + r")[集话話]", "chinese"),
         (r"\s+-\s+(?P<decimal>" + _LABEL + r")" + _END, "separator"),
     )
+    matches = []
     for pattern, source in patterns:
         for match in re.finditer(pattern, scan_stem, re.I):
             if source == "episode_marker" and _INTEGER_RESOURCE.match(stem[match.start():]):
@@ -46,25 +82,34 @@ def protect_fractional_episode(title):
             # Bare channel layouts are ambiguous; E5.1 remains an explicit episode.
             if source == "bracket" and raw in ("2.0", "2.1", "5.1", "7.1"):
                 continue
-            season = match.groupdict().get("season") or ""
-            tail = stem[match.end():]
-            subtitle = re.match(r"\s*[-–—]\s*([^\[【(]+)", tail)
-            # 单集标题只作匹配证据，不应污染用于查作品的片名。
-            episode_title = None
-            if subtitle:
-                episode_title = subtitle[1].strip()
-                resource = re.search(r"(?i)(?<!\w)(?:\d{3,4}[pi]|WEB[ ._-]?DL|WEBRip|BluRay|HEVC|[HX]26[45])\b", episode_title)
-                metadata_tail = ""
-                if resource:
-                    metadata_tail = episode_title[resource.start():]
-                    episode_title = episode_title[:resource.start()].strip(" ._-")
-                tail = metadata_tail + tail[subtitle.end():]
-            cleaned = stem[:match.start()] + season + " " + tail
-            return cleaned + ext, {
-                "raw": raw, "key": episode_key(raw), "source": source,
-                "status": "unconfirmed", "source_season": int(season[1:]) if season else None,
-                "episode_title": episode_title,
-            }
+            if not any(start <= match.start("decimal") < end for start, end, _, _ in matches):
+                matches.append((*match.span("decimal"), match, source))
+    if len(matches) > 1:
+        # Separate fields such as [13.5][14.5] are as ambiguous as a range.
+        return title, {"raw": " / ".join(match["decimal"] for _, _, match, _ in matches),
+                       "key": None, "source": "multiple", "status": "unconfirmed",
+                       "reason": "小数集包含多个编号或范围，保留待确认"}
+    for _, _, match, source in matches:
+        raw = match["decimal"]
+        season = match.groupdict().get("season") or ""
+        tail = stem[match.end():]
+        subtitle = re.match(r"\s*[-–—]\s*([^\[【(]+)", tail)
+        # 单集标题只作匹配证据，不应污染用于查作品的片名。
+        episode_title = None
+        if subtitle:
+            episode_title = subtitle[1].strip()
+            resource = re.search(r"(?i)(?<!\w)(?:\d{3,4}[pi]|WEB[ ._-]?DL|WEBRip|BluRay|HEVC|[HX]26[45])\b", episode_title)
+            metadata_tail = ""
+            if resource:
+                metadata_tail = episode_title[resource.start():]
+                episode_title = episode_title[:resource.start()].strip(" ._-")
+            tail = metadata_tail + tail[subtitle.end():]
+        cleaned = stem[:match.start()] + season + " " + tail
+        return cleaned + ext, {
+            "raw": raw, "key": episode_key(raw), "source": source,
+            "status": "unconfirmed", "source_season": int(season[1:]) if season else None,
+            "episode_title": episode_title,
+        }
     # Malformed explicit decimals must not fall through to E01. Known resolution
     # suffixes are not decimals; this also avoids taking a prefix of E01.123.
     malformed = re.search(r"(?i)(?<![A-Z0-9])(?:S\d{1,2})?EP?\d+\.\d[A-Z0-9.]*", scan_stem)
@@ -91,6 +136,11 @@ def protect_fractional_episode(title):
 
 def release_references(text):
     """Read labelled release references only, not arbitrary decimals in prose."""
+    text = text or ""
+    # Mask every endpoint before the individual reference scan. Negative
+    # lookaheads on the first endpoint alone would still expose a repeated label.
+    for match in reversed(_fractional_ranges(text)):
+        text = text[:match.start()] + " " * len(match[0]) + text[match.end():]
     patterns = (
         r"第(?P<season>[\d一二三四五六七八九十]+)季\s*(?:第)?(?P<label>" + _LABEL + r")" + _END,
         r"Season\s+(?P<season>\d+)\s*(?:Episode\s*)?(?P<label>" + _LABEL + r")" + _END,

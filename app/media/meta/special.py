@@ -6,7 +6,9 @@ import cn2an
 
 from config import RMT_MEDIAEXT
 
-_SPECIAL = r"OVA|OAD|SP|SPECIAL"
+# Prefer the complete word when reading an invalid suffix with match(), not only
+# when fullmatch() can backtrack past the shorter SP prefix.
+_SPECIAL = r"OVA|OAD|SPECIAL|SP"
 _EXTRA = r"NCOP|NCED|OP|ED|PV|TRAILER|INTERVIEW|BEHIND[ _-]THE[ _-]SCENES"
 _LABEL = re.compile(r"(?P<kind>" + _SPECIAL + "|" + _EXTRA + r")\s*(?P<number>\d{1,4})?", re.I)
 _TECH = re.compile(r"(?i)(?<![A-Z0-9])(?:Ma|Hi)?(?:8|10|12)p(?![A-Z0-9])")
@@ -30,11 +32,22 @@ def extract_special(title, include_extras=False):
         labels = [_LABEL.fullmatch(part) for part in parts]
         if all(labels):
             matches.extend((label, block.span()) for label in labels)
-        elif re.match(r"(?i)^(?:OVA|OAD|SP)\s*\d", block[1]):
+        elif re.match(r"(?i)^(?:" + _SPECIAL + r")\s*\d", block[1]):
             label = _LABEL.match(block[1])
             if label:
                 matches.append((label, block.span()))
                 malformed = True
+    # Consume unbracketed ranges before the single-label suffix fallback can
+    # mistake OVA01-OVA02 for only OVA02. Ordinary title words stay out of scope.
+    ambiguous = (r"(?i)(?:\s+-\s+|(?<!\w)(?=(?:OVA|OAD)\s*\d))"
+                 r"(?P<content>(?P<label>(?:" + _SPECIAL + r")\s*\d{1,4})"
+                 r"(?:[.．]\d[A-Z0-9.]*|\s*(?:[-–—~～至到/＋+&,]|to\b|and\b)\s*"
+                 r"(?:(?:" + _SPECIAL + r")\s*)?\d+[A-Z0-9.]*)+)"
+                 r"(?=\s*\[|\s+-\s+|$)")
+    for match in re.finditer(ambiguous, stem):
+        if not any(start <= match.start("content") < end for _, (start, end) in matches):
+            matches.append((_LABEL.fullmatch(match["label"]), match.span("content")))
+            malformed = True
     # Unbracketed labels require a release separator or numbered OVA/OAD suffix.
     for match in re.finditer(r"(?i)(?:\s+-\s+)((?:" + _SPECIAL + "|" + _EXTRA +
                              r")\s*\d{0,4})(?=\s+-\s+|\s*\[|$)", stem):
@@ -47,8 +60,27 @@ def extract_special(title, include_extras=False):
             matches.append((_LABEL.fullmatch(match[1]), match.span(1)))
     formal = re.search(r"(?i)(?<![A-Z0-9])S00EP?(\d{1,4})(?![A-Z0-9])", stem)
     formal_range = bool(formal and re.match(r"(?i)\s*-\s*(?:E|EP)?\d", stem[formal.end():]))
-    if formal_range and not matches:
-        # Ordinary multi-episode formal ranges retain the existing range parser.
+    formal_list = []
+    cursor = formal.end() if formal else len(stem)
+    while formal:
+        following = re.match(r"(?i)[ ._+&]+(?:S(\d{1,2}))?EP?(\d{1,4})(?![A-Z0-9])", stem[cursor:])
+        if not following:
+            break
+        formal_list.append((int(following[1] or 0), int(following[2])))
+        cursor += following.end()
+    consecutive = bool(formal_list) and all(
+        season == 0 and episode == int(formal[1]) + offset
+        for offset, (season, episode) in enumerate(formal_list, 1))
+    if (formal_range or consecutive) and not matches:
+        # Preserve the normal parser's explicit continuous multi-episode support
+        # for dots, spaces and plus signs as well as hyphenated ranges.
+        if consecutive:
+            # The generic parser deliberately caps unmarked multi-file guesses
+            # at two episodes. Canonicalize this fully enumerated continuous list
+            # into its explicit range syntax before that safeguard is applied.
+            stem = (stem[:formal.start()] + "S00E%02d-E%02d" % (int(formal[1]), formal_list[-1][1])
+                    + stem[cursor:])
+            return stem + ext, None
         return title, None
     if not matches and not formal:
         return title, None
@@ -64,7 +96,7 @@ def extract_special(title, include_extras=False):
             "status": "unconfirmed", "episode_title": None,
             "formal": (0, int(formal[1])) if formal else None,
             "source_filename": os.path.basename(title), "is_extra": is_extra}
-    if malformed or formal_range:
+    if malformed or formal_range or formal_list:
         data["reason"] = "特殊集发布编号范围不明确，保留待确认"
     if len(labels) > 1 and not (is_extra and all(k in ("NCOP", "NCED", "OP", "ED") for k, _ in labels)):
         data["reason"] = "特殊内容标签或编号冲突"

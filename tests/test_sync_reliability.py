@@ -41,8 +41,10 @@ def load_class(path, name, methods, namespace):
 
 
 def env():
-    return dict(os=os, re=re, time=time, uuid=uuid, json=json, traceback=traceback,
-                MediaType=MediaType, Enum=Enum, MatchMode=NS(NORMAL='normal'), EpisodeFormat=object,
+    from app.utils.episode_format import EpisodeFormat
+    # 季集验证的失败回滚使用深拷贝；AST 加载保留与生产方法相同的依赖。
+    return dict(os=os, re=re, time=time, uuid=uuid, json=json, traceback=traceback, copy=copy,
+                MediaType=MediaType, Enum=Enum, MatchMode=NS(NORMAL='normal'), EpisodeFormat=EpisodeFormat,
                 log=Mock(), ExceptionUtils=Mock(), lock=threading.Lock(), urlencode=urlencode,
                 Config=lambda: NS(get_config=lambda key: {}),
                 DEFAULT_EPISODE_MAPPINGS=[], DEFAULT_NAME_ALIASES={},
@@ -177,7 +179,8 @@ class RecognitionTests(unittest.TestCase):
             info['seasons'] = tmdb_seasons
         # 模拟解析器须区分明确 Sxx 和缺失季标记，不能总返回默认季 1。
         season_match = re.search(r"S(\d+)E", name)
-        meta = NS(type=MediaType.TV, begin_episode=parsed_episode,
+        # 与 MetaBase 一致提供可选区间终点，供手动覆盖前后的完整编号比较使用。
+        meta = NS(type=MediaType.TV, begin_episode=parsed_episode, end_episode=None, end_season=None,
                   begin_season=int(season_match[1]) if season_match else None,
                   note={}, skip_reason=None, tmdb_info=info, tmdb_id=456,
                   set_tmdb_info=Mock())
@@ -200,6 +203,7 @@ class RecognitionTests(unittest.TestCase):
         self.media.tmdb = True
         self.media.save_rename_cache = Mock()
         metas = [NS(type=MediaType.MOVIE, note={}, skip_reason=None, begin_season=None,
+                    end_season=None, begin_episode=None, end_episode=None,
                     get_episode_list=lambda: [], set_tmdb_info=Mock()) for _ in range(3)]
         self.ns['MetaInfo'] = Mock(side_effect=metas)
         with tempfile.TemporaryDirectory() as directory:
@@ -505,6 +509,17 @@ class QueueTests(unittest.TestCase):
 
 
 class HardlinkTests(unittest.TestCase):
+    def test_invalid_season_reports_actionable_error_before_transfer(self):
+        # No filesystem scan or media lookup is allowed for invalid batch input.
+        self.transfer.progress = Mock()
+        self.transfer.media = Mock()
+        result, message = self.transfer.transfer_media(
+            in_from="manual", in_path="unused.mkv", season="S01")
+        self.assertFalse(result)
+        self.assertIn("季号参数无效", message)
+        self.transfer.media.get_media_info_on_files.assert_not_called()
+        self.transfer.progress.end.assert_called_once_with('filetransfer')
+
     def setUp(self):
         self.ns = env()
         self.mode = MediaType.ANIME  # Enum-shaped transfer mode; no app imports needed.
