@@ -19,7 +19,9 @@ function $(selector) {
   return elements.get(selector);
 }
 $.ajax = options => requests.push(options);
-const window = {history: {state: {extra: {other_view: 'preserved'}}}};
+const listeners = [];
+const window = {history: {state: {extra: {other_view: 'preserved'}}},
+  addEventListener(name, callback) { listeners.push({name, callback}); }};
 const ctx = vm.createContext({$, window, document: {getElementById: () => grid},
   NProgress: {start() {}, done() {}},
   show_fail_modal() { failures++; },
@@ -64,4 +66,22 @@ ctx.load_library_items(1);
 ctx.library_view_instance = {};
 requests[2].complete();
 assert.equal(saves, 1);
+// popstate switches history before the navigation animation replaces the DOM.
+ctx.library_items_loading = false;
+ctx.library_view_instance = {};
+ctx.load_library_items(5);
+const duringNavigation = requests[3];
+assert.equal(listeners.length, 1);
+assert.equal(listeners[0].name, 'popstate');
+listeners[0].callback();
+duringNavigation.success({code: -1});
+duringNavigation.error();
+duringNavigation.complete();
+assert.equal(saves, 1);
+assert.equal(failures, 0);
+ctx.load_library_items(6);
+assert.equal(requests.length, 4);
+// Reloading scripts on a new page must not accumulate global event listeners.
+vm.runInContext(fs.readFileSync('web/static/js/media-library.js', 'utf8'), ctx);
+assert.equal(listeners.length, 1);
 console.log('Media library history lifecycle tests passed');

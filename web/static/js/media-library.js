@@ -18,6 +18,16 @@ var library_subtitle_audit_task_id = "";
 var library_subtitle_upload_task_id = "";
 var library_subtitle_upload_request = null;
 
+// popstate changes the history entry before the SPA replaces its DOM. Invalidate
+// immediately so a late response cannot write into that 150 ms transition window.
+// The script is reloaded on navigation; install only one window-level listener.
+if (typeof window.addEventListener === "function" && !window.library_history_listener_installed) {
+  window.addEventListener("popstate", function () {
+    library_view_instance = null;
+  });
+  window.library_history_listener_installed = true;
+}
+
 function library_escape_html(value) {
   if (value === null || value === undefined) {
     return "";
@@ -116,7 +126,7 @@ function load_library_items(page) {
   // a newly opened library, even when it has the same URL and element IDs.
   const view = library_view_instance;
   const grid = document.getElementById("library_items_grid");
-  const is_current_view = () => grid && view === library_view_instance &&
+  const is_current_view = () => grid && view && view === library_view_instance &&
       document.getElementById("library_items_grid") === grid;
   if (!is_current_view()) {
     return;
