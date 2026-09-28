@@ -15,6 +15,9 @@ from urllib.parse import urljoin, urlsplit
 
 import requests
 
+import log
+from app.utils import ExceptionUtils
+
 
 class OnlineSubtitles:
     FORMATS = {"srt", "ass", "ssa", "vtt", "smi", "sub"}
@@ -303,8 +306,35 @@ class OnlineSubtitles:
                         raise ValueError("字幕源返回空文件")
                     return bytes(content)
             raise ValueError("字幕下载重定向过多")
-        except requests.RequestException:
-            raise ValueError("字幕下载失败，请稍后重新搜索") from None
+        except requests.RequestException as error:
+            self._report_download_failure(error, url)
+            if isinstance(error, requests.exceptions.HTTPError):
+                code = getattr(getattr(error, "response", None), "status_code", None)
+                message = f"字幕源返回 HTTP {code if code else '异常状态'}，请稍后重新搜索或选择其他字幕"
+            elif isinstance(error, (requests.exceptions.ConnectTimeout, requests.exceptions.ReadTimeout)):
+                message = "字幕下载超时，请检查网络后重试"
+            else:
+                message = "字幕下载失败，请稍后重新搜索"
+            raise ValueError(message) from None
+
+    @staticmethod
+    def _report_download_failure(error, url):
+        """Surface the real cause in console and app logs.  Provider URLs
+        never reach the message: Assrt links embed the API token, so only
+        the exception class, HTTP status and target hostname are logged."""
+        ExceptionUtils.exception_traceback(error)
+        if not os.environ.get("NASTOOL_CONFIG"):
+            # Config-less contexts (unit tests) cannot build the app logger.
+            return
+        try:
+            detail = type(error).__name__
+            code = getattr(getattr(error, "response", None), "status_code", None)
+            if code:
+                detail = f"{detail} HTTP {code}"
+            host = urlsplit(url).hostname or "unknown"
+            log.error("【OnlineSubtitles】字幕下载失败：%s（来源主机 %s）" % (detail, host))
+        except Exception:
+            pass
 
     def files(self, item, member=None):
         """Return choices for an archive, or a single selected file; never extract paths."""
