@@ -210,7 +210,19 @@ class SpecialResolver:
                 and not episodes and season == 0 and note.get("source_season") is not None
                 and note["source_season"] in (context.get("release_seasons") or []))
 
-    def resolve(self, meta, bound=None, context=None, manual=None):
+    @staticmethod
+    def validate_type_hint(info, mtype_hint):
+        """Constrain the final target, allowing an independently typed parent."""
+        if mtype_hint is None:
+            return
+        if tmdb_type(info.get("media_type")) != tmdb_type(mtype_hint):
+            raise ValueError("特殊内容目标与明确指定的媒体类型冲突")
+        if mtype_hint == MediaType.ANIME:
+            genres = info.get("genre_ids") or [g.get("id") for g in info.get("genres") or []]
+            if "16" not in {str(value) for value in genres}:
+                raise ValueError("明确指定动漫但特殊内容目标缺少动画分类")
+
+    def resolve(self, meta, bound=None, context=None, manual=None, mtype_hint=None):
         note = requires_confirmation(meta)
         try:
             if note.get("reason"):
@@ -219,6 +231,7 @@ class SpecialResolver:
             note["parent"] = {"media_type": identity(parent)[0].name, "id": parent["id"]}
             meta.set_tmdb_info(parent)
             if note.get("is_extra"):
+                self.validate_type_hint(parent, mtype_hint)
                 if not self.context_allows(note, parent, parent, None, None, context):
                     raise ValueError("附加内容与选集任务约束冲突")
                 note["status"] = "confirmed"
@@ -307,6 +320,7 @@ class SpecialResolver:
                         raise ValueError("附加文件无唯一独立电影目标")
                     target_info = movies[0]
                     evidence = "独立作品完整标题"
+            self.validate_type_hint(target_info, mtype_hint)
             season, number = (season, ep["episode_number"]) if ep else (None, None)
             if not self.context_allows(note, parent, target_info, season, number, context):
                 raise ValueError("特殊集映射与下载任务约束冲突")

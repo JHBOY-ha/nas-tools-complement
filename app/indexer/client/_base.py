@@ -7,6 +7,7 @@ from app.filter import Filter
 from app.helper import ProgressHelper
 from app.media import Media
 from app.media.meta import MetaInfo
+from app.media.meta.special_resolver import identity, tmdb_type
 from app.utils import DomUtils, RequestUtils, StringUtils, ExceptionUtils
 from app.utils.types import MediaType, SearchType
 
@@ -273,6 +274,22 @@ class _IIndexClient(metaclass=ABCMeta):
                         bound_info = self.media.get_tmdb_info(mtype=match_media.type,
                                                               tmdbid=match_media.tmdb_id,
                                                               chinese=False)
+                    # Explicit episode/type evidence cannot be overwritten by
+                    # an IMDb match; MOVIE alone can be the parser's fallback.
+                    if (tmdb_type(meta_info.type) == MediaType.TV
+                            and tmdb_type((bound_info or {}).get("media_type")) != MediaType.TV):
+                        index_match_fail += 1
+                        continue
+                    if (filter_args.get("type") and tmdb_type(filter_args["type"])
+                            != tmdb_type((bound_info or {}).get("media_type"))):
+                        index_match_fail += 1
+                        continue
+                    llm_identity = release_note.get("llm") or {}
+                    if (llm_identity.get("candidate_verified") and llm_identity.get("tmdb_type")
+                            and tmdb_type(llm_identity["tmdb_type"])
+                            != tmdb_type((bound_info or {}).get("media_type"))):
+                        index_match_fail += 1
+                        continue
                     if not bound_info or not self.media._prepare_media_identity(meta_info, bound_info):
                         log.info(f"【{self.index_type}】{torrent_name} 的 IMDb 作品已匹配，但季集未通过校验")
                         index_match_fail += 1
@@ -291,11 +308,16 @@ class _IIndexClient(metaclass=ABCMeta):
                             f"【{self.index_type}】{torrent_name} 识别为 {media_info.get_name()} 未匹配到媒体信息")
                         index_match_fail += 1
                         continue
-                    # TMDBID是否匹配
-                    if str(media_info.tmdb_id) != str(match_media.tmdb_id):
+                    # TMDB IDs are scoped to movie/TV; check before metadata
+                    # merge erases the resource's independently resolved type.
+                    if identity(media_info.tmdb_info) != identity(match_media.tmdb_info):
                         log.info(
                             f"【{self.index_type}】{torrent_name} 识别为 {media_info.type.value} {media_info.get_title_string()} 不匹配")
                         index_match_fail += 1
+                        continue
+                    if (filter_args.get("type") and tmdb_type(filter_args["type"])
+                            != tmdb_type(media_info.type)):
+                        index_rule_fail += 1
                         continue
                     # 合并媒体数据
                     media_info = self.media.merge_media_info(media_info, match_media)

@@ -1027,12 +1027,25 @@ class Media:
 
     def _apply_episode_mapping(self, meta_info, info):
         """Apply an explicit per-work release numbering rule, verified by TMDB."""
-        if not info or info.get("media_type") != MediaType.TV:
+        if not info:
+            return
+        episodes = meta_info.get_episode_list()
+        mapped_note = (meta_info.note or {}).get("episode_mapping") or {}
+        if mapped_note.get("provider") == "configured":
+            # This proof belongs to one work and one unchanged output, not any
+            # object carrying an episode_mapping (specials use that key too).
+            if (info.get("media_type") == MediaType.TV
+                    and mapped_note.get("tmdb_id") == str(info.get("id"))
+                    and mapped_note.get("target_type") == "TV"
+                    and meta_info.get_season_list() == [mapped_note.get("target_season")]
+                    and episodes == mapped_note.get("target_episodes")):
+                return
+            raise ValueError("已有季集映射与当前作品或编号冲突，请重新解析发布编号")
+        if info.get("media_type") != MediaType.TV:
             return
         mappings = (Config().get_config("media") or {}).get("episode_mappings", DEFAULT_EPISODE_MAPPINGS) or []
         if not mappings:
             return
-        episodes = meta_info.get_episode_list()
         if not episodes:
             return
         matches = [rule for rule in mappings
@@ -1052,7 +1065,8 @@ class Media:
         if not set(mapped).issubset(valid):
             raise ValueError("季集映射目标尚未得到TMDB确认")
         note = dict(meta_info.note or {})
-        note["episode_mapping"] = {"source_season": meta_info.begin_season,
+        note["episode_mapping"] = {"provider": "configured", "tmdb_id": str(info["id"]),
+                                   "target_type": "TV", "source_season": meta_info.begin_season,
                                    "source_episodes": episodes, "target_season": target,
                                    "target_episodes": mapped}
         meta_info.note = note
@@ -1239,11 +1253,11 @@ class Media:
             release_episodes = self.__episode_list_of(meta_info)
             try:
                 self._apply_episode_mapping(meta_info, info)
+                if not (getattr(meta_info, "note", None) or {}).get("episode_mapping"):
+                    self._apply_llm_season(meta_info, info)
             except (ValueError, TypeError, KeyError) as error:
                 log.warn("【Meta】无法确认季集映射：%s" % error)
                 return False
-            if not (getattr(meta_info, "note", None) or {}).get("episode_mapping"):
-                self._apply_llm_season(meta_info, info)
             if not self.__verify_remapped_episodes(meta_info, info,
                                                    release_season=release_season,
                                                    release_episodes=release_episodes):
@@ -1283,7 +1297,7 @@ class Media:
         if note.get("episode_mapping"):
             return True
         binding = note.get("season_binding") or {}
-        if binding.get("tmdb_episode") is not None:
+        if binding.get("tmdb_episode") is not None and len(release_episodes) == 1:
             return True
         mapped = self.__convert_absolute_episodes(meta_info, info, release_episodes)
         if mapped:
@@ -1363,10 +1377,14 @@ class Media:
         if not valid_episodes:
             log.warn("【Meta】LLM季号%s缺少TMDB集列表，暂不采用" % season)
             return False
+        # A scalar LLM target cannot represent a multi-episode release.
         episodes = meta_info.get_episode_list()
+        if (len(episodes) > 1 and meta_info.begin_season in (None, int(season))
+                and not set(episodes).issubset(valid_episodes)):
+            raise ValueError("LLM 目标季无法验证完整多集范围")
         applied_episode = None
         llm_episode = llm_note.get("tmdb_episode")
-        if llm_episode is not None and int(llm_episode) in valid_episodes:
+        if len(episodes) <= 1 and llm_episode is not None and int(llm_episode) in valid_episodes:
             applied_episode = int(llm_episode)
             meta_info.begin_episode = applied_episode
             meta_info.end_episode = None
@@ -1520,12 +1538,13 @@ class Media:
         # 识别
         meta_info = MetaInfo(title, subtitle=subtitle, mtype=mtype)
         if requires_confirmation(meta_info) and not (meta_info.note or {}).get("fractional_episode"):
-            return SpecialResolver(self).resolve(meta_info)
+            return SpecialResolver(self).resolve(meta_info, mtype_hint=mtype)
         if not meta_info.get_name() or not meta_info.type:
             log.warn("【Rmt】%s 未识别出有效信息！" % meta_info.org_string)
             return None
         if mtype:
             meta_info.type = mtype
+        identity_prepared = False
         media_key = self.__make_cache_key(meta_info)
         if not cache or not self.get_cache_info(meta_info).get("id"):
             file_media_info = None
@@ -1536,8 +1555,11 @@ class Media:
                                                      tmdbid=llm_tmdb_id,
                                                      chinese=chinese,
                                                      append_to_response=append_to_response)
-                if file_media_info and not self._prepare_media_identity(meta_info, file_media_info, mtype_hint=mtype):
-                    file_media_info = None
+                if file_media_info and not identity_prepared:
+                    identity_prepared = self._prepare_media_identity(
+                        meta_info, file_media_info, mtype_hint=mtype)
+                    if not identity_prepared:
+                        file_media_info = None
                 if not file_media_info:
                     log.warn("【Meta】LLM直出TMDBID无效或未命中，回退名称检索：%s" % llm_tmdb_id)
             main_query_name = meta_info.get_name()
@@ -1566,8 +1588,11 @@ class Media:
                                                      tmdbid=file_media_info.get("id"),
                                                      chinese=chinese,
                                                      append_to_response=append_to_response)
-            if file_media_info and not self._prepare_media_identity(meta_info, file_media_info, mtype_hint=mtype):
-                file_media_info = None
+            if file_media_info and not identity_prepared:
+                identity_prepared = self._prepare_media_identity(
+                    meta_info, file_media_info, mtype_hint=mtype)
+                if not identity_prepared:
+                    file_media_info = None
             # 保存到缓存
             if file_media_info:
                 self.__insert_media_cache(media_key=media_key,
@@ -1586,8 +1611,11 @@ class Media:
                 if cn_fallback_name:
                     meta_info.cn_name = cn_fallback_name
                     meta_info.en_name = None
-        if file_media_info and not self._prepare_media_identity(meta_info, file_media_info, mtype_hint=mtype):
-            file_media_info = None
+        if file_media_info and not identity_prepared:
+            identity_prepared = self._prepare_media_identity(
+                meta_info, file_media_info, mtype_hint=mtype)
+            if not identity_prepared:
+                file_media_info = None
         # 赋值TMDB信息并返回
         meta_info.set_tmdb_info(file_media_info)
         if (meta_info.note or {}).get("fractional_episode"):
@@ -1680,6 +1708,7 @@ class Media:
         default_info, default_type, default_context = tmdb_info, media_type, download_context
         # 遍历每个文件，看得出来的名称是不是不一样，不一样的先搜索媒体信息
         for file_path in file_list:
+            identity_prepared = False
             tmdb_info, media_type, download_context = default_info, default_type, default_context
             context = (download_contexts or {}).get(file_path) or download_context
             try:
@@ -1717,7 +1746,8 @@ class Media:
                     # A task target constrains independently verified file evidence;
                     # it must never act as a manual override for every task member.
                     meta_info = SpecialResolver(self, fractional_cache).resolve(
-                        meta_info, bound=tmdb_info, context=download_context, manual=manual)
+                        meta_info, bound=tmdb_info, context=download_context, manual=manual,
+                        mtype_hint=default_type)
                     return_media_infos[file_path] = meta_info
                     continue
                 parent_name = os.path.basename(os.path.dirname(file_path))
@@ -1775,9 +1805,11 @@ class Media:
                             file_media_info = self.get_tmdb_info(mtype=llm_tmdb_type,
                                                                  tmdbid=llm_tmdb_id,
                                                                  chinese=chinese)
-                            if file_media_info and not self._prepare_media_identity(meta_info, file_media_info,
-                                                                                    mtype_hint=media_type):
-                                file_media_info = None
+                            if file_media_info and not identity_prepared:
+                                identity_prepared = self._prepare_media_identity(
+                                    meta_info, file_media_info, mtype_hint=media_type)
+                                if not identity_prepared:
+                                    file_media_info = None
                             if not file_media_info:
                                 log.warn("【Meta】LLM直出TMDBID无效或未命中，回退名称检索：%s" % llm_tmdb_id)
                         main_query_name = meta_info.get_name()
@@ -1803,9 +1835,11 @@ class Media:
                             file_media_info = self.get_tmdb_info(mtype=file_media_info.get("media_type"),
                                                                  tmdbid=file_media_info.get("id"),
                                                                  chinese=chinese)
-                        if file_media_info and not self._prepare_media_identity(meta_info, file_media_info,
-                                                                                mtype_hint=media_type):
-                            file_media_info = None
+                        if file_media_info and not identity_prepared:
+                            identity_prepared = self._prepare_media_identity(
+                                meta_info, file_media_info, mtype_hint=media_type)
+                            if not identity_prepared:
+                                file_media_info = None
                         # 保存到缓存
                         if file_media_info:
                             self.__insert_media_cache(media_key=media_key,
@@ -1824,9 +1858,11 @@ class Media:
                             if cn_fallback_name:
                                 meta_info.cn_name = cn_fallback_name
                                 meta_info.en_name = None
-                    if file_media_info and not self._prepare_media_identity(meta_info, file_media_info,
-                                                                            mtype_hint=media_type):
-                        file_media_info = None
+                    if file_media_info and not identity_prepared:
+                        identity_prepared = self._prepare_media_identity(
+                            meta_info, file_media_info, mtype_hint=media_type)
+                        if not identity_prepared:
+                            file_media_info = None
                     # 赋值TMDB信息
                     meta_info.set_tmdb_info(file_media_info)
                     if (meta_info.note or {}).get("fractional_episode"):

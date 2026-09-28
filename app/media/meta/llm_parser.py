@@ -247,7 +247,16 @@ class LLMMetaParser(object):
             original_year = meta_info.year
             original_season = meta_info.begin_season
             rule_names = [name for name in (meta_info.cn_name, meta_info.en_name) if name]
+            # Explicit multi-episode numbering is release evidence. LLM hints
+            # may refine names, but range conversion requires full TMDB evidence.
+            range_fields = ("begin_season", "end_season", "total_seasons",
+                            "begin_episode", "end_episode", "total_episodes")
+            release_range = ({key: getattr(meta_info, key) for key in range_fields}
+                             if len(meta_info.get_episode_list()) > 1 else None)
             self.__apply_result(meta_info, llm_result)
+            if release_range:
+                for key, value in release_range.items():
+                    setattr(meta_info, key, value)
             note["llm"].update({
                 "applied": True,
                 "confidence": llm_result.get("confidence", 0),

@@ -16,6 +16,7 @@ from unittest.mock import patch
 # downstream download guards; method counts are not a real-world accuracy metric.
 RECOGNITION_MODULES = (
     "tests.test_metainfo",
+    "tests.test_metadata_binding_guards",
     "tests.test_meta_recognition_plan",
     "tests.test_fractional_versions",
     "tests.test_special_episodes",
