@@ -43,9 +43,9 @@
               <div class="col-12 col-md-6 col-xl-4">
                 <div class="d-flex align-items-center gap-1 mb-2">
                   <label class="form-label mb-0" for="subtitle_task_text_file_limit_mb">文本字幕单文件（MiB）</label>
-                  {{ policy_help("subtitle_task_text_file_limit_mb_help", "文本字幕单文件（MiB）说明", "单个 SRT、ASS 等文本字幕文件的大小上限。MiB 为文件容量单位，1 MiB = 1024 × 1024 字节。默认 20；范围 1–100。") }}
+                  {{ policy_help("subtitle_task_text_file_limit_mb_help", "文本字幕单文件（MiB）说明", "单个 SRT、ASS 等文本字幕文件的大小上限。MiB 为文件容量单位，1 MiB = 1024 × 1024 字节。默认 20；范围 1–200。") }}
                 </div>
-                <input class="form-control" type="number" id="subtitle_task_text_file_limit_mb" data-policy-key="text_file_limit_mb" min="1" max="100" aria-describedby="subtitle_task_text_file_limit_mb_help" required>
+                <input class="form-control" type="number" id="subtitle_task_text_file_limit_mb" data-policy-key="text_file_limit_mb" min="1" max="200" aria-describedby="subtitle_task_text_file_limit_mb_help" required>
               </div>
               <div class="col-12 col-md-6 col-xl-4">
                 <div class="d-flex align-items-center gap-1 mb-2">

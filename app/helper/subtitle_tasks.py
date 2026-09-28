@@ -68,7 +68,7 @@ _QUEUE_POSITION_UNSET = object()
 
 _POLICY_RANGES = {
     "max_upload_queue": (1, 32),
-    "text_file_limit_mb": (1, 100),
+    "text_file_limit_mb": (1, 200),
     "vobsub_limit_mb": (10, 250),
     # The subtitle endpoint hard cap is 260 MiB.  Keep the configurable
     # payload ceiling below it so multipart headers still fit and an
