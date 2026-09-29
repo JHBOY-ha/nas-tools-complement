@@ -30,12 +30,13 @@ class MediaType(Enum):
     ANIME = '动漫'
 
 
-def load_class(path, name, methods, namespace):
+def load_class(path, name, methods, namespace, keep_attrs=False):
     tree = ast.parse((ROOT / path).read_text())
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == name)
     cls.decorator_list = []
     cls.bases = []
-    cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in methods]
+    cls.body = [n for n in cls.body if (keep_attrs and isinstance(n, ast.Assign))
+                or (isinstance(n, ast.FunctionDef) and n.name in methods)]
     exec(compile(ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[])), path, 'exec'), namespace)
     return namespace[name]
 
@@ -75,8 +76,9 @@ class RecognitionTests(unittest.TestCase):
             '__search_media_info', '__confirm_search_result', '__search_media_by_alias_candidates',
             '_prepare_media_identity', '_apply_episode_mapping', '_apply_llm_season',
             '__verify_remapped_episodes', '__convert_absolute_episodes', '__suggest_episode_mapping',
-            '__episode_list_of',
-            '__search_tv_by_name'], self.ns)
+            '__episode_list_of', '__lacks_anime_genre', '__normalize_identity_name',
+            '__candidate_all_names', '__is_other_work_by_prefix',
+            '__search_tv_by_name'], self.ns, keep_attrs=True)
         self.media = cls()
 
     def test_explicit_work_mapping_is_verified_and_not_applied_twice(self):
@@ -123,7 +125,7 @@ class RecognitionTests(unittest.TestCase):
 
     def test_llm_id_requires_candidate_and_matching_type(self):
         for verified, kind, expected in [(False, 'tv', None), (True, 'movie', None), (True, 'tv', 123)]:
-            meta = NS(type=MediaType.ANIME, note={'llm': {
+            meta = NS(type=MediaType.ANIME, begin_episode=3, note={'llm': {
                 'tmdb_id': 123, 'tmdb_type': kind, 'candidate_verified': verified}})
             self.assertEqual(expected, self.media._Media__extract_llm_tmdb_target(meta)[0])
 
@@ -146,6 +148,40 @@ class RecognitionTests(unittest.TestCase):
         self.assertFalse(self.media._valid_media_identity(meta, info))
         info['seasons'].append({'season_number': 2})
         self.assertTrue(self.media._valid_media_identity(meta, info))
+
+    def test_new_anime_entry_without_genres_uses_original_language(self):
+        meta = NS(type=MediaType.ANIME, begin_season=None, cn_name='这样高大的女孩子你喜欢吗？')
+        info = {'media_type': MediaType.TV, 'name': '这样高大的女孩子你喜欢吗？',
+                'genres': [], 'original_language': 'ja'}
+        self.assertTrue(self.media._valid_media_identity(meta, info))
+        info['original_language'] = 'en'
+        self.assertFalse(self.media._valid_media_identity(meta, info))
+        info.update(original_language='ja', genres=[{'id': 18}])
+        self.assertFalse(self.media._valid_media_identity(meta, info))
+
+    def test_short_name_prefix_allows_alias_or_verified_subtitle(self):
+        info = {'id': 94664, 'media_type': MediaType.TV, 'name': '无职转生～到了异世界就拿出真本事～',
+                'genres': [{'id': 16}], 'alternative_titles': {'results': []}}
+        meta = NS(type=MediaType.TV, begin_season=None, cn_name='无职转生', note={})
+        self.assertFalse(self.media._valid_media_identity(meta, info))
+        info['alternative_titles']['results'].append({'title': '无职转生'})
+        self.assertTrue(self.media._valid_media_identity(meta, info))
+        info['alternative_titles']['results'] = []
+        meta.note = {'llm': {'candidate_verified': True, 'tmdb_id': 94664}}
+        self.assertTrue(self.media._valid_media_identity(meta, info))
+        other = {'id': 1, 'media_type': MediaType.TV, 'name': '海贼王女', 'genres': [{'id': 16}]}
+        meta = NS(type=MediaType.TV, begin_season=None, cn_name='海贼王',
+                  note={'llm': {'candidate_verified': True, 'tmdb_id': 1}})
+        self.assertFalse(self.media._valid_media_identity(meta, other))
+
+    def test_verified_movie_candidate_is_allowed_for_anime_without_episode(self):
+        meta = NS(type=MediaType.ANIME, begin_episode=None, note={'llm': {
+            'tmdb_id': 1279865, 'tmdb_type': 'movie', 'candidate_verified': True}})
+        self.assertEqual((1279865, MediaType.MOVIE), self.media._Media__extract_llm_tmdb_target(meta))
+        meta.begin_episode = 3
+        self.assertEqual((None, None), self.media._Media__extract_llm_tmdb_target(meta))
+        meta.begin_episode = None
+        self.assertEqual((None, None), self.media._Media__extract_llm_tmdb_target(meta, MediaType.TV))
 
     def test_verified_tv_can_correct_default_movie_but_not_explicit_hint(self):
         meta = NS(type=MediaType.MOVIE, note={'llm': {
@@ -180,11 +216,12 @@ class RecognitionTests(unittest.TestCase):
         self.assertEqual(456, meta.tmdb_id)
         self.assertEqual(MediaType.ANIME, meta.type)
 
-    def identify_file(self, name, episodes, seasons=(2,), parsed_episode=3, tmdb_seasons=None):
+    def identify_file(self, name, episodes, seasons=(2,), parsed_episode=3, tmdb_seasons=None,
+                      source_title=None, parsed_season=1):
         info = {'media_type': MediaType.TV, 'id': 456}
         if tmdb_seasons is not None:
             info['seasons'] = tmdb_seasons
-        meta = NS(type=MediaType.TV, begin_episode=parsed_episode, begin_season=1,
+        meta = NS(type=MediaType.TV, begin_episode=parsed_episode, begin_season=parsed_season,
                   set_tmdb_info=Mock())
         meta.get_episode_list = lambda: [meta.begin_episode] if meta.begin_episode else []
         self.ns['MetaInfo'] = Mock(return_value=meta)
@@ -196,7 +233,8 @@ class RecognitionTests(unittest.TestCase):
             path = str(Path(directory) / name)
             Path(path).touch()
             result = self.media.get_media_info_on_files([path], info, MediaType.TV,
-                download_context={'tmdb_info': info, 'seasons': list(seasons), 'episodes': episodes})
+                download_context={'tmdb_info': info, 'seasons': list(seasons), 'episodes': episodes,
+                                  'source_title': source_title})
         return result, meta
 
     def test_monitored_batch_keeps_each_file_identity(self):
@@ -229,6 +267,16 @@ class RecognitionTests(unittest.TestCase):
 
     def test_season_conflict_is_not_silently_overwritten(self):
         result, _ = self.identify_file('Other S01E03.mkv', [3])
+        self.assertEqual({}, result)
+
+    def test_file_reusing_rss_release_season_follows_verified_context(self):
+        result, meta = self.identify_file('Honzuki no Gekokujou S04E23.mkv', [23], parsed_episode=23,
+                                          source_title='小书痴 领主的养女 / Honzuki no Gekokujou S04E23',
+                                          parsed_season=4)
+        self.assertEqual(1, len(result))
+        self.assertEqual(2, meta.begin_season)
+        result, _ = self.identify_file('Honzuki no Gekokujou S03E23.mkv', [23], parsed_episode=23,
+                                       source_title='Honzuki no Gekokujou S04E23', parsed_season=3)
         self.assertEqual({}, result)
 
     def test_absolute_episode_conflict_requires_mapping(self):

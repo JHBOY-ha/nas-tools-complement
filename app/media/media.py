@@ -991,6 +991,52 @@ class Media:
         genres = info.get("genre_ids") or [g.get("id") for g in info.get("genres", [])]
         return [str(genre).upper() for genre in genres or []]
 
+    # 新建的 TMDB 条目常常还没有分类，这类条目只按原语言判断是否可能是动画
+    ANIME_ORIGINAL_LANGUAGES = ("ja", "zh", "cn", "ko")
+    TITLE_SUBTITLE_SEPARATORS = " 　～~:：-－—・·!！?？,，、/／(（[【「『"
+
+    @staticmethod
+    def __lacks_anime_genre(info):
+        genres = Media.__get_genre_ids(info)
+        if genres:
+            return not set(genres).intersection(set(ANIME_GENREIDS))
+        return (info.get("original_language") or "").lower() not in Media.ANIME_ORIGINAL_LANGUAGES
+
+    @staticmethod
+    def __normalize_identity_name(name):
+        return re.sub(r"[\s·・:：\-－_.,，!！?？～~]+", "", str(name or "")).upper()
+
+    @staticmethod
+    def __candidate_all_names(info):
+        names = [info.get("name"), info.get("title"),
+                 info.get("original_name"), info.get("original_title")]
+        alternative = info.get("alternative_titles") or {}
+        for item in (alternative.get("results") or alternative.get("titles") or []):
+            names.append(item.get("title"))
+        for item in (info.get("translations") or {}).get("translations") or []:
+            data = item.get("data") or {}
+            names.extend([data.get("name"), data.get("title")])
+        return [name for name in names if name]
+
+    @staticmethod
+    def __is_other_work_by_prefix(meta_info, info, short_name, candidate_name):
+        """
+        短片名只是候选名前缀时，候选可能是另一部作品（海贼王 / 海贼王女），也可能只是
+        带副标题的正式名（无职转生 / 无职转生～到了异世界就拿出真本事～）。
+        候选别名里有该短名，或 LLM 已从候选列表选中此作品且短名后紧跟副标题分隔符时放行。
+        """
+        target = Media.__normalize_identity_name(short_name)
+        if any(Media.__normalize_identity_name(name) == target
+               for name in Media.__candidate_all_names(info)):
+            return False
+        llm_note = (getattr(meta_info, "note", None) or {}).get("llm") or {}
+        suffix = candidate_name[len(short_name):]
+        if (isinstance(llm_note, dict) and llm_note.get("candidate_verified")
+                and str(llm_note.get("tmdb_id")) == str(info.get("id"))
+                and suffix[:1] in Media.TITLE_SUBTITLE_SEPARATORS):
+            return False
+        return True
+
     @staticmethod
     def _valid_media_identity(meta_info, info):
         if not info:
@@ -998,11 +1044,12 @@ class Media:
         short_name = getattr(meta_info, "cn_name", None) or ""
         candidate_name = info.get("name") or info.get("title") or ""
         if (short_name and len(short_name) <= 4 and candidate_name.startswith(short_name)
-                and candidate_name != short_name):
+                and candidate_name != short_name
+                and Media.__is_other_work_by_prefix(meta_info, info, short_name, candidate_name)):
             log.warn("【Meta】短片名仅与候选前缀相同，拒绝绑定另一作品")
             return False
         if Media.__expect_anime_genre(meta_info):
-            if not set(Media.__get_genre_ids(info)).intersection(set(ANIME_GENREIDS)):
+            if Media.__lacks_anime_genre(info):
                 log.warn("【Meta】动漫候选缺少动画分类，拒绝绑定：%s" % candidate_name)
                 return False
         if info.get("media_type") == MediaType.TV and meta_info.begin_season is not None:
@@ -1054,7 +1101,7 @@ class Media:
     def _prepare_media_identity(self, meta_info, info):
         # Reject a wrong adaptation before using its episode metadata.
         if Media.__expect_anime_genre(meta_info) and info:
-            if not set(Media.__get_genre_ids(info)).intersection(set(ANIME_GENREIDS)):
+            if Media.__lacks_anime_genre(info):
                 return self._valid_media_identity(meta_info, info)
         release_season = getattr(meta_info, "begin_season", None)
         release_episodes = self.__episode_list_of(meta_info)
@@ -1230,7 +1277,13 @@ class Media:
         else:
             mtype = self.__resolve_tmdb_mtype(meta_type=meta_info.type, hint_type=mtype_hint)
         expected_type = self.__resolve_tmdb_mtype(meta_type=meta_info.type, hint_type=mtype_hint)
-        if expected_type and mtype != expected_type and (mtype_hint or meta_info.type != MediaType.MOVIE):
+        # 没有集号的动漫发布（剧场版 BD 等）允许绑定经候选列表验证的电影
+        anime_movie = (mtype == MediaType.MOVIE and not mtype_hint
+                       and meta_info.type == MediaType.ANIME
+                       and getattr(meta_info, "begin_episode", None) is None
+                       and llm_note.get("candidate_verified"))
+        if (expected_type and mtype != expected_type and not anime_movie
+                and (mtype_hint or meta_info.type != MediaType.MOVIE)):
             log.warn("【Meta】LLM候选类型与作品类型冲突，回退名称检索")
             return None, None
         # 仅接受经外部候选列表验证的ID，不能凭LLM生成的数字直接绑定作品。
@@ -1645,6 +1698,16 @@ class Media:
                         seasons = download_context.get("seasons") or []
                         episodes = download_context.get("episodes") or []
                         explicit_season = re.search(r"(?i)(?:S|Season[ ._-]*)(\d{1,2})(?=[E ._\-]|$)", file_name)
+                        if explicit_season and len(seasons) == 1 and meta_info.begin_season not in seasons:
+                            # RSS 阶段已按季名把发布季映射到 TMDB 季（小书痴 S04 -> TMDB S02），
+                            # 文件沿用同一发布季标记时按下载任务的季号整理。
+                            source_season = re.search(r"(?i)(?:S|Season[ ._-]*)(\d{1,2})(?=[E ._\-]|$)",
+                                                      download_context.get("source_title") or "")
+                            if source_season and int(source_season.group(1)) == int(explicit_season.group(1)):
+                                log.info("【Meta】文件沿用RSS发布季标记S%s，按下载任务季号整理为S%s"
+                                         % (explicit_season.group(1), seasons[0]))
+                                meta_info.begin_season = seasons[0]
+                                meta_info.end_season = None
                         if explicit_season and seasons and meta_info.begin_season not in seasons:
                             raise ValueError("文件季号与RSS下载任务冲突：%s" % file_name)
                         if len(seasons) == 1 and not explicit_season:

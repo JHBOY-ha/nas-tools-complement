@@ -655,7 +655,8 @@ class MetaBase(object):
             if not genre_ids and info.get("genres"):
                 genre_ids = [g.get("id") for g in info.get("genres") if g.get("id")]
             if not genre_ids:
-                return MediaType.TV
+                # 新建条目尚未补分类时沿用已识别出的动漫类型，避免被归到电视剧目录
+                return MediaType.ANIME if self.type == MediaType.ANIME else MediaType.TV
             if isinstance(genre_ids, list):
                 genre_ids = [str(val).upper() for val in genre_ids]
             else:
