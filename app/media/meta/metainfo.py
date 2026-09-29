@@ -63,6 +63,9 @@ def MetaInfo(title, subtitle=None, mtype=None, use_llm=True, _prepared=None):
         meta_info = MetaBase(title, subtitle)
         meta_info.en_name = numeric_title.strip()
         meta_info.type = MediaType.MOVIE
+    elif not special and re.search(r"(?i)(?<![A-Z0-9])\d{1,2}(?:st|nd|rd|th)[ ._-]+Season\b", title or ""):
+        # 序数季的歧义保护对显式动漫类型及括号路由同样生效。
+        meta_info = MetaVideo(title, subtitle, fileflag)
     elif special or mtype == MediaType.ANIME or is_anime(title):
         meta_info = MetaAnime(title, subtitle, fileflag)
     else:
@@ -100,7 +103,8 @@ def MetaInfo(title, subtitle=None, mtype=None, use_llm=True, _prepared=None):
         if codec:
             meta_info.video_encode = codec[1].upper()
 
-    if use_llm and not numeric_movie and not fractional_episode and not special:
+    if (use_llm and not numeric_movie and not fractional_episode and not special
+            and not meta_info.note.get("ordinal_candidates")):
         # LLM增强识别（配置关闭或调用失败时会自动回落规则识别结果）
         meta_info = LLMMetaParser().merge_into(meta_info=meta_info,
                                                title=title,

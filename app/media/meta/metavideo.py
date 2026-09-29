@@ -37,7 +37,7 @@ class MetaVideo(MetaBase):
     _name_no_chinese_re = r".*版|.*字幕"
     _name_se_words = ['共', '第', '季', '集', '话', '話', '期']
     _name_nostring_re = r"^PTS|^JADE|^AOD|^CHC|^[A-Z]{1,4}TV[\-0-9UVHDK]*" \
-                        r"|HBO$|\s+HBO|\d{1,2}th|\d{1,2}bit|NETFLIX|AMAZON|IMAX|^3D|\s+3D|^BBC\s+|\s+BBC|BBC$|DISNEY\+?|XXX|\s+DC$" \
+                        r"|HBO$|\s+HBO|\d{1,2}bit|NETFLIX|AMAZON|IMAX|^3D|\s+3D|^BBC\s+|\s+BBC|BBC$|DISNEY\+?|XXX|\s+DC$" \
                         r"|[第\s共]+[0-9一二三四五六七八九十\-\s]+季" \
                         r"|[第\s共]+[0-9一二三四五六七八九十\-\s]+[集话話]" \
                         r"|连载|日剧|美剧|电视剧|动画片|动漫|欧美|西德|日韩|超高清|高清|蓝光|翡翠台|梦幻天堂·龙网|★?\d*月?新番" \
@@ -52,11 +52,13 @@ class MetaVideo(MetaBase):
     _video_encode_re = r"^[HX]26[45]$|^AVC$|^HEVC$|^VC\d?$|^MPEG\d?$|^Xvid$|^DivX$|^HDR\d*$"
     _audio_encode_re = r"^DTS\d?$|^DTSHD$|^DTSHDMA$|^Atmos$|^TrueHD\d?$|^AC3$|^\dAudios?$|^DDP\d?$|^DD\d?$|^LPCM\d?$|^AAC\d?$|^FLAC\d?$|^HD\d?$|^MA\d?$"
 
-    def __init__(self, title, subtitle=None, fileflag=False):
+    def __init__(self, title, subtitle=None, fileflag=False, _ordinal_as_title=False):
         super().__init__(title, subtitle, fileflag)
         if not title:
             return
         original_title = title
+        self._ordinal_as_title = _ordinal_as_title
+        self._ambiguous_ordinal = False
         # Remove series totals before tokenization so ``12 集全`` cannot become E12.
         title = re.sub(self._subtitle_episode_all_re, " ", title, flags=re.IGNORECASE)
         # Isolated standard channel blocks are metadata: [2.0] after S01E01
@@ -151,6 +153,14 @@ class MetaVideo(MetaBase):
         # 处理part
         if self.part and self.part.upper() == "PART":
             self.part = None
+        # 裸写的 “Title 2nd Season 3” 有两种解释，先保留证据，不能按整季下载。
+        if self._ambiguous_ordinal and not _ordinal_as_title:
+            alternate = MetaVideo(original_title, subtitle, fileflag, _ordinal_as_title=True)
+            fields = ("cn_name", "en_name", "begin_season", "end_season", "total_seasons",
+                      "begin_episode", "end_episode", "total_episodes")
+            self.note["ordinal_candidates"] = [
+                {key: getattr(candidate, key) for key in fields} for candidate in (self, alternate)]
+            self.skip_reason = "序数词可能属于片名，季集解释尚未唯一确认"
         # 制作组/字幕组
         self.resource_team = ReleaseGroupsMatcher().match(title=original_title) or None
 
@@ -189,7 +199,14 @@ class MetaVideo(MetaBase):
 
     def __ordinal_season(self):
         match = re.fullmatch(r"(\d{1,2})(?:ST|ND|RD|TH)", self._prev_raw_token or "", re.IGNORECASE)
-        return int(match.group(1)) if match else None
+        if not match or self._ordinal_as_title:
+            return None
+        # Season N Episode M / Season N E05 是完整结构，序数词应保留在片名中。
+        following, after = self.tokens.cur(), self.tokens.peek()
+        if (following and following.isdigit() and len(following) <= 2 and after
+                and (after.upper() == "EPISODE" or re.fullmatch(r"EP?\d{1,4}", after, re.I))):
+            return None
+        return int(match.group(1))
 
     def __init_name(self, token):
         if not token:
@@ -477,7 +494,14 @@ class MetaVideo(MetaBase):
             if ordinal:
                 self.begin_season = ordinal
                 self.total_seasons = 1
-                self._last_token_type = "season"
+                # 仅序数季上下文接受个位集号，不放宽普通片名中的数字。
+                self._last_token_type = "ordinal_season"
+                following = self.tokens.cur()
+                self._ambiguous_ordinal = bool(
+                    following and following.isdigit() and len(following) <= 2
+                    and re.search(r"(?i)(?<![A-Z0-9])" + re.escape(self._prev_raw_token)
+                                  + r"[ ._-]+Season[ ._-]+" + re.escape(following)
+                                  + r"(?![A-Z0-9])", self.org_string))
                 self._stop_name_flag = True
                 self._continue_flag = False
                 self.type = MediaType.TV
@@ -585,7 +609,8 @@ class MetaVideo(MetaBase):
                 self._stop_name_flag = bool(self.get_name())
                 self.type = MediaType.TV
             elif self.begin_episode is None \
-                    and 1 < len(token) < 4 \
+                    and (1 < len(token) < 4 or
+                         (len(token) == 1 and self._last_token_type == "ordinal_season")) \
                     and self._last_token_type != "year" \
                     and self._last_token_type != "videoencode" \
                     and token != self._unknown_name_str:

@@ -835,7 +835,7 @@ class Media:
         # callers through full recognition instead of leaving a valid special
         # permanently unconfirmed after the download evidence gate rejects it.
         note = getattr(meta_info, "note", None) or {}
-        if any(note.get(key) for key in ("special_episode", "fractional_episode", "extra")):
+        if any(note.get(key) for key in ("special_episode", "fractional_episode", "extra", "ordinal_candidates")):
             return {}
         cached = self.meta.get_meta_data_by_key(self.__make_cache_key(meta_info))
         name = meta_info.get_name()
@@ -1683,6 +1683,56 @@ class Media:
                 return file_media_info
         return {}
 
+    def __resolve_ordinal_candidates(self, meta_info, bound=None, mtype_hint=None):
+        """只有名称与正式季集支持唯一解释时，才消费有歧义的序数词。"""
+        accepted = []
+        resolver = SpecialResolver(self)
+        for fields in meta_info.note["ordinal_candidates"]:
+            parsed = copy.copy(meta_info)
+            parsed.note = copy.deepcopy(meta_info.note)
+            parsed.note.pop("ordinal_candidates", None)
+            parsed.skip_reason = None
+            for key, value in fields.items():
+                setattr(parsed, key, value)
+            try:
+                # 复用完整分页与精确名称校验；普通模糊检索会把失败折叠为空，
+                # 不能用来证明另一种解释不存在。每个候选独立应用季集映射。
+                infos = [bound] if bound else resolver.search([parsed.get_name()], year=parsed.year)
+                for info in infos:
+                    if self.__resolve_tmdb_mtype(meta_type=info.get("media_type")) != MediaType.TV:
+                        continue
+                    names = {self.__normalize_identity_name(name) for name in self.__candidate_all_names(info)}
+                    if self.__normalize_identity_name(parsed.get_name()) not in names:
+                        continue
+                    candidate = copy.copy(parsed)
+                    candidate.note = copy.deepcopy(parsed.note)
+                    if not self._prepare_media_identity(candidate, info, mtype_hint=mtype_hint):
+                        continue
+                    episodes = candidate.get_episode_list()
+                    if episodes:
+                        detail = self.get_tmdb_tv_season_detail(info["id"], candidate.begin_season)
+                        if not detail or not isinstance(detail.get("episodes"), list):
+                            return {}
+                        numbers = {ep.get("episode_number") for ep in detail["episodes"]
+                                   if type(ep.get("episode_number")) is int}
+                        expected_count = next((season.get("episode_count") for season in info.get("seasons", [])
+                                               if season.get("season_number") == candidate.begin_season), None)
+                        # 不完整的单集列表不能证明该解释无效。
+                        if not numbers or (isinstance(expected_count, int) and len(numbers) < expected_count):
+                            return {}
+                        if not set(episodes).issubset(numbers):
+                            continue
+                    accepted.append((candidate, info))
+            except Exception as error:
+                # 查询失败不是排除另一种解释的证据，下次识别仍可重试。
+                log.warn("【Meta】序数季候选核验失败：%s" % error)
+                return {}
+        if len(accepted) != 1:
+            return {}
+        candidate, info = accepted[0]
+        meta_info.__dict__.update(candidate.__dict__)
+        return info
+
     def __search_media_info(self, meta_info, mtype_hint=None, strict=None,
                             chinese=True, append_to_response=None):
         """
@@ -1690,6 +1740,8 @@ class Media:
         每个候选只准备一次作品身份（含季集映射），与发布名对不上的候选会被丢弃并继续兜底；
         返回的结果已完成准备，调用方不能再次准备，否则会重复偏移集号。
         """
+        if (meta_info.note or {}).get("ordinal_candidates"):
+            return self.__resolve_ordinal_candidates(meta_info, mtype_hint=mtype_hint)
         file_media_info = None
         llm_tmdb_id, llm_tmdb_type = self.__extract_llm_tmdb_target(meta_info=meta_info,
                                                                     mtype_hint=mtype_hint)
@@ -2006,6 +2058,12 @@ class Media:
                     bound_type = tmdb_info.get("media_type") or media_type
                     meta_info = MetaInfo(title=file_name, mtype=bound_type,
                                          use_llm=not bool(download_context), _prepared=prepared[file_path])
+                    # 下载任务只提供作品约束，不能吞掉序数词歧义或补成整季。
+                    if (meta_info.note or {}).get("ordinal_candidates"):
+                        if not self.__resolve_ordinal_candidates(meta_info, bound=tmdb_info,
+                                                                mtype_hint=media_type):
+                            return_media_infos[file_path] = meta_info
+                            continue
                     fractional = (meta_info.note or {}).get("fractional_episode")
                     if fractional:
                         fractional["file_path"] = file_path
