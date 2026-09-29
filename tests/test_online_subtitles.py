@@ -18,6 +18,104 @@ OnlineSubtitles = module.OnlineSubtitles
 
 
 class OnlineSubtitleTest(unittest.TestCase):
+    @staticmethod
+    def response(code=200, payload=None, content=b'subtitle'):
+        # Model requests' context manager and HTTPError response for fallback tests.
+        response = Mock(status_code=code, is_redirect=False)
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        response.json.return_value = payload
+        response.iter_content.return_value = [content]
+        if code >= 400:
+            response.raise_for_status.side_effect = module.requests.HTTPError(response=response)
+        return response
+
+    def test_assrt_api_mirror_preserves_endpoint_and_parameters(self):
+        params = {'token': 'SECRET', 'id': '123456'}
+        for failure in (self.response(520), module.requests.ConnectTimeout()):
+            with self.subTest(failure=type(failure).__name__):
+                with patch.object(module.requests, 'get', side_effect=[failure, self.response(payload={'status': 0})]) as get:
+                    self.assertEqual(OnlineSubtitles()._json('https://api.assrt.net/v1/sub/detail', params), {'status': 0})
+                self.assertEqual(get.call_args.args[0], 'https://api.makedie.me/v1/sub/detail')
+                self.assertEqual(get.call_args.kwargs['params'], params)
+                self.assertFalse(get.call_args.kwargs['allow_redirects'])
+
+    def test_api_fallback_is_bounded_and_does_not_retry_client_errors(self):
+        for url, responses, expected_calls in (
+                ('https://api.assrt.net/v1/sub/search', [self.response(401)], 1),
+                ('https://example.com/api', [self.response(520)], 1),
+                ('https://api.assrt.net/v1/sub/search', [self.response(520), self.response(520)], 2),
+                ('https://api.assrt.net/v1/sub/search', [self.response(payload=[])], 1)):
+            with self.subTest(url=url, expected_calls=expected_calls):
+                with patch.object(module.requests, 'get', side_effect=responses) as get:
+                    with self.assertRaises(ValueError):
+                        OnlineSubtitles()._json(url, {'token': 'SECRET'})
+                self.assertEqual(get.call_count, expected_calls)
+        with patch.object(module.requests, 'get', return_value=self.response(payload={'status': 30900})) as get:
+            self.assertEqual(OnlineSubtitles()._json('https://api.assrt.net/v1/sub/search', {})['status'], 30900)
+            self.assertEqual(get.call_count, 1)
+
+    def test_assrt_http_520_upgrades_preserving_signed_url(self):
+        service = OnlineSubtitles()
+        url = 'http://file1.assrt.net:80/download/123/a%20b.srt?_=123&-=a%2Fb&api=1'
+        with patch.object(service, '_check_url') as check, patch.object(module.requests, 'get', side_effect=[self.response(520), self.response()]) as get:
+            self.assertEqual(service._download(url), b'subtitle')
+        upgraded = 'https://file1.assrt.net/download/123/a%20b.srt?_=123&-=a%2Fb&api=1'
+        self.assertEqual([call.args[0] for call in get.call_args_list], [url, upgraded])
+        self.assertEqual([call.args[0] for call in check.call_args_list], [url, upgraded])
+
+    def test_download_fallback_does_not_change_hosts_or_downgrade_https(self):
+        service = OnlineSubtitles()
+        for url, code, count in (
+                ('http://file1.assrt.net/sub', 520, 2),
+                ('https://file1.assrt.net/sub', 520, 1),
+                ('http://file1.assrt.net/sub', 403, 1),
+                ('http://file1.assrt.net.evil.example/sub', 520, 1),
+                ('http://example.com/sub', 520, 1)):
+            with self.subTest(url=url, code=code):
+                with patch.object(service, '_check_url'), patch.object(service, '_report_download_failure'), patch.object(module.requests, 'get', side_effect=[self.response(code) for _ in range(count)]) as get:
+                    with self.assertRaisesRegex(ValueError, 'HTTP ' + str(code)):
+                        service._download(url)
+                self.assertEqual(get.call_count, count)
+
+    def test_thunder_failure_reasons_reach_realtime_log_without_secrets(self):
+        invalid_json = self.response()
+        invalid_json.json.side_effect = ValueError('SECRET response body')
+        cases = [
+            (self.response(403), 'HTTP 403'),
+            (self.response(520), 'HTTP 520'),
+            (module.requests.ConnectTimeout('SECRET'), '请求超时'),
+            (module.requests.exceptions.SSLError('SECRET'), 'TLS/证书验证失败'),
+            (module.requests.exceptions.ProxyError('http://user:SECRET@proxy'), '代理连接失败'),
+            (module.requests.ConnectionError('SECRET'), '网络连接失败'),
+            (invalid_json, '无法解析 JSON'),
+            (self.response(payload=[]), 'JSON 顶层不是对象'),
+            (self.response(payload={'code': 1001, 'message': 'SECRET'}), 'code=1001'),
+            (self.response(payload={'code': 'SECRET'}), 'code=缺失或格式异常'),
+            (self.response(payload={'code': 0, 'data': {}}), 'data 不是列表'),
+            (self.response(payload={'code': 0, 'data': ['SECRET']}), '字幕条目不是对象'),
+        ]
+        service = OnlineSubtitles('SECRET')
+        # Exercise the real queue append, replacing only the configured logger.
+        for response, expected in cases:
+            with self.subTest(expected=expected):
+                with patch.object(service, 'cid', return_value=''), patch.object(module.requests, 'get', side_effect=[response]), patch.object(module.log.Logger, 'get_instance', return_value=Mock()), patch.object(module.log, 'LOG_QUEUE', []):
+                    results, warnings = service.search('影片', '/private/SECRET.mkv', 'thunder')
+                    self.assertFalse(results)
+                    self.assertEqual(warnings, ['迅雷检索失败，请稍后重试'])
+                    self.assertEqual(len(module.log.LOG_QUEUE), 1)
+                    record = module.log.LOG_QUEUE[0]
+                    self.assertEqual(record['level'], 'ERROR')
+                    self.assertIn(expected, record['text'])
+                    self.assertIn('api-shoulei-ssl.xunlei.com', record['text'])
+                    self.assertNotIn('SECRET', record['text'])
+
+    def test_thunder_empty_results_do_not_log_failure(self):
+        service = OnlineSubtitles()
+        with patch.object(service, 'cid', return_value=''), patch.object(module.requests, 'get', return_value=self.response(payload={'code': 0, 'data': []})), patch.object(module.log, 'error') as error:
+            self.assertEqual(service.search('影片', '/media.mkv', 'thunder'), ([], []))
+            error.assert_not_called()
+
     def test_cid_small_and_sampled_files(self):
         for size in (17, 0xf000, 200000):
             content = bytes(index % 251 for index in range(size))
@@ -39,7 +137,8 @@ class OnlineSubtitleTest(unittest.TestCase):
 
     def test_provider_failure_does_not_hide_other_results(self):
         service = OnlineSubtitles('secret')
-        with patch.object(service, 'cid', return_value=''), patch.object(service, '_json', side_effect=[ValueError(), {'status': 0, 'sub': {'subs': [{'id': 42, 'native_name': '电影.srt'}]}}]):
+        # A logging backend failure must not interrupt Assrt fallback.
+        with patch.object(module.log, 'error', side_effect=RuntimeError('logger unavailable')), patch.object(service, 'cid', return_value=''), patch.object(service, '_json', side_effect=[ValueError(), {'status': 0, 'sub': {'subs': [{'id': 42, 'native_name': '电影.srt'}]}}]):
             results, warnings = service.search('电影', '/media.mkv')
         self.assertEqual(results[0]['remote_id'], '42')
         self.assertEqual(len(warnings), 1)

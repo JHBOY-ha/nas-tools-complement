@@ -15,6 +15,13 @@ from urllib.parse import urljoin, urlsplit
 
 import requests
 
+import log
+from app.utils import ExceptionUtils
+
+
+class SubtitleSourceError(ValueError):
+    """Safe diagnostic text, excluding request URLs, credentials and response bodies."""
+
 
 class OnlineSubtitles:
     FORMATS = {"srt", "ass", "ssa", "vtt", "smi", "sub"}
@@ -39,15 +46,54 @@ class OnlineSubtitles:
 
     def _json(self, url, params):
         # Do not surface requests exceptions: Assrt URLs contain credentials.
-        try:
-            with requests.get(url, params=params, timeout=(5, 20)) as response:
-                response.raise_for_status()
-                result = response.json()
-                if not isinstance(result, dict):
-                    raise ValueError()
-                return result
-        except (requests.RequestException, ValueError):
-            raise ValueError("字幕源请求失败，请检查网络或 API Token") from None
+        urls = [url]
+        parsed = urlsplit(url)
+        assrt_api = parsed.scheme == "https" and parsed.netloc == "api.assrt.net"
+        thunder_api = parsed.hostname == "api-shoulei-ssl.xunlei.com"
+        # Only the documented API mirror may receive the token; file hosts are
+        # not interchangeable. Keep the endpoint and all parameters intact.
+        if assrt_api:
+            urls.append(parsed._replace(netloc="api.makedie.me").geturl())
+        for index, candidate in enumerate(urls):
+            try:
+                with requests.get(candidate, params=params, timeout=(5, 20),
+                                  allow_redirects=not assrt_api) as response:
+                    response.raise_for_status()
+                    if assrt_api and response.is_redirect:
+                        raise ValueError()
+                    result = response.json()
+                    if not isinstance(result, dict):
+                        raise SubtitleSourceError("响应格式错误：JSON 顶层不是对象")
+                    return result
+            except (requests.RequestException, ValueError) as error:
+                code = getattr(getattr(error, "response", None), "status_code", None)
+                # HTTP 4xx and invalid JSON must not consume a second request.
+                # Business errors in successful JSON replies go to the caller.
+                retryable = (isinstance(error, (requests.ConnectionError, requests.Timeout))
+                             or (isinstance(code, int) and 500 <= code < 600))
+                if index + 1 < len(urls) and retryable:
+                    continue
+                if thunder_api:
+                    # requests exception strings can include URLs and proxy
+                    # credentials. Describe the category without serializing them.
+                    if isinstance(error, SubtitleSourceError):
+                        reason = str(error)
+                    elif isinstance(code, int):
+                        reason = f"接口返回 HTTP {code}"
+                    elif isinstance(error, requests.exceptions.SSLError):
+                        reason = "TLS/证书验证失败"
+                    elif isinstance(error, requests.exceptions.ProxyError):
+                        reason = "代理连接失败"
+                    elif isinstance(error, requests.Timeout):
+                        reason = "请求超时（连接上限 5 秒，读取上限 20 秒）"
+                    elif isinstance(error, requests.ConnectionError):
+                        reason = "网络连接失败（请检查 DNS、网络出口及目标服务）"
+                    elif isinstance(error, ValueError):
+                        reason = "响应格式错误：无法解析 JSON"
+                    else:
+                        reason = "请求失败"
+                    raise SubtitleSourceError(f"{reason}；异常类型 {type(error).__name__}") from None
+                raise ValueError("字幕源请求失败，请检查网络或 API Token") from None
 
     @staticmethod
     def episode_numbers(text):
@@ -203,9 +249,18 @@ class OnlineSubtitles:
                     warnings.append("无法读取文件特征，迅雷仅按名称检索")
                 data = self._json("https://api-shoulei-ssl.xunlei.com/oracle/subtitle", {"name": query})
                 if data.get("code") != 0:
-                    raise ValueError("迅雷字幕接口暂不可用")
+                    # Log only numeric business codes, never arbitrary upstream
+                    # messages which may echo user input or signed download URLs.
+                    code = data.get("code")
+                    code_text = str(code) if isinstance(code, int) or (isinstance(code, str) and re.fullmatch(r"-?\d{1,12}", code)) else "缺失或格式异常"
+                    raise SubtitleSourceError(f"接口业务错误：code={code_text}")
                 seen = set()
-                for entry in data.get("data") or []:
+                entries = data.get("data")
+                if entries is not None and not isinstance(entries, list):
+                    raise SubtitleSourceError("响应格式错误：data 不是列表")
+                for entry in entries or []:
+                    if not isinstance(entry, dict):
+                        raise SubtitleSourceError("响应格式错误：字幕条目不是对象")
                     ext = str(entry.get("ext") or "").lower().lstrip(".")
                     url = entry.get("url")
                     if not url or url in seen or ext not in self.FORMATS:
@@ -216,7 +271,14 @@ class OnlineSubtitles:
                                     "hash_match": bool(cid and cid == str(entry.get("cid") or "").upper()),
                                     "url": url})
                 results.sort(key=lambda item: (item["hash_match"], "简体" in item["language"]), reverse=True)
-            except (ValueError, TypeError, AttributeError):
+            except (ValueError, TypeError, AttributeError) as error:
+                # log.error feeds the system real-time queue as well as normal
+                # logging. Logging failures must not hide other provider results.
+                reason = str(error) if isinstance(error, SubtitleSourceError) else f"响应处理失败（{type(error).__name__}）"
+                try:
+                    log.error(f"【OnlineSubtitles】迅雷检索失败：{reason}（来源主机 api-shoulei-ssl.xunlei.com）")
+                except Exception:
+                    pass
                 warnings.append("迅雷检索失败，请稍后重试")
         if provider in ("all", "assrt"):
             if not self.token:
@@ -285,6 +347,7 @@ class OnlineSubtitles:
             raise ValueError("无法解析字幕下载地址") from None
 
     def _download(self, url):
+        https_fallback_used = False
         try:
             for _ in range(6):
                 self._check_url(url)
@@ -292,6 +355,18 @@ class OnlineSubtitles:
                                   stream=True, timeout=(5, 30), allow_redirects=False) as response:
                     if response.is_redirect:
                         url = urljoin(url, response.headers.get("Location", ""))
+                        continue
+                    # An Assrt HTTP file gateway can fail independently of its
+                    # HTTPS endpoint. Upgrade once without changing signed bytes
+                    # in the path/query, and validate the new target next time.
+                    parsed = urlsplit(url)
+                    if (not https_fallback_used and parsed.scheme == "http"
+                            and re.fullmatch(r"file\d+\.assrt\.net", parsed.hostname or "")
+                            and parsed.port in (None, 80)
+                            and isinstance(response.status_code, int)
+                            and 500 <= response.status_code < 600):
+                        url = parsed._replace(scheme="https", netloc=parsed.hostname).geturl()
+                        https_fallback_used = True
                         continue
                     response.raise_for_status()
                     content = bytearray()
@@ -303,8 +378,35 @@ class OnlineSubtitles:
                         raise ValueError("字幕源返回空文件")
                     return bytes(content)
             raise ValueError("字幕下载重定向过多")
-        except requests.RequestException:
-            raise ValueError("字幕下载失败，请稍后重新搜索") from None
+        except requests.RequestException as error:
+            self._report_download_failure(error, url)
+            if isinstance(error, requests.exceptions.HTTPError):
+                code = getattr(getattr(error, "response", None), "status_code", None)
+                message = f"字幕源返回 HTTP {code if code else '异常状态'}，请稍后重新搜索或选择其他字幕"
+            elif isinstance(error, (requests.exceptions.ConnectTimeout, requests.exceptions.ReadTimeout)):
+                message = "字幕下载超时，请检查网络后重试"
+            else:
+                message = "字幕下载失败，请稍后重新搜索"
+            raise ValueError(message) from None
+
+    @staticmethod
+    def _report_download_failure(error, url):
+        """Surface the real cause in console and app logs.  Provider URLs
+        never reach the message: Assrt links embed the API token, so only
+        the exception class, HTTP status and target hostname are logged."""
+        ExceptionUtils.exception_traceback(error)
+        if not os.environ.get("NASTOOL_CONFIG"):
+            # Config-less contexts (unit tests) cannot build the app logger.
+            return
+        try:
+            detail = type(error).__name__
+            code = getattr(getattr(error, "response", None), "status_code", None)
+            if code:
+                detail = f"{detail} HTTP {code}"
+            host = urlsplit(url).hostname or "unknown"
+            log.error("【OnlineSubtitles】字幕下载失败：%s（来源主机 %s）" % (detail, host))
+        except Exception:
+            pass
 
     def files(self, item, member=None):
         """Return choices for an archive, or a single selected file; never extract paths."""

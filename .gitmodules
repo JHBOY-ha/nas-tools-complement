@@ -4,9 +4,6 @@
 [submodule "third_party/transmission-rpc"]
 	path = third_party/transmission-rpc
 	url = https://github.com/Trim21/transmission-rpc
-[submodule "third_party/anitopy"]
-	path = third_party/anitopy
-	url = https://github.com/igorcmoura/anitopy
 [submodule "third_party/plexapi"]
 	path = third_party/plexapi
 	url = https://github.com/pkkid/python-plexapi

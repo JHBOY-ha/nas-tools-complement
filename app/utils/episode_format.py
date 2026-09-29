@@ -6,6 +6,18 @@ from config import SPLIT_CHARS
 class EpisodeFormat(object):
     _key = ""
 
+    @staticmethod
+    def normalize_season(season):
+        """Validate a manual season once, preserving blank auto mode and explicit S00."""
+        if season is None or season == "":
+            return None
+        # Do not silently truncate floats or interpret booleans as season numbers.
+        if type(season) is int and season >= 0:
+            return season
+        if isinstance(season, str) and re.fullmatch(r"[0-9]+", season.strip()):
+            return int(season.strip())
+        raise ValueError("季号参数无效：请输入非负整数（0 表示特别篇），或留空自动识别")
+
     def __init__(self, eformat, details: str = None, offset=None, key="ep"):
         self._format = eformat
         self._start_ep = None
@@ -82,4 +94,3 @@ class EpisodeFormat(object):
         else:
             return int(re.compile(r'[a-zA-Z]*', re.IGNORECASE).sub("", episode_splits[0])), int(
                 re.compile(r'[a-zA-Z]*', re.IGNORECASE).sub("", episode_splits[1]))
-

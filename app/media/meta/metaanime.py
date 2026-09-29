@@ -15,7 +15,7 @@ class MetaAnime(MetaBase):
     识别动漫
     """
     _anime_no_words = ['CHS&CHT', 'MP4', 'GB MP4', 'WEB-DL']
-    _name_nostring_re = r"S\d{2}\s*-\s*S\d{2}|S\d{2}|\s+S\d{1,2}|EP?\d{2,4}\s*-\s*EP?\d{2,4}|EP?\d{2,4}|\s+EP?\d{1,4}"
+    _name_nostring_re = MetaBase._season_episode_marker_re
     _roman_season_map = {
         "I": 1,
         "II": 2,
@@ -38,6 +38,8 @@ class MetaAnime(MetaBase):
             original_title = title
             # 字幕组信息会被预处理掉
             anitopy_info_origin = anitopy.parse(title)
+            # Series totals are metadata, not candidates for anitopy's bare episode rule.
+            title = re.sub(self._subtitle_episode_all_re, " ", title, flags=re.IGNORECASE)
             title = self.__prepare_title(title)
             anitopy_info = anitopy.parse(title)
             if anitopy_info:
@@ -45,11 +47,17 @@ class MetaAnime(MetaBase):
                 name = anitopy_info.get("anime_title")
                 if name and name.find("/") != -1:
                     name = name.split("/")[-1].strip()
-                if not name or name in self._anime_no_words or (len(name) < 5 and not StringUtils.is_chinese(name)):
+                # A short numeric title is reliable when a separate season/episode was
+                # found; do not replace ``86 - 01`` with its release-group bracket.
+                numeric_title = bool(name and name.isdigit() and (
+                    anitopy_info.get("anime_season") or anitopy_info.get("episode_number")))
+                if (not name or name in self._anime_no_words
+                        or (len(name) < 5 and not StringUtils.is_chinese(name) and not numeric_title)):
                     anitopy_info = anitopy.parse("[ANIME]" + title)
                     if anitopy_info:
                         name = anitopy_info.get("anime_title")
-                if not name or name in self._anime_no_words or (len(name) < 5 and not StringUtils.is_chinese(name)):
+                if (not name or name in self._anime_no_words
+                        or (len(name) < 5 and not StringUtils.is_chinese(name) and not numeric_title)):
                     name_match = re.search(r'\[(.+?)]', title)
                     if name_match and name_match.group(1):
                         name = name_match.group(1).strip()
@@ -70,6 +78,7 @@ class MetaAnime(MetaBase):
                 # 拆份中英文名称
                 if name:
                     lastword_type = ""
+                    leading_numbers = []
                     for word in name.split():
                         if not word:
                             continue
@@ -80,12 +89,23 @@ class MetaAnime(MetaBase):
                                 self.cn_name = "%s %s" % (self.cn_name or "", word)
                             elif lastword_type == "en":
                                 self.en_name = "%s %s" % (self.en_name or "", word)
+                            else:
+                                # Keep leading title numbers until their language is known.
+                                leading_numbers.append(word)
                         elif StringUtils.is_chinese(word):
+                            if leading_numbers:
+                                word = " ".join(leading_numbers + [word])
+                                leading_numbers = []
                             self.cn_name = "%s %s" % (self.cn_name or "", word)
                             lastword_type = "cn"
                         else:
+                            if leading_numbers:
+                                word = " ".join(leading_numbers + [word])
+                                leading_numbers = []
                             self.en_name = "%s %s" % (self.en_name or "", word)
                             lastword_type = "en"
+                    if leading_numbers:
+                        self.en_name = " ".join(leading_numbers)
                 if self.cn_name:
                     _, self.cn_name, _, _, _, _ = StringUtils.get_keyword_from_string(self.cn_name)
                     if self.cn_name:

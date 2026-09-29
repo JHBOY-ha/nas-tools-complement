@@ -55,6 +55,12 @@ app:
 
 # 【配置媒体库信息】
 media:
+  # 特殊集只按明确证据映射；完整配置示例见 docs/meta-season-episode-recognition.md。
+  special_episode_mappings: []
+  # 本地附加内容默认关闭；启用时须指定 jellyfin、plex 或 emby。
+  extras:
+    enabled: false
+    server_profile:
   # 【媒体库管理软件】：emby、jellyfin、plex，需要在emby或jellyfin或plex区配置详细信息，用于下载检查控重、媒体库展示等，建议配置
   media_server: emby
   # 【媒体库数据同步周期】：定时同步媒体服务器数据到本地，单位小时

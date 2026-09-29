@@ -41,8 +41,10 @@ def load_class(path, name, methods, namespace):
 
 
 def env():
-    return dict(os=os, re=re, time=time, uuid=uuid, json=json, traceback=traceback,
-                MediaType=MediaType, Enum=Enum, MatchMode=NS(NORMAL='normal'), EpisodeFormat=object,
+    from app.utils.episode_format import EpisodeFormat
+    # 季集验证的失败回滚使用深拷贝；AST 加载保留与生产方法相同的依赖。
+    return dict(os=os, re=re, time=time, uuid=uuid, json=json, traceback=traceback, copy=copy,
+                MediaType=MediaType, Enum=Enum, MatchMode=NS(NORMAL='normal'), EpisodeFormat=EpisodeFormat,
                 log=Mock(), ExceptionUtils=Mock(), lock=threading.Lock(), urlencode=urlencode,
                 Config=lambda: NS(get_config=lambda key: {}),
                 DEFAULT_EPISODE_MAPPINGS=[], DEFAULT_NAME_ALIASES={},
@@ -53,6 +55,16 @@ def env():
 class RecognitionTests(unittest.TestCase):
     def setUp(self):
         self.ns = env()
+        # 批次分类使用真实的小数集检测器。
+        from app.media.meta.fractional import protect_fractional_episode
+        self.ns["protect_fractional_episode"] = protect_fractional_episode
+        from app.media.meta.metainfo import prepare_title
+        self.ns["prepare_title"] = prepare_title
+        # New special classification is pure and safe in the AST harness.
+        from app.media.meta.special import extract_special
+        from app.media.meta.special_resolver import identity
+        self.ns["extract_special"] = extract_special
+        self.ns["identity"] = identity
         cls = load_class('app/media/media.py', 'Media', [
             '__search_media_with_name', '__extract_llm_tmdb_target', '__resolve_tmdb_mtype',
             'get_media_info_on_files', 'get_cache_info', '__make_cache_key', '_valid_media_identity',
@@ -167,7 +179,12 @@ class RecognitionTests(unittest.TestCase):
         info = {'media_type': MediaType.TV, 'id': 456}
         if tmdb_seasons is not None:
             info['seasons'] = tmdb_seasons
-        meta = NS(type=MediaType.TV, begin_episode=parsed_episode, begin_season=1,
+        # 模拟解析器须区分明确 Sxx 和缺失季标记，不能总返回默认季 1。
+        season_match = re.search(r"S(\d+)E", name)
+        # 与 MetaBase 一致提供可选区间终点，供手动覆盖前后的完整编号比较使用。
+        meta = NS(type=MediaType.TV, begin_episode=parsed_episode, end_episode=None, end_season=None,
+                  begin_season=int(season_match[1]) if season_match else None,
+                  note={}, skip_reason=None, tmdb_info=info, tmdb_id=456,
                   set_tmdb_info=Mock())
         meta.get_episode_list = lambda: [meta.begin_episode] if meta.begin_episode else []
         self.ns['MetaInfo'] = Mock(return_value=meta)
@@ -187,7 +204,9 @@ class RecognitionTests(unittest.TestCase):
                                   get_bluray_dir=lambda p: None)
         self.media.tmdb = True
         self.media.save_rename_cache = Mock()
-        metas = [NS(type=MediaType.MOVIE, set_tmdb_info=Mock()) for _ in range(3)]
+        metas = [NS(type=MediaType.MOVIE, note={}, skip_reason=None, begin_season=None,
+                    end_season=None, begin_episode=None, end_episode=None,
+                    get_episode_list=lambda: [], set_tmdb_info=Mock()) for _ in range(3)]
         self.ns['MetaInfo'] = Mock(side_effect=metas)
         with tempfile.TemporaryDirectory() as directory:
             paths = [str(Path(directory) / ('film%s.mkv' % i)) for i in range(3)]
@@ -281,6 +300,9 @@ class JellyfinTests(unittest.TestCase):
 class DownloadTests(unittest.TestCase):
     def setUp(self):
         self.ns = env()
+        # Exercise the production evidence gate in the isolated AST downloader.
+        from app.media.meta.special import download_block_reason
+        self.ns['download_block_reason'] = download_block_reason
         cls = load_class('app/downloader/downloader.py', 'Downloader',
                          ['transfer', '_get_download_context', '_create_download_context', 'check_exists_medias', 'get_monitored_download_contexts'], self.ns)
         self.d = cls()
@@ -489,12 +511,23 @@ class QueueTests(unittest.TestCase):
 
 
 class HardlinkTests(unittest.TestCase):
+    def test_invalid_season_reports_actionable_error_before_transfer(self):
+        # No filesystem scan or media lookup is allowed for invalid batch input.
+        self.transfer.progress = Mock()
+        self.transfer.media = Mock()
+        result, message = self.transfer.transfer_media(
+            in_from="manual", in_path="unused.mkv", season="S01")
+        self.assertFalse(result)
+        self.assertIn("季号参数无效", message)
+        self.transfer.media.get_media_info_on_files.assert_not_called()
+        self.transfer.progress.end.assert_called_once_with('filetransfer')
+
     def setUp(self):
         self.ns = env()
         self.mode = MediaType.ANIME  # Enum-shaped transfer mode; no app imports needed.
         self.ns['RmtMode'].LINK = self.mode
         cls = load_class('app/filetransfer.py', 'FileTransfer', [
-            '__transfer_file', '__transfer_origin_file', '__get_best_target_path', '_existing_media_files', 'transfer_media'], self.ns)
+            '__transfer_file', '__transfer_origin_file', '__get_best_target_path', '_existing_media_files', '_check_fractional_destinations', 'transfer_media'], self.ns)
         self.transfer = cls()
         self.transfer.dbhelper = Mock()
         self.transfer._FileTransfer__transfer_subtitles = Mock(return_value=0)
@@ -511,6 +544,7 @@ class HardlinkTests(unittest.TestCase):
         t.dbhelper.insert_transfer_blacklist.return_value = True
         t._FileTransfer__transfer_command = Mock()
         meta = NS(tmdb_id=1, type=MediaType.MOVIE, category='', title='Film', year='2026',
+                  note={}, skip_reason=None,
                   en_name='Film', cn_name='', begin_season=None, begin_episode=None,
                   imdb_id=None, set_tmdb_info=Mock(), tmdb_info={'id': 1},
                   get_title_string=lambda: 'Film (2026)')

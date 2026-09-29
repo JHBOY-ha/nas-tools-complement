@@ -12,10 +12,21 @@ var library_subtitle_audit_categories = {};
 var library_subtitle_audit_roots = {};
 var library_items_loading = false;
 var library_pending_page = null;
+var library_view_instance = null;
 var library_categories_cache = {};
 var library_subtitle_audit_task_id = "";
 var library_subtitle_upload_task_id = "";
 var library_subtitle_upload_request = null;
+
+// popstate changes the history entry before the SPA replaces its DOM. Invalidate
+// immediately so a late response cannot write into that 150 ms transition window.
+// The script is reloaded on navigation; install only one window-level listener.
+if (typeof window.addEventListener === "function" && !window.library_history_listener_installed) {
+  window.addEventListener("popstate", function () {
+    library_view_instance = null;
+  });
+  window.library_history_listener_installed = true;
+}
 
 function library_escape_html(value) {
   if (value === null || value === undefined) {
@@ -87,7 +98,39 @@ function update_library_category_options(categories) {
   $("#library_filter_category").html(html);
 }
 
+function library_saved_view() {
+  const extra = window.history.state && window.history.state.extra;
+  return (extra && extra.library_view) || null;
+}
+
+function library_save_history_state() {
+  // Record the current filter/sort/page onto the active history entry so
+  // SPA back/forward restores this view instead of the default one.
+  if (typeof window_history !== "function") {
+    return;
+  }
+  const extra = (window.history.state && window.history.state.extra) || {};
+  window_history(false, Object.assign({}, extra, {library_view: {
+    type: $("#library_filter_type").val() || "all",
+    category: $("#library_filter_category").val() || "",
+    subtitle: $("#library_filter_subtitle").val() || "all",
+    sort_by: $("#library_sort_by").val() || "default",
+    sort_order: $("#library_sort_order").val() || "desc",
+    keyword: String($("#library_filter_keyword").val() || "").trim(),
+    page: library_page || 1
+  }}));
+}
+
 function load_library_items(page) {
+  // DOM identity and an initialization token distinguish a departed view from
+  // a newly opened library, even when it has the same URL and element IDs.
+  const view = library_view_instance;
+  const grid = document.getElementById("library_items_grid");
+  const is_current_view = () => grid && view && view === library_view_instance &&
+      document.getElementById("library_items_grid") === grid;
+  if (!is_current_view()) {
+    return;
+  }
   page = page || 1;
   if (page < 1) {
     return;
@@ -112,6 +155,7 @@ function load_library_items(page) {
     data: JSON.stringify(library_filter_data(page)),
     timeout: 0,
     success: function (ret) {
+      if (!is_current_view()) { return; }
       ret = ret || {};
       if (ret.code !== 0) {
         $("#library_items_summary").text("字幕库加载失败");
@@ -142,19 +186,22 @@ function load_library_items(page) {
       init_library_posters();
     },
     error: function () {
+      if (!is_current_view()) { return; }
       $("#library_prev_btn,#library_next_btn").prop("disabled", false);
       $("#library_items_summary").text("字幕库加载失败，请稍后重试");
       show_fail_modal("网络错误");
     },
     complete: function () {
+      if (!is_current_view()) { return; }
       NProgress.done();
       library_items_loading = false;
+      library_save_history_state();
       $("#library_filter_btn,#library_filter_trigger,#library_refresh_btn").prop("disabled", false);
       const pending_page = library_pending_page;
       library_pending_page = null;
       if (pending_page !== null) {
         setTimeout(function () {
-          load_library_items(pending_page);
+          if (is_current_view()) { load_library_items(pending_page); }
         }, 50);
       }
     }
@@ -972,6 +1019,11 @@ function finish_library_upload_task(task) {
 }
 
 function init_media_library_page(options) {
+  // A previous view's requests may still be in flight; they must not own the
+  // new view's loading flags or pending page after navigation/restoration.
+  library_view_instance = {};
+  library_items_loading = false;
+  library_pending_page = null;
   options = options || {};
   SubtitleTasks.init();
   library_default_media_server = (options.default_server || window.CURRENT_MEDIA_SERVER_TYPE || library_default_media_server || "emby").toLowerCase();
@@ -1150,9 +1202,25 @@ function init_media_library_page(options) {
     $("#library_filter_keyword").val("").trigger("input").trigger("focus");
   });
 
+  const saved_view = library_saved_view();
+  if (saved_view) {
+    $("#library_filter_type").val(saved_view.type || "all");
+    $("#library_filter_subtitle").val(saved_view.subtitle || "all");
+    $("#library_sort_by").val(saved_view.sort_by || "default");
+    $("#library_sort_order").val(saved_view.sort_order || "desc");
+    $("#library_filter_keyword").val(saved_view.keyword || "");
+    // Category options only exist after the first server response, so seed
+    // the select with the saved value; update_library_category_options
+    // preserves it through the selected check and rebuilds the real list.
+    const saved_category = String(saved_view.category || "");
+    if (saved_category) {
+      $("#library_filter_category").html(
+          `<option value="${library_escape_html(saved_category)}" selected></option>`);
+    }
+  }
   update_library_sort_order_labels();
   update_library_filter_badge();
-  load_library_items(1);
+  load_library_items(saved_view ? Math.max(parseInt(saved_view.page, 10) || 1, 1) : 1);
 }
 
 var library_online_path = "";

@@ -865,6 +865,8 @@
 <script src="../static/js/nprogress.js"></script>
 <script src="../static/js/ace.js"></script>
 <script src="../static/js/util.js"></script>
+{% include "rename/special_confirmation.html" %}
+<script src="../static/js/special-confirmation.js"></script>
 <!-- 提示弹窗 -->
 <script type="text/javascript">
   // 显示全局加载蒙版
@@ -1939,7 +1941,11 @@
         if (ret.retcode == 0) {
         navmenu(flag);
         } else {
-        show_fail_modal(`重新识别失败：${ret.retmsg}！`);
+        if (ret.pending && ret.pending.length) {
+          SpecialConfirmation.open(ret.pending, ret.retmsg);
+        } else {
+          show_fail_modal(`重新识别失败：${ret.retmsg || ret.msg || '请求失败，请重试'}！`);
+        }
         }
     });
   }
@@ -2044,7 +2050,11 @@
           navmenu(source);
         });
       } else {
-        //处理失败
+        // Special files can recover through a TMDB review without re-entering identifiers.
+        if (ret.pending && ret.pending.length) {
+          SpecialConfirmation.open(ret.pending, ret.retmsg);
+          return;
+        }
         show_fail_modal(ret.retmsg, function(){
           $('#modal-media-identification').modal('show');
         });
