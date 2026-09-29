@@ -89,6 +89,7 @@ class MetaVideo(MetaBase):
         tokens = Tokens(title)
         self.tokens = tokens
         # 解析名称、年份、季、集、资源类型、分辨率等
+        self._prev_raw_token = None
         token = tokens.get_next()
         while token:
             # Part
@@ -118,6 +119,7 @@ class MetaVideo(MetaBase):
             if self._continue_flag:
                 self.__init_audio_encode(token)
             # 取下一个，直到没有为卡
+            self._prev_raw_token = token
             token = tokens.get_next()
             self._continue_flag = True
         # 合成质量
@@ -178,9 +180,16 @@ class MetaVideo(MetaBase):
         # 仅在下一 token 是有效编号时消费英文标记，保留真实片名中的单词。
         limit = {"SEASON": 2, "EPISODE": 4}.get(token.upper())
         following = self.tokens.cur()
+        if token.upper() == "SEASON" and self.__ordinal_season():
+            # 4th Season 已经给出季号，后面的数字是集号（[4th Season][18 - 总第84]）
+            return False
         return bool(limit and following and following.isdigit()
                     and len(following) <= limit
                     and not (len(following) == 4 and following.startswith(("19", "20"))))
+
+    def __ordinal_season(self):
+        match = re.fullmatch(r"(\d{1,2})(?:ST|ND|RD|TH)", self._prev_raw_token or "", re.IGNORECASE)
+        return int(match.group(1)) if match else None
 
     def __init_name(self, token):
         if not token:
@@ -202,6 +211,12 @@ class MetaVideo(MetaBase):
             return
         # 拼写季集标记交给对应解析器；前置 Episode 后仍可继续读取标题。
         if self.__is_written_marker(token):
+            return
+        if token.upper() == "SEASON" and self.__ordinal_season():
+            # 4th Season 是季标记，片名到此结束；撤回已拼入英文名的序数词
+            if self.en_name and self.en_name.split()[-1] == self._prev_raw_token:
+                self.en_name = " ".join(self.en_name.split()[:-1]) or None
+            self._stop_name_flag = True
             return
         if re.fullmatch(r"\d{1,2}x\d{1,3}", token, re.IGNORECASE):
             # 1x03 是完整季集标记，不参与英文片名拼接。
@@ -457,8 +472,17 @@ class MetaVideo(MetaBase):
                 self._stop_name_flag = True
                 self._continue_flag = False
                 self.type = MediaType.TV
-        elif token.upper() == "SEASON" and self.begin_season is None and self.__is_written_marker(token):
-            self._last_token_type = "SEASON"
+        elif token.upper() == "SEASON" and self.begin_season is None:
+            ordinal = self.__ordinal_season()
+            if ordinal:
+                self.begin_season = ordinal
+                self.total_seasons = 1
+                self._last_token_type = "season"
+                self._stop_name_flag = True
+                self._continue_flag = False
+                self.type = MediaType.TV
+            elif self.__is_written_marker(token):
+                self._last_token_type = "SEASON"
 
     def __has_explicit_episode_range(self):
         # 明确 E01-E03 / S01E01-03 的文件允许包含三集以上；

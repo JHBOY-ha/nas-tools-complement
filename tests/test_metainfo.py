@@ -74,6 +74,21 @@ class MetaInfoTest(TestCase):
         self.assertEqual(4, meta.begin_season)
         self.assertEqual(14, meta.begin_episode)
 
+    def test_ordinal_season_keeps_following_number_as_episode(self):
+        # 4th Season 已给出季号；后面的 18 是集号，不能读成 Season 18
+        for title, name, season, episode in [
+            ("[晚街与灯][Re：从零开始的异世界生活 第四季 / Re:Zero kara Hajimeru Isekai Seikatsu 4th Season]"
+             "[18 - 总第84][WEB-DL Remux][1080P_AVC_AAC][简繁日内封PGS]",
+             "Re:Zero Kara Hajimeru Isekai Seikatsu", 4, 18),
+            ("Show 3rd Season 12 1080p", "Show", 3, 12),
+            ("Show Name Season 2 Episode 5 1080p WEB-DL", "Show Name", 2, 5),
+        ]:
+            with self.subTest(title=title):
+                meta = MetaInfo(title, use_llm=False)
+                self.assertEqual(name, meta.get_name())
+                self.assertEqual(season, meta.begin_season)
+                self.assertEqual([episode], meta.get_episode_list())
+
     def test_fansub_episode_number_without_leading_zero(self):
         for title, episode in [
             ("[SAIO-Raws] Hundred 10 [BD 1920x1080 HEVC-10bit OPUS ASSx2].mkv", 10),
