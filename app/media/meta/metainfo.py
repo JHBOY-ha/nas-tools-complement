@@ -63,13 +63,26 @@ def MetaInfo(title, subtitle=None, mtype=None, use_llm=True, _prepared=None):
         meta_info = MetaBase(title, subtitle)
         meta_info.en_name = numeric_title.strip()
         meta_info.type = MediaType.MOVIE
-    elif not special and re.search(r"(?i)(?<![A-Z0-9])\d{1,2}(?:st|nd|rd|th)[ ._-]+Season\b", title or ""):
-        # 序数季的歧义保护对显式动漫类型及括号路由同样生效。
-        meta_info = MetaVideo(title, subtitle, fileflag)
     elif special or mtype == MediaType.ANIME or is_anime(title):
         meta_info = MetaAnime(title, subtitle, fileflag)
     else:
         meta_info = MetaVideo(title, subtitle, fileflag)
+
+    if (isinstance(meta_info, MetaAnime) and not special and not fractional_episode
+            and re.search(r"(?i)(?<![A-Z0-9])\d{1,2}(?:st|nd|rd|th)[ ._-]+Season\b", title or "")):
+        # Share ordinal title/season evidence without replacing the anime parser.
+        # Its completion blocks, ranges, groups and codecs remain authoritative.
+        ordinal = MetaVideo(title, subtitle, fileflag)
+        for key in ("cn_name", "en_name", "begin_season", "end_season", "total_seasons"):
+            setattr(meta_info, key, getattr(ordinal, key))
+        explicit = re.search(r"(?i)\bSeason[ ._-]+\d{1,2}[ ._-]+(?:Episode\b|EP?\d)", title or "")
+        if (explicit or ordinal.note.get("ordinal_candidates") or ordinal.note.get("ordinal_default")
+                or not meta_info.get_episode_list()):
+            for key in ("begin_episode", "end_episode", "total_episodes"):
+                setattr(meta_info, key, getattr(ordinal, key))
+        meta_info.note.update(ordinal.note)
+        meta_info.skip_reason = ordinal.skip_reason
+        meta_info.type = ordinal.type
 
     meta_info.ignored_words = used_info.get("ignored")
     meta_info.replaced_words = used_info.get("replaced")

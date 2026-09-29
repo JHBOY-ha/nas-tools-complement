@@ -158,9 +158,13 @@ class MetaVideo(MetaBase):
             alternate = MetaVideo(original_title, subtitle, fileflag, _ordinal_as_title=True)
             fields = ("cn_name", "en_name", "begin_season", "end_season", "total_seasons",
                       "begin_episode", "end_episode", "total_episodes")
-            self.note["ordinal_candidates"] = [
+            # Two digits keep the historical episode default. This is compatibility,
+            # not proof: a bound identity/manual target may still select the alternate.
+            key = "ordinal_candidates" if self._ambiguous_ordinal == "single" else "ordinal_default"
+            self.note[key] = [
                 {key: getattr(candidate, key) for key in fields} for candidate in (self, alternate)]
-            self.skip_reason = "序数词可能属于片名，季集解释尚未唯一确认"
+            if key == "ordinal_candidates":
+                self.skip_reason = "序数词可能属于片名，季集解释尚未唯一确认"
         # 制作组/字幕组
         self.resource_team = ReleaseGroupsMatcher().match(title=original_title) or None
 
@@ -497,11 +501,13 @@ class MetaVideo(MetaBase):
                 # 仅序数季上下文接受个位集号，不放宽普通片名中的数字。
                 self._last_token_type = "ordinal_season"
                 following = self.tokens.cur()
-                self._ambiguous_ordinal = bool(
+                ambiguous = bool(
                     following and following.isdigit() and len(following) <= 2
                     and re.search(r"(?i)(?<![A-Z0-9])" + re.escape(self._prev_raw_token)
                                   + r"[ ._-]+Season[ ._-]+" + re.escape(following)
                                   + r"(?![A-Z0-9])", self.org_string))
+                if ambiguous and 1 <= int(following) <= 99:
+                    self._ambiguous_ordinal = "single" if len(following) == 1 else "default"
                 self._stop_name_flag = True
                 self._continue_flag = False
                 self.type = MediaType.TV

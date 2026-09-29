@@ -290,7 +290,18 @@ class _IIndexClient(metaclass=ABCMeta):
                             != tmdb_type((bound_info or {}).get("media_type"))):
                         index_match_fail += 1
                         continue
-                    if not bound_info or not self.media._prepare_media_identity(meta_info, bound_info):
+                    # IMDb is an independent work constraint, not a reason to skip
+                    # ordinal interpretation validation or leave a stale skip_reason.
+                    if bound_info and any(release_note.get(key) for key in ("ordinal_candidates", "ordinal_default")):
+                        prepared = self.media.resolve_ordinal_identity(
+                            meta_info, bound=bound_info, mtype_hint=filter_args.get("type"))
+                        if prepared and not meta_info.note.get("ordinal_resolution"):
+                            # The compatibility default still needs the original
+                            # identity/number-mapping checks; it is not a bypass.
+                            prepared = self.media._prepare_media_identity(meta_info, bound_info)
+                    else:
+                        prepared = bound_info and self.media._prepare_media_identity(meta_info, bound_info)
+                    if not prepared:
                         log.info(f"【{self.index_type}】{torrent_name} 的 IMDb 作品已匹配，但季集未通过校验")
                         index_match_fail += 1
                         continue

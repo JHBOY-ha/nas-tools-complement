@@ -707,6 +707,9 @@ class Rss:
             return False
 
         quick_meta = MetaInfo(title=title, use_llm=False)
+        # An unresolved ordinal candidate is not episode coverage evidence.
+        if (quick_meta.note or {}).get("ordinal_candidates"):
+            return False
         title_episodes = quick_meta.get_episode_list()
         if not title_episodes:
             return False

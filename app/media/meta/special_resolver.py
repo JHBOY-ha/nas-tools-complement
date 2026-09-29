@@ -42,7 +42,9 @@ class SpecialResolver:
         return self.cached(("season", str(info["id"]), number),
                            lambda: self.media.get_tmdb_tv_season_detail(info["id"], number))
 
-    def search(self, names, year=None, anime=False):
+    def search(self, names, year=None, anime=False, exact=True):
+        # Ordinal callers need unmatched details too: absent aliases are unknown,
+        # not proof that the alternative interpretation does not exist.
         candidates = {}
         for name in dict.fromkeys(name for name in names if name):
             items = []
@@ -78,7 +80,7 @@ class SpecialResolver:
                 titles = [info.get(k) for k in ("title", "name", "original_title", "original_name")]
                 aliases = info.get("alternative_titles") or {}
                 titles.extend(a.get("title") for a in aliases.get("titles", aliases.get("results", [])))
-                if normalized(name) not in {normalized(t) for t in titles if t}:
+                if exact and normalized(name) not in {normalized(t) for t in titles if t}:
                     continue
                 candidates[identity(info)] = info
         return list(candidates.values())

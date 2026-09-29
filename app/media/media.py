@@ -18,6 +18,7 @@ from app.media.meta._base import MetaBase
 from app.media.meta.fractional import episode_key, release_references
 from app.media.meta.special import normalized, requires_confirmation
 from app.media.meta.special_resolver import SpecialResolver, identity
+from app.media.meta.ordinal import OrdinalResolver
 from app.media.meta.recognition_rules import DEFAULT_EPISODE_MAPPINGS, DEFAULT_NAME_ALIASES
 from app.media.tmdbv3api import TMDb, Search, Movie, TV, Person, Find, TMDbException, Discover, Trending, Episode, Genre
 from app.utils import PathUtils, EpisodeFormat, RequestUtils, NumberUtils, StringUtils, cacheman
@@ -1139,7 +1140,7 @@ class Media:
             return None, True
         return None, False
 
-    def _apply_episode_mapping(self, meta_info, info):
+    def _apply_episode_mapping(self, meta_info, info, season_fetch=None):
         """Apply an explicit per-work release numbering rule, verified by TMDB."""
         if not info:
             return
@@ -1174,7 +1175,9 @@ class Media:
         rule = matches[0]
         target = int(rule["target_season"])
         mapped = [ep + int(rule.get("offset", 0)) for ep in episodes]
-        detail = self.get_tmdb_tv_season_detail(info["id"], target) or {}
+        # Ordinal batches reuse provider evidence without changing ordinary mapping keys.
+        detail = (season_fetch(info, target) if season_fetch else
+                  self.get_tmdb_tv_season_detail(info["id"], target)) or {}
         valid = {e.get("episode_number") for e in detail.get("episodes", [])}
         if not set(mapped).issubset(valid):
             raise ValueError("季集映射目标尚未得到TMDB确认")
@@ -1336,6 +1339,13 @@ class Media:
         return True
 
     def _prepare_media_identity(self, meta_info, info, mtype_hint=None):
+        # A verified provider/LLM identity can contradict the two-digit title default.
+        # Reuse that evidence without issuing another name search or changing ordinary
+        # release-season cache semantics. Candidate validation clears this flag first.
+        if info and (meta_info.note or {}).get("ordinal_default"):
+            resolver = OrdinalResolver(self)
+            if resolver.prefers_alternate(meta_info, info):
+                return bool(resolver.resolve(meta_info, bound=info, mtype_hint=mtype_hint))
         # 默认电影只是解析器的未知类型回退；仅用户明确指定的类型约束候选身份。
         if mtype_hint:
             expected = self.__resolve_tmdb_mtype(meta_type=mtype_hint)
@@ -1683,65 +1693,28 @@ class Media:
                 return file_media_info
         return {}
 
-    def __resolve_ordinal_candidates(self, meta_info, bound=None, mtype_hint=None):
-        """只有名称与正式季集支持唯一解释时，才消费有歧义的序数词。"""
-        accepted = []
-        resolver = SpecialResolver(self)
-        for fields in meta_info.note["ordinal_candidates"]:
-            parsed = copy.copy(meta_info)
-            parsed.note = copy.deepcopy(meta_info.note)
-            parsed.note.pop("ordinal_candidates", None)
-            parsed.skip_reason = None
-            for key, value in fields.items():
-                setattr(parsed, key, value)
-            try:
-                # 复用完整分页与精确名称校验；普通模糊检索会把失败折叠为空，
-                # 不能用来证明另一种解释不存在。每个候选独立应用季集映射。
-                infos = [bound] if bound else resolver.search([parsed.get_name()], year=parsed.year)
-                for info in infos:
-                    if self.__resolve_tmdb_mtype(meta_type=info.get("media_type")) != MediaType.TV:
-                        continue
-                    names = {self.__normalize_identity_name(name) for name in self.__candidate_all_names(info)}
-                    if self.__normalize_identity_name(parsed.get_name()) not in names:
-                        continue
-                    candidate = copy.copy(parsed)
-                    candidate.note = copy.deepcopy(parsed.note)
-                    if not self._prepare_media_identity(candidate, info, mtype_hint=mtype_hint):
-                        continue
-                    episodes = candidate.get_episode_list()
-                    if episodes:
-                        detail = self.get_tmdb_tv_season_detail(info["id"], candidate.begin_season)
-                        if not detail or not isinstance(detail.get("episodes"), list):
-                            return {}
-                        numbers = {ep.get("episode_number") for ep in detail["episodes"]
-                                   if type(ep.get("episode_number")) is int}
-                        expected_count = next((season.get("episode_count") for season in info.get("seasons", [])
-                                               if season.get("season_number") == candidate.begin_season), None)
-                        # 不完整的单集列表不能证明该解释无效。
-                        if not numbers or (isinstance(expected_count, int) and len(numbers) < expected_count):
-                            return {}
-                        if not set(episodes).issubset(numbers):
-                            continue
-                    accepted.append((candidate, info))
-            except Exception as error:
-                # 查询失败不是排除另一种解释的证据，下次识别仍可重试。
-                log.warn("【Meta】序数季候选核验失败：%s" % error)
-                return {}
-        if len(accepted) != 1:
-            return {}
-        candidate, info = accepted[0]
-        meta_info.__dict__.update(candidate.__dict__)
-        return info
+    def resolve_ordinal_identity(self, meta_info, bound=None, mtype_hint=None,
+                                 evidence_cache=None, manual=None):
+        """Shared by name lookup, bound files and IMDb; never stores work-cache proof."""
+        resolver = OrdinalResolver(self, evidence_cache)
+        defaults = (meta_info.note or {}).get("ordinal_default")
+        if defaults and bound and manual is None:
+            # Two digits incur no new query unless the bound work supplies contrary
+            # title evidence. Manual targets always take precedence over this default.
+            if not resolver.prefers_alternate(meta_info, bound):
+                return bound
+        return resolver.resolve(meta_info, bound=bound, mtype_hint=mtype_hint, manual=manual)
 
     def __search_media_info(self, meta_info, mtype_hint=None, strict=None,
-                            chinese=True, append_to_response=None):
+                            chinese=True, append_to_response=None, evidence_cache=None):
         """
         按发布名检索作品：LLM 直出 ID → 名称检索 → 中文兜底 → 外部（Bangumi）候选名。
         每个候选只准备一次作品身份（含季集映射），与发布名对不上的候选会被丢弃并继续兜底；
         返回的结果已完成准备，调用方不能再次准备，否则会重复偏移集号。
         """
         if (meta_info.note or {}).get("ordinal_candidates"):
-            return self.__resolve_ordinal_candidates(meta_info, mtype_hint=mtype_hint)
+            return self.resolve_ordinal_identity(meta_info, mtype_hint=mtype_hint,
+                                                 evidence_cache=evidence_cache)
         file_media_info = None
         llm_tmdb_id, llm_tmdb_type = self.__extract_llm_tmdb_target(meta_info=meta_info,
                                                                     mtype_hint=mtype_hint)
@@ -1846,7 +1819,7 @@ class Media:
                                                        chinese=chinese,
                                                        append_to_response=append_to_response)
             # 保存到缓存
-            if file_media_info:
+            if file_media_info and not (meta_info.note or {}).get("ordinal_resolution"):
                 self.__insert_media_cache(media_key=media_key,
                                           file_media_info=file_media_info)
         # 赋值TMDB信息并返回
@@ -2039,9 +2012,10 @@ class Media:
                         # 返回结果已完成身份准备，不能再次准备
                         file_media_info = self.__search_media_info(meta_info=meta_info,
                                                                    mtype_hint=media_type,
-                                                                   chinese=chinese)
+                                                                   chinese=chinese,
+                                                                   evidence_cache=fractional_cache)
                         # 保存到缓存
-                        if file_media_info:
+                        if file_media_info and not (meta_info.note or {}).get("ordinal_resolution"):
                             self.__insert_media_cache(media_key=media_key,
                                                       file_media_info=file_media_info)
                     # 赋值TMDB信息
@@ -2058,12 +2032,27 @@ class Media:
                     bound_type = tmdb_info.get("media_type") or media_type
                     meta_info = MetaInfo(title=file_name, mtype=bound_type,
                                          use_llm=not bool(download_context), _prepared=prepared[file_path])
-                    # 下载任务只提供作品约束，不能吞掉序数词歧义或补成整季。
-                    if (meta_info.note or {}).get("ordinal_candidates"):
-                        if not self.__resolve_ordinal_candidates(meta_info, bound=tmdb_info,
-                                                                mtype_hint=media_type):
+                    ordinal = any((meta_info.note or {}).get(key) for key in
+                                  ("ordinal_candidates", "ordinal_default"))
+                    if ordinal:
+                        # The original manual identity must survive task-context selection.
+                        if (default_info and download_context and download_context.get("tmdb_info")
+                                and identity(default_info) != identity(download_context["tmdb_info"])):
+                            meta_info.skip_reason = "人工作品与下载任务身份冲突"
                             return_media_infos[file_path] = meta_info
                             continue
+                        begin, end = episode_format.split_episode(file_name) if episode_format else (None, None)
+                        manual = None
+                        if season is not None and begin is not None:
+                            manual = dict(begin_season=season, end_season=None, total_seasons=1,
+                                          begin_episode=begin, end_episode=end,
+                                          total_episodes=(end or begin) - begin + 1)
+                        if not self.resolve_ordinal_identity(meta_info, bound=tmdb_info,
+                                mtype_hint=default_type or media_type,
+                                evidence_cache=fractional_cache, manual=manual):
+                            return_media_infos[file_path] = meta_info
+                            continue
+                        identity_prepared = bool(meta_info.note.get("ordinal_resolution"))
                     fractional = (meta_info.note or {}).get("fractional_episode")
                     if fractional:
                         fractional["file_path"] = file_path
@@ -2082,7 +2071,8 @@ class Media:
                     # 手动入口总会构造 EpisodeFormat；空对象不代表用户指定了集号。
                     has_episode_override = episode_format and (
                         episode_format.format or episode_format.start_ep is not None)
-                    if not fractional and not has_season_override and not has_episode_override:
+                    if (not fractional and not identity_prepared
+                            and not has_season_override and not has_episode_override):
                         release_episodes = self.__episode_list_of(meta_info)
                         self._apply_episode_mapping(meta_info, tmdb_info)
                         if not (getattr(meta_info, "note", None) or {}).get("episode_mapping"):
@@ -3363,6 +3353,9 @@ class Media:
         if not file_name or not cache_info:
             return
         meta_info = MetaInfo(title=file_name)
+        # Human/ordinal decisions are file evidence, never reusable shortened names.
+        if any(meta_info.note.get(key) for key in ("ordinal_candidates", "ordinal_default")):
+            return
         self.__insert_media_cache(self.__make_cache_key(meta_info), cache_info)
 
     @staticmethod
