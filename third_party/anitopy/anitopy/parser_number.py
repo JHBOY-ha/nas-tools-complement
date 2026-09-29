@@ -299,6 +299,14 @@ def match_episode_patterns(word, token):
     numeric_front = word[0].isdigit()
     numeric_back = word[-1].isdigit()
 
+    # Compact completion blocks such as [28END] have a single token; require
+    # the whole bracket so a numeric title containing END is not truncated.
+    if numeric_front and token.enclosed and parser_helper.is_token_isolated(token):
+        completion = re.match(r'^(\d{1,4})(END|FINAL)$', word, re.IGNORECASE)
+        if completion and set_episode_number(completion.group(1), token, validate=True):
+            Elements.insert(ElementCategory.RELEASE_INFORMATION, completion.group(2))
+            return True
+
     # e.g. "01v2"
     if numeric_front and numeric_back:
         if match_single_episode_pattern(word, token):
@@ -464,10 +472,32 @@ def search_for_separated_numbers(tokens):
 
 def search_for_isolated_numbers(tokens):
     for token in tokens:
-        if not token.enclosed or not parser_helper.is_token_isolated(token):
+        if not token.enclosed:
             continue
 
+        end_marker = None
+        if not parser_helper.is_token_isolated(token):
+            # Accept only a complete [number END/FINAL] block. Do not relax
+            # isolation globally: years, resolutions and title words use it too.
+            previous_token = Tokens.find_previous(token, TokenFlags.NOT_DELIMITER)
+            marker = Tokens.find_next(token, TokenFlags.NOT_DELIMITER)
+            if previous_token is None or previous_token.category != TokenCategory.BRACKET \
+                    or marker is None or not marker.enclosed \
+                    or marker.content.upper() not in ('END', 'FINAL'):
+                continue
+            keyword = keyword_manager.find(keyword_manager.normalize(marker.content),
+                                           ElementCategory.RELEASE_INFORMATION)
+            closing_token = Tokens.find_next(marker, TokenFlags.NOT_DELIMITER)
+            if keyword is None or closing_token is None \
+                    or closing_token.category != TokenCategory.BRACKET:
+                continue
+            end_marker = marker
+
         if set_episode_number(token.content, token, validate=True):
+            if end_marker is not None:
+                # Keep the existing release_information value, but prevent the
+                # contextual completion marker from becoming part of a title.
+                end_marker.category = TokenCategory.IDENTIFIER
             return True
 
     return False

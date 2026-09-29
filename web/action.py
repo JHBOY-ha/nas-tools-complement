@@ -44,6 +44,7 @@ from app.utils.types import RmtMode, OsType, SearchType, DownloaderType, SyncTyp
 from config import RMT_MEDIAEXT, TMDB_IMAGE_W500_URL, RMT_SUBEXT, Config
 from web.backend.search_torrents import search_medias_for_web, search_media_by_message
 from web.backend.web_utils import WebUtils
+from web.backend.special_confirmation import SpecialConfirmation, special_file
 
 
 class WebAction:
@@ -86,6 +87,7 @@ class WebAction:
             "remove_rss_media": self.__remove_rss_media,
             "add_rss_media": self.__add_rss_media,
             "re_identification": self.re_identification,
+            "special_confirmation": self.special_confirmation,
             "media_info": self.__media_info,
             "test_connection": self.__test_connection,
             "user_manager": self.__user_manager,
@@ -769,7 +771,11 @@ class WebAction:
                 self.dbhelper.update_transfer_unknown_state(path)
             return {"retcode": 0, "retmsg": "转移成功"}
         else:
-            return {"retcode": 2, "retmsg": ret_msg}
+            pending = []
+            if special_file(path):
+                pending.append({"flag": "history" if logid else "unidentification",
+                                "id": logid or data.get("unknown_id"), "filename": os.path.basename(path)})
+            return {"retcode": 2, "retmsg": ret_msg, "pending": pending}
 
     def __rename_udf(self, data):
         """
@@ -1447,6 +1453,10 @@ class WebAction:
                     title=name, tmdbid=media_info.tmdb_id)
         return {"code": code, "msg": msg, "page": page, "name": name, "rssid": rssid}
 
+    def special_confirmation(self, data):
+        """Use the existing authenticated action route for review and confirmed output."""
+        return SpecialConfirmation(self.dbhelper, Media(), FileTransfer()).run(data)
+
     def re_identification(self, data):
         """
         未识别的重新识别
@@ -1455,6 +1465,7 @@ class WebAction:
         ids = data.get("ids")
         ret_flag = True
         ret_msg = []
+        pending = []
         if flag == "unidentification":
             for wid in ids:
                 paths = self.dbhelper.get_unknown_path_by_id(wid)
@@ -1477,6 +1488,9 @@ class WebAction:
                     self.dbhelper.update_transfer_unknown_state(path)
                 else:
                     ret_flag = False
+                    # Failed special files have a recoverable, per-file review action.
+                    if special_file(path):
+                        pending.append({"id": wid, "flag": flag, "filename": os.path.basename(path)})
                     if msg not in ret_msg:
                         ret_msg.append(msg)
         elif flag == "history":
@@ -1500,12 +1514,15 @@ class WebAction:
                                                                target_dir=dest_dir)
                 if not succ_flag:
                     ret_flag = False
+                    # Failed special files have a recoverable, per-file review action.
+                    if special_file(path):
+                        pending.append({"id": wid, "flag": flag, "filename": os.path.basename(path)})
                     if msg not in ret_msg:
                         ret_msg.append(msg)
         if ret_flag:
             return {"retcode": 0, "retmsg": "转移成功"}
         else:
-            return {"retcode": 2, "retmsg": "、".join(ret_msg)}
+            return {"retcode": 2, "retmsg": "、".join(ret_msg), "pending": pending}
 
     def __media_info(self, data):
         """

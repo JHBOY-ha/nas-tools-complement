@@ -15,6 +15,8 @@ from app.helper import DbHelper, ProgressHelper
 from app.helper import ThreadHelper
 from app.media import Media, Category, Scraper
 from app.media.meta import MetaInfo
+from app.media.meta.extra_transfer import EXTRA_FOLDERS, publish_extra, publish_exclusive
+from app.media.meta.special import extract_special
 from app.mediaserver import MediaServer
 from app.message import Message
 from app.subtitle import Subtitle
@@ -400,7 +402,7 @@ class FileTransfer:
             log.error("【Rmt】%s %s到unknown失败，错误码 %s" % (file_item, rmt_mode.value, retcode))
         return retcode
 
-    def __transfer_file(self, file_item, new_file, rmt_mode, over_flag=False, old_file=None):
+    def __transfer_file(self, file_item, new_file, rmt_mode, over_flag=False, old_file=None, protected=False):
         """
         转移一个文件，同时处理字幕
         :param file_item: 原文件路径
@@ -409,6 +411,10 @@ class FileTransfer:
         :param over_flag: 是否覆盖，为True时会先删除再转移
         """
         file_name = os.path.basename(file_item)
+        if protected:
+            # Recheck/publish atomically at the actual write, not only during batch preflight.
+            publish_exclusive(file_item, new_file, rmt_mode, self.__transfer_command, lambda: True)
+            return self.__transfer_subtitles(org_name=file_item, new_name=new_file, rmt_mode=rmt_mode)
         if not over_flag and os.path.exists(new_file):
             log.warn("【Rmt】文件已存在：%s" % new_file)
             return 0
@@ -491,6 +497,12 @@ class FileTransfer:
         # 开始进度
         self.progress.start('filetransfer')
 
+        # Report invalid manual input before scanning files or starting any transfer.
+        try:
+            season = EpisodeFormat.normalize_season(season)
+        except ValueError as error:
+            return __finish_transfer(False, str(error))
+
         episode = (None, False) if not episode else episode
         if not in_path:
             log.error("【Rmt】输入路径错误!")
@@ -526,11 +538,21 @@ class FileTransfer:
                         # 未输入大小限制默认为配置大小限制
                         now_filesize = self._min_filesize if not str(min_filesize).isdigit() else int(
                             min_filesize) * 1024 * 1024
+                    # Explicit special clips can be smaller than the ordinary media limit.
+                    extras_enabled = ((Config().get_config("media") or {}).get("extras") or {}).get("enabled") is True
                     # 查找目录下的文件
                     file_list = PathUtils.get_dir_files(in_path=in_path,
                                                         episode_format=episode[0],
                                                         exts=RMT_MEDIAEXT,
-                                                        filesize=now_filesize)
+                                                        filesize=0)
+                    def eligible(path):
+                        try:
+                            return (os.path.getsize(path) >= now_filesize
+                                    or bool(extract_special(os.path.basename(path), extras_enabled)[1]))
+                        except OSError:
+                            # Let per-file recognition report a disappearing special.
+                            return True
+                    file_list = [path for path in file_list if eligible(path)]
                     log.debug("【Rmt】文件清单：" + str(file_list))
                     if len(file_list) == 0:
                         log.warn("【Rmt】%s 目录下未找到媒体文件，当前最小文件大小限制为 %s"
@@ -610,9 +632,22 @@ class FileTransfer:
         refresh_library_items = []
         # 需要下载字段的清单
         download_subtitle_items = []
+        # 先检测小数集目标冲突，避免批次内较大文件覆盖先写入的版本。
+        checked_roots = self._check_fractional_destinations(Medias, target_dir, rmt_mode)
         # 处理识别后的每一个文件或单个文件夹
         for file_item, media in Medias.items():
             try:
+                # 跳过结果不得落入未识别目录，也不能执行重命名或转移。
+                if getattr(media, "skip_reason", None):
+                    log.info("【Rmt】%s 跳过：%s" % (file_item, media.skip_reason))
+                    # 下载器把成功结果作为移动模式删种依据，故跳过必须返回失败。
+                    success_flag = False
+                    failed_count += 1
+                    error_message = "跳过 %s：%s" % (os.path.basename(file_item), media.skip_reason)
+                    # A retained source still needs a database ID for the confirmation dialog.
+                    if self.dbhelper.is_need_insert_transfer_unknown(file_item):
+                        self.dbhelper.insert_transfer_unknown(file_item, target_dir, rmt_mode)
+                    continue
                 # 总数量
                 total_count = total_count + 1
 
@@ -662,7 +697,24 @@ class FileTransfer:
                     else:
                         log.error("【Rmt】%s 无法识别媒体信息！" % file_name)
                     continue
-                # 不启用洗版/强制整理时，已有有效入库记录可阻止跨盘重复入库。
+                if (media.note or {}).get("extra"):
+                    # Extras bypass all regular-media history, scraping and subtitle work.
+                    extra = media.note["extra"]
+                    self._recheck_extra_destination(file_item, media, target_dir)
+                    destination = extra["destination"]
+                    def record_extra():
+                        if self.dbhelper.insert_extra_transfer_history(
+                                file_item, destination, media, extra["category"], rmt_mode) is not True:
+                            return False
+                        return self.dbhelper.insert_transfer_blacklist(file_item) is not False
+                    publish_extra(file_item, destination, rmt_mode, self.__transfer_command, record_extra)
+                    refresh = {"type": media.type, "category": media.category, "title": media.title,
+                               "year": media.year, "target_path": extra["library_root"]}
+                    if refresh not in refresh_library_items:
+                        refresh_library_items.append(refresh)
+                    continue
+                # 不启用洗版/强制整理时，按正式季集去重（包括已确认小数集）。
+                # 无历史记录的同 inode 重试仍由后续转移流程补写历史。
                 if rmt_mode == RmtMode.LINK and not udf_flag and not self._filesize_cover:
                     existing = self._existing_media_files(media)
                     already_exists = bool(existing) if media.type == MediaType.MOVIE else False
@@ -684,7 +736,9 @@ class FileTransfer:
                 # 当前文件大小
                 media.size = os.path.getsize(file_item)
                 # 目的目录，有输入target_dir时，往这个目录放
-                if target_dir:
+                if file_item in checked_roots:
+                    dist_path = checked_roots[file_item]
+                elif target_dir:
                     dist_path = target_dir
                 else:
                     dist_path = self.__get_best_target_path(mtype=media.type, in_path=file_item, size=media.size,
@@ -706,6 +760,10 @@ class FileTransfer:
                 # 新文件后缀
                 file_ext = os.path.splitext(file_item)[-1]
                 new_file = ret_file_path
+                protected = any((media.note or {}).get(key, {}).get("status") == "confirmed"
+                                for key in ("fractional_episode", "special_episode"))
+                if protected and file_exist_flag and not os.path.samefile(file_item, ret_file_path):
+                    raise ValueError("特殊集目标已存在不同文件，保留源文件")
                 # 已存在的文件数量
                 exist_filenum = 0
                 handler_flag = False
@@ -737,7 +795,7 @@ class FileTransfer:
                                 ret = self.__transfer_file(file_item=file_item,
                                                            new_file=new_file,
                                                            rmt_mode=rmt_mode,
-                                                           over_flag=True, old_file=old_file)
+                                                           over_flag=True, old_file=old_file, protected=protected)
                                 if ret != 0:
                                     success_flag = False
                                     error_message = "文件转移失败，错误码 %s" % ret
@@ -817,7 +875,7 @@ class FileTransfer:
                         ret = self.__transfer_file(file_item=file_item,
                                                    new_file=new_file,
                                                    rmt_mode=rmt_mode,
-                                                   over_flag=False)
+                                                   over_flag=False, protected=protected)
                         if ret != 0:
                             success_flag = False
                             error_message = "文件转移失败，错误码 %s" % ret
@@ -1276,6 +1334,128 @@ class FileTransfer:
                                        target_file=new_file,
                                        rmt_mode=sync_transfer_mode), ""
 
+    def _extra_destination(self, source, media, target_dir, directory_cache=None, revalidate=False):
+        """Choose one verified parent directory, never every library or a source sibling."""
+        config = (Config().get_config("media") or {}).get("extras") or {}
+        profile = config.get("server_profile")
+        if config.get("enabled") is not True or profile not in EXTRA_FOLDERS:
+            raise ValueError("Extras 未启用或缺少有效 server_profile")
+        fields = self.get_format_dict(media)
+        template = self._movie_dir_rmt_format if media.type == MediaType.MOVIE else self._tv_dir_rmt_format
+        dirname = re.sub(r"[-_\s.]*None", "", template.format(**fields))
+        category = ((media.type == MediaType.MOVIE and self._movie_category_flag)
+                    or (media.type == MediaType.TV and self._tv_category_flag)
+                    or (media.type == MediaType.ANIME and self._anime_category_flag))
+        def parent(root):
+            return os.path.abspath(os.path.join(root, media.category, dirname) if category
+                                   else os.path.join(root, dirname))
+        key = (media.type.name, str(media.tmdb_id), dirname, bool(category),
+               media.category if category else None)
+        cache = directory_cache if directory_cache is not None else {}
+        evidence = None
+        if target_dir:
+            root, folder = os.path.abspath(target_dir), parent(target_dir)
+        else:
+            evidence = cache.get(key)
+            # Preflight shares one snapshot; publication rechecks its live witness.
+            if evidence and revalidate and (not os.path.isdir(evidence["root"])
+                                            or not os.path.isfile(evidence["witness"])):
+                cache.pop(key, None)
+                evidence = None
+            if evidence is None:
+                groups = {}
+                for row in self.dbhelper.get_media_transfer_history(media.tmdb_id, media.type):
+                    if not row.DEST or not row.DEST_PATH or not row.DEST_FILENAME:
+                        continue
+                    candidate = parent(row.DEST)
+                    recorded = os.path.abspath(os.path.join(row.DEST_PATH, row.DEST_FILENAME))
+                    if os.path.commonpath([candidate, recorded]) == candidate:
+                        groups.setdefault((os.path.abspath(row.DEST), candidate), []).append(recorded)
+                choices = []
+                for (candidate_root, candidate_folder), records in groups.items():
+                    # One live regular file proves this directory, but every other
+                    # candidate directory must still be checked for ambiguity.
+                    witness = next((record for record in records if os.path.isfile(record)), None)
+                    if witness:
+                        choices.append({"key": key, "root": candidate_root,
+                                        "folder": candidate_folder, "witness": witness})
+                if len(choices) != 1:
+                    raise ValueError("Extras 所属作品目标目录不唯一或尚未入库，请指定目标目录")
+                evidence = cache[key] = choices[0]
+            root, folder = evidence["root"], evidence["folder"]
+        if not os.path.isdir(root) or os.path.commonpath([root, folder]) != root or folder == root:
+            raise ValueError("Extras 作品目录必须位于目标媒体库内")
+        category_dir = EXTRA_FOLDERS[profile][media.note["extra"]["category"]]
+        filename = StringUtils.clear_file_name(os.path.basename(source))
+        destination = os.path.abspath(os.path.join(folder, category_dir, filename))
+        # Prevent a pre-existing directory symlink from publishing outside the library.
+        if os.path.commonpath([os.path.realpath(root), os.path.realpath(os.path.dirname(destination))]) != os.path.realpath(root):
+            raise ValueError("Extras 目标路径越出媒体库")
+        # Retain only the selected witness for publication; the batch cache is local.
+        media.note["extra"]["directory_evidence"] = evidence
+        return root, destination
+
+    def _recheck_extra_destination(self, source, media, target_dir):
+        """Revalidate the witness and path without changing a preflight destination."""
+        extra = media.note["extra"]
+        evidence = extra.get("directory_evidence")
+        cache = {tuple(evidence["key"]): evidence} if evidence else {}
+        root, destination = self._extra_destination(source, media, target_dir, cache, revalidate=True)
+        # A moved library needs a new batch collision check, never silent rerouting.
+        if root != extra["library_root"] or destination != extra["destination"]:
+            raise ValueError("Extras 目标目录已变化，保留源文件等待重新预检")
+
+    def _check_fractional_destinations(self, medias, target_dir, rmt_mode):
+        """Preflight decimal destinations before publishing any file in the batch."""
+        # All evidence-bound content receives the same preflight collision protection.
+        fractional = {path for path, meta in medias.items() if meta and not meta.skip_reason
+                      and any((meta.note or {}).get(key, {}).get("status") == "confirmed"
+                              for key in ("fractional_episode", "special_episode", "extra"))}
+        if not fractional:
+            return {}
+        roots, destinations = {}, {}
+        extra_directories = {}  # Shared only by this preflight, never across batches.
+        for path, meta in medias.items():
+            if not meta or meta.skip_reason or not meta.tmdb_info:
+                continue
+            try:
+                if (meta.note or {}).get("extra"):
+                    root, destination = self._extra_destination(path, meta, target_dir, extra_directories)
+                    meta.note["extra"].update(library_root=root, destination=destination)
+                    destinations.setdefault(os.path.normcase(os.path.abspath(os.path.splitext(destination)[0])), []).append(path)
+                    continue
+                root = target_dir or self.__get_best_target_path(
+                    mtype=meta.type, in_path=path, size=os.path.getsize(path), rmt_mode=rmt_mode)
+                if not root:
+                    raise ValueError("目标目录未确定")
+                roots[path] = root
+                _, _, exists, destination = self.__is_media_exists(root, meta)
+                if not destination:
+                    raise ValueError("无法生成目标文件名")
+                stem = os.path.splitext(destination)[0] if exists else destination
+                destinations.setdefault(os.path.normcase(os.path.abspath(stem)), []).append(path)
+                # 已存在的不同内容不能被小数集按体积覆盖；同一硬链接重试可通过。
+                if path in fractional and exists and not os.path.samefile(path, destination):
+                    meta.skip_reason = "小数集目标已存在不同文件，保留源文件"
+            except Exception as err:
+                if path in fractional:
+                    meta.skip_reason = "小数集目标校验失败：%s" % err
+        for paths in destinations.values():
+            if len(paths) < 2 or not fractional.intersection(paths):
+                continue
+            try:
+                if all(os.path.samefile(paths[0], other) for other in paths[1:]):
+                    continue
+            except OSError as err:
+                # Sources can disappear during preflight; fail this collision group only.
+                for path in paths:
+                    medias[path].skip_reason = "目标冲突校验失败，保留源文件：%s" % err
+                continue
+            # 整数文件仍可整理；同名小数文件全部跳过，避免先写入者获胜。
+            for path in fractional.intersection(paths):
+                medias[path].skip_reason = "小数集与本批其他文件目标冲突，保留源文件"
+        return roots
+
     def get_format_dict(self, media):
         """
         根据媒体信息，返回Format字典
@@ -1293,6 +1473,8 @@ class FileTransfer:
             "name": StringUtils.clear_file_name(media.get_name()),
             "year": media.year,
             "edition": media.get_edtion_string() or None,
+            # 独立剪辑版占位符；空值沿用可选字段的分隔符清理。
+            "cut": getattr(media, "cut", None) or None,
             "videoFormat": media.resource_pix,
             "releaseGroup": media.resource_team,
             "effect": media.resource_effect,

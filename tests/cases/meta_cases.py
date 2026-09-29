@@ -153,7 +153,8 @@ meta_cases = [{
         "part": "",
         "season": "",
         "episode": "",
-        "restype": "",
+        # The corrected movie route preserves the explicitly supplied source.
+        "restype": "WEBRip",
         "pix": "1080p",
         "video_codec": "",
         "audio_codec": "5.1"

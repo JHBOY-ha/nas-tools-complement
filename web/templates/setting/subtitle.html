@@ -16,8 +16,15 @@
 <div class="page-body">
   <div class="container-xl">
     <div class="d-grid gap-3 grid-normal-card">
-      <a class="card card-link-pop p-3" href="#" data-bs-toggle="modal" data-bs-target="#modal-online-subtitles">
-        <div class="card-body text-center"><div class="card-title">在线字幕（迅雷 / Assrt）</div><div class="text-muted">迅雷无需配置 · Assrt {{ "已配置 Token" if (subtitle_config.get("assrt") or {}).get("token") else "未配置 Token" }}</div></div>
+      <!-- 迅雷官网 Logo 本地托管；完整展示横向标识，封面沿用字幕服务卡片布局。 -->
+      <a class="card card-link-pop p-0" href="#modal-online-subtitles" data-bs-toggle="modal"
+         data-bs-target="#modal-online-subtitles" aria-label="配置在线字幕（迅雷 / Assrt）">
+        <div class="card-cover card-cover-blurred text-center">
+          <span class="avatar avatar-xl avatar-thumb avatar-rounded" aria-hidden="true"
+                style="background-image: url(../static/img/xunlei.svg); background-size: 80% auto; background-repeat: no-repeat">
+          </span>
+        </div>
+        <div class="card-body text-center"><div class="card-title mb-1">在线字幕（迅雷 / Assrt）</div><div class="text-muted">迅雷无需配置 · Assrt {{ "已配置 Token" if (subtitle_config.get("assrt") or {}).get("token") else "未配置 Token" }}</div></div>
       </a>
       <!-- 首页卡片只负责打开配置，API Consumers 快捷入口放在弹窗内。 -->
       <a class="card card-link-pop p-0" href="#modal-opensubtitles"
@@ -254,8 +261,15 @@
     <div class="modal-header"><h5 class="modal-title">在线字幕</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button></div>
     <div class="modal-body">
       <p>迅雷无需配置。Assrt 按影片名称检索，需要 <a href="https://assrt.net/usercp.php" target="_blank" rel="noopener noreferrer">Assrt API Token</a>。</p>
-      <label for="subtitle.assrt.token" class="form-label">Assrt API Token</label>
-      <input id="subtitle.assrt.token" type="password" autocomplete="new-password" class="form-control" value="{{ ((subtitle_config or {}).get('assrt') or {}).get('token') or '' }}">
+      {# 复用统一问号与 tooltip；浮层挂在弹窗内避免遮挡，与输入框共用辅助说明。 #}
+      {% set online_subtitle_help = '迅雷无需配置；使用 Assrt 时，点击上方链接获取 API Token，填入后保存。使用入口：媒体整理 → 字幕库。电影点击“在线字幕”；电视剧、动漫先“选择剧集”，再点击“检索本集字幕”。可修改检索词并选择来源，检索后点击“下载并保存”；ZIP 包需选择匹配的字幕文件，暂不支持 RAR。下载进度在任务中心查看，完成后保存到视频旁，不覆盖已有字幕。视频须位于已配置的媒体库目录内且可读取；结果超过 30 分钟需重新检索。此配置不影响其他自动字幕下载器。' %}
+      <div class="form-label d-flex align-items-center gap-1">
+        <label for="subtitle.assrt.token" class="mb-0">Assrt API Token</label>
+        <button type="button" class="form-help subtitle-help border-0 p-0" data-bs-toggle="tooltip"
+                data-bs-container="#modal-online-subtitles" title="{{ online_subtitle_help }}" aria-label="在线字幕配置与使用说明">?</button>
+      </div>
+      <span class="visually-hidden" id="online-subtitle-help">{{ online_subtitle_help }}</span>
+      <input id="subtitle.assrt.token" type="password" autocomplete="new-password" class="form-control" aria-describedby="online-subtitle-help" value="{{ ((subtitle_config or {}).get('assrt') or {}).get('token') or '' }}">
     </div>
     <div class="modal-footer"><button type="button" class="btn btn-primary" onclick="ajax_post('update_config', input_select_GetVal('modal-online-subtitles'), function(ret) { if (ret.code === 0) { $('#modal-online-subtitles').modal('hide'); window_history_refresh(); } else { show_fail_modal(ret.msg || '保存失败'); } });">保存</button></div>
   </div></div>

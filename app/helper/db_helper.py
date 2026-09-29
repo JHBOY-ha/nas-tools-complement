@@ -259,6 +259,23 @@ class DbHelper:
             )
         )
 
+    @DbPersist(_db)
+    def insert_extra_transfer_history(self, source, destination, media, category, mode):
+        """Persist only after publication; retries use the destination primary key."""
+        destination = os.path.abspath(destination)
+        row = self._db.query(EXTRATRANSFERHISTORY).filter(
+            EXTRATRANSFERHISTORY.DEST_PATH == destination).first()
+        if row:
+            if row.PARENT_ID != int(media.tmdb_id) or row.PARENT_TYPE != media.tmdb_info["media_type"].name:
+                return False
+            return True
+        self._db.insert(EXTRATRANSFERHISTORY(
+            DEST_PATH=destination, SOURCE_PATH=os.path.abspath(source),
+            PARENT_TYPE=media.tmdb_info["media_type"].name, PARENT_ID=int(media.tmdb_id),
+            CATEGORY=category, MODE=mode.value,
+            COMPLETED_AT=time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())))
+        return True
+
     def get_media_transfer_history(self, tmdbid, mtype):
         if not tmdbid:
             return []

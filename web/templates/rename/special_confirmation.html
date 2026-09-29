@@ -1,0 +1,28 @@
+<!-- Shared review dialog: TMDB text is inserted with text(), never interpreted as HTML. -->
+<div class="modal modal-blur fade" id="special-confirmation-modal" tabindex="-1" aria-labelledby="special-confirmation-title" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable"><div class="modal-content">
+    <div class="modal-header"><h5 class="modal-title" id="special-confirmation-title">确认特殊集</h5>
+      <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button></div>
+    <div class="modal-body">
+      <details class="mb-3"><summary>本次识别结果</summary><p id="special-batch-result" class="text-break"></p></details>
+      <p id="special-source" class="text-break"></p>
+      <p class="text-muted">查询 TMDB 信息并打开详情核对，选择对应作品和单集。确认仅用于当前文件，按原转移方式和目录整理。</p>
+      <div class="mb-3"><label class="form-label" for="special-query">作品名称</label>
+        <div class="input-group"><input id="special-query" class="form-control" type="search" maxlength="200">
+          <button class="btn" id="special-clear" type="button">清空</button>
+          <button class="btn btn-primary" id="special-search" type="button">查询 TMDB</button></div></div>
+      <div id="special-status" role="status" aria-live="polite" class="mb-3 text-break"></div>
+      <fieldset id="special-works"><legend class="form-label">选择作品</legend><div class="list-group" id="special-work-list"></div></fieldset>
+      <div id="special-detail" class="mt-3" hidden>
+        <div id="special-work-detail" class="mb-3"></div>
+        <div id="special-season-wrap" class="mb-3"><label class="form-label" for="special-season">季</label><select class="form-select" id="special-season"></select></div>
+        <fieldset id="special-episodes"><legend class="form-label">选择对应单集</legend><div class="list-group" id="special-episode-list"></div></fieldset>
+      </div>
+      <p id="special-preview" class="mt-3 fw-bold text-break"></p>
+      <label class="form-check mt-3"><input type="checkbox" class="form-check-input" id="special-reviewed" disabled>
+        <span class="form-check-label">我已核对作品和剧集信息，确认此文件对应所选内容</span></label>
+    </div>
+    <div class="modal-footer"><button class="btn" id="special-skip" type="button">暂不处理</button>
+      <button class="btn btn-primary" id="special-submit" type="button" disabled>确认并重新识别</button></div>
+  </div></div>
+</div>

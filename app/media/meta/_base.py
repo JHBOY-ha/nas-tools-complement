@@ -160,15 +160,26 @@ class MetaBase(object):
     replaced_words = None
     offset_words = None
     # 备注字典
-    note = {}
+    note = None
     # 副标题解析
     _subtitle_flag = False
     _subtitle_season_re = r"[第\s]+([0-9一二三四五六七八九十S\-]+)\s*季"
     _subtitle_season_all_re = r"全\s*([0-9一二三四五六七八九十]+)\s*季|([0-9一二三四五六七八九十]+)\s*季全"
     _subtitle_episode_re = r"[第\s]+([0-9一二三四五六七八九十EP\-]+)\s*[集话話期]"
     _subtitle_episode_all_re = r"([0-9一二三四五六七八九十]+)\s*集全|全\s*([0-9一二三四五六七八九十]+)\s*[集话話期]"
+    # A marker must occupy an entire Latin token; Case39 is a title, not E39.
+    # Keep combined numbering, release revisions and adjacent Chinese names valid.
+    _season_episode_marker_re = (
+        r"(?<![A-Z0-9])(?:S\d{1,2}(?:EP?\d{1,4})*|(?:EP?\d{1,4})+)"
+        r"(?:V\d{1,2})?(?![A-Z0-9])"
+    )
 
     def __init__(self, title, subtitle=None, fileflag=False):
+        # 备注与跳过状态必须属于本次解析，不能在文件之间共享。
+        self.note = {}
+        # 每次解析独立保存剪辑版本，不参与来源/效果过滤。
+        self.cut = None
+        self.skip_reason = None
         self.category_handler = Category()
         self.fanart = Fanart()
         if not title:
@@ -707,7 +718,10 @@ class MetaBase(object):
                 self.type = MediaType.TV
                 self._subtitle_flag = True
             # 第x集
-            episode_str = re.search(r'%s' % self._subtitle_episode_re, title_text, re.IGNORECASE)
+            # ``12 集全`` also resembles ``12 集``; remove the total before
+            # reading Chinese single-episode evidence, but keep it for type detection.
+            episode_text = re.sub(self._subtitle_episode_all_re, " ", title_text, flags=re.IGNORECASE)
+            episode_str = re.search(r'%s' % self._subtitle_episode_re, episode_text, re.IGNORECASE)
             if episode_str:
                 episodes = episode_str.group(1)
                 if episodes:
@@ -740,9 +754,8 @@ class MetaBase(object):
             # x集全
             episode_all_str = re.search(r'%s' % self._subtitle_episode_all_re, title_text, re.IGNORECASE)
             if episode_all_str:
-                self.begin_episode = None
-                self.end_episode = None
-                self.total_episodes = 0
+                # Pack totals describe the series and must not erase file numbering.
+                # Name parsers exclude these totals before extracting episode tokens.
                 self.type = MediaType.TV
             # 全x季 x季全
             season_all_str = re.search(r"%s" % self._subtitle_season_all_re, title_text, re.IGNORECASE)

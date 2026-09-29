@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 from unittest import TestCase
+from unittest.mock import patch
 
 from app.media.meta import MetaInfo
 from app.utils.types import MediaType
@@ -8,6 +9,18 @@ from tests.cases.meta_cases import meta_cases
 
 
 class MetaInfoTest(TestCase):
+    def test_bocchi_final_episode_is_tv(self):
+        # Exercise the full rule parser without LLM or user word substitutions.
+        with patch('app.media.meta.metainfo.WordsHelper') as words:
+            words.return_value.process.side_effect = lambda title: (title, [], {})
+            for block, episode in (('[12 END]', 12), ('[28 END]', 28), ('[28END]', 28)):
+                with self.subTest(block=block):
+                    meta = MetaInfo('[DMG][BOCCHI_THE_ROCK!]%s[1080P][GB].mp4' % block,
+                                    use_llm=False)
+                    self.assertEqual('Bocchi The Rock!', meta.en_name)
+                    self.assertEqual(episode, meta.begin_episode)
+                    self.assertEqual(MediaType.TV, meta.type)
+
     def setUp(self) -> None:
         pass
 
@@ -18,21 +31,24 @@ class MetaInfoTest(TestCase):
         for info in meta_cases:
             if not info.get("title"):
                 continue
-            meta_info = MetaInfo(title=info.get("title"), subtitle=info.get("subtitle"))
-            target = {
-                "type": meta_info.type.value,
-                "cn_name": meta_info.cn_name or "",
-                "en_name": meta_info.en_name or "",
-                "year": meta_info.year or "",
-                "part": meta_info.part or "",
-                "season": meta_info.get_season_string(),
-                "episode": meta_info.get_episode_string(),
-                "restype": meta_info.get_edtion_string(),
-                "pix": meta_info.resource_pix or "",
-                "video_codec": meta_info.video_encode or "",
-                "audio_codec": meta_info.audio_encode or ""
-            }
-            self.assertEqual(target, info.get("target"))
+            # Report every corpus failure independently; these are rule-parser
+            # expectations and must not be rewritten by a configured LLM.
+            with self.subTest(title=info["title"]):
+                meta_info = MetaInfo(title=info.get("title"), subtitle=info.get("subtitle"), use_llm=False)
+                target = {
+                    "type": meta_info.type.value,
+                    "cn_name": meta_info.cn_name or "",
+                    "en_name": meta_info.en_name or "",
+                    "year": meta_info.year or "",
+                    "part": meta_info.part or "",
+                    "season": meta_info.get_season_string(),
+                    "episode": meta_info.get_episode_string(),
+                    "restype": meta_info.get_edtion_string(),
+                    "pix": meta_info.resource_pix or "",
+                    "video_codec": meta_info.video_encode or "",
+                    "audio_codec": meta_info.audio_encode or ""
+                }
+                self.assertEqual(target, info.get("target"))
 
     def test_anime_roman_numeral_season_is_preserved(self):
         meta_info = MetaInfo(
