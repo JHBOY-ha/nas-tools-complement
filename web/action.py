@@ -24,6 +24,7 @@ from app.filter import Filter
 from app.helper import DbHelper, ProgressHelper, ThreadHelper, \
     MetaHelper, DisplayHelper, WordsHelper, CookieCloudHelper, OpenSubtitles
 from app.indexer import Indexer
+from app.indexer import public as indexer_public
 from app.media import Category, Media, Bangumi, DouBan
 from app.media.meta import MetaInfo, MetaBase
 from app.mediaserver import MediaServer
@@ -191,6 +192,9 @@ class WebAction:
             "openclaw_qr_status": self.__openclaw_qr_status,
             "get_sites": self.__get_sites,
             "get_indexers": self.__get_indexers,
+            "get_public_indexer_status": self.__get_public_indexer_status,
+            "refresh_public_indexer": self.__refresh_public_indexer,
+            "test_public_indexer": self.__test_public_indexer,
             "get_download_dirs": self.__get_download_dirs,
             "find_hardlinks": self.__find_hardlinks,
             "update_sites_cookie_ua": self.__update_sites_cookie_ua,
@@ -4423,6 +4427,30 @@ class WebAction:
         获取索引器
         """
         return {"code": 0, "indexers": Indexer().get_indexer_dict()}
+
+    @staticmethod
+    def __get_public_indexer_status(data=None):
+        return {"code": 0, "data": indexer_public.status()}
+
+    @staticmethod
+    def __refresh_public_indexer(data):
+        indexer_id = (data or {}).get("id")
+        if indexer_id and indexer_id not in indexer_public.ADAPTERS:
+            return {"code": 1, "msg": "索引器不存在"}
+        return {"code": 0, "data": indexer_public.refresh(indexer_id)}
+
+    @staticmethod
+    def __test_public_indexer(data):
+        indexer_id = (data or {}).get("id")
+        if not indexer_id or indexer_id not in indexer_public.ADAPTERS:
+            return {"code": 1, "msg": "索引器不存在"}
+        keyword = str((data or {}).get("keyword") or "matrix").strip()
+        start = datetime.datetime.now()
+        results = indexer_public.search_for_nastools(indexer_id, keyword, fetch=5)
+        seconds = round((datetime.datetime.now() - start).total_seconds(), 1)
+        if not results:
+            return {"code": 1, "msg": f"未获取到结果，耗时 {seconds} 秒"}
+        return {"code": 0, "msg": f"获取到 {len(results)} 条结果，耗时 {seconds} 秒"}
 
     @staticmethod
     def __get_download_dirs(data):

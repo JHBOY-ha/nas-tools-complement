@@ -1,196 +1,130 @@
-{% import 'macro/form.html' as FORM %}
+{% import 'macro/svg.html' as SVG %}
 <div class="container-xl">
-  <!-- Page title -->
   <div class="page-header d-print-none">
     <div class="row align-items-center">
       <div class="col">
-        <h2 class="page-title">
-          索引器
-        </h2>
+        <h2 class="page-title">索引器</h2>
+        <div class="text-muted mt-1">内建索引器已展开为独立站点；私有站点沿用站点维护配置。</div>
       </div>
     </div>
   </div>
 </div>
-<!-- 业务页面代码 -->
+
 <div class="page-body">
   <div class="container-xl">
-    <div class="d-grid gap-3 grid-normal-card">
-      <a class="card card-link-pop p-0" href="#" data-bs-toggle="modal" data-bs-target="#modal-builtin">
-        <div class="card-cover card-cover-blurred text-center" style="background-color: #2E72B9">
-          <span class="avatar avatar-xl avatar-thumb avatar-rounded"
-                style="background-image: url(../static/img/indexer.jpg)">
-          </span>
+    <div class="mb-3">
+      <button type="button" class="btn btn-primary" onclick="save_builtin_indexers()">
+        {{ SVG.check() }} 保存索引器
+      </button>
+      <button type="button" class="btn ms-2" onclick="navmenu('indexer', true)">
+        {{ SVG.reload() }} 重新读取
+      </button>
+    </div>
+    <div class="row row-cards">
+      {% for Indexer in Indexers %}
+      <div class="col-12 col-xl-6">
+        <div class="card">
+          <div class="card-header">
+            <h3 class="card-title">{{ Indexer.name }}</h3>
+            <span class="badge bg-blue-lt ms-2">私有站点</span>
+          </div>
+          <div class="card-body">
+            <label class="form-check">
+              <input class="form-check-input" type="checkbox" name="indexer_sites" value="{{ Indexer.id }}"
+                     {% if Config.pt.indexer_sites and Indexer.id in Config.pt.indexer_sites %}checked{% endif %}>
+              <span class="form-check-label">参与搜索</span>
+            </label>
+          </div>
         </div>
-        <div class="card-body text-center">
-          <div class="card-title mb-1">内建索引器</div>
-          <div class="text-muted">{% if Config.pt.search_indexer == "builtin" %}<span class="badge bg-green"
-                                                                                      title="已开启"></span>
-            正在使用{% endif %}</div>
+      </div>
+      {% endfor %}
+      {% for Indexer in PublicIndexers %}
+      {% set Status = PublicStatus[Indexer.id] %}
+      <div class="col-12 col-xl-6">
+        <div class="card">
+          <div class="card-header">
+            <h3 class="card-title">{{ Indexer.name }}</h3>
+            <span class="badge bg-green-lt ms-2">公开站点</span>
+            <div class="card-actions btn-actions">
+              <a href="javascript:void(0)" class="btn-action" title="配置基础链接"
+                 data-bs-toggle="modal" data-bs-target="#modal-public-indexer-{{ Indexer.id }}">{{ SVG.settings() }}</a>
+              <a href="javascript:void(0)" class="btn-action" title="测试"
+                 onclick="test_public_indexer('{{ Indexer.id }}')">{{ SVG.circle_check() }}</a>
+              <a href="javascript:void(0)" class="btn-action" title="重新获取基础链接"
+                 onclick="refresh_public_indexer('{{ Indexer.id }}')">{{ SVG.refresh() }}</a>
+            </div>
+          </div>
+          <div class="card-body">
+            <label class="form-check">
+              <input class="form-check-input" type="checkbox" name="public_indexers" value="{{ Indexer.id }}"
+                     {% if Indexer.selected %}checked{% endif %}>
+              <span class="form-check-label">参与搜索</span>
+            </label>
+            <div class="mt-2">当前使用：<span class="font-weight-medium">{{ Status.base_url or '等待首次搜索发现' }}</span></div>
+          </div>
         </div>
-      </a>
-      {% for Type, Indexer in IndexerConf.items() %}
-      <a class="card card-link-pop p-0" href="#" data-bs-toggle="modal" data-bs-target="#modal-{{ Type }}">
-        <div class="card-cover card-cover-blurred text-center {{ Indexer.background }}">
-          <span class="avatar avatar-xl avatar-thumb avatar-rounded"
-                style="background-image: url('{{ Indexer.img_url }}')">
-          </span>
-        </div>
-        <div class="card-body text-center">
-          <div class="card-title mb-1">{{ Indexer.name }}</div>
-          <div class="text-muted">{% if Config.pt.search_indexer == Type %}<span class="badge bg-green"
-                                                                                      title="已开启"></span>
-            正在使用{% endif %}</div>
-        </div>
-      </a>
+      </div>
       {% endfor %}
     </div>
   </div>
 </div>
-{% for Type, Indexer in IndexerConf.items() %}
-<div class="modal modal-blur fade" id="modal-{{ Type }}" tabindex="-1" role="dialog" aria-hidden="true"
-     data-bs-backdrop="static" data-bs-keyboard="false">
+
+{% for Indexer in PublicIndexers %}
+<div class="modal modal-blur fade" id="modal-public-indexer-{{ Indexer.id }}" tabindex="-1" role="dialog" aria-hidden="true">
   <div class="modal-dialog modal-lg modal-dialog-centered" role="document">
     <div class="modal-content">
       <div class="modal-header">
-        <h5 class="modal-title">{{ Indexer.name }}</h5>
+        <h5 class="modal-title">{{ Indexer.name }} 基础链接</h5>
         <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
       </div>
       <div class="modal-body">
-      {{ FORM.gen_form_config_elements(Type, Config, Indexer.config) }}
+        <label class="form-label" for="public-indexer-bases-{{ Indexer.id }}">基础链接</label>
+        <textarea class="form-control" id="public-indexer-bases-{{ Indexer.id }}" rows="5"
+                  placeholder="https://example.com/">{{ Indexer.bases|join('\n') }}</textarea>
+        <div class="text-muted mt-2">{{ Indexer.base_help }}</div>
       </div>
       <div class="modal-footer">
-        <button onclick="test_indexer_config('{{ Type }}')" id="{{ Type }}_test_btn" class="btn me-auto">
-          测试
-        </button>
-        <button onclick="save_indexer_config('{{ Type }}')" id="{{ Type }}_save_btn" class="btn btn-primary">
-          确定
-        </button>
+        <button type="button" class="btn" onclick="refresh_public_indexer('{{ Indexer.id }}')">重新获取</button>
+        <button type="button" class="btn btn-primary" onclick="save_public_indexer('{{ Indexer.id }}')">保存</button>
       </div>
     </div>
   </div>
 </div>
 {% endfor %}
-<div class="modal modal-blur fade" id="modal-builtin" tabindex="-1" role="dialog" aria-hidden="true"
-     data-bs-backdrop="static" data-bs-keyboard="false">
-  <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable" role="document">
-    <div class="modal-content">
-      <div class="modal-header">
-        <h5 class="modal-title">内建索引器</h5>
-        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
-      </div>
-      <div class="modal-body">
-        <div class="row">
-          <div class="col">
-            <div class="mb-3">
-              <div class="btn-list">
-                <label class="form-label required">私有站点 <span class="form-help"
-                                                                  title="当前可以使用的私有站点清单，内建索引器支持私有站点的先决条件：1、在站点维护中正确配置站点地址和Cookie；2、站点己被支持"
-                                                                  data-bs-toggle="tooltip">?</span></label>
-                <a href="javascript:void(0)" class="ms-auto" onclick="select_btn_SelectALL(this, 'indexer_sites_private')">全选</a>
-              </div>
-              <div class="form-selectgroup">
-                {% if PrivateCount > 0 %}
-                  {% for Indexer in Indexers %}
-                    {% if not Indexer.public %}
-                      <label class="form-selectgroup-item">
-                        <input type="checkbox" name="indexer_sites_private" value="{{ Indexer.id }}"
-                               class="form-selectgroup-input"
-                               {% if Config.pt.indexer_sites and Indexer.id in Config.pt.indexer_sites %}checked{% endif %}>
-                        <span class="form-selectgroup-label">{{ Indexer.name }}</span>
-                      </label>
-                    {% endif %}
-                  {% endfor %}
-                {% else %}
-                  <label class="form-selectgroup-item">
-                    <span class="form-selectgroup-label">无</span>
-                  </label>
-                {% endif %}
-              </div>
-            </div>
-            <div class="mb-3">
-              <div class="btn-list">
-                <label class="form-label">公开站点 <span class="form-help"
-                                                         title="当前可用的公开站点，公开站点只要被内建索引器支持了就会在这里显示；部分站点需要有浏览器内核环境才能使用；同时大部分公开站点都需要网络代理才能访问"
-                                                         data-bs-toggle="tooltip">?</span></label>
-                <a href="javascript:void(0)" class="ms-auto" onclick="select_btn_SelectALL(this, 'indexer_sites_public')">全选</a>
-              </div>
-              <div class="form-selectgroup">
-                {% if PublicCount > 0 %}
-                  {% for Indexer in Indexers %}
-                    {% if Indexer.public %}
-                      <label class="form-selectgroup-item">
-                        <input type="checkbox" name="indexer_sites_public" value="{{ Indexer.id }}"
-                               class="form-selectgroup-input"
-                               {% if Config.pt.indexer_sites and Indexer.id in Config.pt.indexer_sites %}checked{% endif %}>
-                        <span class="form-selectgroup-label">{{ Indexer.name }}</span>
-                      </label>
-                    {% endif %}
-                  {% endfor %}
-                {% else %}
-                  <label class="form-selectgroup-item">
-                    <span class="form-selectgroup-label">无</span>
-                  </label>
-                {% endif %}
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-      <div class="modal-footer">
-        <button onclick="save_indexer_config('builtin')" id="builtin_save_btn" class="btn btn-primary">确定</button>
-      </div>
-    </div>
-  </div>
-</div>
-<script type="text/javascript">
-  // 当前处理的类型
-  var currType = "";
 
-  // 保存配置
-  function save_config(type, func, test) {
-    currType = type;
-    let params = {};
-    if (type !== "builtin") {
-      params = input_select_GetVal(`modal-${type}`);
-      $(`#modal-${type} textarea`).each(function () {
-        const key = $(this).attr("id");
-        params[key] = $(this).val();
-      });
-    } else {
-      let sites = select_GetSelectedVAL("^indexer_sites");
-      params['pt.indexer_sites'] = sites
-    }
-    params['test'] = test || false;
-    params['pt.search_indexer'] = type;
-    ajax_post("update_config", params, func);
+<script type="text/javascript">
+  function save_builtin_indexers() {
+    ajax_post("update_config", {
+      "pt.search_indexer": "builtin",
+      "pt.indexer_sites": select_GetSelectedVAL("indexer_sites")
+    }, function () { window_history_refresh(); });
   }
 
-  //保存配置、关闭和刷新页面
-  function save_indexer_config(type) {
-    $(`#modal-${type}`).modal('hide');
-    save_config(type, function (ret) {
-      window_history_refresh();
+  function save_public_indexer(id) {
+    const bases = $(`#public-indexer-bases-${id}`).val().split(/[\n,]+/).map(v => v.trim()).filter(Boolean);
+    if (bases.some(v => !v.startsWith("https://"))) { show_fail_modal("基础链接必须是 https:// 地址"); return; }
+    const current = {{ PublicIndexers | map(attribute='id') | list | tojson }};
+    const existing = {};
+    {% for Indexer in PublicIndexers %}
+    existing["{{ Indexer.id }}"] = {"bases": $(`#public-indexer-bases-{{ Indexer.id }}`).val().split(/[\n,]+/).map(v => v.trim()).filter(Boolean)};
+    {% endfor %}
+    if (!current.includes(id)) existing[id] = {"bases": bases};
+    ajax_post("update_config", {
+      "pt.public_indexers": {"enabled": select_GetSelectedVAL("public_indexers"), "sites": existing}
+    }, function () { window_history_refresh(); });
+  }
+
+  function refresh_public_indexer(id) {
+    ajax_post("refresh_public_indexer", {"id": id}, function (ret) {
+      if (ret.code !== 0) show_fail_modal(ret.msg || "重新获取失败");
+      else show_success_modal(ret.data[id].message || "基础链接已刷新", () => window_history_refresh());
     });
   }
 
-  //保存配置和测试配置
-  function test_indexer_config(type) {
-    $(`#${type}_test_btn`).text("测试中...").attr("disabled", true);
-    save_config(type, function (ret) {
-      let command;
-      {% for Type, Indexer in IndexerConf.items() %}
-      if (currType === "{{ Type }}") {
-        command = "{{ Indexer.test_command }}";
-      }
-      {% endfor %}
-      ajax_post("test_connection", {"command": command}, function (ret) {
-        if (ret.code === 0) {
-          $(`#${currType}_test_btn`).text("测试成功").attr("disabled", false);
-        } else {
-          $(`#${currType}_test_btn`).text("测试失败！").attr("disabled", false);
-        }
-      });
-    }, true);
+  function test_public_indexer(id) {
+    ajax_post("test_public_indexer", {"id": id}, function (ret) {
+      if (ret.code === 0) show_success_modal(ret.msg);
+      else show_fail_modal(ret.msg || "测试失败");
+    });
   }
-
 </script>

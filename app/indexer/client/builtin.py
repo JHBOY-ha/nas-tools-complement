@@ -9,6 +9,7 @@ from app.indexer.client._rarbg import Rarbg
 from app.indexer.client._render_spider import RenderSpider
 from app.indexer.client._spider import TorrentSpider
 from app.indexer.client._tnode import TNodeSpider
+from app.indexer import public
 from app.sites import Sites
 from app.utils import StringUtils
 from app.utils.types import SearchType, IndexerType
@@ -91,23 +92,12 @@ class BuiltinIndexer(_IIndexClient):
                     _indexer_domains.append(indexer.domain)
                     indexer.name = site.get("name")
                     ret_indexers.append(indexer)
-        # 公开站点
+        # 公开站点由本地适配器直接管理，基础链接可配置和重新发现。
         if public:
-            for site, attr in self.sites.get_public_sites():
-                indexer = IndexerHelper().get_indexer(url=site,
-                                                      public=True,
-                                                      proxy=attr.get("proxy"),
-                                                      render=attr.get("render"),
-                                                      language=attr.get("language"),
-                                                      parser=attr.get("parser"))
-                if indexer:
-                    if indexer_id and indexer.id == indexer_id:
-                        return indexer
-                    if check and indexer_sites and indexer.id not in indexer_sites:
-                        continue
-                    if indexer.domain not in _indexer_domains:
-                        _indexer_domains.append(indexer.domain)
-                        ret_indexers.append(indexer)
+            for item in public.get_indexers(check=check):
+                if indexer_id and indexer_id == item["id"]:
+                    return item
+                ret_indexers.append(item)
         return ret_indexers
 
     def search(self, order_seq,
@@ -123,7 +113,7 @@ class BuiltinIndexer(_IIndexClient):
             return None
         # 不是配置的索引站点过滤掉
         indexer_sites = Config().get_config("pt").get("indexer_sites") or []
-        if indexer_sites and indexer.id not in indexer_sites:
+        if indexer.get("module") != "public" and indexer_sites and indexer.id not in indexer_sites:
             return []
         # fix 共用同一个dict时会导致某个站点的更新全局全效
         if filter_args is None:
@@ -149,7 +139,9 @@ class BuiltinIndexer(_IIndexClient):
             return []
         result_array = []
         try:
-            if indexer.parser == "Rarbg":
+            if indexer.get("module") == "public":
+                result_array = public.search_for_nastools(indexer.id, search_word)
+            elif indexer.parser == "Rarbg":
                 imdb_id = match_media.imdb_id if match_media else None
                 result_array = Rarbg().search(keyword=search_word, indexer=indexer, imdb_id=imdb_id)
             elif indexer.parser == "TNodeSpider":
@@ -183,9 +175,11 @@ class BuiltinIndexer(_IIndexClient):
         """
         if not index_id:
             return []
-        indexer: IndexerConf = self.get_indexers(indexer_id=index_id)
+        indexer = self.get_indexers(indexer_id=index_id)
         if not indexer:
             return []
+        if indexer.get("module") == "public":
+            return public.search_for_nastools(index_id, keyword)
         if indexer.parser == "RenderSpider":
             return RenderSpider().search(keyword=keyword,
                                          indexer=indexer,

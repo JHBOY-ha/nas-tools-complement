@@ -29,6 +29,7 @@ from app.downloader import Downloader
 from app.filter import Filter
 from app.helper import SecurityHelper, MetaHelper, ChromeHelper, ThreadHelper, DbHelper
 from app.indexer import Indexer
+from app.indexer import public as indexer_public
 from app.library import MediaLibrary
 from app.media.meta import MetaInfo
 from app.mediaserver import WebhookEvent, MediaServer
@@ -1363,14 +1364,17 @@ def download_setting():
 @App.route('/indexer', methods=['POST', 'GET'])
 @login_required
 def indexer():
-    indexers = Indexer().get_builtin_indexers(check=False)
+    indexers = Indexer().get_builtin_indexers(check=False, public=False)
     private_count = len([item.id for item in indexers if not item.public])
-    public_count = len([item.id for item in indexers if item.public])
+    public_indexers = indexer_public.get_indexers(check=False)
+    public_count = len(public_indexers)
     return render_template("setting/indexer.html",
                            Config=Config().get_config(),
                            PrivateCount=private_count,
                            PublicCount=public_count,
                            Indexers=indexers,
+                           PublicIndexers=public_indexers,
+                           PublicStatus=indexer_public.status(),
                            IndexerConf=ModuleConf.INDEXER_CONF)
 
 
@@ -1762,6 +1766,9 @@ def do():
         return {"code": -1, "msg": str(e)}
     if data:
         data = json.loads(data)
+    if cmd in ("refresh_public_indexer", "test_public_indexer") \
+            and current_user.get_id() != "0":
+        return {"code": -1, "msg": "只有管理员可以操作公开索引器"}
     return WebAction().action(cmd, data)
 
 

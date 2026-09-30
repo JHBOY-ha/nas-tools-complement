@@ -275,6 +275,14 @@ class Downloader:
         blocked = download_block_reason(media_info)
         if blocked:
             return None, blocked
+        if media_info.enclosure and media_info.enclosure.startswith("public:"):
+            from app.indexer import public as indexer_public
+            _prefix, indexer_id, details_url = media_info.enclosure.split(":", 2)
+            magnet = indexer_public.resolve_for_nastools(
+                indexer_id, {"detailsUrl": details_url, "magnetUrl": ""})
+            if not magnet:
+                return None, "无法解析公开索引器磁力链接"
+            media_info.set_torrent_info(enclosure=magnet)
         # 标题
         title = media_info.org_string
         # 详情页面
