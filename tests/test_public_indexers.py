@@ -38,6 +38,11 @@ class PublicIndexerTest(unittest.TestCase):
         indexers = BuiltinIndexer().get_indexers(check=False)
         self.assertIn("52bt", [item["id"] for item in indexers])
 
+    def test_builtin_selection_saves_public_indexer_bases(self):
+        from app.conf import ModuleConf
+        self.assertIn("jackett", ModuleConf.INDEXER_CONF)
+        self.assertIn("prowlarr", ModuleConf.INDEXER_CONF)
+
     def test_base_refresher_rejects_private_addresses(self):
         pool = BaseUrlRefresher("test", ("https://public.example.test/",))
         self.assertEqual(pool.candidates(), ["https://public.example.test/"])

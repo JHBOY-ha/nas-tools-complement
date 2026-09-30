@@ -1766,9 +1766,6 @@ def do():
         return {"code": -1, "msg": str(e)}
     if data:
         data = json.loads(data)
-    if cmd in ("refresh_public_indexer", "test_public_indexer") \
-            and current_user.get_id() != "0":
-        return {"code": -1, "msg": "只有管理员可以操作公开索引器"}
     return WebAction().action(cmd, data)
 
 
