@@ -111,9 +111,13 @@ class BuiltinIndexer(_IIndexClient):
         """
         if not indexer or not key_word:
             return None
+        indexer_is_public = indexer.get("module") == "public"
+        indexer_name = indexer.get("name") if isinstance(indexer, dict) else indexer.name
+        indexer_rule = indexer.get("rule") if isinstance(indexer, dict) else indexer.rule
         # 不是配置的索引站点过滤掉
         indexer_sites = Config().get_config("pt").get("indexer_sites") or []
-        if indexer.get("module") != "public" and indexer_sites and indexer.id not in indexer_sites:
+        if not indexer_is_public and indexer_sites \
+                and (indexer.get("id") if isinstance(indexer, dict) else indexer.id) not in indexer_sites:
             return []
         # fix 共用同一个dict时会导致某个站点的更新全局全效
         if filter_args is None:
@@ -121,26 +125,27 @@ class BuiltinIndexer(_IIndexClient):
         else:
             _filter_args = copy.deepcopy(filter_args)
         # 不在设定搜索范围的站点过滤掉
-        if _filter_args.get("site") and indexer.name not in _filter_args.get("site"):
+        if _filter_args.get("site") and indexer_name not in _filter_args.get("site"):
             return []
         # 搜索条件没有过滤规则时，使用站点的过滤规则
-        if not _filter_args.get("rule") and indexer.rule:
-            _filter_args.update({"rule": indexer.rule})
+        if not _filter_args.get("rule") and indexer_rule:
+            _filter_args.update({"rule": indexer_rule})
         # 计算耗时
         start_time = datetime.datetime.now()
-        log.info(f"【{self.index_type}】开始检索Indexer：{indexer.name} ...")
+        log.info(f"【{self.index_type}】开始检索Indexer：{indexer_name} ...")
         # 特殊符号处理
         search_word = StringUtils.handler_special_chars(text=key_word,
                                                         replace_word=" ",
                                                         allow_space=True)
         # 避免对英文站搜索中文
-        if indexer.language == "en" and StringUtils.is_chinese(search_word):
-            log.warn(f"【{self.index_type}】{indexer.name} 无法使用中文名搜索")
+        indexer_language = indexer.get("language") if isinstance(indexer, dict) else indexer.language
+        if indexer_language == "en" and StringUtils.is_chinese(search_word):
+            log.warn(f"【{self.index_type}】{indexer_name} 无法使用中文名搜索")
             return []
         result_array = []
         try:
-            if indexer.get("module") == "public":
-                result_array = public_indexer.search_for_nastools(indexer.id, search_word)
+            if indexer_is_public:
+                result_array = public_indexer.search_for_nastools(indexer.get("id"), search_word)
             elif indexer.parser == "Rarbg":
                 imdb_id = match_media.imdb_id if match_media else None
                 result_array = Rarbg().search(keyword=search_word, indexer=indexer, imdb_id=imdb_id)
@@ -157,11 +162,11 @@ class BuiltinIndexer(_IIndexClient):
         except Exception as err:
             print(str(err))
         if len(result_array) == 0:
-            log.warn(f"【{self.index_type}】{indexer.name} 未检索到数据")
-            self.progress.update(ptype='search', text=f"{indexer.name} 未检索到数据")
+            log.warn(f"【{self.index_type}】{indexer_name} 未检索到数据")
+            self.progress.update(ptype='search', text=f"{indexer_name} 未检索到数据")
             return []
         else:
-            log.warn(f"【{self.index_type}】{indexer.name} 返回数据：{len(result_array)}")
+            log.warn(f"【{self.index_type}】{indexer_name} 返回数据：{len(result_array)}")
             return self.filter_search_results(result_array=result_array,
                                               order_seq=order_seq,
                                               indexer=indexer,
@@ -180,11 +185,11 @@ class BuiltinIndexer(_IIndexClient):
             return []
         if indexer.get("module") == "public":
             return public_indexer.search_for_nastools(index_id, keyword)
-        if indexer.parser == "RenderSpider":
+        if indexer.get("parser") == "RenderSpider":
             return RenderSpider().search(keyword=keyword,
                                          indexer=indexer,
                                          page=page)
-        elif indexer.parser == "TNodeSpider":
+        elif indexer.get("parser") == "TNodeSpider":
             return TNodeSpider(indexer=indexer).search(keyword=keyword, page=page)
         return self.__spider_search(indexer=indexer,
                                     page=page,

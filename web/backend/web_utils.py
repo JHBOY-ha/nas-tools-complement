@@ -108,7 +108,8 @@ class WebUtils:
                                          append_to_response="all")
             if not info:
                 return None
-            media_info = MetaInfo(title=info.get("title") if mtype == MediaType.MOVIE else info.get("name"))
+            media_info = MetaInfo(title=info.get("title") if mtype == MediaType.MOVIE else info.get("name"),
+                                  use_llm=False)
             media_info.set_tmdb_info(info)
 
         return media_info
@@ -138,14 +139,15 @@ class WebUtils:
                                                    episode=episode_num,
                                                    page=page)
         else:
-            meta_info = MetaInfo(title=content)
+            # Searchbar discovery only needs a query split, not LLM enhancement.
+            meta_info = MetaInfo(title=content, use_llm=False)
             tmdbinfos = Media().get_tmdb_infos(title=meta_info.get_name(),
                                                year=meta_info.year,
                                                mtype=mtype,
                                                page=page)
             medias = []
             for tmdbinfo in tmdbinfos:
-                tmp_info = MetaInfo(title=keyword)
+                tmp_info = MetaInfo(title=keyword, use_llm=False)
                 tmp_info.set_tmdb_info(tmdbinfo)
                 if meta_info.type != MediaType.MOVIE and tmp_info.type == MediaType.MOVIE:
                     continue

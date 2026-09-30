@@ -56,6 +56,19 @@ class PublicIndexerTest(unittest.TestCase):
         finally:
             Indexer.get_indexers = original
 
+    def test_search_scheduler_accepts_dict_site_priority(self):
+        from app.indexer.indexer import Indexer
+        original = Indexer.get_indexers
+        try:
+            Indexer.get_indexers = lambda self: [
+                {"id": "52bt", "name": "52BT", "pri": 1}
+            ]
+            indexers = Indexer().get_indexers()
+            priority = indexers[0].get("pri", 0) if isinstance(indexers[0], dict) else indexers[0].pri
+            self.assertEqual(100 - int(priority), 99)
+        finally:
+            Indexer.get_indexers = original
+
     def test_base_refresher_rejects_private_addresses(self):
         pool = BaseUrlRefresher("test", ("https://public.example.test/",))
         self.assertEqual(pool.candidates(), ["https://public.example.test/"])

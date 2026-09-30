@@ -158,7 +158,8 @@ class Indexer(object):
         executor = ThreadPoolExecutor(max_workers=len(indexers))
         all_task = []
         for index in indexers:
-            order_seq = 100 - int(index.pri)
+            priority = index.get("pri", 0) if isinstance(index, dict) else index.pri
+            order_seq = 100 - int(priority or 0)
             task = executor.submit(self._client.search,
                                    order_seq,
                                    index,

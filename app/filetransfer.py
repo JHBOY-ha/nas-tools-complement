@@ -1561,7 +1561,9 @@ class FileTransfer:
             rssid = self.dbhelper.get_rss_movie_id(title=title, year=year, tmdbid=tmdbid)
         else:
             if not tmdbid:
-                meta_info = MetaInfo(title=title)
+                # Discovery responses already carry authoritative titles; do
+                # not send them through optional LLM recognition.
+                meta_info = MetaInfo(title=title, use_llm=False)
                 title = meta_info.get_name()
                 season = meta_info.get_season_string()
                 if season:

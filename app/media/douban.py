@@ -90,7 +90,7 @@ class DouBan:
             if not search_res:
                 return None
             for res in search_res:
-                douban_meta = MetaInfo(title=res.get("target", {}).get("title"))
+                douban_meta = MetaInfo(title=res.get("target", {}).get("title"), use_llm=False)
                 if metainfo.title == douban_meta.get_name() \
                         and (int(res.get("target", {}).get("year")) in year_range or not year_range):
                     return res.get("target_id")
@@ -100,7 +100,7 @@ class DouBan:
             if not search_res:
                 return None
             for res in search_res:
-                douban_meta = MetaInfo(title=res.get("target", {}).get("title"))
+                douban_meta = MetaInfo(title=res.get("target", {}).get("title"), use_llm=False)
                 if metainfo.title == douban_meta.get_name() \
                         and (str(res.get("target", {}).get("year")) == str(metainfo.year) or not metainfo.year):
                     return res.get("target_id")
@@ -175,7 +175,7 @@ class DouBan:
             if item_obj.get("type_name") not in (MediaType.TV.value, MediaType.MOVIE.value):
                 continue
             item = item_obj.get("target")
-            meta_info = MetaInfo(title=item.get("title"))
+            meta_info = MetaInfo(title=item.get("title"), use_llm=False)
             meta_info.title = item.get("title")
             if item_obj.get("type_name") == MediaType.MOVIE.value:
                 meta_info.type = MediaType.MOVIE
@@ -219,7 +219,7 @@ class DouBan:
             title = web_info.get("title")
             if title:
                 title = title
-                metainfo = MetaInfo(title=title)
+                metainfo = MetaInfo(title=title, use_llm=False)
                 if metainfo.cn_name:
                     title = metainfo.cn_name
                     # 有中文的去掉日文和韩文
