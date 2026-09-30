@@ -43,6 +43,19 @@ class PublicIndexerTest(unittest.TestCase):
         self.assertIn("jackett", ModuleConf.INDEXER_CONF)
         self.assertIn("prowlarr", ModuleConf.INDEXER_CONF)
 
+    def test_indexer_dict_accepts_dict_sites(self):
+        from app.indexer import Indexer
+        original = Indexer.get_indexers
+        try:
+            Indexer.get_indexers = lambda self: [
+                {"id": "52bt", "name": "52BT", "public": True, "builtin": True}
+            ]
+            self.assertEqual(Indexer().get_indexer_dict(), [
+                {"id": "52bt", "name": "52BT"}
+            ])
+        finally:
+            Indexer.get_indexers = original
+
     def test_base_refresher_rejects_private_addresses(self):
         pool = BaseUrlRefresher("test", ("https://public.example.test/",))
         self.assertEqual(pool.candidates(), ["https://public.example.test/"])

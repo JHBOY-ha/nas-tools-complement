@@ -56,9 +56,9 @@ class Indexer(object):
         """
         return [
             {
-                "id": index.id,
-                "name": index.name
-            } for index in self.get_indexers()
+                "id": index["id"] if isinstance(index, dict) else index.id,
+                "name": index["name"] if isinstance(index, dict) else index.name
+            } for index in (self.get_indexers() or [])
         ]
 
     def get_indexer_hash_dict(self):
@@ -67,6 +67,14 @@ class Indexer(object):
         """
         IndexerDict = {}
         for item in self.get_indexers() or []:
+            if isinstance(item, dict):
+                IndexerDict[StringUtils.md5_hash(item["name"])] = {
+                    "id": item["id"],
+                    "name": item["name"],
+                    "public": item.get("public", False),
+                    "builtin": item.get("builtin", False)
+                }
+                continue
             IndexerDict[StringUtils.md5_hash(item.name)] = {
                 "id": item.id,
                 "name": item.name,
@@ -79,7 +87,10 @@ class Indexer(object):
         """
         获取当前索引器的索引站点名称
         """
-        return [indexer.name for indexer in self.get_indexers()]
+        return [
+            indexer["name"] if isinstance(indexer, dict) else indexer.name
+            for indexer in (self.get_indexers() or [])
+        ]
 
     @staticmethod
     def get_builtin_indexers(check=True, public=True, indexer_id=None):
