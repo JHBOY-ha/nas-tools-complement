@@ -626,8 +626,9 @@ class Media:
         if StringUtils.is_chinese(file_media_name):
             return {}
         log.info("【Meta】正在从TheDbMovie网站查询：%s ..." % file_media_name)
-        tmdb_url = "https://www.themoviedb.org/search?query=%s" % file_media_name
-        res = RequestUtils(timeout=5).get_res(url=tmdb_url)
+        # Requests encodes only the query value, preserving &/#/+ in titles.
+        tmdb_url = "https://www.themoviedb.org/search"
+        res = RequestUtils(timeout=5).get_res(url=tmdb_url, params={"query": file_media_name})
         if res and res.status_code == 200:
             html_text = res.text
             if not html_text:
@@ -666,7 +667,7 @@ class Media:
                 else:
                     log.info("【Meta】%s TMDB网站未查询到媒体信息！" % file_media_name)
             except Exception as err:
-                print(str(err))
+                log.error("【Meta】TMDB网页解析失败：%s" % str(err))
                 return None
         return None
 
@@ -2197,7 +2198,7 @@ class Media:
                         skipped.note["extra" if special["is_extra"] else "special_episode"] = special
                     skipped.skip_reason = "小数集识别失败，保留源文件：%s" % err
                     return_media_infos[file_path] = skipped
-                print(str(err))
+                # Keep the existing contextual log as the single error output.
                 log.error("【Rmt】发生错误：%s - %s" % (str(err), traceback.format_exc()))
         # 循环结束
         return return_media_infos
@@ -2212,7 +2213,8 @@ class Media:
         ret_infos = []
         for info in infos:
             tmdbid = info.get("id")
-            vote = round(float(info.get("vote_average")), 1) if info.get("vote_average") else 0,
+            # The API contract is a numeric score, including the missing-score case.
+            vote = round(float(info.get("vote_average")), 1) if info.get("vote_average") else 0
             image = TMDB_IMAGE_W500_URL % info.get("poster_path")
             overview = info.get("overview")
             if mtype:
@@ -2921,7 +2923,7 @@ class Media:
                     return []
                 return self.__dict_media_casts(self.tv.credits(tmdbid).get("cast"))
         except Exception as err:
-            print(str(err))
+            log.error("【Meta】演职人员查询失败：%s" % str(err))
         return []
 
     @staticmethod
@@ -2976,7 +2978,7 @@ class Media:
             else:
                 return self.genre.tv_list()
         except Exception as err:
-            print(str(err))
+            log.error("【Meta】媒体类型查询失败：%s" % str(err))
         return []
 
     @staticmethod
@@ -3310,7 +3312,7 @@ class Media:
         try:
             aka_names = self.person.details(person_id).get("also_known_as", []) or []
         except Exception as err:
-            print(str(err))
+            log.error("【Meta】人物中文名查询失败：%s" % str(err))
             return ""
         for aka_name in aka_names:
             if StringUtils.is_chinese(aka_name):
@@ -3333,7 +3335,7 @@ class Media:
             aka_names = self.person.details(person_id).get("also_known_as", []) or []
             return aka_names
         except Exception as err:
-            print(str(err))
+            log.error("【Meta】人物别名查询失败：%s" % str(err))
             return []
 
     def get_random_discover_backdrop(self):
@@ -3383,7 +3385,7 @@ class Media:
                 tmdbinfo = tmdbinfo[0]
                 return tmdbinfo.get("id")
         except Exception as err:
-            print(str(err))
+            log.error("【Meta】TMDB作品ID查询失败：%s" % str(err))
         return None
 
     @staticmethod

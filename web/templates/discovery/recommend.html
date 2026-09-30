@@ -64,8 +64,8 @@
   // 过滤器
   Filter = '{{ Filter or "" }}';
 
-  // 过滤参数
-  Params = {{ Params|safe or "{}" }}
+  // JSON escapes script delimiters while preserving booleans and null values.
+  Params = {{ Params|tojson }};
 
   // 插入N个占位卡片 代替loading动画
   var page_card_num = 20;

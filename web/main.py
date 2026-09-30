@@ -49,6 +49,7 @@ from web.backend.WXBizMsgCrypt3 import WXBizMsgCrypt
 from web.backend.user import User
 from web.backend.wallpaper import get_login_wallpaper
 from web.backend.web_utils import WebUtils
+from web.backend.action_permissions import PAGE_ACTIONS, action_allowed
 from web.security import require_auth
 
 # 配置文件锁
@@ -343,6 +344,15 @@ LoginManager.init_app(App)
 
 # API注册
 App.register_blueprint(apiv1_bp, url_prefix="/api/v1")
+
+
+@App.before_request
+def check_page_permission():
+    """Block direct settings/backup access before a view can expose credentials."""
+    command = PAGE_ACTIONS.get(request.endpoint)
+    # Anonymous requests retain the view's Flask-Login redirect behavior.
+    if command and current_user.is_authenticated and not action_allowed(current_user, command):
+        return {"code": -1, "msg": "没有访问此页面的权限"}, 403
 
 
 @App.after_request
@@ -682,7 +692,13 @@ def recommend():
     Keyword = request.args.get("keyword") or ""
     Source = request.args.get("source") or ""
     FilterKey = request.args.get("filter") or ""
-    Params = json.loads(request.args.get("params")) if request.args.get("params") else {}
+    # Filters require a mapping, including when URLs contain JSON null or arrays.
+    try:
+        Params = json.loads(request.args.get("params")) if request.args.get("params") else {}
+    except ValueError:
+        Params = {}
+    if not isinstance(Params, dict):
+        Params = {}
     return render_template("discovery/recommend.html",
                            Type=Type,
                            SubType=SubType,

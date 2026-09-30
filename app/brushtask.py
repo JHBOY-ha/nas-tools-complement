@@ -16,6 +16,7 @@ from app.sites import Sites
 from app.utils import StringUtils, Torrent, ExceptionUtils
 from app.utils.commons import singleton
 from app.utils.types import BrushDeleteType
+from app.utils.security_utils import parse_rule_dict
 from config import BRUSH_REMOVE_TORRENTS_INTERVAL, Config
 
 
@@ -96,6 +97,13 @@ class BrushTask(object):
         brushtasks = self.dbhelper.get_brushtasks()
         _brush_tasks = []
         for task in brushtasks:
+            try:
+                # Invalid legacy/database rules are skipped, never executed.
+                rss_rule = parse_rule_dict(task.RSS_RULE)
+                remove_rule = parse_rule_dict(task.REMOVE_RULE)
+            except ValueError:
+                log.error("【Brush】刷流任务规则格式无效，已跳过：%s" % task.ID)
+                continue
             site_info = self.sites.get_sites(siteid=task.SITE)
             if site_info:
                 site_url = StringUtils.get_base_url(site_info.get("signurl") or site_info.get("rssurl"))
@@ -113,8 +121,8 @@ class BrushTask(object):
                 "downloader_name": downloader_info.get("name"),
                 "transfer": task.TRANSFER,
                 "free": task.FREELEECH,
-                "rss_rule": eval(task.RSS_RULE),
-                "remove_rule": eval(task.REMOVE_RULE),
+                "rss_rule": rss_rule,
+                "remove_rule": remove_rule,
                 "seed_size": task.SEED_SIZE,
                 "rss_url": site_info.get("rssurl"),
                 "cookie": site_info.get("cookie"),

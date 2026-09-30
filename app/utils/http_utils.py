@@ -1,9 +1,5 @@
 import requests
-import urllib3
-from urllib3.exceptions import InsecureRequestWarning
 from config import Config
-
-urllib3.disable_warnings(InsecureRequestWarning)
 
 
 class RequestUtils:
@@ -21,7 +17,7 @@ class RequestUtils:
                  timeout=None,
                  referer=None,
                  content_type=None,
-                 verify=False):
+                 verify=True):
         if not content_type:
             content_type = "application/x-www-form-urlencoded; charset=UTF-8"
         if headers:
@@ -52,9 +48,8 @@ class RequestUtils:
             self._session = session
         if timeout:
             self._timeout = timeout
-        # Keep the historical default for existing integrations, while
-        # allowing credential-bearing clients to opt into certificate checks.
-        self._verify = bool(verify)
+        # Verify certificates by default; requests also accepts a private CA path.
+        self._verify = verify
 
     def post(self, url, params=None, json=None):
         if json is None:
@@ -95,7 +90,12 @@ class RequestUtils:
                                  proxies=self._proxies,
                                  timeout=self._timeout,
                                  params=params)
-            return str(r.content, 'utf-8')
+            # Prefer declared encodings, retain strict UTF-8 when absent, and
+            # return the existing failure sentinel rather than leaking decode errors.
+            declared = 'charset' in r.headers.get('Content-Type', '').lower()
+            return r.content.decode((r.encoding if declared else None) or 'utf-8')
+        except (UnicodeError, LookupError):
+            return None
         except requests.exceptions.RequestException:
             return None
 

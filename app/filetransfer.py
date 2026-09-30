@@ -22,6 +22,7 @@ from app.message import Message
 from app.subtitle import Subtitle
 from app.utils import EpisodeFormat, PathUtils, StringUtils, SystemUtils, ExceptionUtils
 from app.utils.types import MediaType, SyncType, RmtMode
+from app.utils.security_utils import compile_ignore_pattern
 from config import RMT_SUBEXT, RMT_MEDIAEXT, RMT_FAVTYPE, RMT_MIN_FILESIZE, DEFAULT_MOVIE_FORMAT, \
     DEFAULT_TV_FORMAT, Config
 
@@ -59,6 +60,7 @@ class FileTransfer:
     _refresh_mediaserver = False
     _ignored_paths = []
     _ignored_files = ''
+    _ignore_config_error = ""
 
     def __init__(self):
         self.media = Media()
@@ -73,6 +75,17 @@ class FileTransfer:
 
     def init_config(self):
         media = Config().get_config('media')
+        # Compile both patterns before publishing either. Invalid startup/legacy
+        # settings pause transfers instead of crashing or silently removing filters.
+        self._ignore_config_error = ""
+        try:
+            ignored_paths = compile_ignore_pattern((media or {}).get('ignored_paths'))
+            ignored_files = compile_ignore_pattern((media or {}).get('ignored_files'))
+        except ValueError as err:
+            self._ignore_config_error = str(err)
+            log.error("【Rmt】%s，暂停整理直到配置修正" % self._ignore_config_error)
+        else:
+            self._ignored_paths, self._ignored_files = ignored_paths, ignored_files
         self._scraper_flag = media.get("nfo_poster")
         self._scraper_nfo = Config().get_config('scraper_nfo')
         self._scraper_pic = Config().get_config('scraper_pic')
@@ -123,18 +136,6 @@ class FileTransfer:
                 self._min_filesize = min_filesize * 1024 * 1024
             elif isinstance(min_filesize, str) and min_filesize.isdigit():
                 self._min_filesize = int(min_filesize) * 1024 * 1024
-            # 文件路径转移忽略词
-            ignored_paths = media.get('ignored_paths')
-            if ignored_paths:
-                if ignored_paths.endswith(";"):
-                    ignored_paths = ignored_paths[:-1]
-                self._ignored_paths = re.compile(r'%s' % re.sub(r';', r'|', ignored_paths))
-            # 文件名转移忽略词
-            ignored_files = media.get('ignored_files')
-            if ignored_files:
-                if ignored_files.endswith(";"):
-                    ignored_files = ignored_files[:-1]
-                self._ignored_files = re.compile(r'%s' % re.sub(r';', r'|', ignored_files))
             # 高质量文件覆盖
             self._filesize_cover = media.get('filesize_cover')
             # 电影重命名格式
@@ -1516,6 +1517,9 @@ class FileTransfer:
         """
         if not file_list:
             return [], ""
+        # Malformed persisted filters must never result in unfiltered transfers.
+        if self._ignore_config_error:
+            return [], "忽略词配置无效，暂停整理直到配置修正"
         #  过滤掉文件列表中文件路径包含文件路径转移忽略词的
         if self._ignored_paths:
             try:

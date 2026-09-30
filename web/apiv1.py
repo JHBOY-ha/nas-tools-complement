@@ -8,7 +8,7 @@ from app.utils import TokenCache
 from config import Config
 from web.action import WebAction
 from web.backend.user import User
-from web.security import require_auth, login_required, generate_access_token
+from web.security import require_api_auth, api_permission_required, login_required, generate_access_token
 
 apiv1_bp = Blueprint("apiv1",
                      __name__,
@@ -50,7 +50,7 @@ class ApiResource(Resource):
     """
     API 认证
     """
-    method_decorators = [require_auth]
+    method_decorators = [require_api_auth]
 
 
 class ClientResource(Resource):
@@ -101,7 +101,10 @@ class UserLogin(Resource):
             "success": True,
             "data": {
                 "token": token,
-                "apikey": Config().get_config("security").get("api_key"),
+                # Preserve the client response shape without distributing the
+                # master credential. User tokens work on REST resources by role.
+                "apikey": (Config().get_config("security").get("api_key")
+                           if str(user_info.id) == "0" else token),
                 "userinfo": {
                     "userid": user_info.id,
                     "username": user_info.username,
@@ -235,6 +238,7 @@ class ServiceRun(ClientResource):
 @site.route('/statistics')
 class SiteStatistic(ApiResource):
     @staticmethod
+    @api_permission_required("get_site_user_statistics")
     def get():
         """
         获取站点数据明细（密钥认证）
@@ -252,6 +256,7 @@ class SiteStatistic(ApiResource):
 @site.route('/sites')
 class SiteSites(ApiResource):
     @staticmethod
+    @api_permission_required("get_site")
     def get():
         """
         获取所有站点配置（密钥认证）
@@ -916,6 +921,7 @@ class SystemMessage(ClientResource):
     parser.add_argument('lst_time', type=str, help='时间（YYYY-MM-DD HH24:MI:SS）', location='form')
 
     @system.doc(parser=parser)
+    @api_permission_required("refresh_process")
     def post(self):
         """
         查询消息中心消息
@@ -979,6 +985,7 @@ class ConfigRestore(ClientResource):
 @config.route('/info')
 class ConfigInfo(ClientResource):
     @staticmethod
+    @api_permission_required("update_config")
     def post():
         """
         获取所有配置信息
@@ -1291,6 +1298,7 @@ class RssParserUpdate(ClientResource):
 @rss.route('/parser/list')
 class RssParserList(ClientResource):
     @staticmethod
+    @api_permission_required("get_rssparser")
     def post():
         """
         查询所有解析器
@@ -1307,6 +1315,7 @@ class RssParserList(ClientResource):
 @rss.route('/list')
 class RssList(ClientResource):
     @staticmethod
+    @api_permission_required("get_userrss_task")
     def post():
         """
         查询所有自定义订阅任务
@@ -1623,6 +1632,7 @@ class BrushTaskInfo(ClientResource):
 @brushtask.route('/list')
 class BrushTaskList(ClientResource):
     @staticmethod
+    @api_permission_required("brushtask_detail")
     def post():
         """
         查询所有刷流任务
@@ -1699,6 +1709,7 @@ class BrushTaskDownloaderInfo(ClientResource):
 @brushtask.route('/downloader/list')
 class BrushTaskDownloaderList(ClientResource):
     @staticmethod
+    @api_permission_required("get_downloader")
     def post():
         """
         查询所有刷流下载器

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import logging
+import json
 import os
 import time
 from functools import lru_cache
@@ -10,6 +11,7 @@ import requests.exceptions
 
 from .as_obj import AsObj
 from .exceptions import TMDbException
+from app.utils.security_utils import normalize_proxies, parse_rule_dict
 
 logger = logging.getLogger(__name__)
 
@@ -67,20 +69,21 @@ class TMDb(object):
 
     @property
     def proxies(self):
-        return os.environ.get(self.TMDB_PROXIES)
+        return os.environ.get(self.TMDB_PROXIES) or "{}"
 
     @proxies.setter
     def proxies(self, proxies):
-        if proxies:
-            proxies_strs = []
-            for key, value in proxies.items():
-                if not value:
-                    continue
-                proxies_strs.append("'%s': '%s'" % (key, value))
-            if proxies_strs:
-                os.environ[self.TMDB_PROXIES] = "{%s}" % ",".join(proxies_strs)
-            else:
-                os.environ[self.TMDB_PROXIES] = 'None'
+        # JSON safely escapes credentials and stays hashable for the HTTP LRU.
+        try:
+            normalized = normalize_proxies(proxies)
+        except ValueError:
+            # Keep startup available for configuration repair, but never silently
+            # send requests directly when a configured proxy is invalid.
+            # Search/Movie/TV use separate instances sharing this environment key.
+            os.environ[self.TMDB_PROXIES] = "INVALID_PROXY"
+            logger.error("代理配置无效，请修正后重试")
+            return
+        os.environ[self.TMDB_PROXIES] = json.dumps(normalized, sort_keys=True)
 
     @api_key.setter
     def api_key(self, api_key):
@@ -139,7 +142,9 @@ class TMDb(object):
     @staticmethod
     @lru_cache(maxsize=REQUEST_CACHE_MAXSIZE)
     def cached_request(method, url, data, proxies):
-        return requests.request(method, url, data=data, proxies=eval(proxies), verify=False, timeout=10)
+        # Safely read legacy dict repr as well as the new canonical JSON value.
+        proxy_dict = normalize_proxies(parse_rule_dict(proxies if proxies and proxies != "None" else "{}"))
+        return requests.request(method, url, data=data, proxies=proxy_dict, verify=True, timeout=10)
 
     def cache_clear(self):
         return self.cached_request.cache_clear()
@@ -147,6 +152,8 @@ class TMDb(object):
     def _call(
             self, action, append_to_response, call_cached=True, method="GET", data=None
     ):
+        if self.proxies == "INVALID_PROXY":
+            raise TMDbException("代理配置无效，请修正后重试")
         if self.api_key is None or self.api_key == "":
             raise TMDbException("No API key found.")
 
@@ -161,7 +168,8 @@ class TMDb(object):
         if self.cache and self.obj_cached and call_cached and method != "POST":
             req = self.cached_request(method, url, data, self.proxies)
         else:
-            req = self._session.request(method, url, data=data, proxies=eval(self.proxies), timeout=10, verify=False)
+            proxy_dict = normalize_proxies(parse_rule_dict(self.proxies if self.proxies != "None" else "{}"))
+            req = self._session.request(method, url, data=data, proxies=proxy_dict, timeout=10, verify=True)
 
         headers = req.headers
 
