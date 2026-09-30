@@ -40,8 +40,9 @@ if [ "${NASTOOL_AUTO_UPDATE}" = "true" ]; then
             git remote add origin "${REPO_URL}" >/dev/null 2>&1
         fi
         echo "windows/" > .gitignore
-        git fetch --depth 1 origin ${branch}
-        git reset --hard origin/${branch}
+        # 显式 refspec：单分支克隆的仓库拉取其他分支时也能建立 origin/<branch>
+        git fetch --depth 1 origin "+refs/heads/${branch}:refs/remotes/origin/${branch}" && \
+            git reset --hard "origin/${branch}"
     fi
     if [ $? -eq 0 ] && [ -d .git ]; then
         git clean -dffx
