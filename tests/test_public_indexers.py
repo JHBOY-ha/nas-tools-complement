@@ -1,6 +1,7 @@
 import unittest
 
 from app.indexer import public
+from app.indexer.client.builtin import BuiltinIndexer
 from app.indexer.providers.common import BaseUrlRefresher, validate_public_url
 from config import Config
 
@@ -32,6 +33,10 @@ class PublicIndexerTest(unittest.TestCase):
         result = {"title": "Movie", "detailsUrl": "https://example.test/link/"}
         converted = public._convert("seedhub", result)
         self.assertEqual(converted["enclosure"], "public:seedhub:https://example.test/link/")
+
+    def test_builtin_public_flag_does_not_shadow_adapter_module(self):
+        indexers = BuiltinIndexer().get_indexers(check=False)
+        self.assertIn("52bt", [item["id"] for item in indexers])
 
     def test_base_refresher_rejects_private_addresses(self):
         pool = BaseUrlRefresher("test", ("https://public.example.test/",))
