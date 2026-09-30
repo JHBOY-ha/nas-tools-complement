@@ -26,6 +26,29 @@ export class Golbal {
   static noImage = "../static/img/no-image.png";
   static noImage_person = "../static/img/person.png";
 
+  static poster_image_url(value) {
+    try {
+      const url = new URL(value);
+      if (!/^https?:$/.test(url.protocol) || url.username || url.password
+          || (url.port && url.port !== "80" && url.port !== "443")
+          || !/^(?:img\d*|qnmob3)\.doubanio\.com$/.test(url.hostname)
+          || !/^\/view\/photo\/[^/]+\/public\/p\d+\.(?:jpe?g|png|webp)$/.test(url.pathname)) {
+        return value;
+      }
+      // Douban's mobile CDN needs image processing; its bare URL can return an invalid PNG.
+      url.protocol = "https:";
+      url.hostname = "qnmob3.doubanio.com";
+      url.port = "";
+      const resize = "imageView2/2/q/80/w/500/h/750/format/webp";
+      if (!url.searchParams.has(resize)) {
+        url.search += (url.search ? "&" : "?") + resize;
+      }
+      return url.href;
+    } catch (e) {
+      return value;
+    }
+  }
+
   // 转换传值的空字符情况
   static repNull(value) {
     if (!value || value == "None" || value == "null" || value == "undefined") {

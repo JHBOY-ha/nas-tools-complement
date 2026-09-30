@@ -120,7 +120,8 @@ export class NormalCard extends observeState(CustomElement) {
         ${this._placeholder ? NormalCardPlaceholder.render_placeholder() : nothing}
         <div ?hidden=${this._placeholder} class="rounded-4">
           <img class="card-img rounded-4" alt="" style="box-shadow:0 0 0 1px #888888; display: block; min-width: 100%; max-width: 100%; min-height: 100%; max-height: 100%; object-fit: cover;"
-             src=${this.lazy == "1" ? "" : this.image ?? Golbal.noImage}
+             referrerpolicy="no-referrer"
+             src=${this.lazy == "1" ? "" : Golbal.poster_image_url(this.image) ?? Golbal.noImage}
              @error=${() => { if (this.lazy != "1") {this.image = Golbal.noImage; this._card_image_error = true} }}
              @load=${() => { this._placeholder = false }}/>
           ${this._render_left_up()}

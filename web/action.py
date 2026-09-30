@@ -1196,7 +1196,9 @@ class WebAction:
             # 升级
             branch = "dev" if os.environ.get(
                 "NASTOOL_VERSION") == "dev" else "master"
-            os.system(f"git fetch --depth 1 origin {branch}")
+            # 显式 refspec：单分支克隆的仓库拉取其他分支时也能建立 origin/<branch>
+            os.system(
+                f"git fetch --depth 1 origin +refs/heads/{branch}:refs/remotes/origin/{branch}")
             os.system(f"git reset --hard origin/{branch}")
             os.system("git submodule update --init --recursive")
             # 安装依赖
