@@ -9,12 +9,14 @@ import stat
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from contextlib import contextmanager
 
-from sqlalchemy import func, or_, text as sql_text
+from sqlalchemy import and_, func, or_, text as sql_text
 
 import log
 from app.db.main_db import MainDb
+from app.helper.subtitle_media_status import upsert_subtitle_rows
 from app.db.models import (
     SUBTITLEAUDITSTATE,
     SUBTITLEMEDIASTATUS,
@@ -183,6 +185,10 @@ class SubtitleTaskManager:
         self._spooling_ids = set()
         self._audit_snapshot_cache = {}
         self._last_persistent_cache_cleanup = 0
+        self._last_cleanup = None
+        self._cleanup_lock = threading.Lock()
+        self._staging_absent_cache = OrderedDict()
+        self._settings_cache = None
         self._heavy_condition = threading.Condition(threading.Lock())
         self._heavy_active = 0
         self._interactive_waiters = 0
@@ -360,12 +366,18 @@ class SubtitleTaskManager:
 
     def get_settings(self):
         with self._lock:
+            now = time.monotonic()
+            if self._settings_cache and now < self._settings_cache[0]:
+                return dict(self._settings_cache[1])
             row = self._db.query(SUBTITLETASKSETTING).filter(SUBTITLETASKSETTING.ID == 1).first()
             overrides = _loads(row.POLICY, {}) if row else {}
             policy = dict(DEFAULT_POLICY)
             if isinstance(overrides, dict):
                 policy.update({key: value for key, value in overrides.items() if key in DEFAULT_POLICY})
-            return self.validate_settings(policy, complete=True)
+            policy = self.validate_settings(policy, complete=True)
+            # Return copies; callers attach task-specific policy overrides.
+            self._settings_cache = (now + 2, dict(policy))
+            return policy
 
     @classmethod
     def validate_settings(cls, values, complete=False):
@@ -429,6 +441,7 @@ class SubtitleTaskManager:
                     UPDATED_AT=now
                 ))
             self._db.commit()
+            self._settings_cache = (time.monotonic() + 2, dict(policy))
         return policy
 
     def _validate_disk_policy(self, policy):
@@ -908,6 +921,7 @@ class SubtitleTaskManager:
     def _task_dict(self, row, include_result=True, include_items=False,
                    queue_position=_QUEUE_POSITION_UNSET):
         now = time.time()
+        payload = _loads(row.PAYLOAD, {})
         active_seconds = float(row.ACTIVE_SECONDS or 0)
         if row.RUN_STARTED_AT and row.STATUS in ["running", "canceling"]:
             active_seconds += max(now - row.RUN_STARTED_AT, 0)
@@ -933,8 +947,8 @@ class SubtitleTaskManager:
             if queue_position is _QUEUE_POSITION_UNSET else queue_position,
             "cancellable": row.STATUS in ACTIVE_STATES,
             "progress": progress,
-            "payload": _loads(row.PAYLOAD, {}),
-            "scope": _loads(row.PAYLOAD, {}),
+            "payload": payload,
+            "scope": payload,
             "policy_snapshot": _loads(row.POLICY, {}),
             "created_at": _iso(row.CREATED_AT),
             "queued_at": _iso(row.QUEUED_AT),
@@ -952,18 +966,18 @@ class SubtitleTaskManager:
     def _queue_position(self, row):
         if row.STATUS not in ["queued", "recovering"] or row.TYPE not in ["upload", "repair"]:
             return None
-        queued_rows = self._db.query(SUBTITLETASK.ID).filter(
+        # Count predecessors in scheduler order instead of loading/sorting
+        # the complete queue on every single-task polling request.
+        return 1 + self._db.query(SUBTITLETASK).filter(
             SUBTITLETASK.TYPE.in_(["upload", "repair"]),
-            SUBTITLETASK.STATUS.in_(["queued", "recovering"])
-        ).order_by(
-            SUBTITLETASK.PRIORITY.desc(),
-            SUBTITLETASK.CREATED_AT.asc(),
-            SUBTITLETASK.ID.asc()
-        ).all()
-        return next((
-            index for index, queued in enumerate(queued_rows, 1)
-            if str(queued[0]) == str(row.ID)
-        ), None)
+            SUBTITLETASK.STATUS.in_(["queued", "recovering"]),
+            or_(SUBTITLETASK.PRIORITY > row.PRIORITY,
+                and_(SUBTITLETASK.PRIORITY == row.PRIORITY,
+                     SUBTITLETASK.CREATED_AT < row.CREATED_AT),
+                and_(SUBTITLETASK.PRIORITY == row.PRIORITY,
+                     SUBTITLETASK.CREATED_AT == row.CREATED_AT,
+                     SUBTITLETASK.ID < row.ID))
+        ).count()
 
     @staticmethod
     def _staging_identity(stat_result):
@@ -992,6 +1006,9 @@ class SubtitleTaskManager:
         seen_names = set()
         components = []
         total_bytes = 0
+        sampled_free = None
+        sampled_at = 0
+        sampled_bytes = 0
         for index, upload_file in enumerate(files):
             original_name = os.path.basename(str(getattr(upload_file, "filename", "") or "")).replace("\x00", "")
             if not original_name or original_name in [".", ".."]:
@@ -1010,7 +1027,7 @@ class SubtitleTaskManager:
             incoming_path = self._trusted_incoming_path(stream)
 
             def consume(reader, writer=None):
-                nonlocal size, total_bytes
+                nonlocal size, total_bytes, sampled_free, sampled_at, sampled_bytes
                 while True:
                     chunk = reader.read(1024 * 1024)
                     if not chunk:
@@ -1026,14 +1043,21 @@ class SubtitleTaskManager:
                         raise TaskUploadTooLarge("字幕批次总量超出限制")
                     if existing_reserved + total_bytes * reserve_factor > staging_quota:
                         raise TaskStorageInsufficient("字幕暂存总额度不足")
-                    free = shutil.disk_usage(self._staging_root).free
+                    now = time.monotonic()
+                    # Between samples debit our own writes locally. All quota
+                    # and derived-byte guards still run for every chunk.
+                    if sampled_free is None or now - sampled_at >= 1 \
+                            or total_bytes - sampled_bytes >= 64 * 1024 * 1024:
+                        sampled_free = shutil.disk_usage(self._staging_root).free
+                        sampled_at, sampled_bytes = now, total_bytes
                     future_derived_bytes = total_bytes * (reserve_factor - 1)
                     pending_write = len(chunk) if writer is not None else 0
-                    if free - existing_future_reserved - pending_write \
+                    if sampled_free - existing_future_reserved - pending_write \
                             - future_derived_bytes < reserve:
                         raise TaskStorageInsufficient("字幕暂存卷可用空间不足，已保留安全余量")
                     if writer is not None:
                         writer.write(chunk)
+                        sampled_free -= len(chunk)
                     digest.update(chunk)
 
             try:
@@ -1083,6 +1107,10 @@ class SubtitleTaskManager:
                 "size": size,
                 "staged_identity": self._staging_identity(staged_stat)
             })
+        # Catch external disk consumers once more before accepting the batch.
+        free = shutil.disk_usage(self._staging_root).free
+        if free - existing_future_reserved - total_bytes * (reserve_factor - 1) < reserve:
+            raise TaskStorageInsufficient("字幕暂存卷可用空间不足，已保留安全余量")
         return components, total_bytes
 
     def _active_staging_reservations(self):
@@ -1105,8 +1133,19 @@ class SubtitleTaskManager:
                 SUBTITLETASK.STATUS
             ).filter(
                 SUBTITLETASK.TYPE == "upload",
-                SUBTITLETASK.STATUS.in_(list(TASK_STATES))
+                SUBTITLETASK.STATUS.in_(list(ACTIVE_STATES))
             ).all()
+            # History needs only IDs until a directory must be retried. A
+            # bounded negative cache avoids reloading large terminal payloads
+            # and probing already removed UUID directories on every upload.
+            terminal_ids = [str(row[0]) for row in self._db.query(SUBTITLETASK.ID).filter(
+                SUBTITLETASK.TYPE == "upload",
+                SUBTITLETASK.STATUS.in_(list(TERMINAL_STATES))
+            ).all() if not self._staging_known_absent(str(row[0]))]
+            for offset in range(0, len(terminal_ids), 500):
+                rows.extend(self._db.query(
+                    SUBTITLETASK.ID, SUBTITLETASK.PAYLOAD, SUBTITLETASK.STATUS
+                ).filter(SUBTITLETASK.ID.in_(terminal_ids[offset:offset + 500])).all())
         for row in rows:
             task_id, raw_payload, status = row
             payload = _loads(raw_payload, {}) if raw_payload else {}
@@ -1126,7 +1165,26 @@ class SubtitleTaskManager:
                 future_total += max(reserved - raw_bytes, 0)
         return total, future_total
 
+    def _staging_known_absent(self, task_id, cleaned=False):
+        with self._lock:
+            cached = self._staging_absent_cache.get(str(task_id))
+            if cached is not None and cached[0] > time.monotonic():
+                return not cleaned or cached[1]
+            self._staging_absent_cache.pop(str(task_id), None)
+            return False
+
+    def _remember_staging_absent(self, task_id, cleaned=False):
+        with self._lock:
+            # Missing directory alone is not proof that every ownership marker
+            # was consumed. Only completed cleanup can skip marker retries.
+            self._staging_absent_cache[str(task_id)] = (time.monotonic() + 300, cleaned)
+            self._staging_absent_cache.move_to_end(str(task_id))
+            while len(self._staging_absent_cache) > 4096:
+                self._staging_absent_cache.popitem(last=False)
+
     def _terminal_staging_present(self, task_id, payload):
+        if self._staging_known_absent(task_id):
+            return False
         staging_dir = str(
             (payload or {}).get("staging_dir")
             or os.path.join(self._staging_root, str(task_id))
@@ -1140,6 +1198,7 @@ class SubtitleTaskManager:
             current = os.lstat(real_target)
             return stat.S_ISDIR(current.st_mode) and not stat.S_ISLNK(current.st_mode)
         except FileNotFoundError:
+            self._remember_staging_absent(task_id)
             return False
         except (OSError, ValueError, TypeError):
             # Fail closed for quota accounting when the staging volume is
@@ -1235,10 +1294,23 @@ class SubtitleTaskManager:
     def _active_target_reservations(self, volume_key):
         total = 0
         required_reserve = 0
-        rows = self._db.query(SUBTITLETASK).filter(
+        rows = self._db.query(SUBTITLETASK.ID, SUBTITLETASK.PAYLOAD, SUBTITLETASK.POLICY).filter(
             SUBTITLETASK.TYPE == "upload",
             SUBTITLETASK.STATUS.in_(list(ACTIVE_STATES))
         ).all()
+        # Aggregate current item state once per capacity check; never cache
+        # reservations across item completion/cancellation or task admission.
+        pending_sizes = dict(self._db.query(
+            SUBTITLETASKITEM.TASK_ID,
+            func.sum((func.max(func.coalesce(SUBTITLETASKITEM.SIZE, 0), 0)
+                      + func.max(func.coalesce(SUBTITLETASKITEM.COMPANION_SIZE, 0), 0)) * 2)
+        ).join(SUBTITLETASK, SUBTITLETASK.ID == SUBTITLETASKITEM.TASK_ID).filter(
+            SUBTITLETASK.TYPE == "upload",
+            SUBTITLETASK.STATUS.in_(list(ACTIVE_STATES)),
+            func.lower(func.coalesce(SUBTITLETASKITEM.STATUS, "")).notin_(
+                ["succeeded", "failed", "canceled"]
+            )
+        ).group_by(SUBTITLETASKITEM.TASK_ID).all())
         for row in rows:
             payload = _loads(row.PAYLOAD, {}) or {}
             row_volume = payload.get("target_volume_key")
@@ -1260,20 +1332,7 @@ class SubtitleTaskManager:
                 int(policy.get("reserve_free_mb") or DEFAULT_POLICY["reserve_free_mb"])
                 * 1024 * 1024
             )
-            items = self._db.query(
-                SUBTITLETASKITEM.SIZE,
-                SUBTITLETASKITEM.COMPANION_SIZE,
-                SUBTITLETASKITEM.STATUS
-            ).filter(SUBTITLETASKITEM.TASK_ID == row.ID).all()
-            pending = [
-                item for item in items
-                if str(item[2] or "").lower() not in ["succeeded", "failed", "canceled"]
-            ]
-            if pending:
-                total += sum(
-                    (max(int(item[0] or 0), 0) + max(int(item[1] or 0), 0)) * 2
-                    for item in pending
-                )
+            total += int(pending_sizes.get(row.ID) or 0)
         return total, required_reserve
 
     def _check_target_capacity(self, path, volume_key, additional_bytes=0, reserve_bytes=0):
@@ -1687,6 +1746,9 @@ class SubtitleTaskManager:
                         pending_recovery = None
                     task_id = self._claim_next_interactive()
                     if not task_id:
+                        # Retry failed cleanup even when no new tasks arrive;
+                        # use the worker so NAS cleanup cannot stall heartbeats.
+                        self.cleanup(force=False)
                         break
                     try:
                         self._execute_task(task_id)
@@ -1928,7 +1990,7 @@ class SubtitleTaskManager:
                 self.finish_task(task_id, status, error=str(error), message=str(error))
         finally:
             try:
-                self.cleanup()
+                self.cleanup(force=False)
             except Exception as error:
                 self._db.rollback()
                 ExceptionUtils.exception_traceback(error)
@@ -2339,17 +2401,15 @@ class SubtitleTaskManager:
             return 0
         server = str(server or "").lower()
         written = 0
+        rows = []
         with self._lock:
             for fingerprint, result in entries:
                 if not isinstance(fingerprint, dict) or not fingerprint.get("path"):
                     continue
                 now = time.time()
                 path = os.path.normcase(os.path.abspath(str(fingerprint.get("path"))))
-                row = self._db.query(SUBTITLEPROBECACHE).filter(
-                    SUBTITLEPROBECACHE.SERVER == server,
-                    SUBTITLEPROBECACHE.PATH == path
-                ).first()
                 values = {
+                    "SERVER": server, "PATH": path, "CREATED_AT": now,
                     "FINGERPRINT": _fingerprint_hash(fingerprint),
                     "SIZE": int(fingerprint.get("size") or 0),
                     "MTIME_NS": str(fingerprint.get("mtime_ns") or ""),
@@ -2364,19 +2424,12 @@ class SubtitleTaskManager:
                     "RESULT": _dumps(result or {}),
                     "UPDATED_AT": now
                 }
-                if row:
-                    for key, value in values.items():
-                        setattr(row, key, value)
-                else:
-                    self._db.insert(SUBTITLEPROBECACHE(
-                        SERVER=server,
-                        PATH=path,
-                        CREATED_AT=now,
-                        **values
-                    ))
+                rows.append(values)
                 written += 1
             if written:
                 try:
+                    upsert_subtitle_rows(self._db, SUBTITLEPROBECACHE, rows,
+                                         ["SERVER", "PATH"], preserve_columns=["CREATED_AT"])
                     self._db.commit()
                 except Exception:
                     self._db.rollback()
@@ -2391,14 +2444,21 @@ class SubtitleTaskManager:
         if not normalized:
             return 0
         with self._lock:
-            query = self._db.query(SUBTITLEPROBECACHE).filter(or_(
-                SUBTITLEPROBECACHE.PATH.in_(list(normalized)),
-                SUBTITLEPROBECACHE.PAIR_PATH.in_(list(normalized))
-            ))
-            count = query.count()
-            if count:
-                query.delete(synchronize_session=False)
+            count = 0
+            paths = list(normalized)
+            try:
+                # Each path is bound twice in the OR: 400 keeps both lists
+                # below SQLite's older 999-variable limit.
+                for offset in range(0, len(paths), 400):
+                    chunk = paths[offset:offset + 400]
+                    count += self._db.query(SUBTITLEPROBECACHE).filter(or_(
+                        SUBTITLEPROBECACHE.PATH.in_(chunk),
+                        SUBTITLEPROBECACHE.PAIR_PATH.in_(chunk)
+                    )).delete(synchronize_session=False)
                 self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
             return count
 
     def replace_audit_states(self, scope_key, server, media_statuses, task_id=None):
@@ -2444,6 +2504,9 @@ class SubtitleTaskManager:
             replace = False
             message = "外挂字幕检测部分完成：最新状态达到 50000 条持久化上限"
         now = time.time()
+        audit_rows = self._audit_state_values(scope_key, server, media_statuses, task_id, now)
+        snapshot_rows = self._media_status_values(server, media_snapshots or [], now)
+        serialized_result = _dumps(result or {})
         with self._lock:
             row = self._db.query(SUBTITLETASK).filter(
                 SUBTITLETASK.ID == str(task_id), SUBTITLETASK.TYPE == "audit"
@@ -2456,7 +2519,7 @@ class SubtitleTaskManager:
                 self._checkpoint_active(row, now, keep_running=False)
                 row.STATUS = "canceled"
                 row.PHASE = "complete"
-                row.RESULT = _dumps(result or {})
+                row.RESULT = serialized_result
                 row.ERROR = None
                 row.MESSAGE = "字幕检测已取消"
                 row.FINISHED_AT = now
@@ -2469,19 +2532,15 @@ class SubtitleTaskManager:
                         SUBTITLEAUDITSTATE.SCOPE_KEY == str(scope_key),
                         SUBTITLEAUDITSTATE.SERVER == str(server).lower()
                     ).delete(synchronize_session=False)
-                    self._insert_audit_states(scope_key, server, media_statuses, task_id)
-                else:
-                    self._upsert_audit_states_uncommitted(
-                        scope_key, server, media_statuses, task_id, now
-                    )
-                self._upsert_media_statuses_uncommitted(
-                    server, media_snapshots or [], now
-                )
+                upsert_subtitle_rows(self._db, SUBTITLEAUDITSTATE, audit_rows,
+                                     ["SCOPE_KEY", "SERVER", "SUBTITLE_PATH"])
+                upsert_subtitle_rows(self._db, SUBTITLEMEDIASTATUS, snapshot_rows,
+                                     ["SERVER", "MEDIA_PATH"])
                 self._checkpoint_active(row, now, keep_running=False)
                 row.STATUS = status
                 row.PHASE = "complete"
                 row.PERCENT = 100 if status == "succeeded" else row.PERCENT
-                row.RESULT = _dumps(result or {})
+                row.RESULT = serialized_result
                 row.ERROR = None
                 row.MESSAGE = str(message or "")
                 row.FINISHED_AT = now
@@ -2494,43 +2553,30 @@ class SubtitleTaskManager:
             return self._task_dict(row, include_result=True, include_items=True)
 
     def _upsert_media_statuses_uncommitted(self, server, snapshots, now):
-        """Publish inspected media snapshots in the same audit transaction."""
-        server = str(server or "").lower()
-        normalized = []
+        """Publish snapshots in bounded SQL batches within the audit transaction."""
+        upsert_subtitle_rows(self._db, SUBTITLEMEDIASTATUS,
+                             self._media_status_values(server, snapshots, now),
+                             ["SERVER", "MEDIA_PATH"])
+
+    def _media_status_values(self, server, snapshots, now):
+        rows = []
         for snapshot in snapshots:
-            path = os.path.normcase(os.path.abspath(os.path.normpath(
-                str((snapshot or {}).get("media_path") or "")
-            )))
-            if path:
-                normalized.append((path, snapshot))
-        for offset in range(0, len(normalized), 500):
-            chunk = normalized[offset:offset + 500]
-            paths = [path for path, _ in chunk]
-            existing = self._db.query(SUBTITLEMEDIASTATUS).filter(
-                SUBTITLEMEDIASTATUS.SERVER == server,
-                SUBTITLEMEDIASTATUS.MEDIA_PATH.in_(paths)
-            ).all()
-            rows_by_path = {row.MEDIA_PATH: row for row in existing}
-            for path, snapshot in chunk:
-                row = rows_by_path.get(path)
-                values = {
-                    "MEDIA_EXISTS": self._nullable_flag(snapshot.get("media_exists")),
-                    "HAS_INTERNAL": self._nullable_flag(snapshot.get("has_internal")),
-                    "HAS_CHINESE_INTERNAL": self._nullable_flag(snapshot.get("has_chinese_internal")),
-                    "HAS_EXTERNAL": self._nullable_flag(snapshot.get("has_external")),
-                    "HAS_CHINESE_EXTERNAL": self._nullable_flag(snapshot.get("has_chinese_external")),
-                    "STATUS": str(snapshot.get("status") or "unknown"),
-                    "SOURCE": str(snapshot.get("source") or "audit"),
-                    "CHECKED_AT": now,
-                    "UPDATED_AT": now,
-                }
-                if row:
-                    for key, value in values.items():
-                        setattr(row, key, value)
-                else:
-                    self._db.insert(SUBTITLEMEDIASTATUS(
-                        SERVER=server, MEDIA_PATH=path, **values
-                    ))
+            raw_path = str((snapshot or {}).get("media_path") or "")
+            if not raw_path:
+                continue
+            path = os.path.normcase(os.path.abspath(os.path.normpath(raw_path)))
+            rows.append({
+                "SERVER": str(server or "").lower(), "MEDIA_PATH": path,
+                "MEDIA_EXISTS": self._nullable_flag(snapshot.get("media_exists")),
+                "HAS_INTERNAL": self._nullable_flag(snapshot.get("has_internal")),
+                "HAS_CHINESE_INTERNAL": self._nullable_flag(snapshot.get("has_chinese_internal")),
+                "HAS_EXTERNAL": self._nullable_flag(snapshot.get("has_external")),
+                "HAS_CHINESE_EXTERNAL": self._nullable_flag(snapshot.get("has_chinese_external")),
+                "STATUS": str(snapshot.get("status") or "unknown"),
+                "SOURCE": str(snapshot.get("source") or "audit"),
+                "CHECKED_AT": now, "UPDATED_AT": now,
+            })
+        return rows
 
     @staticmethod
     def _nullable_flag(value):
@@ -2548,70 +2594,33 @@ class SubtitleTaskManager:
             self._invalidate_audit_snapshot_cache(server)
 
     def _upsert_audit_states_uncommitted(self, scope_key, server, media_statuses, task_id, now):
-        scope_key = str(scope_key)
-        server = str(server).lower()
-        entries = []
-        for key, value in (media_statuses or {}).items():
-            media_path = str((value or {}).get("media_path") or key)
-            entries.append((
-                os.path.normcase(os.path.normpath(media_path)),
-                media_path,
-                value or {}
-            ))
-        for offset in range(0, len(entries), 500):
-            chunk = entries[offset:offset + 500]
-            paths = [entry[0] for entry in chunk]
-            existing = self._db.query(SUBTITLEAUDITSTATE).filter(
-                SUBTITLEAUDITSTATE.SCOPE_KEY == scope_key,
-                SUBTITLEAUDITSTATE.SERVER == server,
-                SUBTITLEAUDITSTATE.SUBTITLE_PATH.in_(paths)
-            ).all()
-            existing_by_path = {row.SUBTITLE_PATH: row for row in existing}
-            for normalized, media_path, value in chunk:
-                row = existing_by_path.get(normalized)
-                stored_value = dict(value)
-                # The timestamp belongs to this path-level observation, not to
-                # whichever category scan happened to finish most recently.
-                stored_value["checked_at"] = _iso(now)
-                if row:
-                    row.MEDIA_PATH = media_path
-                    row.STATUS = str(value.get("status") or "error")
-                    row.REASON = str(value.get("reason") or "")
-                    row.RESULT = _dumps(stored_value)
-                    row.TASK_ID = task_id
-                    row.CONFIRMED_AT = now
-                    row.UPDATED_AT = now
-                else:
-                    self._db.insert(self._audit_state_row(
-                        scope_key, server, normalized, media_path, stored_value, task_id, now
-                    ))
+        upsert_subtitle_rows(
+            self._db, SUBTITLEAUDITSTATE,
+            self._audit_state_values(scope_key, server, media_statuses, task_id, now),
+            ["SCOPE_KEY", "SERVER", "SUBTITLE_PATH"]
+        )
 
     def _insert_audit_states(self, scope_key, server, media_statuses, task_id,
                              confirmed_at=None):
+        # Replacement and incremental publication share the same bounded writer.
         now = float(confirmed_at if confirmed_at is not None else time.time())
-        for key, value in (media_statuses or {}).items():
-            media_path = str((value or {}).get("media_path") or key)
-            normalized = os.path.normcase(os.path.normpath(media_path))
-            self._db.insert(self._audit_state_row(
-                scope_key, server, normalized, media_path, value, task_id, now
-            ))
+        self._upsert_audit_states_uncommitted(scope_key, server, media_statuses, task_id, now)
 
     @staticmethod
-    def _audit_state_row(scope_key, server, normalized, media_path, value, task_id, now):
-        stored_value = dict(value or {})
-        stored_value["checked_at"] = _iso(now)
-        return SUBTITLEAUDITSTATE(
-            SCOPE_KEY=str(scope_key),
-            SERVER=str(server).lower(),
-            SUBTITLE_PATH=normalized,
-            MEDIA_PATH=media_path,
-            STATUS=str((value or {}).get("status") or "error"),
-            REASON=str((value or {}).get("reason") or ""),
-            RESULT=_dumps(stored_value),
-            TASK_ID=task_id,
-            CONFIRMED_AT=now,
-            UPDATED_AT=now
-        )
+    def _audit_state_values(scope_key, server, media_statuses, task_id, now):
+        rows = []
+        for key, value in (media_statuses or {}).items():
+            value = value or {}
+            media_path = str(value.get("media_path") or key)
+            stored_value = dict(value, checked_at=_iso(now))
+            rows.append({
+                "SCOPE_KEY": str(scope_key), "SERVER": str(server).lower(),
+                "SUBTITLE_PATH": os.path.normcase(os.path.normpath(media_path)),
+                "MEDIA_PATH": media_path, "STATUS": str(value.get("status") or "error"),
+                "REASON": str(value.get("reason") or ""), "RESULT": _dumps(stored_value),
+                "TASK_ID": task_id, "CONFIRMED_AT": now, "UPDATED_AT": now,
+            })
+        return rows
 
     def get_audit_states(self, scope_key, server):
         rows = self._db.query(SUBTITLEAUDITSTATE).filter(
@@ -2727,7 +2736,24 @@ class SubtitleTaskManager:
                 self._invalidate_audit_snapshot_cache()
             return count
 
-    def cleanup(self):
+    def cleanup(self, force=True):
+        """Explicit cleanup is immediate; worker maintenance runs at most once/minute."""
+        if not self._cleanup_lock.acquire(blocking=False):
+            return
+        try:
+            now = time.monotonic()
+            if not force and self._last_cleanup is not None and now - self._last_cleanup < 60:
+                return
+            try:
+                self._cleanup_retained_tasks()
+            finally:
+                # A failing NAS/SQLite must not create an idle-worker retry
+                # storm. Retry next minute; explicit maintenance can retry now.
+                self._last_cleanup = time.monotonic()
+        finally:
+            self._cleanup_lock.release()
+
+    def _cleanup_retained_tasks(self):
         now = time.time()
         policy = self.get_settings()
         cutoff = now - policy["task_retention_days"] * 86400
@@ -2736,7 +2762,10 @@ class SubtitleTaskManager:
         terminal_ids = set()
         terminal_upload_ids = set()
         with self._lock:
-            terminal_rows = self._db.query(SUBTITLETASK).filter(
+            terminal_rows = self._db.query(
+                SUBTITLETASK.ID, SUBTITLETASK.TYPE, SUBTITLETASK.FINISHED_AT,
+                SUBTITLETASK.UPDATED_AT, SUBTITLETASK.CREATED_AT
+            ).filter(
                 SUBTITLETASK.STATUS.in_(list(TERMINAL_STATES))
             ).order_by(SUBTITLETASK.FINISHED_AT.desc(), SUBTITLETASK.CREATED_AT.desc()).all()
             terminal_ids = {str(row.ID) for row in terminal_rows}
@@ -2748,11 +2777,22 @@ class SubtitleTaskManager:
                 if (row.FINISHED_AT or row.UPDATED_AT or row.CREATED_AT) < cutoff
                 or index >= policy["task_retention_count"]
             }
-            if delete_ids:
-                cleanup_markers = {
-                    task_id: self._upload_marker_paths(task_id)
-                    for task_id in delete_ids
-                }
+            pending_ids = [task_id for task_id in terminal_upload_ids | delete_ids
+                           if not self._staging_known_absent(task_id, cleaned=True)]
+            cleanup_payloads = {}
+            # Fetch ownership metadata in batches, including retained uploads
+            # whose previous cleanup failed. No per-task SELECT loop is needed.
+            for offset in range(0, len(pending_ids), 500):
+                chunk = pending_ids[offset:offset + 500]
+                for task_id, payload in self._db.query(SUBTITLETASK.ID, SUBTITLETASK.PAYLOAD).filter(
+                        SUBTITLETASK.ID.in_(chunk)).all():
+                    cleanup_payloads[str(task_id)] = _loads(payload, {})
+                for task_id, result in self._db.query(
+                        SUBTITLETASKITEM.TASK_ID, SUBTITLETASKITEM.RESULT).filter(
+                        SUBTITLETASKITEM.TASK_ID.in_(chunk)).all():
+                    marker = str((_loads(result, {}) or {}).get("ownership_marker") or "")
+                    if marker:
+                        cleanup_markers.setdefault(str(task_id), []).append(marker)
             if now - self._last_persistent_cache_cleanup >= 3600:
                 try:
                     cache_cutoff = now - _PROBE_CACHE_RETENTION_DAYS * 86400
@@ -2760,27 +2800,23 @@ class SubtitleTaskManager:
                     cache_changed = self._db.query(SUBTITLEPROBECACHE).filter(
                         SUBTITLEPROBECACHE.UPDATED_AT < cache_cutoff
                     ).delete(synchronize_session=False)
-                    cache_overflow = [
-                        row[0] for row in self._db.query(SUBTITLEPROBECACHE.ID).order_by(
-                            SUBTITLEPROBECACHE.UPDATED_AT.desc()
-                        ).offset(_PROBE_CACHE_MAX_ROWS).all()
-                    ]
-                    if cache_overflow:
-                        cache_changed += self._db.query(SUBTITLEPROBECACHE).filter(
-                            SUBTITLEPROBECACHE.ID.in_(cache_overflow)
-                        ).delete(synchronize_session=False)
+                    # Keep overflow selection inside SQLite. UPDATED_AT indexes
+                    # serve the ordering, and no unbounded IN parameter list is built.
+                    cache_overflow = self._db.query(SUBTITLEPROBECACHE.ID).order_by(
+                        SUBTITLEPROBECACHE.UPDATED_AT.desc(), SUBTITLEPROBECACHE.ID.desc()
+                    ).offset(_PROBE_CACHE_MAX_ROWS).limit(-1)
+                    cache_changed += self._db.query(SUBTITLEPROBECACHE).filter(
+                        SUBTITLEPROBECACHE.ID.in_(cache_overflow)
+                    ).delete(synchronize_session=False)
                     state_changed = self._db.query(SUBTITLEAUDITSTATE).filter(
                         SUBTITLEAUDITSTATE.UPDATED_AT < state_cutoff
                     ).delete(synchronize_session=False)
-                    state_overflow = [
-                        row[0] for row in self._db.query(SUBTITLEAUDITSTATE.ID).order_by(
-                            SUBTITLEAUDITSTATE.UPDATED_AT.desc()
-                        ).offset(_AUDIT_STATE_MAX_ROWS).all()
-                    ]
-                    if state_overflow:
-                        state_changed += self._db.query(SUBTITLEAUDITSTATE).filter(
-                            SUBTITLEAUDITSTATE.ID.in_(state_overflow)
-                        ).delete(synchronize_session=False)
+                    state_overflow = self._db.query(SUBTITLEAUDITSTATE.ID).order_by(
+                        SUBTITLEAUDITSTATE.UPDATED_AT.desc(), SUBTITLEAUDITSTATE.ID.desc()
+                    ).offset(_AUDIT_STATE_MAX_ROWS).limit(-1)
+                    state_changed += self._db.query(SUBTITLEAUDITSTATE).filter(
+                        SUBTITLEAUDITSTATE.ID.in_(state_overflow)
+                    ).delete(synchronize_session=False)
                     # DELETE starts a SQLite write transaction even when it matches
                     # zero rows. Always finish it before the worker goes idle.
                     self._db.commit()
@@ -2804,7 +2840,9 @@ class SubtitleTaskManager:
         for task_id in delete_ids:
             try:
                 if self._cleanup_task_staging(
-                        task_id, marker_paths=cleanup_markers.get(task_id)):
+                        task_id, marker_paths=cleanup_markers.get(
+                            task_id, [] if task_id in cleanup_payloads else None),
+                        payload=cleanup_payloads.get(task_id)):
                     deletable_ids.add(task_id)
                 else:
                     protected_ids.add(str(task_id))
@@ -2812,12 +2850,15 @@ class SubtitleTaskManager:
                 protected_ids.add(str(task_id))
         if deletable_ids:
             with self._lock:
-                self._db.query(SUBTITLETASKITEM).filter(
-                    SUBTITLETASKITEM.TASK_ID.in_(list(deletable_ids))
-                ).delete(synchronize_session=False)
-                self._db.query(SUBTITLETASK).filter(
-                    SUBTITLETASK.ID.in_(list(deletable_ids))
-                ).delete(synchronize_session=False)
+                ids = list(deletable_ids)
+                for offset in range(0, len(ids), 500):
+                    chunk = ids[offset:offset + 500]
+                    self._db.query(SUBTITLETASKITEM).filter(
+                        SUBTITLETASKITEM.TASK_ID.in_(chunk)
+                    ).delete(synchronize_session=False)
+                    self._db.query(SUBTITLETASK).filter(
+                        SUBTITLETASK.ID.in_(chunk)
+                    ).delete(synchronize_session=False)
                 self._db.commit()
         # A recent terminal upload is retained in SQLite for the task center,
         # but its raw/derived bytes must still be retried after a transient NAS
@@ -2825,7 +2866,10 @@ class SubtitleTaskManager:
         # remains important because only this path has exact task ownership.
         for task_id in terminal_upload_ids - {str(value) for value in delete_ids}:
             try:
-                if not self._cleanup_task_staging(task_id):
+                if not self._cleanup_task_staging(
+                        task_id, marker_paths=cleanup_markers.get(
+                            task_id, [] if task_id in cleanup_payloads else None),
+                        payload=cleanup_payloads.get(task_id)):
                     protected_ids.add(task_id)
             except Exception:
                 protected_ids.add(task_id)
@@ -3014,9 +3058,12 @@ class SubtitleTaskManager:
             except OSError:
                 continue
 
-    def _cleanup_task_staging(self, task_id, marker_paths=None):
-        task = self._db.query(SUBTITLETASK).filter(SUBTITLETASK.ID == str(task_id)).first()
-        payload = _loads(task.PAYLOAD, {}) if task else {}
+    def _cleanup_task_staging(self, task_id, marker_paths=None, payload=None):
+        if self._staging_known_absent(task_id, cleaned=True):
+            return True
+        if payload is None:
+            task = self._db.query(SUBTITLETASK).filter(SUBTITLETASK.ID == str(task_id)).first()
+            payload = _loads(task.PAYLOAD, {}) if task else {}
         staging_dir = payload.get("staging_dir") or os.path.join(self._staging_root, str(task_id))
         if marker_paths is None:
             marker_paths = self._upload_marker_paths(task_id)
@@ -3033,7 +3080,10 @@ class SubtitleTaskManager:
         real_target = os.path.realpath(staging_dir)
         try:
             if os.path.commonpath([real_root, real_target]) == real_root and real_target != real_root:
-                return self._remove_tree(real_target)
+                removed = self._remove_tree(real_target)
+                if removed:
+                    self._remember_staging_absent(task_id, cleaned=True)
+                return removed
         except ValueError:
             return False
         return False

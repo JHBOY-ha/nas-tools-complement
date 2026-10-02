@@ -3,9 +3,33 @@ import time
 from datetime import datetime
 
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.dialects.sqlite import insert
 
 from app.db.main_db import MainDb
 from app.db.models import SUBTITLEMEDIASTATUS
+
+
+def upsert_subtitle_rows(db, model, rows, key_columns, preserve_columns=()):
+    """Execute bounded batches without ORM per-row INSERTs or generated-ID reads.
+
+    The caller owns the transaction, including audit/task atomicity. Each
+    executemany row has its own bind parameters, so 500 rows do not multiply
+    SQLite's variable limit. Expire loaded instances after the Core write.
+    """
+    if not rows:
+        return
+    db.session.flush()
+    statement = insert(model.__table__)
+    excluded = set(key_columns) | set(preserve_columns)
+    statement = statement.on_conflict_do_update(
+        index_elements=key_columns,
+        set_={key: statement.excluded[key] for key in rows[0] if key not in excluded}
+    )
+    for offset in range(0, len(rows), 500):
+        db.session.execute(statement, rows[offset:offset + 500])
+    for instance in list(db.session.identity_map.values()):
+        if isinstance(instance, model):
+            db.session.expire(instance)
 
 
 class SubtitleMediaStatusStore:
@@ -86,15 +110,14 @@ class SubtitleMediaStatusStore:
         checked_at = float(checked_at or now)
         saved = 0
         try:
+            rows = []
             for snapshot in snapshots or []:
                 path = self.normalize_path(snapshot.get("media_path"))
                 if not server or not path:
                     continue
-                row = self._db.query(SUBTITLEMEDIASTATUS).filter(
-                    SUBTITLEMEDIASTATUS.SERVER == server,
-                    SUBTITLEMEDIASTATUS.MEDIA_PATH == path
-                ).first()
                 values = {
+                    "SERVER": server,
+                    "MEDIA_PATH": path,
                     "MEDIA_EXISTS": self._flag(snapshot.get("media_exists")),
                     "HAS_INTERNAL": self._flag(snapshot.get("has_internal")),
                     "HAS_CHINESE_INTERNAL": self._flag(snapshot.get("has_chinese_internal")),
@@ -105,14 +128,11 @@ class SubtitleMediaStatusStore:
                     "CHECKED_AT": checked_at,
                     "UPDATED_AT": now,
                 }
-                if row:
-                    for key, value in values.items():
-                        setattr(row, key, value)
-                else:
-                    self._db.insert(SUBTITLEMEDIASTATUS(
-                        SERVER=server, MEDIA_PATH=path, **values
-                    ))
+                rows.append(values)
                 saved += 1
+            upsert_subtitle_rows(
+                self._db, SUBTITLEMEDIASTATUS, rows, ["SERVER", "MEDIA_PATH"]
+            )
             self._db.commit()
             return saved
         except OperationalError as error:
