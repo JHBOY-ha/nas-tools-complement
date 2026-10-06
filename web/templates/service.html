@@ -375,9 +375,10 @@
 
   // 备份
   $("#backup_btn").unbind("click").click(function () {
-    $(this).text("备份中...").attr("disabled", true);
+    const backupButton = $(this);
+    backupButton.text("备份中...").attr("disabled", true).attr("aria-busy", "true");
     ajax_backup(function () {
-      $(this).attr("disabled", false).text("备份当前配置");
+      backupButton.attr("disabled", false).attr("aria-busy", "false").text("备份当前配置");
     });
   });
 
@@ -386,12 +387,15 @@
     if (!backup_dropzone || !backup_dropzone.files || !backup_dropzone.files[0]) {
       return;
     }
-    $(this).text("恢复中...").attr("disabled", true);
+    // Capture the trigger: AJAX callbacks do not retain the button as `this`.
+    const restoreButton = $(this);
+    restoreButton.text("恢复中...").attr("disabled", true).attr("aria-busy", "true");
     ajax_post("restory_backup", { file_name: backup_dropzone.files[backup_dropzone.files.length - 1].name }, function (ret) {
-      $(this).attr("disabled", false).text("恢复配置");
+      restoreButton.attr("disabled", false).attr("aria-busy", "false").text("恢复配置");
       $("#modal-backup").modal('hide');
       if (ret.code === 0) {
-        show_success_modal("备份恢复成功，请重启系统生效！");
+        // A staged restore is not an applied restore; keep restart explicit.
+        show_success_modal(ret.restart_required ? "备份已校验并暂存，重启后离线恢复生效。" : "备份恢复成功，请重启系统生效！");
       } else {
         show_fail_modal(`备份恢复失败：${ret.msg}`, function() {
           $("#modal-backup").modal('show');

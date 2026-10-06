@@ -11,7 +11,25 @@ from app.utils.workload import get_transfer_gate
 from app.utils.isolated_io import IsolatedIOTimeout, get_io_pool
 from app.utils.isolated_fs import fs_os as os, isolated_open as open
 
-_publish_lock = Lock()
+_publish_locks = {}
+_publish_locks_guard = Lock()
+
+
+@contextmanager
+def _local_destination_lock(destination):
+    """Count holders and waiters so unrelated publications never share a lock."""
+    key = os.path.normcase(os.path.abspath(destination))
+    with _publish_locks_guard:
+        entry = _publish_locks.setdefault(key, [Lock(), 0])
+        entry[1] += 1
+    try:
+        with entry[0]:
+            yield
+    finally:
+        with _publish_locks_guard:
+            entry[1] -= 1
+            if not entry[1]:
+                _publish_locks.pop(key, None)
 
 
 @contextmanager
@@ -19,7 +37,11 @@ def _lock_destination(destination):
     """Serialize publication through cleanup, including other app processes."""
     # Keep the lock file: unlinking it lets another process lock a different inode.
     # OS locks are released on process exit, so a crash cannot leave a stale lock.
-    with _publish_lock, get_io_pool().session() as worker:
+    # Waiting on the same target consumes neither an I/O worker nor a transfer
+    # slot. Long-lived flock handles use their own bounded pool, leaving stat
+    # and upload admission available while multiple copies are in progress.
+    with _local_destination_lock(destination), get_transfer_gate().slot(), \
+            get_io_pool('publication').session() as worker:
         # Keep the OS lock in a bounded child through persistence and source
         # cleanup; open/flock/NAS waits do not pin the application indefinitely.
         token = worker.execute('lock', path=destination + '.extra-lock')
@@ -56,7 +78,10 @@ def publish_exclusive(source, destination, mode, transfer, record):
     os.makedirs(os.path.dirname(destination), exist_ok=True)
     # Protected publication may hash existing copies as well as transfer them.
     # Nested legacy transfer commands reuse this same process-wide I/O slot.
-    with _lock_destination(destination), get_transfer_gate().slot():
+    from app.db.main_db import MainDb
+    # Reserve a future record slot before publication, without retaining the
+    # SQLite writer lock while copying/hashing NAS files.
+    with MainDb().reserve_write(), _lock_destination(destination):
         _publish_extra(source, destination, mode, transfer, record)
 
 
@@ -124,8 +149,12 @@ def _publish_extra(source, destination, mode, transfer, record):
     if (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns) != (
             stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns):
         raise OSError("Extras 源文件在转移期间变化，保留源文件")
-    if record() is not True:
-        raise OSError("Extras 已落盘但记录失败，保留源文件等待重试")
+    from app.db.main_db import MainDb
+    # History and blacklist updates share one root transaction. Only its
+    # durable acknowledgement permits irreversible MOVE-source cleanup.
+    with MainDb().write_transaction():
+        if record() is not True:
+            raise OSError("Extras 已落盘但记录失败，保留源文件等待重试")
     if mode == RmtMode.MOVE and os.path.abspath(source) != os.path.abspath(destination):
         os.unlink(source)
     if os.path.lexists(pending):

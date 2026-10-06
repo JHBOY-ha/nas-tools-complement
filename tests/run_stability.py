@@ -12,11 +12,28 @@ import unittest
 from unittest.mock import patch
 
 
+DATABASE_REVIEW_FIXES = (
+    'tests.test_database_review_fixes',
+    # Only corrected behaviors belong in the default suite; the remaining
+    # review observations are intentionally kept in the explicit audit runner.
+    'tests.test_deepseek_audit_reproduction.DeepSeekReproduction.test_01_low_space_blocks_prepare_and_real_write',
+    'tests.test_deepseek_audit_reproduction.DeepSeekReproduction.test_03_matching_schema_skips_payload_hashes',
+    'tests.test_deepseek_audit_reproduction.DeepSeekReproduction.test_04_sync_rejection_preserves_previous_cache',
+    'tests.test_deepseek_audit_reproduction.DeepSeekReproduction.test_06_failed_boots_reuse_identical_migration_backup',
+    'tests.test_deepseek_audit_reproduction.DeepSeekReproduction.test_10_pending_restore_can_be_canceled_and_archive_explicitly_deleted',
+    'tests.test_deepseek_audit_reproduction.DeepSeekReproduction.test_12_update_without_prepare_bootstraps_safely',
+)
+
+
 STABILITY_MODULES = (
     "tests.test_stability_regressions",
     # Simulated workloads verify budgets without probing the production NAS.
     "tests.test_workload_limits",
     "tests.test_b4_hardening",
+    # WAL itself has a mandatory fixed-runtime acceptance runner. These real
+    # file/transaction/migration cases also run on the legacy DELETE fallback.
+    "tests.test_database_governance",
+    "tests.test_database_migrations",
     "tests.test_subtitle_tasks",
     "tests.test_subtitle_transaction_safety",
     "tests.test_subtitle_task_pipeline",
@@ -25,7 +42,7 @@ STABILITY_MODULES = (
     "tests.test_subtitle_season_pack",
     "tests.test_subtitle_align",
     "tests.test_subtitle_task_security",
-)
+) + DATABASE_REVIEW_FIXES
 
 
 def main():

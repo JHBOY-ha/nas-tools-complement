@@ -119,6 +119,10 @@ class AuditSecurityRegressionTest(unittest.TestCase):
         }
         self.config.get_config.side_effect = lambda key=None: (
             self.configuration if key is None else self.configuration.get(key, {}))
+        # Extracted dispatch methods still need their real admission constants;
+        # omitting newer imports would fail before reaching the policy itself.
+        from app.helper.action_tasks import COMMAND_TITLES
+        from app.utils.workload import TaskQueueFull
         self.ns = {
             "base64": base64, "json": json, "os": os, "shutil": shutil,
             "re": re, "time": time, "deepcopy": deepcopy, "lru_cache": lru_cache,
@@ -134,6 +138,7 @@ class AuditSecurityRegressionTest(unittest.TestCase):
             "BrushTask": MagicMock(), "StringUtils": MagicMock(),
             "action_allowed": POLICY.action_allowed,
             "ACTION_PERMISSIONS": POLICY.ACTION_PERMISSIONS,
+            "COMMAND_TITLES": COMMAND_TITLES, "TaskQueueFull": TaskQueueFull,
             "PAGE_ACTIONS": POLICY.PAGE_ACTIONS,
             "ModuleConf": SimpleNamespace(RMT_MODES={}),
             "RmtMode": SimpleNamespace(COPY=object()),
@@ -150,7 +155,7 @@ class AuditSecurityRegressionTest(unittest.TestCase):
             "action", "api_action", "__test_connection", "__user_manager", "update_system",
             "__rename_file", "__import_custom_words", "__delete_history",
             "set_config_value", "__update_config", "__add_brushtask", "__brushtask_detail",
-            "__add_or_edit_custom_word",
+            "__add_or_edit_custom_word", "__restory_backup",
             "__history_delete_plan", "__analyse_import_custom_words_code", "delete_media_file",
         }
         cls = load_source("web/action.py", methods, self.ns, "WebAction")
@@ -457,7 +462,7 @@ class AuditSecurityRegressionTest(unittest.TestCase):
 
     def test_03_permissionless_user_cannot_call_sensitive_commands(self):
         for command in ("user_manager", "update_config", "update_system", "import_custom_words",
-                        "test_connection", "rename_file", "delete_history"):
+                        "test_connection", "rename_file", "delete_history", "restory_backup"):
             with self.subTest(command=command):
                 self.assertEqual(self.post(command, {}).json["code"], -1)
         self.action.dbhelper.insert_user.assert_not_called()

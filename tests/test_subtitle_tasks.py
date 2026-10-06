@@ -52,10 +52,17 @@ class _MemoryDb:
         self._session.remove()
 
     def init_db(self):
-        Base.metadata.create_all(self.engine)
+        # Fixtures keep writable sessions for arranging states; reads still use
+        # the same publication predicate as production, so hidden rows cannot
+        # accidentally make an atomic-publication regression pass.
+        from app.db.publication import seed_legacy
+        with self.engine.begin() as connection:
+            Base.metadata.create_all(connection)
+            seed_legacy(connection)
 
     def query(self, *objects):
-        return self.session.query(*objects)
+        from app.db.publication import filter_visible
+        return filter_visible(self.session.query(*objects), objects)
 
     def insert(self, value):
         self.session.add(value)

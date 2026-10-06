@@ -1,4 +1,4 @@
-"""Standalone bounded-I/O worker: never import application state or SQLite."""
+"""Standalone bounded-I/O worker: fixed operations, never application state."""
 import base64
 import errno
 import hashlib
@@ -26,8 +26,97 @@ def _metadata(path, follow=True):
     }}
 
 
+def _validate_sqlite(connection):
+    """Structural/FK checks also gate the application's publication invariants."""
+    # Several checks must observe the same generation when a live source is
+    # validated. This short read transaction never covers archive/file I/O.
+    connection.execute('BEGIN')
+    try:
+        _validate_sqlite_snapshot(connection)
+    finally:
+        connection.rollback()
+
+
+def _validate_sqlite_snapshot(connection):
+    if connection.execute('PRAGMA integrity_check').fetchall() != [('ok',)] or \
+            connection.execute('PRAGMA foreign_key_check').fetchone() is not None:
+        raise ValueError('Database integrity or foreign-key error')
+    tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if 'SUBTITLE_PUBLICATION' not in tables:
+        return  # Recognized legacy schemas are upgraded by the parent, offline.
+    if 'SUBTITLE_STATE_CLOCK' not in tables:
+        raise ValueError('Missing publication clock')
+    clocks = connection.execute('SELECT ID,SEQUENCE,typeof(SEQUENCE) FROM SUBTITLE_STATE_CLOCK').fetchall()
+    if len(clocks) != 1 or clocks[0][0] != 1 or clocks[0][2] != 'integer' or clocks[0][1] < 0:
+        raise ValueError('Invalid publication clock')
+    maximum = connection.execute("SELECT coalesce(max(SEQUENCE),0) FROM SUBTITLE_PUBLICATION "
+                                 "WHERE STATUS='published'").fetchone()[0]
+    if not isinstance(maximum, int) or maximum > clocks[0][1]:
+        raise ValueError('Publication clock moved backwards')
+    # GC changes physical row counts, but never a publication's committed
+    # receipts. Validate receipts/visibility without demanding deleted history.
+    if connection.execute("SELECT 1 FROM SUBTITLE_PUBLICATION WHERE STATUS NOT IN ('building','aborted','published') "
+            "OR EXPECTED_AUDIT<0 OR EXPECTED_MEDIA<0 OR WRITTEN_AUDIT<0 OR WRITTEN_MEDIA<0 "
+            "OR WRITTEN_AUDIT>EXPECTED_AUDIT OR WRITTEN_MEDIA>EXPECTED_MEDIA "
+            "OR (STATUS='published' AND (SEQUENCE IS NULL OR typeof(SEQUENCE)!='integer' OR SEQUENCE<0 "
+            "OR WRITTEN_AUDIT!=EXPECTED_AUDIT OR WRITTEN_MEDIA!=EXPECTED_MEDIA)) LIMIT 1").fetchone():
+        raise ValueError('Invalid publication receipts')
+    if 'SUBTITLE_AUDIT_SCOPE_HEAD' in tables and connection.execute(
+            'SELECT 1 FROM SUBTITLE_AUDIT_SCOPE_HEAD WHERE typeof(REPLACE_SEQUENCE)!=\'integer\' '
+            'OR REPLACE_SEQUENCE<0 OR REPLACE_SEQUENCE>? LIMIT 1', (clocks[0][1],)).fetchone():
+        raise ValueError('Invalid replacement fence')
+    if 'SUBTITLE_TASK' in tables and connection.execute(
+            "SELECT 1 FROM SUBTITLE_PUBLICATION p JOIN SUBTITLE_TASK t ON t.ID=p.TASK_ID "
+            "WHERE p.STATUS='published' AND t.STATUS NOT IN ('succeeded','partial') LIMIT 1").fetchone():
+        raise ValueError('Published task does not have its matching terminal state')
+
+
 def execute(operation, arguments):
     """Fixed operations only; payloads cannot select Python code or a shell."""
+    if operation in ('sqlite_backup', 'sqlite_validate'):
+        # Only these explicit operations open SQLite. Source connections are
+        # read-only and use this process's SAME standard-library runtime; no
+        # application ORM, credentials or writer Session enters the child.
+        import sqlite3
+        from contextlib import closing
+        from pathlib import Path
+        source = Path(arguments['source']).resolve()
+        with open(source, 'rb') as stream:
+            header = stream.read(20)
+        version = sqlite3.sqlite_version_info
+        fixed = (version >= (3, 51, 3) or version[:2] == (3, 50) and version >= (3, 50, 7)
+                 or version[:2] == (3, 44) and version >= (3, 44, 6))
+        if header[18:20] == b'\x02\x02' and not fixed:
+            raise ValueError('Unsupported WAL runtime')
+        deadline = time.monotonic() + arguments.get('seconds', 120)
+        def progress(_status, _remaining, _total):
+            if time.monotonic() > deadline:
+                raise TimeoutError('Snapshot deadline exceeded')
+        with closing(sqlite3.connect(source.as_uri() + '?mode=ro', uri=True, timeout=5)) as src:
+            # Do not depend on a distributor's compiled synchronous default.
+            # Source reads and the destination's FIRST backup commit use FULL.
+            for name, value in {'synchronous': 2, 'foreign_keys': 1, 'query_only': 1,
+                                'busy_timeout': arguments.get('busy_timeout_ms', 30000)}.items():
+                src.execute('PRAGMA %s=%d' % (name, value))
+                if src.execute('PRAGMA %s' % name).fetchone()[0] != value:
+                    raise ValueError('Unsafe source connection')
+            if operation == 'sqlite_backup':
+                destination = arguments['destination']
+                descriptor = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                os.close(descriptor)
+                with closing(sqlite3.connect(destination, timeout=5)) as dst:
+                    for name, value in {'synchronous': 2, 'foreign_keys': 1,
+                                        'busy_timeout': arguments.get('busy_timeout_ms', 30000)}.items():
+                        dst.execute('PRAGMA %s=%d' % (name, value))
+                        if dst.execute('PRAGMA %s' % name).fetchone()[0] != value:
+                            raise ValueError('Unsafe snapshot connection')
+                    src.backup(dst, pages=256, progress=progress, sleep=0.02)
+                    dst.execute('PRAGMA journal_mode=DELETE')
+                    dst.execute('PRAGMA synchronous=FULL')
+                    _validate_sqlite(dst)
+            else:
+                _validate_sqlite(src)
+        return True
     if operation == 'stat':
         return _metadata(arguments['path'], arguments.get('follow', True))
     if operation == 'disk_usage':

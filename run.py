@@ -99,12 +99,19 @@ signal.signal(signal.SIGTERM, sigal_handler)
 def init_system():
     # 配置
     log.console('NAStool 当前版本号：%s' % APP_VERSION)
-    # 数据库初始化
-    init_db()
-    # 数据库更新
-    update_db()
-    # 数据初始化
-    init_data()
+    # Known capacity/schema failures have actionable messages; do not replace
+    # them with a bare traceback or continue into services with an unsafe DB.
+    from app.db.transactions import DatabaseBusy, DatabaseWriteError
+    try:
+        init_db()
+        update_db()
+        init_data()
+    except DatabaseBusy as error:
+        log.console('数据库启动未准入（容量或繁忙）：%s' % error)
+        raise SystemExit(1) from None
+    except DatabaseWriteError as error:
+        log.console('数据库启动安全检查失败：%s；请核对版本及升级前备份，勿删除原库' % error)
+        raise SystemExit(1) from None
     # 升级配置文件
     update_config()
     # 检查配置文件

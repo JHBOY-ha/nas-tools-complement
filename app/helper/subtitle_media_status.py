@@ -7,6 +7,8 @@ from sqlalchemy.dialects.sqlite import insert
 
 from app.db.main_db import MainDb
 from app.db.models import SUBTITLEMEDIASTATUS
+from app.db.transactions import read_snapshot, write_transaction
+from app.db import publication as state_publication
 
 
 def upsert_subtitle_rows(db, model, rows, key_columns, preserve_columns=()):
@@ -76,13 +78,16 @@ class SubtitleMediaStatusStore:
             return {}
         snapshots = {}
         try:
-            for offset in range(0, len(paths), self._query_chunk_size):
-                chunk = paths[offset:offset + self._query_chunk_size]
-                rows = self._db.query(SUBTITLEMEDIASTATUS).filter(
-                    SUBTITLEMEDIASTATUS.SERVER == server,
-                    SUBTITLEMEDIASTATUS.MEDIA_PATH.in_(chunk)
-                ).all()
-                snapshots.update({row.MEDIA_PATH: self._as_dict(row) for row in rows})
+            # A publication can occur between chunks. Pin only these SQL reads
+            # so one response cannot mix two atomically published generations.
+            with read_snapshot(self._db):
+                for offset in range(0, len(paths), self._query_chunk_size):
+                    chunk = paths[offset:offset + self._query_chunk_size]
+                    rows = self._db.query(SUBTITLEMEDIASTATUS).filter(
+                        SUBTITLEMEDIASTATUS.SERVER == server,
+                        SUBTITLEMEDIASTATUS.MEDIA_PATH.in_(chunk)
+                    ).all()
+                    snapshots.update({row.MEDIA_PATH: self._as_dict(row) for row in rows})
             return snapshots
         except Exception:
             # Match list_for_server/get behavior during first-run schema setup.
@@ -130,10 +135,9 @@ class SubtitleMediaStatusStore:
                 }
                 rows.append(values)
                 saved += 1
-            upsert_subtitle_rows(
-                self._db, SUBTITLEMEDIASTATUS, rows, ["SERVER", "MEDIA_PATH"]
-            )
-            self._db.commit()
+            # Published versions are immutable; readers select the latest
+            # committed marker rather than modifying a cached ORM identity.
+            state_publication.publish_now(self._db, media_rows=rows)
             return saved
         except OperationalError as error:
             self._db.rollback()
@@ -149,11 +153,13 @@ class SubtitleMediaStatusStore:
         keys = [key for key in keys if key]
         if not keys:
             return 0
-        count = self._db.query(SUBTITLEMEDIASTATUS).filter(
-            SUBTITLEMEDIASTATUS.SERVER == str(server or "").strip().lower(),
-            SUBTITLEMEDIASTATUS.MEDIA_PATH.in_(keys)
-        ).delete(synchronize_session=False)
-        self._db.commit()
+        count = 0
+        for offset in range(0, len(keys), 400):
+            with write_transaction(self._db):
+                rows = self._db.query(SUBTITLEMEDIASTATUS).filter(
+                    SUBTITLEMEDIASTATUS.SERVER == str(server or '').strip().lower(),
+                    SUBTITLEMEDIASTATUS.MEDIA_PATH.in_(keys[offset:offset + 400])).all()
+                count += state_publication.delete_rows(self._db, SUBTITLEMEDIASTATUS, rows)
         return count
 
     @staticmethod

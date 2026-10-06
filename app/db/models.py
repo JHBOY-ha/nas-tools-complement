@@ -612,6 +612,13 @@ class SUBTITLETASK(Base):
         Index('INDX_SUBTITLE_TASK_FINISHED', 'FINISHED_AT'),
         # 队列领取与列表排队位次按 PRIORITY/CREATED_AT/ID 排序。
         Index('INDX_SUBTITLE_TASK_QUEUE', 'TYPE', 'STATUS', 'PRIORITY', 'CREATED_AT'),
+        # Fixed predicates are shared with the claim queries. Parameterized
+        # IN lists cannot reliably prove SQLite partial-index applicability.
+        Index('INDX_SUBTITLE_TASK_INTERACTIVE_CLAIM', text('PRIORITY DESC'),
+              'CREATED_AT', 'ID', sqlite_where=text(
+                  "TYPE IN ('upload','repair') AND STATUS IN ('queued','recovering')")),
+        Index('INDX_SUBTITLE_TASK_AUDIT_CLAIM', 'CREATED_AT', 'ID',
+              sqlite_where=text("TYPE='audit' AND STATUS IN ('queued','recovering')")),
     )
 
     ID = Column(Text, primary_key=True)
@@ -688,6 +695,7 @@ class SUBTITLEPROBECACHE(Base):
         Index('INDX_SUBTITLE_PROBE_CACHE_UPDATED', 'UPDATED_AT'),
         # 失效路径时按 PAIR_PATH 反查，原先无索引导致整表扫描。
         Index('INDX_SUBTITLE_PROBE_CACHE_PAIR', 'PAIR_PATH'),
+        Index('INDX_SUBTITLE_PROBE_CACHE_PATH', 'PATH'),
     )
 
     ID = Column(Integer, Sequence('ID'), primary_key=True)
@@ -706,12 +714,51 @@ class SUBTITLEPROBECACHE(Base):
     UPDATED_AT = Column(Float, nullable=False)
 
 
+class SUBTITLEPUBLICATION(Base):
+    """Visibility marker committed atomically with an audit task's terminal state."""
+    __tablename__ = 'SUBTITLE_PUBLICATION'
+    __table_args__ = (
+        Index('INDX_SUBTITLE_PUBLICATION_STATE', 'STATUS', 'CREATED_AT'),
+        UniqueConstraint('SEQUENCE', name='UN_SUBTITLE_PUBLICATION_SEQUENCE'),
+    )
+    ID = Column(Text, primary_key=True)
+    TASK_ID = Column(Text)
+    SERVER = Column(Text)
+    SCOPE_KEY = Column(Text)
+    MODE = Column(Text, nullable=False, server_default=text("'upsert'"))
+    STATUS = Column(Text, nullable=False, server_default=text("'building'"))
+    SEQUENCE = Column(Integer)
+    EXPECTED_AUDIT = Column(Integer, nullable=False, server_default=text('0'))
+    EXPECTED_MEDIA = Column(Integer, nullable=False, server_default=text('0'))
+    WRITTEN_AUDIT = Column(Integer, nullable=False, server_default=text('0'))
+    WRITTEN_MEDIA = Column(Integer, nullable=False, server_default=text('0'))
+    CREATED_AT = Column(Float, nullable=False)
+    UPDATED_AT = Column(Float, nullable=False)
+
+
+class SUBTITLESTATECLOCK(Base):
+    """Never derive the publication clock from records that garbage collection deletes."""
+    __tablename__ = 'SUBTITLE_STATE_CLOCK'
+    ID = Column(Integer, primary_key=True)
+    SEQUENCE = Column(Integer, nullable=False, server_default=text('0'))
+
+
+class SUBTITLEAUDITSCOPEHEAD(Base):
+    """Replacement fences survive removal of the publication's historical rows."""
+    __tablename__ = 'SUBTITLE_AUDIT_SCOPE_HEAD'
+    SCOPE_KEY = Column(Text, primary_key=True)
+    SERVER = Column(Text, primary_key=True)
+    REPLACE_SEQUENCE = Column(Integer, nullable=False, server_default=text('0'))
+
+
 class SUBTITLEAUDITSTATE(Base):
-    """Latest confirmed state for one subtitle inside a stable audit scope."""
+    """Immutable audit versions; the database facade selects published latest rows."""
 
     __tablename__ = 'SUBTITLE_AUDIT_STATE'
     __table_args__ = (
-        UniqueConstraint('SCOPE_KEY', 'SERVER', 'SUBTITLE_PATH', name='UN_SUBTITLE_AUDIT_STATE_PATH'),
+        UniqueConstraint('SCOPE_KEY', 'SERVER', 'SUBTITLE_PATH', 'PUBLICATION_ID',
+                         name='UN_SUBTITLE_AUDIT_STATE_VERSION'),
+        Index('INDX_SUBTITLE_AUDIT_STATE_PUBLICATION', 'PUBLICATION_ID', 'ID'),
         Index('INDX_SUBTITLE_AUDIT_STATE_SCOPE', 'SCOPE_KEY', 'SERVER'),
         Index('INDX_SUBTITLE_AUDIT_STATE_STATUS', 'STATUS'),
         Index('INDX_SUBTITLE_AUDIT_STATE_UPDATED', 'UPDATED_AT'),
@@ -724,6 +771,10 @@ class SUBTITLEAUDITSTATE(Base):
     )
 
     ID = Column(Integer, Sequence('ID'), primary_key=True)
+    PUBLICATION_ID = Column(Text, ForeignKey('SUBTITLE_PUBLICATION.ID',
+                                            name='FK_SUBTITLE_AUDIT_STATE_PUBLICATION'), nullable=False,
+                            server_default=text("'legacy'"))
+    IS_DELETED = Column(Integer, nullable=False, server_default=text('0'))
     SCOPE_KEY = Column(Text, nullable=False)
     SERVER = Column(Text, nullable=False)
     SUBTITLE_PATH = Column(Text, nullable=False)
@@ -745,13 +796,19 @@ class SUBTITLEMEDIASTATUS(Base):
 
     __tablename__ = 'SUBTITLE_MEDIA_STATUS'
     __table_args__ = (
-        UniqueConstraint('SERVER', 'MEDIA_PATH', name='UN_SUBTITLE_MEDIA_STATUS_PATH'),
+        UniqueConstraint('SERVER', 'MEDIA_PATH', 'PUBLICATION_ID',
+                         name='UN_SUBTITLE_MEDIA_STATUS_VERSION'),
+        Index('INDX_SUBTITLE_MEDIA_STATUS_PUBLICATION', 'PUBLICATION_ID', 'ID'),
         Index('INDX_SUBTITLE_MEDIA_STATUS_SERVER', 'SERVER'),
         Index('INDX_SUBTITLE_MEDIA_STATUS_STATUS', 'STATUS'),
         Index('INDX_SUBTITLE_MEDIA_STATUS_CHECKED', 'CHECKED_AT'),
     )
 
     ID = Column(Integer, Sequence('ID'), primary_key=True)
+    PUBLICATION_ID = Column(Text, ForeignKey('SUBTITLE_PUBLICATION.ID',
+                                            name='FK_SUBTITLE_MEDIA_STATUS_PUBLICATION'), nullable=False,
+                            server_default=text("'legacy'"))
+    IS_DELETED = Column(Integer, nullable=False, server_default=text('0'))
     SERVER = Column(Text, nullable=False)
     MEDIA_PATH = Column(Text, nullable=False)
     MEDIA_EXISTS = Column(Integer)

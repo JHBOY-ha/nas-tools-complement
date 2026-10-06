@@ -2914,25 +2914,24 @@ class WebAction:
 
     @staticmethod
     def __restory_backup(data):
-        """
-        解压恢复备份文件
-        """
-        filename = data.get("file_name")
-        if filename:
-            config_path = Config().get_config_path()
-            temp_path = Config().get_temp_path()
-            file_path = os.path.join(temp_path, filename)
-            try:
-                shutil.unpack_archive(file_path, config_path, format='zip')
-                return {"code": 0, "msg": ""}
-            except Exception as e:
-                ExceptionUtils.exception_traceback(e)
-                return {"code": 1, "msg": str(e)}
-            finally:
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-
-        return {"code": 1, "msg": "文件不存在"}
+        """Validate and stage a private restore; active database files stay open safely."""
+        from app.db.backup import stage_restore
+        from app.db.transactions import DatabaseBusy, DatabaseWriteError
+        filename = (data or {}).get('file_name')
+        if not isinstance(filename, str) or os.path.basename(filename) != filename or not filename.endswith('.zip'):
+            return {'code': 1, 'msg': '备份文件名无效'}
+        file_path = os.path.join(Config().get_temp_path(), filename)
+        if os.path.islink(file_path) or not os.path.isfile(file_path):
+            return {'code': 1, 'msg': '备份文件不存在或路径无效'}
+        try:
+            return stage_restore(file_path, Config().get_config_path())
+        except (DatabaseBusy, DatabaseWriteError) as error:
+            return {'code': 1, 'msg': str(error)}
+        except Exception:
+            return {'code': 1, 'msg': '备份校验或暂存失败，请检查备份及可用空间'}
+        finally:
+            if os.path.isfile(file_path) and not os.path.islink(file_path):
+                os.remove(file_path)
 
     @staticmethod
     def __start_mediasync(data):

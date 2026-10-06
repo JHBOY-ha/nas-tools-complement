@@ -125,7 +125,8 @@ class IsolationPool:
         if not response.get('ok'):
             if response.get('kind') == 'TimeoutExpired':
                 raise IsolatedIOTimeout(errno.ETIMEDOUT, '外部操作超过总时限，结果未确认')
-            error_type = IsolatedIOError if operation in ('http', 'resolve') else OSError
+            error_type = IsolatedIOError if operation in (
+                'http', 'resolve', 'sqlite_backup', 'sqlite_validate') else OSError
             error = error_type(response.get('errno') or errno.EIO,
                                'I/O 操作失败：%s' % response.get('kind', 'Unknown'))
             error.worker_kind = response.get('kind')
@@ -293,7 +294,9 @@ def get_io_pool(kind='filesystem'):
         if kind not in _pools:
             # Separate file operations from external network requests so a slow
             # provider cannot consume capacity needed to publish task outputs.
-            limits = {'filesystem': 2, 'bulk': 2, 'network': 4}
+            # Publication handles span long copies. The transfer gate admits
+            # them first (at most 8 configured slots), outside the metadata pool.
+            limits = {'filesystem': 2, 'bulk': 2, 'network': 4, 'publication': 8}
             _pools[kind] = IsolationPool(limits[kind])
         return _pools[kind]
 

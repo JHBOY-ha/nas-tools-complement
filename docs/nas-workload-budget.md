@@ -1,7 +1,9 @@
 # 单进程 NAS 稳定性与任务预算
 
 日期：2026-10-06。适用当前单主进程、多线程部署；危险 I/O 使用独立、复用的子进程。
-数据库源码、迁移、连接池和受保护事务方法继续暂停修改，并已用指纹核对。
+数据库暂停已由用户明确实施要求取代。本轮新增 WAL 安全检查、两库 FIFO 写事务、
+原子版本发布、索引/统计及安全备份恢复；保留既有 Session 清理、读池和压力告警。
+完整规则见 [数据库治理说明](database-governance.md)。
 
 ## 默认预算
 
@@ -14,9 +16,12 @@
 | 主服务/RSS/刷流/删种 | 共用 6 | 共用 64 | 保留迟到、防重入与合并；只关闭自身任务 |
 | 文件转移 | 2 | FIFO | 同目标互斥，嵌套受保护发布复用槽 |
 | 元数据/暂存 I/O 子进程 | 2 | 16 | 常规操作 10 秒，目录清理 60 秒 |
+| 发布文件锁子进程 | 最多 8，受转移闸门约束 | 16 | 按需创建；同目标先在线程锁等待，不占元数据池 |
 | 哈希/比较/转移子进程 | 2 | 16 | 哈希/比较 300 秒；转移沿用 external_transfer_timeout |
 | 网络子进程 | 4 | 16 | DNS 最多 5 秒，整次在线操作共享 90 秒 |
 | 上传接收租约 | 2 | 不排队 | 接收前预占队列槽/空间，满时立即繁忙 |
+| 两库写事务 | 合计 1 | 64（含预留） | FIFO、30 秒准入等待；每库一条独立写连接，读池并发 |
+| 审计持久化 | 最多 1000 行/事务 | 复用写入 FIFO | 每批重新排队；building 不可见，最终原子发布 |
 
 这不是所有 WSGI/原生线程的统一线程数。取消 Future 不释放运行中 I/O 的真实槽。
 无法立即回收的进程及其进程组继续计费，防止无限补开。D 状态内核调用可能仍要等待
@@ -58,6 +63,13 @@ app:
 会话清理会同时覆盖注入的任务数据库、user.db 与 media.db；其中一个全局清理失败时
 仍尝试另一个。隔离 HTTP 保留 `verify` 的布尔值或私有 CA 路径；暂存流仍禁止跟随
 软链接，追加流在每次实际写入时通过 `O_APPEND` 选择文件末尾。
+
+数据库默认 `journal_mode=auto`、`synchronous=FULL`、自动 checkpoint 1000 页、
+WAL 警戒/高水位 64/256 MiB、保留空闲 2048 MiB。旧运行时 DELETE 可安全回退；
+不安全环境中的既有 WAL 或显式 WAL 拒绝启动。写前另检查估算预算，高水位受
+长读阻挡时拒绝新写，成功回收后恢复；SQL/fsync 不因调用方超时而释放槽。
+备份/完整性检查使用已有 bulk 子进程池，不增加无限独立池。恢复只暂存，返回
+`restart_required=true`，重启关闭业务连接后离线替换，并保留校验过的旧库副本。
 
 字幕策略默认暂存 **1536 MiB**、保留空闲 **2048 MiB**，仍满足 250 MiB 批次六倍额度。
 管理员已保存的显式值保留，既有任务策略快照不自动改写。接收前按 Content-Length
@@ -103,18 +115,23 @@ multipart 不持共享提交锁，每用户提交互斥保留去重；结束、�
 
 ## 验证与部署边界
 
-2026-10-06 最终本地结果：完整稳定性 **236 项**、识别 **341 项**、在线字幕/OpenSubtitles
-**63 项**通过；两套真实浏览器回归通过。严格 UI 静态审查、官方 DESIGN.md lint、Python/JS
-语法与 `git diff --check` 通过。数据库与受保护事务方法指纹保持一致。
+2026-10-06 本轮本地结果：完整稳定性 **281 项**、数据库专项 **51 项**、识别 **341 项**、
+在线字幕/OpenSubtitles **64 项**通过；三个 Chrome 回归入口通过。数据库专项使用
+临时 SQLite 3.51.3；默认 3.37.2 的显式 DELETE 回退另有 **41 项**通过。严格 UI
+静态审查无发现，Python/JS 语法与 diff 检查通过，具体证据见
+[交付说明](stability-hardening-delivery.md)。
 
 ```bash
 python3 -m tests.run_stability
+python3 -m tests.run_database
 python3 -m tests.run_recognition
 python3 -m tests.run_stability tests.test_online_subtitles tests.test_opensubtitles_api
 node tests/test_action_tasks_ui.js
 node tests/test_special_confirmation_ui.js
+node tests/test_database_restore_ui.js
 python3 scripts/audit_action_ui.py
 python3 scripts/verify_nas_workload.py
+python3 scripts/verify_database_workload.py
 ```
 
 浏览器测试需要 Playwright 与 Chrome，支持 NODE_PATH/CHROME_PATH。静态审查覆盖新增共享
@@ -123,6 +140,11 @@ python3 scripts/verify_nas_workload.py
 本地可丢弃 smoke 复制并核对 8×4 MiB，实际峰值并行 2、I/O 子进程 2。这是本机临时目录
 测量，不是 NAS 吞吐量。脚本支持人工选择 --scratch-root，只创建/清理唯一临时子目录，
 不读取应用配置或数据库。
+
+数据库脚本使用基线 commit `8d84b13` 与当前实现、5 万条状态、10 读/10 普通写，
+默认三轮；支持同卷 `--scratch-root`，不读取生产库。本机 P95 门槛已通过，但分批
+FULL 的审计结果提交耗时、次数及版本空间增加；不承诺总 I/O 减少。NAS 需补测
+磁盘延迟、正常高峰及完整审计，并按相同门槛复验后才确认稳定性收益。
 
 本轮未部署、重启生产服务或写生产数据。真实 NAS/btrfs 卷与外部字幕服务尚未联调，
 不据本地回归宣称真实 NAS 压力或性能改善已测量。

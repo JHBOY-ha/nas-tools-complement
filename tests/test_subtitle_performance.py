@@ -48,25 +48,30 @@ class SubtitleDatabasePerformanceTest(TestCase):
         self.db.session.execute(SUBTITLETASK.__table__.insert(), rows)
         self.db.commit()
 
-    def test_bulk_audit_and_snapshot_writes_preserve_values_and_loaded_rows(self):
+    def test_bulk_audit_and_snapshot_writes_preserve_values_and_immutable_versions(self):
         states = {f'/review/{i}.mkv': {'status': 'ok'} for i in range(1000)}
         self.sql.clear()
         self.manager.upsert_audit_states('scope', 'emby', states)
-        self.assertEqual(self.counts()['INSERT'], 2)
-        self.assertEqual(self.counts()['SELECT'], 0)
+        # Two executemany batches plus ONE publication marker, not one INSERT
+        # or SELECT per media. Constant receipt/clock reads enforce atomicity.
+        self.assertEqual(self.counts()['INSERT'], 3)
+        self.assertEqual(self.counts()['SELECT'], 3)
         loaded = self.db.query(SUBTITLEAUDITSTATE).filter_by(SUBTITLE_PATH='/review/0.mkv').one()
         states['/review/0.mkv']['status'] = 'warning'
         self.sql.clear()
         self.manager.upsert_audit_states('scope', 'emby', states)
-        self.assertEqual(self.counts()['INSERT'], 2)
-        self.assertEqual(loaded.STATUS, 'warning')
-        self.assertEqual(json.loads(loaded.RESULT)['checked_at'],
+        self.assertEqual(self.counts()['INSERT'], 3)
+        self.assertEqual(loaded.STATUS, 'ok')
+        current = self.db.query(SUBTITLEAUDITSTATE).filter_by(SUBTITLE_PATH='/review/0.mkv').one()
+        self.assertNotEqual(loaded.ID, current.ID)
+        self.assertEqual(current.STATUS, 'warning')
+        self.assertEqual(json.loads(current.RESULT)['checked_at'],
                          self.manager.get_audit_states('scope', 'emby')['/review/0.mkv']['checked_at'])
         self.sql.clear()
         store = SubtitleMediaStatusStore(db=self.db)
         store.upsert_many('emby', [dict(media_path=path, has_external=False) for path in states])
-        self.assertEqual(self.counts()['SELECT'], 0)
-        self.assertEqual(self.counts()['INSERT'], 2)
+        self.assertEqual(self.counts()['SELECT'], 3)
+        self.assertEqual(self.counts()['INSERT'], 3)
         self.assertFalse(store.get('emby', '/review/0.mkv')['has_external'])
         # A duplicate key in one batch must update, not fail a unique constraint.
         store.upsert_many('emby', [dict(media_path='/review/0.mkv', has_external=value)

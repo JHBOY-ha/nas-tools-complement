@@ -1,6 +1,7 @@
 import datetime
 import errno
 import hashlib
+import itertools
 import json
 import re
 import stat
@@ -14,6 +15,9 @@ from sqlalchemy import and_, func, or_, text as sql_text
 
 import log
 from app.db.main_db import MainDb
+from app.db.transactions import write_transaction, read_snapshot, DatabaseBusy, DatabaseWriteError
+from app.db import publication as state_publication
+from app.db.settings import DatabaseSettings
 from app.db.session_scope import release_db_connections
 from app.utils.isolated_fs import fs_os as os, isolated_open as open
 from app.utils.isolated_io import isolated_disk_usage, isolated_hash, isolated_remove_tree, get_io_pool
@@ -128,6 +132,10 @@ class TaskStorageInsufficient(SubtitleTaskError):
     status_code = 507
 
 
+class TaskCancelled(SubtitleTaskError):
+    """Internal publication cancellation; handled before exposing new versions."""
+
+
 def _loads(value, default=None):
     if value is None or value == "":
         return {} if default is None else default
@@ -208,6 +216,17 @@ class SubtitleTaskManager:
         # task.
         self._heavy_requests = {}
 
+    @contextmanager
+    def _write_lock(self, required_bytes=0):
+        """Submit lock (if needed) -> FIFO write admission -> manager lock.
+
+        Never enter this boundary while holding the manager lock from a read
+        path. The outer transaction commits only after the short state section.
+        """
+        with write_transaction(self._db, required_bytes=required_bytes):
+            with self._lock:
+                yield
+
     def register_processor(self, task_type, processor):
         task_type = str(task_type or "").lower()
         if task_type not in ["upload", "repair", "audit"] or not callable(processor):
@@ -237,15 +256,19 @@ class SubtitleTaskManager:
             # admission opens; periodic cleanup remains age-gated.
             with self._submit_lock:
                 self._cleanup_incoming_files(remove_all=True)
-            with self._lock:
-                self._db.init_db()
+            # Schema, recovery and NAS directory work have their own boundaries.
+            # Holding a read-side RLock across them would invert FIFO admission.
+            self._db.init_db()
+            with self._write_lock():
                 self._ensure_schema_columns()
-                os.makedirs(self._staging_root, exist_ok=True)
-                os.makedirs(self._cleanup_marker_root, exist_ok=True)
-                os.makedirs(self._incoming_root, exist_ok=True)
-                self._recover_tasks()
-                self._migrate_legacy_audit_history()
-                self.cleanup()
+            os.makedirs(self._staging_root, exist_ok=True)
+            os.makedirs(self._cleanup_marker_root, exist_ok=True)
+            os.makedirs(self._incoming_root, exist_ok=True)
+            state_publication.abort_unfinished(self._db)
+            self._recover_tasks()
+            self._migrate_legacy_audit_history()
+            self.cleanup()
+            with self._lock:
                 self._stop.clear()
                 self._started = True
                 self._worker = threading.Thread(
@@ -339,7 +362,7 @@ class SubtitleTaskManager:
         # hard crash cannot provide an exact stop timestamp, but graceful NAS
         # shutdowns must not lose the cumulative task budget checkpoint.
         if self._started:
-            with self._lock:
+            with self._write_lock():
                 now = time.time()
                 rows = self._db.query(SUBTITLETASK).filter(
                     SUBTITLETASK.STATUS.in_(["running", "canceling"])
@@ -465,7 +488,7 @@ class SubtitleTaskManager:
         policy = self.validate_settings(current, complete=True)
         self._validate_disk_policy(policy)
         now = time.time()
-        with self._lock:
+        with self._write_lock():
             row = self._db.query(SUBTITLETASKSETTING).filter(SUBTITLETASKSETTING.ID == 1).first()
             if row:
                 row.POLICY = _dumps(policy)
@@ -513,7 +536,7 @@ class SubtitleTaskManager:
                 "payload": payload
             })
         now = time.time()
-        with self._lock:
+        with self._write_lock():
             if task_type == "audit":
                 self._interrupt_orphaned_audits_locked(
                     "检测执行线程已退出，任务已安全中断"
@@ -570,7 +593,7 @@ class SubtitleTaskManager:
                 # reserve the global audit slot forever.  Persist interruption;
                 # the heartbeat retries this write if SQLite is also transient.
                 self._db.rollback()
-                with self._lock:
+                with self._write_lock():
                     self._interrupt_orphaned_audits_locked(
                         f"检测后台线程启动失败：{str(error)}",
                         include_unclaimed=True
@@ -748,7 +771,7 @@ class SubtitleTaskManager:
                         additional_bytes=payload.get("target_reserved_bytes") or 0,
                         reserve_bytes=policy["reserve_free_mb"] * 1024 * 1024
                     )
-                with self._lock:
+                with self._write_lock():
                     row = SUBTITLETASK(
                         ID=task_id,
                         TYPE="upload",
@@ -1032,8 +1055,7 @@ class SubtitleTaskManager:
     def _ensure_queue_capacity(self, exclude_token=None):
         policy = self.get_settings()
         queued = self._db.query(SUBTITLETASK).filter(
-            SUBTITLETASK.TYPE.in_(["upload", "repair"]),
-            SUBTITLETASK.STATUS.in_(["queued", "recovering"])
+            sql_text("TYPE IN ('upload','repair') AND STATUS IN ('queued','recovering')")
         ).count()
         receiving = sum(1 for key, lease in self._admissions.items()
                         if key != exclude_token and not lease['submitted'])
@@ -1066,8 +1088,7 @@ class SubtitleTaskManager:
             # the caller's filtered page.  Build them once per refresh so the
             # task list remains three queries regardless of queue length.
             queued_rows = self._db.query(SUBTITLETASK.ID).filter(
-                SUBTITLETASK.TYPE.in_(["upload", "repair"]),
-                SUBTITLETASK.STATUS.in_(["queued", "recovering"])
+                sql_text("TYPE IN ('upload','repair') AND STATUS IN ('queued','recovering')")
             ).order_by(
                 SUBTITLETASK.PRIORITY.desc(),
                 SUBTITLETASK.CREATED_AT.asc(),
@@ -1138,8 +1159,7 @@ class SubtitleTaskManager:
         # Count predecessors in scheduler order instead of loading/sorting
         # the complete queue on every single-task polling request.
         return 1 + self._db.query(SUBTITLETASK).filter(
-            SUBTITLETASK.TYPE.in_(["upload", "repair"]),
-            SUBTITLETASK.STATUS.in_(["queued", "recovering"]),
+            sql_text("TYPE IN ('upload','repair') AND STATUS IN ('queued','recovering')"),
             or_(SUBTITLETASK.PRIORITY > row.PRIORITY,
                 and_(SUBTITLETASK.PRIORITY == row.PRIORITY,
                      SUBTITLETASK.CREATED_AT < row.CREATED_AT),
@@ -1646,7 +1666,7 @@ class SubtitleTaskManager:
                 })
 
         cleanup_ids = []
-        with self._lock:
+        with self._write_lock():
             for outcome in outcomes:
                 row = self._db.query(SUBTITLETASK).filter(
                     SUBTITLETASK.ID == outcome["id"]
@@ -1998,7 +2018,7 @@ class SubtitleTaskManager:
         verified = 0
         verified_item_ids = []
         changed = False
-        with self._lock:
+        with self._write_lock():
             for outcome in outcomes:
                 item = self._db.query(SUBTITLETASKITEM).filter(
                     SUBTITLETASKITEM.ID == outcome["id"],
@@ -2101,7 +2121,7 @@ class SubtitleTaskManager:
                 except Exception as worker_error:
                     audit_worker_available = False
                     ExceptionUtils.exception_traceback(worker_error)
-                with self._lock:
+                with self._write_lock():
                     self._interrupt_orphaned_audits_locked(
                         "检测后台线程不可用，任务已安全中断",
                         include_unclaimed=not audit_worker_available
@@ -2153,15 +2173,15 @@ class SubtitleTaskManager:
 
     def _claim_next_interactive(self):
         cleanup_id = None
-        with self._lock:
-            row = self._db.query(SUBTITLETASK).filter(
-                SUBTITLETASK.TYPE.in_(["upload", "repair"]),
-                SUBTITLETASK.STATUS.in_(["queued", "recovering"])
-            ).order_by(
-                SUBTITLETASK.PRIORITY.desc(),
-                SUBTITLETASK.CREATED_AT.asc(),
-                SUBTITLETASK.ID.asc()
-            ).first()
+        with self._write_lock():
+            # This index/query pair is an application contract, not a hint on
+            # arbitrary user SQL. Some fixed SQLite versions otherwise prefer
+            # the old broad index and sort, even after statistics are updated.
+            row = self._db.query(SUBTITLETASK).from_statement(sql_text(
+                "SELECT * FROM SUBTITLE_TASK INDEXED BY INDX_SUBTITLE_TASK_INTERACTIVE_CLAIM "
+                "WHERE TYPE IN ('upload','repair') AND STATUS IN ('queued','recovering') "
+                "ORDER BY PRIORITY DESC, CREATED_AT ASC, ID ASC LIMIT 1"
+            )).first()
             if not row:
                 return None
             if row.CANCEL_REQUESTED:
@@ -2194,11 +2214,12 @@ class SubtitleTaskManager:
         self._audit_wake.set()
 
     def _claim_next_audit(self):
-        with self._lock:
-            row = self._db.query(SUBTITLETASK).filter(
-                SUBTITLETASK.TYPE == "audit",
-                SUBTITLETASK.STATUS.in_(["queued", "recovering"])
-            ).order_by(SUBTITLETASK.CREATED_AT.asc()).first()
+        with self._write_lock():
+            row = self._db.query(SUBTITLETASK).from_statement(sql_text(
+                "SELECT * FROM SUBTITLE_TASK INDEXED BY INDX_SUBTITLE_TASK_AUDIT_CLAIM "
+                "WHERE TYPE='audit' AND STATUS IN ('queued','recovering') "
+                "ORDER BY CREATED_AT ASC, ID ASC LIMIT 1"
+            )).first()
             if not row:
                 return None
             now = time.time()
@@ -2301,7 +2322,7 @@ class SubtitleTaskManager:
                     try:
                         reconciliation = self._reconcile_upload_outputs(task_id)
                         if reconciliation.get("succeeded"):
-                            with self._lock:
+                            with self._write_lock():
                                 row = self._db.query(SUBTITLETASK).filter(
                                     SUBTITLETASK.ID == str(task_id)
                                 ).first()
@@ -2330,7 +2351,7 @@ class SubtitleTaskManager:
     def _recover_unstarted_claim(self, task_id, error):
         cleanup_staging = False
         restart_audit = False
-        with self._lock:
+        with self._write_lock():
             row = self._db.query(SUBTITLETASK).filter(
                 SUBTITLETASK.ID == str(task_id)
             ).first()
@@ -2385,7 +2406,7 @@ class SubtitleTaskManager:
                 # worker's pending recovery and retry; never finalize cancel
                 # or delete staging evidence on an unverified publish boundary.
                 raise
-        with self._lock:
+        with self._write_lock():
             row = self._db.query(SUBTITLETASK).filter(
                 SUBTITLETASK.ID == str(task_id)
             ).first()
@@ -2427,7 +2448,7 @@ class SubtitleTaskManager:
     def update_progress(self, task_id, phase=None, completed=None, total=None, percent=None,
                         current_item=None, message=None, metrics=None, force=False):
         now = time.time()
-        with self._lock:
+        with self._write_lock():
             row = self._db.query(SUBTITLETASK).filter(SUBTITLETASK.ID == str(task_id)).first()
             if not row or row.STATUS in TERMINAL_STATES:
                 return False
@@ -2465,7 +2486,7 @@ class SubtitleTaskManager:
             raise SubtitleTaskError("任务终态无效")
         now = time.time()
         task_type = ""
-        with self._lock:
+        with self._write_lock():
             row = self._db.query(SUBTITLETASK).filter(SUBTITLETASK.ID == str(task_id)).first()
             if not row:
                 raise TaskNotFound("字幕任务不存在")
@@ -2508,7 +2529,7 @@ class SubtitleTaskManager:
         # 锁内重读后写终态。对账涉及全文件哈希与删除，不能在锁内执行。
         cleanup = False
         needs_reconcile = False
-        with self._lock:
+        with self._write_lock():
             row = self._db.query(SUBTITLETASK).filter(SUBTITLETASK.ID == str(task_id)).first()
             if not row or (not admin and owner is not None and row.OWNER != str(owner)):
                 return None
@@ -2545,7 +2566,7 @@ class SubtitleTaskManager:
                 str(task_id), rollback_incomplete=True
             )
 
-        with self._lock:
+        with self._write_lock():
             row = self._db.query(SUBTITLETASK).filter(SUBTITLETASK.ID == str(task_id)).first()
             if not row:
                 return None
@@ -2639,7 +2660,7 @@ class SubtitleTaskManager:
         }
 
     def update_item(self, task_id, item_id, **values):
-        with self._lock:
+        with self._write_lock():
             try:
                 query = self._db.query(SUBTITLETASKITEM).filter(
                     SUBTITLETASKITEM.TASK_ID == str(task_id)
@@ -2766,7 +2787,7 @@ class SubtitleTaskManager:
         server = str(server or "").lower()
         written = 0
         rows = []
-        with self._lock:
+        with self._write_lock():
             for fingerprint, result in entries:
                 if not isinstance(fingerprint, dict) or not fingerprint.get("path"):
                     continue
@@ -2807,7 +2828,7 @@ class SubtitleTaskManager:
         }
         if not normalized:
             return 0
-        with self._lock:
+        with self._write_lock():
             count = 0
             paths = list(normalized)
             try:
@@ -2826,101 +2847,121 @@ class SubtitleTaskManager:
             return count
 
     def replace_audit_states(self, scope_key, server, media_statuses, task_id=None):
-        with self._lock:
-            self._db.query(SUBTITLEAUDITSTATE).filter(
-                SUBTITLEAUDITSTATE.SCOPE_KEY == str(scope_key),
-                SUBTITLEAUDITSTATE.SERVER == str(server).lower()
-            ).delete(synchronize_session=False)
-            self._insert_audit_states(scope_key, server, media_statuses, task_id)
-            self._db.commit()
-            self._invalidate_audit_snapshot_cache(server)
+        rows = self._audit_state_values(scope_key, server, media_statuses, task_id, time.time())
+        with self._write_lock():
+            state_publication.publish_now(self._db, audit_rows=rows,
+                                          server=str(server).lower(), scope_key=str(scope_key), replace=True)
+        self._invalidate_audit_snapshot_cache(server)
 
     def commit_audit_result(self, task_id, scope_key, server, media_statuses,
                             result, status, message, replace=False,
                             media_snapshots=None):
-        """Atomically publish visible audit state and the task terminal status.
-
-        ``cancel_task`` uses the same manager lock, so a cancellation either
-        wins before this transaction (no visible state is written) or arrives
-        after the task is already terminal.
-        """
-        status = str(status or "").lower()
-        if status not in ["succeeded", "partial"]:
-            raise SubtitleTaskError("检测任务终态无效")
-        # Latest-state storage is intentionally bounded.  A scope exceeding
-        # the retention ceiling becomes partial and only upserts confirmed
-        # entries; it must not delete older state as if coverage were complete.
-        limited_statuses = {}
-        state_overflow = False
-        for index, (key, value) in enumerate((media_statuses or {}).items()):
-            if index >= 50000:
-                state_overflow = True
-                break
-            limited_statuses[key] = value
-        media_statuses = limited_statuses
-        if state_overflow:
-            result = dict(result or {})
-            result["partial"] = True
-            result["coverage_complete"] = False
-            result["stop_reason"] = result.get("stop_reason") or "state_limit"
-            result["persisted_state_limit"] = 50000
-            status = "partial"
-            replace = False
-            message = "外挂字幕检测部分完成：最新状态达到 50000 条持久化上限"
+        """Stage bounded hidden versions; publish visibility and terminal state once."""
+        status = str(status or '').lower()
+        if status not in ['succeeded', 'partial']:
+            raise SubtitleTaskError('检测任务终态无效')
+        values = list(itertools.islice((media_statuses or {}).items(), 50000))
+        if len(media_statuses or {}) > 50000:
+            result = dict(result or {}, partial=True, coverage_complete=False,
+                          persisted_state_limit=50000,
+                          stop_reason=(result or {}).get('stop_reason') or 'state_limit')
+            status, replace = 'partial', False
+            message = '外挂字幕检测部分完成：最新状态达到 50000 条持久化上限'
         now = time.time()
-        audit_rows = self._audit_state_values(scope_key, server, media_statuses, task_id, now)
+        audit_rows = self._audit_state_values(scope_key, server, dict(values), task_id, now)
         snapshot_rows = self._media_status_values(server, media_snapshots or [], now)
         serialized_result = _dumps(result or {})
-        with self._lock:
+        publication_id = None
+        with self._write_lock():
             row = self._db.query(SUBTITLETASK).filter(
-                SUBTITLETASK.ID == str(task_id), SUBTITLETASK.TYPE == "audit"
-            ).first()
+                SUBTITLETASK.ID == str(task_id), SUBTITLETASK.TYPE == 'audit').first()
             if not row:
-                raise TaskNotFound("字幕检测任务不存在")
+                raise TaskNotFound('字幕检测任务不存在')
             if row.STATUS in TERMINAL_STATES:
                 return self._task_dict(row, include_result=True, include_items=True)
             if row.CANCEL_REQUESTED:
                 self._checkpoint_active(row, now, keep_running=False)
-                row.STATUS = "canceled"
-                row.PHASE = "complete"
-                row.RESULT = serialized_result
-                row.ERROR = None
-                row.MESSAGE = "字幕检测已取消"
-                row.FINISHED_AT = now
-                row.UPDATED_AT = now
+                row.STATUS, row.PHASE = 'canceled', 'complete'
+                row.RESULT, row.ERROR = serialized_result, None
+                row.MESSAGE, row.FINISHED_AT, row.UPDATED_AT = '字幕检测已取消', now, now
                 self._db.commit()
                 return self._task_dict(row, include_result=True, include_items=True)
-            try:
-                if replace:
-                    self._db.query(SUBTITLEAUDITSTATE).filter(
-                        SUBTITLEAUDITSTATE.SCOPE_KEY == str(scope_key),
-                        SUBTITLEAUDITSTATE.SERVER == str(server).lower()
-                    ).delete(synchronize_session=False)
-                upsert_subtitle_rows(self._db, SUBTITLEAUDITSTATE, audit_rows,
-                                     ["SCOPE_KEY", "SERVER", "SUBTITLE_PATH"])
-                upsert_subtitle_rows(self._db, SUBTITLEMEDIASTATUS, snapshot_rows,
-                                     ["SERVER", "MEDIA_PATH"])
-                self._checkpoint_active(row, now, keep_running=False)
-                row.STATUS = status
-                row.PHASE = "complete"
-                row.PERCENT = 100 if status == "succeeded" else row.PERCENT
-                row.RESULT = serialized_result
-                row.ERROR = None
-                row.MESSAGE = str(message or "")
-                row.FINISHED_AT = now
-                row.UPDATED_AT = now
+        try:
+            publication_id, audit_rows, snapshot_rows = state_publication.begin(
+                self._db, audit_rows, snapshot_rows, str(task_id), str(server).lower(),
+                str(scope_key), replace)
+            self._publication_checkpoint('building', publication_id)
+            batch_rows = DatabaseSettings.from_config().audit_batch_rows
+            for model, rows in ((SUBTITLEAUDITSTATE, audit_rows),
+                                (SUBTITLEMEDIASTATUS, snapshot_rows)):
+                for offset in range(0, len(rows), batch_rows):
+                    batch = rows[offset:offset + batch_rows]
+                    # Account for prepared payloads before acquiring SQLite's
+                    # writer lock, preserving the configured free-space margin.
+                    with self._write_lock(required_bytes=state_publication.batch_bytes(batch)):
+                        row = self._db.query(SUBTITLETASK).filter(SUBTITLETASK.ID == str(task_id)).first()
+                        if not row or row.CANCEL_REQUESTED or row.STATUS in TERMINAL_STATES:
+                            raise TaskCancelled('审计暂存期间取消或中断')
+                        state_publication.stage(self._db, publication_id, model,
+                                                batch)
+                        row.PHASE = 'persisting'
+                        row.MESSAGE = '正在分批保存检测结果；旧结果保持可见'
+                        self._checkpoint_active(row, time.time(), keep_running=True)
+                        row.UPDATED_AT = time.time()
+                        self._db.commit()
+                    # Re-enter FIFO after every commit; other accepted writers
+                    # can finish before all 50000 audit rows have been staged.
+                    self._publication_checkpoint('batch', publication_id)
+            self._publication_checkpoint('before_publish', publication_id)
+            with self._write_lock():
+                row = self._db.query(SUBTITLETASK).filter(SUBTITLETASK.ID == str(task_id)).first()
+                if not row or row.CANCEL_REQUESTED or row.STATUS in TERMINAL_STATES:
+                    raise TaskCancelled('审计发布前取消或中断')
+                state_publication.publish(self._db, publication_id)
+                finished = time.time()
+                self._checkpoint_active(row, finished, keep_running=False)
+                row.STATUS, row.PHASE = status, 'complete'
+                row.PERCENT = 100 if status == 'succeeded' else row.PERCENT
+                row.RESULT, row.ERROR = serialized_result, None
+                row.MESSAGE, row.FINISHED_AT, row.UPDATED_AT = str(message or ''), finished, finished
                 self._db.commit()
-            except Exception:
-                self._db.rollback()
-                raise
+                answer = self._task_dict(row, include_result=True, include_items=True)
             self._invalidate_audit_snapshot_cache(server)
-            return self._task_dict(row, include_result=True, include_items=True)
+            self._publication_checkpoint('published', publication_id)
+            return answer
+        except TaskCancelled:
+            if publication_id:
+                state_publication.abort(self._db, publication_id)
+            with self._write_lock():
+                row = self._db.query(SUBTITLETASK).filter(SUBTITLETASK.ID == str(task_id)).first()
+                if not row:
+                    raise TaskNotFound('字幕检测任务不存在')
+                if row.STATUS not in TERMINAL_STATES:
+                    finished = time.time()
+                    self._checkpoint_active(row, finished, keep_running=False)
+                    row.STATUS, row.PHASE = 'canceled', 'complete'
+                    row.RESULT, row.ERROR = serialized_result, None
+                    row.MESSAGE, row.FINISHED_AT, row.UPDATED_AT = '字幕检测已取消', finished, finished
+                    self._db.commit()
+                return self._task_dict(row, include_result=True, include_items=True)
+        except BaseException:
+            if publication_id:
+                try:
+                    state_publication.abort(self._db, publication_id)
+                except Exception:
+                    # A full/unavailable volume may also reject the abort marker.
+                    # Building rows remain hidden and restart recovery aborts them.
+                    pass
+            raise
+
+    def _publication_checkpoint(self, phase, publication_id):
+        """Test hooks observe crash boundaries; production never replays a batch."""
+        callback = getattr(self, '_publication_hook', None)
+        if callback:
+            callback(phase, publication_id)
 
     def _upsert_media_statuses_uncommitted(self, server, snapshots, now):
-        """Publish snapshots in bounded SQL batches within the audit transaction."""
-        upsert_subtitle_rows(self._db, SUBTITLEMEDIASTATUS,
-                             self._media_status_values(server, snapshots, now),
-                             ["SERVER", "MEDIA_PATH"])
+        state_publication.publish_now(self._db, media_rows=self._media_status_values(server, snapshots, now))
 
     def _media_status_values(self, server, snapshots, now):
         rows = []
@@ -2949,20 +2990,15 @@ class SubtitleTaskManager:
         return 1 if bool(value) else 0
 
     def upsert_audit_states(self, scope_key, server, media_statuses, task_id=None):
-        now = time.time()
-        with self._lock:
-            self._upsert_audit_states_uncommitted(
-                scope_key, server, media_statuses, task_id, now
-            )
-            self._db.commit()
-            self._invalidate_audit_snapshot_cache(server)
+        rows = self._audit_state_values(scope_key, server, media_statuses, task_id, time.time())
+        with self._write_lock():
+            state_publication.publish_now(self._db, audit_rows=rows)
+        self._invalidate_audit_snapshot_cache(server)
 
     def _upsert_audit_states_uncommitted(self, scope_key, server, media_statuses, task_id, now):
-        upsert_subtitle_rows(
-            self._db, SUBTITLEAUDITSTATE,
-            self._audit_state_values(scope_key, server, media_statuses, task_id, now),
-            ["SCOPE_KEY", "SERVER", "SUBTITLE_PATH"]
-        )
+        # Small compatibility updates join their caller's admitted transaction.
+        state_publication.publish_now(self._db, audit_rows=self._audit_state_values(
+            scope_key, server, media_statuses, task_id, now))
 
     def _insert_audit_states(self, scope_key, server, media_statuses, task_id,
                              confirmed_at=None):
@@ -3016,11 +3052,12 @@ class SubtitleTaskManager:
                     normalized_paths.append(normalized)
             if not normalized_paths:
                 return {"movie": {}, "tv": {}, "anime": {}}
-        with self._lock:
+        with read_snapshot(self._db), self._lock:
+            visible_sequence = state_publication.sequence(self._db)
             if normalized_paths is None:
                 cached = self._audit_snapshot_cache.get(server)
-                if cached and cached[0] > time.monotonic():
-                    return cached[1]
+                if cached and cached[0] > time.monotonic() and cached[1] == visible_sequence:
+                    return cached[2]
                 rows = self._db.query(SUBTITLEAUDITSTATE).filter(
                     SUBTITLEAUDITSTATE.SERVER == server
                 ).order_by(SUBTITLEAUDITSTATE.UPDATED_AT.desc()).limit(
@@ -3072,7 +3109,7 @@ class SubtitleTaskManager:
             if normalized_paths is None:
                 self._audit_snapshot_cache[server] = (
                     time.monotonic() + _AUDIT_SNAPSHOT_CACHE_SECONDS,
-                    result
+                    visible_sequence, result
                 )
             return result
 
@@ -3083,22 +3120,19 @@ class SubtitleTaskManager:
             self._audit_snapshot_cache.pop(str(server or "").lower(), None)
 
     def invalidate_audit_states(self, paths):
-        normalized = {
-            os.path.normcase(os.path.normpath(str(path)))
-            for path in (paths or []) if path
-        }
+        normalized = {os.path.normcase(os.path.normpath(str(path))) for path in (paths or []) if path}
         if not normalized:
             return 0
-        with self._lock:
-            query = self._db.query(SUBTITLEAUDITSTATE).filter(
-                SUBTITLEAUDITSTATE.SUBTITLE_PATH.in_(list(normalized))
-            )
-            count = query.count()
-            if count:
-                query.delete(synchronize_session=False)
-                self._db.commit()
-                self._invalidate_audit_snapshot_cache()
-            return count
+        count = 0
+        values = list(normalized)
+        for offset in range(0, len(values), 400):
+            with self._write_lock():
+                rows = self._db.query(SUBTITLEAUDITSTATE).filter(
+                    SUBTITLEAUDITSTATE.SUBTITLE_PATH.in_(values[offset:offset + 400])).all()
+                count += state_publication.delete_rows(self._db, SUBTITLEAUDITSTATE, rows)
+        if count:
+            self._invalidate_audit_snapshot_cache()
+        return count
 
     def cleanup(self, force=True):
         """Explicit cleanup is immediate; worker maintenance runs at most once/minute."""
@@ -3116,6 +3150,49 @@ class SubtitleTaskManager:
                 self._last_cleanup = time.monotonic()
         finally:
             self._cleanup_lock.release()
+
+    def _cleanup_database_caches(self, now):
+        """Each 1000-row deletion re-enters FIFO, outside the NAS cleanup lock."""
+        cache_cutoff = now - _PROBE_CACHE_RETENTION_DAYS * 86400
+        state_cutoff = now - _AUDIT_STATE_RETENTION_DAYS * 86400
+        for expired in (True, False):
+            while True:
+                with self._write_lock():
+                    query = self._db.query(SUBTITLEPROBECACHE.ID)
+                    if expired:
+                        query = query.filter(SUBTITLEPROBECACHE.UPDATED_AT < cache_cutoff)
+                    else:
+                        query = query.order_by(SUBTITLEPROBECACHE.UPDATED_AT.desc(),
+                                               SUBTITLEPROBECACHE.ID.desc()).offset(_PROBE_CACHE_MAX_ROWS)
+                    ids = [row[0] for row in query.limit(1000).all()]
+                    if not ids:
+                        break
+                    for offset in range(0, len(ids), 400):
+                        self._db.query(SUBTITLEPROBECACHE).filter(
+                            SUBTITLEPROBECACHE.ID.in_(ids[offset:offset + 400])).delete(synchronize_session=False)
+                    self._db.commit()
+        for expired in (True, False):
+            while True:
+                with self._write_lock():
+                    query = self._db.query(SUBTITLEAUDITSTATE)
+                    if expired:
+                        query = query.filter(SUBTITLEAUDITSTATE.UPDATED_AT < state_cutoff)
+                    else:
+                        query = query.order_by(SUBTITLEAUDITSTATE.UPDATED_AT.desc(),
+                                               SUBTITLEAUDITSTATE.ID.desc()).offset(_AUDIT_STATE_MAX_ROWS)
+                    rows = query.limit(1000).all()
+                    if not rows:
+                        break
+                    state_publication.delete_rows(self._db, SUBTITLEAUDITSTATE, rows)
+        state_publication.collect(self._db)
+        self._invalidate_audit_snapshot_cache()
+        self._last_persistent_cache_cleanup = now
+        if isinstance(self._db, MainDb):
+            from app.db.main_db import _Database
+            from app.db.runtime import maintain
+            maintain(_Database)
+            from app.db.media_db import _Database as media_database
+            maintain(media_database)
 
     def _cleanup_retained_tasks(self):
         now = time.time()
@@ -3157,45 +3234,14 @@ class SubtitleTaskManager:
                     marker = str((_loads(result, {}) or {}).get("ownership_marker") or "")
                     if marker:
                         cleanup_markers.setdefault(str(task_id), []).append(marker)
-            if now - self._last_persistent_cache_cleanup >= 3600:
-                try:
-                    cache_cutoff = now - _PROBE_CACHE_RETENTION_DAYS * 86400
-                    state_cutoff = now - _AUDIT_STATE_RETENTION_DAYS * 86400
-                    cache_changed = self._db.query(SUBTITLEPROBECACHE).filter(
-                        SUBTITLEPROBECACHE.UPDATED_AT < cache_cutoff
-                    ).delete(synchronize_session=False)
-                    # Keep overflow selection inside SQLite. UPDATED_AT indexes
-                    # serve the ordering, and no unbounded IN parameter list is built.
-                    cache_overflow = self._db.query(SUBTITLEPROBECACHE.ID).order_by(
-                        SUBTITLEPROBECACHE.UPDATED_AT.desc(), SUBTITLEPROBECACHE.ID.desc()
-                    ).offset(_PROBE_CACHE_MAX_ROWS).limit(-1)
-                    cache_changed += self._db.query(SUBTITLEPROBECACHE).filter(
-                        SUBTITLEPROBECACHE.ID.in_(cache_overflow)
-                    ).delete(synchronize_session=False)
-                    state_changed = self._db.query(SUBTITLEAUDITSTATE).filter(
-                        SUBTITLEAUDITSTATE.UPDATED_AT < state_cutoff
-                    ).delete(synchronize_session=False)
-                    state_overflow = self._db.query(SUBTITLEAUDITSTATE.ID).order_by(
-                        SUBTITLEAUDITSTATE.UPDATED_AT.desc(), SUBTITLEAUDITSTATE.ID.desc()
-                    ).offset(_AUDIT_STATE_MAX_ROWS).limit(-1)
-                    state_changed += self._db.query(SUBTITLEAUDITSTATE).filter(
-                        SUBTITLEAUDITSTATE.ID.in_(state_overflow)
-                    ).delete(synchronize_session=False)
-                    # DELETE starts a SQLite write transaction even when it matches
-                    # zero rows. Always finish it before the worker goes idle.
-                    self._db.commit()
-                    if state_changed:
-                        self._invalidate_audit_snapshot_cache()
-                    self._last_persistent_cache_cleanup = now
-                except Exception:
-                    self._db.rollback()
-                    raise
             active_ids = {
                 str(row[0]) for row in self._db.query(SUBTITLETASK.ID).filter(
                     SUBTITLETASK.TYPE == "upload",
                     SUBTITLETASK.STATUS.in_(list(ACTIVE_STATES))
                 ).all()
             }
+        if now - self._last_persistent_cache_cleanup >= 3600:
+            self._cleanup_database_caches(now)
         # Migrate or consume exact ownership evidence before deleting the DB
         # rows that point to it.  Failed evidence persistence keeps both the
         # row and staging directory for a later bounded retry.
@@ -3213,7 +3259,7 @@ class SubtitleTaskManager:
             except Exception:
                 protected_ids.add(str(task_id))
         if deletable_ids:
-            with self._lock:
+            with self._write_lock():
                 ids = list(deletable_ids)
                 for offset in range(0, len(ids), 500):
                     chunk = ids[offset:offset + 500]
@@ -3474,70 +3520,71 @@ class SubtitleTaskManager:
                 store = json.load(file_obj)
             history = (store.get("history") or [])[:3]
             now = time.time()
-            latest_states_by_scope = {}
-            for offset, record in enumerate(reversed(history)):
-                checked_at = self._parse_time(record.get("checked_at")) or now - offset
-                result = dict(record or {})
-                media_statuses = result.pop("media_statuses", {})
-                scope_payload = {
-                    "server": result.get("server") or "emby",
-                    "category": result.get("category") or "",
-                    "subcategory": result.get("subcategory") or "",
-                    "mode": result.get("mode") or "deep"
-                }
-                scope_key = _dumps(scope_payload)
-                task_id = str(uuid.uuid4())
-                complete = result.get("coverage_complete") is not False
-                self._db.insert(SUBTITLETASK(
-                    ID=task_id,
-                    TYPE="audit",
-                    OWNER="0",
-                    STATUS="succeeded" if complete else "partial",
-                    PRIORITY=0,
-                    SERVER=scope_payload["server"],
-                    DEDUPE_KEY=_fingerprint_hash(scope_payload),
-                    SCOPE_KEY=scope_key,
-                    PAYLOAD=_dumps(scope_payload),
-                    POLICY=_dumps(DEFAULT_POLICY),
-                    PHASE="complete",
-                    COMPLETED=int((result.get("summary") or {}).get("total") or 0),
-                    TOTAL=int((result.get("summary") or {}).get("total") or 0),
-                    PERCENT=100,
-                    MESSAGE="从旧字幕检测记录迁移",
-                    METRICS=_dumps(result.get("metrics") or {}),
-                    RESULT=_dumps(result),
-                    CANCEL_REQUESTED=0,
-                    CREATED_AT=checked_at,
-                    QUEUED_AT=checked_at,
-                    STARTED_AT=checked_at,
-                    FINISHED_AT=checked_at,
-                    UPDATED_AT=checked_at
-                ))
-                # The state table stores only the newest snapshot for a scope.
-                # Importing every historical snapshot would violate its unique
-                # (scope, server, path) key when the same media appears twice.
-                latest_states_by_scope[(scope_key, scope_payload["server"])] = (
-                    media_statuses, task_id, checked_at
-                )
-            for (scope_key, server), state in latest_states_by_scope.items():
-                media_statuses, task_id, confirmed_at = state
-                self._insert_audit_states(
-                    scope_key, server, media_statuses, task_id,
-                    confirmed_at=confirmed_at
-                )
-            latest = store.get("latest") or {}
-            for category, snapshot in latest.items():
-                server = str((snapshot or {}).get("server") or "emby")
-                scope_key = _dumps({
-                    "server": server, "category": category,
-                    "subcategory": "", "mode": "legacy"
-                })
-                confirmed_at = self._parse_time((snapshot or {}).get("checked_at")) or now
-                self._insert_audit_states(
-                    scope_key, server, (snapshot or {}).get("media_statuses") or {}, None,
-                    confirmed_at=confirmed_at
-                )
-            self._db.commit()
+            with self._write_lock():
+                latest_states_by_scope = {}
+                for offset, record in enumerate(reversed(history)):
+                    checked_at = self._parse_time(record.get("checked_at")) or now - offset
+                    result = dict(record or {})
+                    media_statuses = result.pop("media_statuses", {})
+                    scope_payload = {
+                        "server": result.get("server") or "emby",
+                        "category": result.get("category") or "",
+                        "subcategory": result.get("subcategory") or "",
+                        "mode": result.get("mode") or "deep"
+                    }
+                    scope_key = _dumps(scope_payload)
+                    task_id = str(uuid.uuid4())
+                    complete = result.get("coverage_complete") is not False
+                    self._db.insert(SUBTITLETASK(
+                        ID=task_id,
+                        TYPE="audit",
+                        OWNER="0",
+                        STATUS="succeeded" if complete else "partial",
+                        PRIORITY=0,
+                        SERVER=scope_payload["server"],
+                        DEDUPE_KEY=_fingerprint_hash(scope_payload),
+                        SCOPE_KEY=scope_key,
+                        PAYLOAD=_dumps(scope_payload),
+                        POLICY=_dumps(DEFAULT_POLICY),
+                        PHASE="complete",
+                        COMPLETED=int((result.get("summary") or {}).get("total") or 0),
+                        TOTAL=int((result.get("summary") or {}).get("total") or 0),
+                        PERCENT=100,
+                        MESSAGE="从旧字幕检测记录迁移",
+                        METRICS=_dumps(result.get("metrics") or {}),
+                        RESULT=_dumps(result),
+                        CANCEL_REQUESTED=0,
+                        CREATED_AT=checked_at,
+                        QUEUED_AT=checked_at,
+                        STARTED_AT=checked_at,
+                        FINISHED_AT=checked_at,
+                        UPDATED_AT=checked_at
+                    ))
+                    # The state table stores only the newest snapshot for a scope.
+                    # Importing every historical snapshot would violate its unique
+                    # (scope, server, path) key when the same media appears twice.
+                    latest_states_by_scope[(scope_key, scope_payload["server"])] = (
+                        media_statuses, task_id, checked_at
+                    )
+                for (scope_key, server), state in latest_states_by_scope.items():
+                    media_statuses, task_id, confirmed_at = state
+                    self._insert_audit_states(
+                        scope_key, server, media_statuses, task_id,
+                        confirmed_at=confirmed_at
+                    )
+                latest = store.get("latest") or {}
+                for category, snapshot in latest.items():
+                    server = str((snapshot or {}).get("server") or "emby")
+                    scope_key = _dumps({
+                        "server": server, "category": category,
+                        "subcategory": "", "mode": "legacy"
+                    })
+                    confirmed_at = self._parse_time((snapshot or {}).get("checked_at")) or now
+                    self._insert_audit_states(
+                        scope_key, server, (snapshot or {}).get("media_statuses") or {}, None,
+                        confirmed_at=confirmed_at
+                    )
+                self._db.commit()
             backup = history_file + ".migrated.bak"
             os.replace(history_file, backup)
             log.info("【SubtitleTask】旧字幕检测记录已迁移到 SQLite")

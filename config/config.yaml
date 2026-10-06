@@ -8,6 +8,19 @@
 #   move会直接移动原文件，会影响做种，请谨慎使用
 #   rclone需要自行映射rclone配置目录到容器中，或在容器内完成rclone配置
 app:
+  # 【数据库治理】：预算重启生效。auto 仅在已修复 SQLite 和本地卷探测通过时启用 WAL。
+  # FULL 固定保留提交持久性；写队列满或卷空间不足时明确拒绝，不放开并发绕过保护。
+  database:
+    journal_mode: auto
+    busy_timeout_seconds: 30
+    writer_queue_size: 64
+    writer_wait_seconds: 30
+    audit_batch_rows: 1000
+    wal_autocheckpoint_pages: 1000
+    wal_warning_mb: 64
+    wal_limit_mb: 256
+    # 小配置卷默认保留 256 MiB；启动/普通写入还需至少 4 MiB 工作空间。
+    reserve_free_mb: 256
   # 【NAS 任务预算】：线程池/队列调整后重启生效；转移并发 1 更适合繁忙机械盘。
   # 后台批任务与 Webhook 分池，Telegram 轮询独立；队列满时报繁忙，重复服务触发合并。
   workload:
