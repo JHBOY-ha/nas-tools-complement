@@ -2,6 +2,7 @@
 import base64
 import json
 import re
+import time
 from abc import ABCMeta, abstractmethod
 from urllib.parse import urljoin, urlsplit
 
@@ -14,6 +15,12 @@ from app.utils import RequestUtils
 from app.utils.types import SiteSchema
 
 SITE_BASE_ORDER = 1000
+
+# 分页与总时长上限。站点返回恒非空的“下一页”、或每页都拖到请求超时时，
+# 原先的 while 循环会让单个站点解析线程被占用数十分钟，进而耗尽站点刷新的
+# 线程池。正常站点的分页数远低于此上限。
+MAX_PAGINATION_PAGES = 100
+PAGINATION_DEADLINE_SECONDS = 300
 
 
 class _ISiteUserInfo(metaclass=ABCMeta):
@@ -139,14 +146,25 @@ class _ISiteUserInfo(metaclass=ABCMeta):
                 msg_links = []
                 next_page = self._parse_message_unread_links(
                     self._get_page_content(urljoin(self._base_url, link)), msg_links)
+                deadline = time.monotonic() + PAGINATION_DEADLINE_SECONDS
+                pages = 1
                 while next_page:
+                    if pages >= MAX_PAGINATION_PAGES or time.monotonic() >= deadline:
+                        log.warn("【Sites】%s 未读消息分页超出上限（%s 页），已停止翻页"
+                                 % (self.site_name, pages))
+                        break
                     next_page = self._parse_message_unread_links(
                         self._get_page_content(urljoin(self._base_url, next_page)), msg_links)
+                    pages += 1
 
                 unread_msg_links.extend(msg_links)
 
+        # 每条未读消息都要单独请求一次正文，未读很多时同样会长时间占用线程。
+        content_deadline = time.monotonic() + PAGINATION_DEADLINE_SECONDS
         for msg_link in unread_msg_links:
-            print(msg_link)
+            if time.monotonic() >= content_deadline:
+                log.warn("【Sites】%s 未读消息正文抓取超出时限，已停止" % self.site_name)
+                break
             log.debug(f"【Sites】{self.site_name} 信息链接 {msg_link}")
             head, date, content = self._parse_message_content(self._get_page_content(urljoin(self._base_url, msg_link)))
             log.debug(f"【Sites】{self.site_name} 标题 {head} 时间 {date} 内容 {content}")
@@ -168,12 +186,19 @@ class _ISiteUserInfo(metaclass=ABCMeta):
                                            self._torrent_seeding_headers))
 
                 # 其他页处理
+                deadline = time.monotonic() + PAGINATION_DEADLINE_SECONDS
+                pages = 1
                 while next_page:
+                    if pages >= MAX_PAGINATION_PAGES or time.monotonic() >= deadline:
+                        log.warn("【Sites】%s 做种分页超出上限（%s 页），已停止翻页"
+                                 % (self.site_name, pages))
+                        break
                     next_page = self._parse_user_torrent_seeding_info(
                         self._get_page_content(urljoin(urljoin(self._base_url, seeding_page), next_page),
                                                self._torrent_seeding_params,
                                                self._torrent_seeding_headers),
                         multi_page=True)
+                    pages += 1
 
     @staticmethod
     def _prepare_html_text(html_text):

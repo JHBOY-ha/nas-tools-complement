@@ -18,7 +18,11 @@ if "undetected_chromedriver" not in sys.modules:
     uc_stub.Chrome = object
     sys.modules["undetected_chromedriver"] = uc_stub
 
-if "webdriver_manager.chrome" not in sys.modules:
+# 仅在真实包不可用时才装桩，避免用普通模块对象遮蔽可用的真实包（那会导致
+# webdriver_manager.firefox 无法解析，导入 feapder 的模块随之失败）。
+try:
+    import webdriver_manager.chrome  # noqa: F401
+except Exception:
     webdriver_manager_stub = types.ModuleType("webdriver_manager")
     chrome_stub = types.ModuleType("webdriver_manager.chrome")
 

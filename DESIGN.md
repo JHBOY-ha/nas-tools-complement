@@ -58,6 +58,14 @@ omitted:
 
 ## 特殊集确认对话框
 
+后台操作的状态协议与特殊集确认共用 `UX-CONTRACT.md`。新增全局任务反馈复用 Tabler
+card/list-group、按钮和 Bootstrap modal，沿用现有颜色、字体、圆角及自然文档滚动。
+接收与排队使用中性文字，真实终态才显示完成；任务结果以文本展示，完成不抢焦点。
+
+滚动表面由 `style.css` 全局基线统一：`--nt-scrollbar-thumb` 映射 Tabler muted，
+track 映射 bg-surface，hover/active 映射 body-color；宽度保持可操作，forced-colors
+使用系统颜色。已有原生滚动外观原先没有显式映射，本次记录并补齐这一共享 owner。
+
 - 复用全局 `navigation.html` 的 Bootstrap modal 和 Tabler 表单/列表样式；共享实现为 `rename/special_confirmation.html` 和 `special-confirmation.js`，未识别列表及历史使用同一流程。
 - 作品查询 → 明确选择作品 → 季/单集详情 → 勾选核对 → 重新识别整理；不默认选择候选，不自动保存跨文件映射。原生季下拉采用系统弹出层，作品和剧集使用原生单选。
 - 窗口内查询状态用 live region；保留原失败结果供展开查看，失败可重试或暂不处理。查询词属于临时确认上下文，不进入导航 URL。长文件名和简介换行，弹窗正文滚动、操作区保持可见。

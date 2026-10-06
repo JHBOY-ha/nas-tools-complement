@@ -2,11 +2,12 @@ import json
 import traceback
 
 import jsonpath
-from apscheduler.executors.pool import ThreadPoolExecutor
+from app.utils.scheduled_executor import SharedScheduledExecutor
 from apscheduler.schedulers.background import BackgroundScheduler
 from lxml import etree
 
 import log
+from app.db.session_scope import with_db_session
 from app.downloader import Downloader
 from app.filter import Filter
 from app.helper import DbHelper
@@ -18,7 +19,7 @@ from app.subscribe import Subscribe
 from app.utils import RequestUtils, StringUtils, ExceptionUtils
 from app.utils.commons import singleton
 from app.utils.types import MediaType, SearchType
-from config import Config
+from config import Config, SCHEDULER_JOB_DEFAULTS
 
 
 @singleton
@@ -122,14 +123,17 @@ class RssChecker(object):
             return
         # 启动RSS任务
         self._scheduler = BackgroundScheduler(timezone=Config().get_timezone(),
+                                              job_defaults=SCHEDULER_JOB_DEFAULTS,
                                               executors={
-                                                  'default': ThreadPoolExecutor(30)
+                                                  # RSS uses the same finite queue as
+                                                  # the other periodic services.
+                                                  'default': SharedScheduledExecutor()
                                               })
         rss_flag = False
         for task in self._rss_tasks:
             if task.get("state") == "Y" and task.get("interval") and str(task.get("interval")).isdigit():
                 rss_flag = True
-                self._scheduler.add_job(func=self.check_task_rss,
+                self._scheduler.add_job(func=with_db_session(self.check_task_rss),
                                         args=[task.get("id")],
                                         trigger='interval',
                                         seconds=int(task.get("interval")) * 60)

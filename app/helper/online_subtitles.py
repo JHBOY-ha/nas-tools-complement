@@ -9,7 +9,6 @@ import ipaddress
 import os
 import re
 import unicodedata
-import socket
 import zipfile
 from urllib.parse import urljoin, urlsplit
 
@@ -17,6 +16,7 @@ import requests
 
 import log
 from app.utils import ExceptionUtils
+from app.utils.isolated_network import bounded_request, resolve_addresses, current_deadline, network_operation
 
 
 class SubtitleSourceError(ValueError):
@@ -56,7 +56,7 @@ class OnlineSubtitles:
             urls.append(parsed._replace(netloc="api.makedie.me").geturl())
         for index, candidate in enumerate(urls):
             try:
-                with requests.get(candidate, params=params, timeout=(5, 20),
+                with bounded_request(candidate, params=params, deadline=current_deadline(), timeout=(5, 20),
                                   allow_redirects=not assrt_api) as response:
                     response.raise_for_status()
                     if assrt_api and response.is_redirect:
@@ -224,6 +224,7 @@ class OnlineSubtitles:
         prefix = re.split(r"(?i)(?<![a-z0-9])(?:s\d+|e(?:p)?\d+|\d+x\d+)|第[零一二三四五六七八九十\d]+[季集]", basename)[0].strip(" ._-")
         return not prefix or not target.get("titles") or cls._matches_title(basename, target["titles"])
 
+    @network_operation
     def search(self, keyword, media_path, provider="all", context=None):
         if provider not in ("all", "thunder", "assrt"):
             raise ValueError("请选择有效的字幕来源")
@@ -331,7 +332,10 @@ class OnlineSubtitles:
                 or parsed.port not in (None, 80, 443)):
             raise ValueError("字幕下载地址无效")
         try:
-            addresses = socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80))
+            # Resolution runs in bounded processes, so a stuck resolver cannot
+            # retain one more Python thread on every subsequent request.
+            addresses = resolve_addresses(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80),
+                                          deadline=current_deadline())
             # Clash-style proxies resolve public hosts into this reserved Fake-IP range.
             # Only known provider domains may use it; LAN/loopback remain blocked.
             known_host = (parsed.hostname == "subtitle.v.geilijiasu.com" or parsed.hostname == "assrt.net"
@@ -343,15 +347,16 @@ class OnlineSubtitles:
                     raise ValueError("字幕下载地址不可访问")
             if not addresses:
                 raise ValueError("无法解析字幕下载地址")
-        except OSError:
+        except (OSError, requests.RequestException):
             raise ValueError("无法解析字幕下载地址") from None
 
+    @network_operation
     def _download(self, url):
         https_fallback_used = False
         try:
             for _ in range(6):
                 self._check_url(url)
-                with requests.get(url, headers={"Referer": "https://assrt.net/", "User-Agent": "NASTool"},
+                with bounded_request(url, deadline=current_deadline(), headers={"Referer": "https://assrt.net/", "User-Agent": "NASTool"},
                                   stream=True, timeout=(5, 30), allow_redirects=False) as response:
                     if response.is_redirect:
                         url = urljoin(url, response.headers.get("Location", ""))
@@ -408,6 +413,7 @@ class OnlineSubtitles:
         except Exception:
             pass
 
+    @network_operation
     def files(self, item, member=None):
         """Return choices for an archive, or a single selected file; never extract paths."""
         name = item["name"]

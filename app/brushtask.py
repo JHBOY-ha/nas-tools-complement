@@ -1,12 +1,15 @@
 import re
 import sys
 import time
+from collections import OrderedDict
 from datetime import datetime
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
+from app.utils.scheduled_executor import SharedScheduledExecutor
 
 import log
+from app.db.session_scope import with_db_session
 from app.downloader.client import Qbittorrent, Transmission
 from app.filter import Filter
 from app.helper import DbHelper
@@ -17,7 +20,7 @@ from app.utils import StringUtils, Torrent, ExceptionUtils
 from app.utils.commons import singleton
 from app.utils.types import BrushDeleteType
 from app.utils.security_utils import parse_rule_dict
-from config import BRUSH_REMOVE_TORRENTS_INTERVAL, Config
+from config import BRUSH_REMOVE_TORRENTS_INTERVAL, Config, SCHEDULER_JOB_DEFAULTS
 
 
 @singleton
@@ -28,7 +31,10 @@ class BrushTask(object):
     dbhelper = None
     _scheduler = None
     _brush_tasks = []
-    _torrents_cache = []
+    # 有界 LRU：原先用 list 只增不减，长期运行内存单调增长，且 `not in list`
+    # 是线性查找。键为种子链接，保留最近处理过的若干条即可满足去重语义。
+    _torrents_cache = OrderedDict()
+    _torrents_cache_max = 5000
     _downloader_infos = []
     _qb_client = "qbittorrent"
     _tr_client = "transmission"
@@ -72,17 +78,21 @@ class BrushTask(object):
             return
         # 启动RSS任务
         task_flag = False
-        self._scheduler = BackgroundScheduler(timezone=Config().get_timezone())
+        self._scheduler = BackgroundScheduler(timezone=Config().get_timezone(),
+                                              job_defaults=SCHEDULER_JOB_DEFAULTS,
+                                              # Brush jobs share bounded admission;
+                                              # rebuilding this scheduler affects only its jobs.
+                                              executors={'default': SharedScheduledExecutor()})
         for task in self._brush_tasks:
             if task.get("state") == "Y" and task.get("interval") and str(task.get("interval")).isdigit():
                 task_flag = True
-                self._scheduler.add_job(func=self.check_task_rss,
+                self._scheduler.add_job(func=with_db_session(self.check_task_rss),
                                         args=[task.get("id")],
                                         trigger='interval',
                                         seconds=int(task.get("interval")) * 60)
         # 启动删种任务
         if task_flag:
-            self._scheduler.add_job(func=self.remove_tasks_torrents,
+            self._scheduler.add_job(func=with_db_session(self.remove_tasks_torrents),
                                     trigger='interval',
                                     seconds=BRUSH_REMOVE_TORRENTS_INTERVAL)
             # 启动
@@ -143,6 +153,20 @@ class BrushTask(object):
             return {}
         else:
             return _brush_tasks
+
+    def __remember_torrent(self, enclosure):
+        """
+        记录已处理过的种子链接（有界 LRU）
+        :return: True 表示首次出现，False 表示已处理过
+        """
+        cache = self._torrents_cache
+        if enclosure in cache:
+            cache.move_to_end(enclosure)
+            return False
+        cache[enclosure] = True
+        while len(cache) > self._torrents_cache_max:
+            cache.popitem(last=False)
+        return True
 
     def check_task_rss(self, taskid):
         """
@@ -219,9 +243,7 @@ class BrushTask(object):
                 # 发布时间
                 pubdate = res.get('pubdate')
 
-                if enclosure not in self._torrents_cache:
-                    self._torrents_cache.append(enclosure)
-                else:
+                if not self.__remember_torrent(enclosure):
                     log.debug("【Brush】%s 已处理过" % torrent_name)
                     continue
 

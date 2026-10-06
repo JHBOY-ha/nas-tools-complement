@@ -17,7 +17,10 @@ class RequestUtils:
                  timeout=None,
                  referer=None,
                  content_type=None,
-                 verify=True):
+                 verify=True,
+                 isolated=False,
+                 deadline=None,
+                 max_bytes=20 * 1024 * 1024):
         if not content_type:
             content_type = "application/x-www-form-urlencoded; charset=UTF-8"
         if headers:
@@ -50,6 +53,11 @@ class RequestUtils:
             self._timeout = timeout
         # Verify certificates by default; requests also accepts a private CA path.
         self._verify = verify
+        # Opt-in transport keeps the existing RequestUtils interface available
+        # to providers while moving DNS/stream reads into bounded subprocesses.
+        self._isolated = isolated
+        self._deadline = deadline
+        self._max_bytes = max_bytes
 
     def post(self, url, params=None, json=None):
         if json is None:
@@ -101,6 +109,13 @@ class RequestUtils:
 
     def get_res(self, url, params=None, allow_redirects=True, stream=False):
         try:
+            if self._isolated:
+                from app.utils.isolated_network import bounded_request
+                return bounded_request(url, params=params, headers=self._headers,
+                                       proxies=self._proxies, cookies=self._cookies,
+                                       timeout=self._timeout, verify=self._verify,
+                                       allow_redirects=allow_redirects, stream=stream,
+                                       deadline=self._deadline, max_bytes=self._max_bytes)
             if self._session:
                 return self._session.get(url,
                                          params=params,
@@ -127,6 +142,15 @@ class RequestUtils:
     def post_res(self, url, params=None, allow_redirects=True, files=None, json=None,
                  stream=False):
         try:
+            if self._isolated:
+                if files is not None:
+                    raise ValueError('Isolated HTTP transport does not accept upload handles')
+                from app.utils.isolated_network import bounded_request
+                return bounded_request(url, method='POST', json=json, headers=self._headers,
+                                       proxies=self._proxies, cookies=self._cookies,
+                                       timeout=self._timeout, verify=self._verify,
+                                       allow_redirects=allow_redirects, stream=stream,
+                                       deadline=self._deadline, max_bytes=self._max_bytes)
             if self._session:
                 return self._session.post(url,
                                           data=params,

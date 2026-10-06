@@ -1,5 +1,194 @@
 # 项目方案
 
+## B4 非数据库改造（2026-10-06，本地实施与验证完成）
+
+用户要求完成剩余改动，同时继续暂停数据库相关修改。数据库源码/迁移及
+`commit_audit_result`、`_ensure_schema_columns`、`_recover_repair_transaction` 的指纹
+已记录在本次会话的 `/tmp/nas-b4-db-baseline.json`，用于验证暂停范围。
+
+- 复用独立 I/O 子进程，固定操作白名单；元数据、批量文件 I/O、外部网络分池。
+  使用实际时间预算与有界准入；无法立即回收的子进程仍占预算，不无限补开。
+- 五个定时服务采用共享有界执行适配器，保留 APScheduler 的迟到/防重入语义；
+  单一调度器关闭仅影响自身 Future。播放检查使用交互容量。
+- 上传采用队列/空间租约及每用户提交互斥；multipart 期间释放共享锁。
+  文件流由子进程读写并校验 inode；真实连接用定时 socket shutdown 限制总时长。
+  默认暂存 1536 MiB、保留空闲 2048 MiB，保留管理员显式配置。
+- 后台操作使用私有 JSON 文件记录状态，不增加 SQL 表；只持久保存身份/状态/结果，
+  不保存操作参数或认证头。重启后未完成操作标记中断，不重放删除/移动。
+- 前后端共用异步操作协议：202 接受、按任务 ID 查询终态、排队任务可取消；
+  查询/取消复核任务归属及原操作权限，执行前重新读取用户权限。
+- 在线字幕采用共享 90 秒网络预算，DNS/下载在有界子进程内运行；
+  同媒体下载使用 in-flight claim，网络不持共享 OpenSubtitles 状态锁。
+
+本地验证：新增 14 项 B4 回归，完整稳定性 236 项、识别 341 项、在线字幕/OpenSubtitles
+63 项通过；两套真实 Chrome 界面回归通过，覆盖异步状态、断网/旧页面回调、特殊集复核、
+文本安全、键盘和窄屏。严格 UI 静态审查及官方 DESIGN.md lint 无错误；语法和 diff 检查通过。
+8×4 MiB 可丢弃 smoke 的峰值转移并行 2、子进程 2。数据库与受保护事务指纹保持一致。
+未部署、未提交/推送；真实 NAS/btrfs 与外部服务尚未联调，本机时间不能当作 NAS 性能结果。
+
+## 单进程 NAS 任务预算（2026-10-06）
+
+目标：减少同时发生的 NAS 转移、限制队列内存及搜索线程增长，并为 Webhook 留出
+独立容量。数据库相关改动已按用户要求停止，本轮保留既有数据库与事务实现。
+
+- `app/utils/workload.py` 新增有界 FIFO executor，使用标准线程池执行有限的 drain
+  loop；取消会移除真实排队载荷，并通知 Future 等待者，不能用取消绕过队列容量。
+  成对回调采用原子批量准入。新增 FIFO 文件转移闸门，冷启动只创建一个实例，
+  嵌套受保护发布复用线程当前槽位；等待和异常均释放相应资源。
+- `ThreadHelper` 后台 6/队列 64、交互 2/队列 16、常驻服务 1/队列 4；保留原有
+  工作单元清理包装。服务、订阅搜索和媒体库同步重复触发使用任务 key 合并，终态后释放。
+- `Indexer` 进程内共享 4/队列 64，搜索结束只取消自身未执行任务；超时的运行中
+  请求继续占据真实槽位，后续调用不能创建更多池绕过预算。失败或未准入站点显式计数。
+- 常规和受保护媒体转移共用默认 2 个 FIFO 槽；同一目标的锁及发布/清理校验保留。
+- 主调度器、RSS、刷流、删种线程默认各 6，播放检查默认 2；不改定时任务的合并、
+  防重入和迟到窗口。后台批任务与搜索、Webhook 分池，避免等待自己池内的子任务。
+- Webhook 两个回调满时共同拒绝，返回 503/Retry-After；Web/API 返回兼容错误，
+  消息入口报告繁忙。已成功的下载/转移遇到附带字幕队列满只告警，避免误报并重试媒体操作。
+- Telegram 轮询使用独立服务池；旧停止 event 结束外层循环，避免配置切换后空转。
+- 预算从 `app.workload` 读取，范围校验后使用；缺失/非法项使用保守默认值，重启生效。
+
+实现、配置取值及验证限制见 `docs/nas-workload-budget.md`。内存队列不新增进程重启
+恢复能力；阻塞的运行中 I/O 仍不能被安全强杀。未进行真实 NAS 吞吐量或峰值内存压测。
+
+验证：新增 21 项任务预算回归；与既有稳定性回归一起定向运行 32 项通过；
+完整 `tests.run_stability` 222 项、`tests.run_recognition` 341 项通过。
+修改 Python 文件语法检查和 `git diff --check` 通过。本轮未提交、推送或部署。
+
+## 稳定性治理 B1–B3：会话生命周期、锁边界与阻塞超时（2026-10-05）
+
+承接下方 B0。本轮完成 B1（低风险行为修复）、B2（会话生命周期）、B3（NAS I/O
+移出全局锁）。每批独立验证，未在真实 NAS 上压测。
+
+### B2 会话生命周期（解决连接池耗尽）
+
+- `app/db/main_db.py`、`app/db/media_db.py` 新增模块级 `remove_session()`。
+- 新增 `app/db/session_scope.py`：`release_db_connections(db=None)` 与
+  `with_db_session(func)`。实测确认机制：只读查询同样签出连接并持有到事务结束，
+  **每个存活线程钉住一条**（8 个线程各查一次即打满 `pool_size=5`）；经包装后
+  线程存活时 `checkedout()` 回到 0。
+- 归还边界：Flask `teardown_appcontext`（`web/main.py`，覆盖每请求新线程）、
+  `ThreadHelper.start_thread`、indexer 提交点、5 个 `BackgroundScheduler` 的
+  任务注册（`scheduler.py` 新增 `_add_job` 辅助方法；其余 4 个在 `func=` 处包装）、
+  字幕管理器 3 个常驻 worker 的每轮迭代。
+- 池参数保持原容量 50（`pool_size=20, max_overflow=30`）并启用 `pool_use_lifo`：
+  刻意不缩小上限，避免在突发并发下反而更容易触发 QueuePool 超时；泄漏已在源头消除。
+- `media_db` 补 `expire_on_commit=False`，与 `user_db` 对齐，避免 commit 后属性
+  访问触发 refresh 再次签出连接。
+- 包装不改变 apscheduler 注册语义：内存 jobstore 的任务 ID 本就是随机 UUID，
+  重复注册的替换行为与包装前一致（已验证）。
+
+### B3 把 NAS I/O 移出 manager 全局锁
+
+统一手法：**锁内快照纯数据 → 锁外做 I/O → 锁内重读复核并提交**。
+
+- `_claim_next_interactive`：取消行的暂存目录删除移到锁外。
+- 新增 `_output_state_snapshot(item)`（纯数据）与 `_evaluate_output_state(snapshot)`
+  （哈希）；`_upload_output_state` 保留为兼容入口。
+- `verify_upload_item_output`、`trusted_upload_item_hashes`、`_upload_staging_valid`、
+  `_reconcile_upload_outputs`、`_recover_tasks` 均改为三段式。
+- `_upload_output_owned` 改为接收已求值的快照，不再内部重算哈希。
+- `_check_target_capacity` 拆出 `_assert_target_capacity`（纯算术）；
+  `ensure_task_target_space` 与 `submit_upload` 的 statvfs 移到锁外。
+- `cancel_task` 三段式：先落库取消意图（原子性锚点）→ 锁外对账 → 锁内重读后写终态；
+  对账期间 worker 若已置终态则以已落库结果为准。
+- `_recover_tasks` 三段式，并抽出 `_recover_repair_transaction`。
+- **保留的保证未变**：删除仍要求 ownership marker + inode 证据；取消时保留已发布
+  字幕；终态与发布校验一致。这些是文件系统证据驱动而非锁驱动。
+- 验证：给 7 个 I/O 入口加探针，遍历 `verify_upload_item_output`、
+  `trusted_upload_item_hashes`、`ensure_task_target_space`、`_reconcile_upload_outputs`、
+  `_upload_staging_valid`、`cancel_task`、`_claim_next_interactive`、`_recover_tasks`，
+  **持锁期间 NAS I/O 次数 = 0**。
+
+### B1 低风险行为修复
+
+- `SystemUtils` 新增 `__run_external_transfer`：rclone/mc 四个 `subprocess.run` 加超时
+  （默认 3600 秒，可用 `app.external_transfer_timeout` 覆盖），超时返回 -1 并提示
+  目标可能残留不完整文件。实测 1 秒超时即在 1 秒终止而非等待 30 秒。
+- `app/filetransfer.py` 的全局 `lock` 改为按**目标路径**加锁：同一目标仍互斥，
+  不同文件并行；无人等待时锁表自动清理。实测同目标串行、异目标并行。
+- `app/indexer/indexer.py`：改为 `with` 管理线程池、`as_completed(timeout=)`、
+  单站点异常不再中断整次检索。实测 1 秒返回而非被 30 秒慢站点拖住。
+- `app/sync.py`：`transfer_all_sync` 加非阻塞互斥，并发触发只执行一次。
+- `app/helper/subtitle_tasks.py`：`start()` 的入口租约改在 `_lock` 之外获取，
+  加锁顺序统一为 `_submit_lock -> _lock`，消除与 `submit_upload` 的 ABBA 死锁。
+- `config.py` 新增 `SCHEDULER_JOB_DEFAULTS`（`misfire_grace_time=60`），5 个调度器
+  全部应用，避免默认 1 秒下静默丢弃迟到执行。
+
+### 测试基建修正
+
+`tests/test_media_library.py`、`test_subtitle_align.py`、`test_subtitle_upload.py` 的
+`webdriver_manager` 桩原先无条件用普通模块对象遮蔽真实包，导致
+`webdriver_manager.firefox` 无法解析、任何导入 feapder 的模块（如 `app.brushtask`）
+在测试中 ImportError。改为仅在真实包不可用时才装桩。
+
+### 验证
+
+- `python3 -m tests.run_stability` 201 项通过（新增
+  `tests/test_stability_regressions.py` 11 项覆盖上述全部不变量）。
+- `python3 -m tests.run_recognition` 341 项通过。
+- 全量 discover 与 HEAD 基线对比：745→756 项，错误 514→505（无新增失败）。
+- 仍未在真实 NAS、真实 btrfs 卷或真实外部字幕服务上验证；未做吞吐量/内存压测。
+- `docs/btrfs-metadata-troubleshooting.md` 给出未定位的历史元数据问题的排查清单。
+
+## 稳定性治理 B0：连接池、索引与阻塞超时（2026-10-05）
+
+对字幕任务执行路径、网络/外部服务超时、数据库与锁竞争、其余后台服务做了四方向
+只读审查。本轮只做 B0（低风险、不改控制流），后续批次见下方「已定位未修复」。
+
+已实施的改动：
+
+- **SQLite 锁等待**：`app/db/main_db.py`、`app/db/media_db.py` 的 `create_engine`
+  增加 `connect_args={"timeout": 30}`。pysqlite 的 `timeout` 即 SQLite 的
+  busy timeout，实测从默认 5000ms 提升到 30000ms，减少慢盘并发写下的
+  `database is locked`。同时加了连接池接近耗尽时的限量告警（每 60 秒最多一条）。
+- **缺失索引**：`app/db/models.py` 补 `SUBTITLE_TASK(CREATED_AT)`、
+  `SUBTITLE_TASK(FINISHED_AT)`、`SUBTITLE_TASK(TYPE,STATUS,PRIORITY,CREATED_AT)`、
+  `SUBTITLE_PROBE_CACHE(PAIR_PATH)`、`SUBTITLE_AUDIT_STATE(SUBTITLE_PATH)`、
+  `TRANSFER_HISTORY(DATE)`；`_ensure_schema_columns` 用 `CREATE INDEX IF NOT EXISTS`
+  覆盖已有库；新增 Alembic 迁移 `f3b7c1d9e204`（`create_all` 不会给已存在表补索引）。
+  建立状态和媒体快照的 UPSERT 仍按 500 行分批。
+  实测 5 万行规模下 `invalidate_audit_states`/`list_tasks`/`cleanup_terminal`/
+  `transfer_hist_order` 均命中索引。**注意**：`invalidate_probe_cache` 的 `OR`
+  需要两侧都可索引，原先只差 `PAIR_PATH` 一侧；刻意**没有**再加单列 `PATH` 索引——
+  实测 SQLite 已能对现有 `(SERVER,PATH)` 唯一索引做 skip-scan
+  （`ANY(SERVER) AND PATH=?`），8 千行规模下显示 SCAN 只是小表的优化器选择。
+- **刷流去重缓存**：`app/brushtask.py` 的 `_torrents_cache` 由只增不减的 list 改为
+  上限 5000 的 `OrderedDict` LRU，成员判断同时从 O(n) 降为 O(1)。插入 5 万条后
+  稳定在 5000，重复项判定仍正确。
+- **唯一漏网的请求超时**：`app/message/client/telegram.py` 的 `sendPhoto` 补
+  `timeout=(5, 30)`（该文件其余调用本就有超时）。
+- **站点分页上限**：`app/sites/siteuserinfo/_base.py` 的两处 `while next_page`
+  加 100 页 / 300 秒上限，未读消息正文抓取同样加时限；顺带移除一处调试 `print`。
+- **上传 body 硬超时**：`web/main.py` 的 `_NasToolsRequest` 在解析 multipart 前
+  给 `werkzeug.socket` 设 120 秒读取超时，超时映射为 408，解析后恢复原值；
+  无该 socket 键的 WSGI 服务器上自动降级为 no-op。
+- **btrfs 排查**：新增 `docs/btrfs-metadata-troubleshooting.md`。结论是应用为纯
+  用户态程序、不触碰底层卷操作，**原理上无法造成 btrfs 元数据损坏**；唯一沾边的
+  间接链路是暂存配额压满卷导致 metadata 耗尽。同时指出约 90 处 `except OSError`
+  会把文件系统故障掩盖成「程序卡顿」。
+
+验证：字幕相关 253 项回归通过；`python3 -m tests.run_recognition` 341 项通过。
+以 HEAD 干净副本做 discover 基线对比（745 项，基线 514 错误 / 本分支 512 错误），
+测试数一致且无新增失败。索引创建与旧库升级补建路径、刷流缓存有界性、
+上传超时的设置与恢复均有独立验证。**未在真实 NAS 或真实 btrfs 卷上验证**，
+未做吞吐量/峰值内存压测。
+
+## 已定位未修复（后续批次）
+
+- **危险 I/O 无法中断**：Python 不能中断阻塞在不可中断系统调用（D 状态）的线程，
+  因此「加看门狗」只能标记失败、**不能解卡**。本轮的处置是在源头消除无限阻塞
+  （外部命令超时、body 读取超时、站点分页上限），并把 NAS I/O 移出全局锁，
+  使个别卡住的调用不再冻结整个应用。彻底隔离仍需把危险 I/O 放进可 kill 的子进程。
+- **B4 待决（需要运营取值或行为变更确认）**：
+  - WAL：Synology 若把 `config/` 放在网络/overlay 文件系统，`-shm` 可能不可用，
+    启用前需在生产卷上探测。
+  - `web/action.py` 的同步长任务（`:4882` 目录同步、`:2959/:2964` RSS/刷流、
+    `:4617` 删种、`:876/:1514` 转移与重识别）仍在请求线程内执行，异步化会改变
+    API 契约，需前端配合。
+  - 上传准入锁仍横跨 multipart body（现有 body 读取硬超时兜底，未改准入算法）。
+  - `app/helper/online_subtitles.py` 的 `socket.getaddrinfo` 无超时、慢速滴流无
+    总时长上限；`app/subtitle.py:2434` 仍在 `_opensubtitles_lock` 内做整个网络序列。
+
 ## 字幕库性能审查更正与修复（2026-10-02）
 
 本轮按原报告 20 项逐项处理。保留上传准入串行、审计状态与任务终态的原子事务、文件发布和删除前的身份／内容校验；不以减少 I/O 为由放宽这些约束。没有数据库结构迁移或新增依赖。

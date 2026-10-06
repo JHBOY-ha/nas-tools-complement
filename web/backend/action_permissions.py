@@ -3,7 +3,9 @@
 # Root-only commands can change credentials, code, or global service settings.
 # Every dispatcher command must be explicitly listed; future additions fail closed.
 _COMMAND_GROUPS = {
-    "": ("logout", "version", "refresh_process"),
+    # These status routes perform original-command and owner checks themselves.
+    "": ("logout", "version", "refresh_process", 'get_action_task', 'get_action_tasks',
+          'find_action_task', 'cancel_action_task'),
     "@admin": (
         "user_manager", "get_users", "restart", "update_system", "reset_db_version",
         "update_config", "update_directory", "test_connection", "restory_backup",

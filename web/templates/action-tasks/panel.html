@@ -1,0 +1,23 @@
+{# Shared operation feedback reuses Tabler and the application's Bootstrap modal. #}
+<section class="container-xl my-3" id="action-task-panel" aria-labelledby="action-task-title" hidden>
+  <div class="card">
+    <div class="card-header d-flex justify-content-between gap-2">
+      <h3 class="card-title" id="action-task-title">后台操作</h3>
+      <button type="button" class="btn btn-sm btn-outline-secondary" id="action-task-refresh">刷新状态</button>
+    </div>
+    <div class="px-3 pt-2" id="action-task-notice" role="status" aria-live="polite"></div>
+    <div class="list-group list-group-flush" id="action-task-list" role="list" aria-label="最近的后台操作"></div>
+  </div>
+</section>
+<div class="modal modal-blur fade" id="action-task-result" tabindex="-1" aria-labelledby="action-task-result-title" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable" role="document">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="action-task-result-title">执行结果</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭执行结果"></button>
+      </div>
+      <div class="modal-body"><pre class="text-wrap text-break mb-0" id="action-task-result-text"></pre></div>
+      <div class="modal-footer"><button type="button" class="btn" data-bs-dismiss="modal">关闭</button></div>
+    </div>
+  </div>
+</div>

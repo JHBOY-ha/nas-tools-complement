@@ -1,14 +1,15 @@
 """Local extra publication: no overwrite, no episode history, recoverable retries."""
 import errno
 import json
-import filecmp
 import hashlib
-import os
 from contextlib import contextmanager
 from threading import Lock
 
 from app.utils.types import RmtMode
 from app.utils.exclusive_publish import rename_exclusive
+from app.utils.workload import get_transfer_gate
+from app.utils.isolated_io import IsolatedIOTimeout, get_io_pool
+from app.utils.isolated_fs import fs_os as os, isolated_open as open
 
 _publish_lock = Lock()
 
@@ -18,27 +19,18 @@ def _lock_destination(destination):
     """Serialize publication through cleanup, including other app processes."""
     # Keep the lock file: unlinking it lets another process lock a different inode.
     # OS locks are released on process exit, so a crash cannot leave a stale lock.
-    with _publish_lock, open(destination + ".extra-lock", "a+b") as handle:
-        if os.name == "nt":
-            import msvcrt
-            if os.fstat(handle.fileno()).st_size == 0:
-                handle.write(b"\0")
-                handle.flush()
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-            try:
-                yield
-            finally:
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-            # A competing process retries later instead of holding a worker forever.
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            try:
-                yield
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    with _publish_lock, get_io_pool().session() as worker:
+        # Keep the OS lock in a bounded child through persistence and source
+        # cleanup; open/flock/NAS waits do not pin the application indefinitely.
+        token = worker.execute('lock', path=destination + '.extra-lock')
+        try:
+            yield
+        finally:
+            worker.execute('unlock', token=token)
+
+
+def _compare(source, target):
+    return get_io_pool('bulk').execute('compare', source=source, target=target, timeout=300)
 
 
 EXTRA_FOLDERS = {
@@ -62,7 +54,9 @@ def publish_exclusive(source, destination, mode, transfer, record):
         raise ValueError("受保护内容仅支持本地硬链接、软链接、复制或移动，远程模式无法保证排他发布")
     destination = os.path.abspath(destination)
     os.makedirs(os.path.dirname(destination), exist_ok=True)
-    with _lock_destination(destination):
+    # Protected publication may hash existing copies as well as transfer them.
+    # Nested legacy transfer commands reuse this same process-wide I/O slot.
+    with _lock_destination(destination), get_transfer_gate().slot():
         _publish_extra(source, destination, mode, transfer, record)
 
 
@@ -79,7 +73,7 @@ def _publish_extra(source, destination, mode, transfer, record):
         # A retained staging inode proves this exact source was published before a
         # database failure. Compare bytes for COPY/MOVE, never trust just the size.
         retry = (os.path.exists(pending) and os.path.samefile(pending, destination)
-                 and filecmp.cmp(source, pending, shallow=False))
+                 and _compare(source, pending))
         if not same and not retry and os.path.isfile(receipt):
             # A no-replace rename consumes pending; its prewritten inode receipt survives crashes.
             with open(receipt, encoding="utf-8") as handle:
@@ -87,13 +81,13 @@ def _publish_extra(source, destination, mode, transfer, record):
             published = os.lstat(destination)
             retry = (saved.get("source") == source_identity
                      and saved.get("target") == [published.st_dev, published.st_ino, published.st_size, published.st_mtime_ns]
-                     and filecmp.cmp(source, destination, shallow=False))
+                     and _compare(source, destination))
         if not same and not retry:
             raise ValueError("Extras 目标已存在不同文件，保留源文件")
     else:
         # Only an unpublished staging file may be discarded. A published inode is
         # an immutable retry receipt and is handled exclusively by the branch above.
-        if os.path.lexists(pending) and not filecmp.cmp(source, pending, shallow=False):
+        if os.path.lexists(pending) and not _compare(source, pending):
             os.unlink(pending)
         if not os.path.lexists(pending):
             staging_mode = RmtMode.COPY if mode == RmtMode.MOVE else mode
@@ -102,7 +96,12 @@ def _publish_extra(source, destination, mode, transfer, record):
                 # opens it for writing. LINK/SOFTLINK already create exclusively.
                 fd = os.open(pending, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
                 os.close(fd)
-            if transfer(source, pending, staging_mode) != 0:
+            transfer_result = transfer(source, pending, staging_mode)
+            if transfer_result == -2:
+                # A timed-out child may not have been reaped. Preserve its
+                # owned inode instead of erasing evidence of an uncertain copy.
+                raise IsolatedIOTimeout(errno.ETIMEDOUT, '文件转移结果未确认，保留暂存')
+            if transfer_result != 0:
                 # A failed copy is not a valid retry receipt.
                 if os.path.lexists(pending):
                     os.unlink(pending)

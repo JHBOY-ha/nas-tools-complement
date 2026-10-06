@@ -19,7 +19,13 @@ if "undetected_chromedriver" not in sys.modules:
     uc_stub.Chrome = object
     sys.modules["undetected_chromedriver"] = uc_stub
 
-if "webdriver_manager.chrome" not in sys.modules:
+# 仅在真实包不可用时才装桩。原来的判据是 "webdriver_manager.chrome" 未加载，
+# 但那时它也一定未加载，于是总是用普通模块对象遮蔽真实包——真实包被遮蔽后
+# webdriver_manager.firefox 无法解析，任何导入 feapder 的模块（如 app.brushtask）
+# 都会 ImportError。
+try:
+    import webdriver_manager.chrome  # noqa: F401
+except Exception:
     webdriver_manager_stub = types.ModuleType("webdriver_manager")
     chrome_stub = types.ModuleType("webdriver_manager.chrome")
 

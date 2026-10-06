@@ -8,6 +8,18 @@
 #   move会直接移动原文件，会影响做种，请谨慎使用
 #   rclone需要自行映射rclone配置目录到容器中，或在容器内完成rclone配置
 app:
+  # 【NAS 任务预算】：线程池/队列调整后重启生效；转移并发 1 更适合繁忙机械盘。
+  # 后台批任务与 Webhook 分池，Telegram 轮询独立；队列满时报繁忙，重复服务触发合并。
+  workload:
+    background_workers: 6
+    background_queue_size: 64
+    interactive_workers: 2
+    interactive_queue_size: 16
+    scheduler_workers: 6
+    scheduler_queue_size: 64
+    search_workers: 4
+    search_queue_size: 64
+    transfer_concurrency: 2
   # 【日志记录类型】：server、file、console
   # 如果是使用Docker安装建议设置为console，通过Docker管理器查看日志
   # 如果是使用群晖套件建议配置为 server，可将日志输出到群晖的日志中心便于查看

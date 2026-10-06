@@ -7,6 +7,8 @@ import re
 import shutil
 import tempfile
 import threading
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
+import requests
 import time
 import uuid
 from contextlib import nullcontext
@@ -17,6 +19,8 @@ from lxml import etree
 import log
 from app.conf import SiteConf
 from app.helper import OpenSubtitles
+from app.utils.isolated_network import current_deadline, network_operation
+from app.utils.isolated_io import isolated_stat
 from app.helper.subtitle_align import SubtitleAligner
 from app.helper.subtitle_health import SubtitleHealth
 from app.utils import RequestUtils, PathUtils, SystemUtils, StringUtils, ExceptionUtils
@@ -37,8 +41,8 @@ class Subtitle:
     _local_path = None
     _opensubtitles_enable = False
     _repair_lock = threading.RLock()
-    # The client shares a login token; serialize check/search/download/publication
-    # so concurrent requests cannot spend quota for the same missing subtitle.
+    # Protect only in-flight claims and publication generations. Network work
+    # runs outside this lock; the client separately guards token/quota state.
     _opensubtitles_lock = threading.RLock()
     _opensubtitles_publication_generation = 0
     _opensubtitles_download_limit = 20 * 1024 * 1024
@@ -2320,10 +2324,11 @@ class Subtitle:
         for _ in range(2):
             response = None
             try:
-                response = RequestUtils(
-                    headers=headers, proxies=Config().get_proxies(), timeout=30,
-                    verify=True
-                ).get_res(link, allow_redirects=False, stream=True)
+                response = RequestUtils(headers=headers, proxies=Config().get_proxies(), timeout=30,
+                                        verify=True, isolated=True, deadline=current_deadline(),
+                                        max_bytes=self._opensubtitles_download_limit).get_res(
+                    link, allow_redirects=False, stream=True
+                )
                 if response is None:
                     continue
                 status = response.status_code
@@ -2357,6 +2362,10 @@ class Subtitle:
                 if valid:
                     return text, ""
                 break
+            except ValueError:
+                return None, '字幕临时链接内容超过 20 MiB 上限'
+            except requests.RequestException:
+                continue
             finally:
                 if response is not None:
                     try:
@@ -2378,7 +2387,8 @@ class Subtitle:
                 temp_target = subtitle_file.name
                 subtitle_file.write(text)
             self.__publish_file_no_replace(temp_target, target)
-            self._opensubtitles_publication_generation += 1
+            with self._opensubtitles_lock:
+                self._opensubtitles_publication_generation += 1
             return True, target
         except FileExistsError:
             return False, "字幕已由其他请求发布，未覆盖：%s" % target
@@ -2415,13 +2425,42 @@ class Subtitle:
     @staticmethod
     def __opensubtitles_path_identity(path):
         try:
-            current = os.stat(path)
+            current = isolated_stat(path)
             return (current.st_dev, current.st_ino, current.st_size,
                     current.st_mtime_ns, current.st_ctime_ns)
         except OSError:
             return None
 
+    @network_operation
     def __download_opensubtitles_item(self, item, selected_file_id=None):
+        key = os.path.normcase(os.path.abspath(str(item.get('file') or '')))
+        with self._opensubtitles_lock:
+            inflight = getattr(self, '_opensubtitles_inflight', None)
+            if inflight is None:
+                inflight = self._opensubtitles_inflight = {}
+            prior = inflight.get(key)
+            owner = prior is None
+            if owner:
+                prior = inflight[key] = Future()
+        if not owner:
+            try:
+                return prior.result(timeout=current_deadline().remaining())
+            except FutureTimeoutError:
+                return False, '现有字幕下载尚未完成，请稍后查看任务结果'
+        try:
+            result = self.__download_opensubtitles_claimed(item, selected_file_id)
+        except BaseException as error:
+            prior.set_exception(error)
+            raise
+        else:
+            prior.set_result(result)
+            return result
+        finally:
+            with self._opensubtitles_lock:
+                if inflight.get(key) is prior:
+                    inflight.pop(key, None)
+
+    def __download_opensubtitles_claimed(self, item, selected_file_id=None):
         directory = os.path.dirname(str(item.get("file") or "")) or "."
         # Directory traversal/language detection can wait on NAS. Perform the
         # normal preflight before taking the shared API token/quota lock, then
@@ -2431,15 +2470,16 @@ class Subtitle:
         identity = self.__opensubtitles_path_identity(directory)
         evidence = []
         existing = self.__existing_opensubtitles_target(item, language_evidence=evidence)
-        with self._opensubtitles_lock:
-            prechecked = identity is not None and identity == self.__opensubtitles_path_identity(directory) \
-                and generation == self._opensubtitles_publication_generation \
-                and languages == tuple(self.opensubtitles.languages) \
-                and all(before is not None and before == self.__opensubtitles_path_identity(path)
-                        for path, before in evidence)
-            return self.__download_opensubtitles_item_locked(
-                item, selected_file_id, prechecked=prechecked, existing=existing
-            )
+        # The target claim prevents duplicate downloads while all directory
+        # evidence and API/content requests run outside the shared state lock.
+        prechecked = identity is not None and identity == self.__opensubtitles_path_identity(directory) \
+            and generation == self._opensubtitles_publication_generation \
+            and languages == tuple(self.opensubtitles.languages) \
+            and all(before is not None and before == self.__opensubtitles_path_identity(path)
+                    for path, before in evidence)
+        return self.__download_opensubtitles_item_locked(
+            item, selected_file_id, prechecked=prechecked, existing=existing
+        )
 
     def __download_opensubtitles_item_locked(self, item, selected_file_id=None,
                                             prechecked=False, existing=None):

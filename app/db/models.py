@@ -513,6 +513,10 @@ class TRANSFERBLACKLIST(Base):
 
 class TRANSFERHISTORY(Base):
     __tablename__ = 'TRANSFER_HISTORY'
+    __table_args__ = (
+        # 转移历史按 DATE 倒序读取，原先无索引导致全表扫描加排序。
+        Index('INDX_TRANSFER_HISTORY_DATE', 'DATE'),
+    )
 
     ID = Column(Integer, Sequence('ID'), primary_key=True)
     MODE = Column(Text)
@@ -602,6 +606,12 @@ class SUBTITLETASK(Base):
         Index('INDX_SUBTITLE_TASK_STATUS_CREATED', 'STATUS', 'CREATED_AT'),
         Index('INDX_SUBTITLE_TASK_DEDUPE', 'OWNER', 'TYPE', 'DEDUPE_KEY'),
         Index('INDX_SUBTITLE_TASK_SCOPE', 'TYPE', 'SCOPE_KEY', 'STATUS'),
+        # 任务列表按 CREATED_AT 排序、历史清理按 FINISHED_AT 排序并裁剪，
+        # 两者原先都退化为全表扫描加排序。
+        Index('INDX_SUBTITLE_TASK_CREATED', 'CREATED_AT'),
+        Index('INDX_SUBTITLE_TASK_FINISHED', 'FINISHED_AT'),
+        # 队列领取与列表排队位次按 PRIORITY/CREATED_AT/ID 排序。
+        Index('INDX_SUBTITLE_TASK_QUEUE', 'TYPE', 'STATUS', 'PRIORITY', 'CREATED_AT'),
     )
 
     ID = Column(Text, primary_key=True)
@@ -676,6 +686,8 @@ class SUBTITLEPROBECACHE(Base):
     __table_args__ = (
         UniqueConstraint('SERVER', 'PATH', name='UN_SUBTITLE_PROBE_CACHE_PATH'),
         Index('INDX_SUBTITLE_PROBE_CACHE_UPDATED', 'UPDATED_AT'),
+        # 失效路径时按 PAIR_PATH 反查，原先无索引导致整表扫描。
+        Index('INDX_SUBTITLE_PROBE_CACHE_PAIR', 'PAIR_PATH'),
     )
 
     ID = Column(Integer, Sequence('ID'), primary_key=True)
@@ -706,6 +718,9 @@ class SUBTITLEAUDITSTATE(Base):
         Index('INDX_SUBTITLE_AUDIT_STATE_SERVER_UPDATED', 'SERVER', 'UPDATED_AT'),
         Index('INDX_SUBTITLE_AUDIT_STATE_SERVER_PATH_UPDATED',
               'SERVER', 'SUBTITLE_PATH', 'UPDATED_AT'),
+        # 现有索引均以 SERVER/SCOPE_KEY 前导，按 SUBTITLE_PATH 单独失效路径
+        # 时无法命中，只能整表扫描。
+        Index('INDX_SUBTITLE_AUDIT_STATE_PATH', 'SUBTITLE_PATH'),
     )
 
     ID = Column(Integer, Sequence('ID'), primary_key=True)

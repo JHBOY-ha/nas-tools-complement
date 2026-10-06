@@ -1,7 +1,9 @@
+@import url("action-tasks/scrollbars.css");
 html {
     --safe-area-inset-top: 0px;
     min-height: calc(100% + env(safe-area-inset-top)  + var(--safe-area-inset-top));
 }
+
 
 body, .page {
     min-height: 100%;

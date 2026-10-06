@@ -5,6 +5,7 @@ import re
 import shutil
 import traceback
 import uuid
+from contextlib import contextmanager
 from enum import Enum
 from threading import Lock
 from time import sleep
@@ -23,10 +24,40 @@ from app.subtitle import Subtitle
 from app.utils import EpisodeFormat, PathUtils, StringUtils, SystemUtils, ExceptionUtils
 from app.utils.types import MediaType, SyncType, RmtMode
 from app.utils.security_utils import compile_ignore_pattern
+from app.utils.workload import get_transfer_gate, TaskQueueFull
+from app.utils.isolated_io import isolated_stat
 from config import RMT_SUBEXT, RMT_MEDIAEXT, RMT_FAVTYPE, RMT_MIN_FILESIZE, DEFAULT_MOVIE_FORMAT, \
     DEFAULT_TV_FORMAT, Config
 
-lock = Lock()
+# 转移操作原先由一把全局锁串行化，导致一次大文件复制、或一次挂起的 rclone/mc
+# 云端传输，会阻塞所有转移任务（定时转移、目录同步、手工转移一起停摆）。
+# 改为按目标路径加锁：同一目标的并发转移仍然互斥，不同文件则可并行，既保留
+# 竞态保护又消除全局排队。条目在无人等待时移除，不会长期增长。
+_target_locks = {}
+_target_locks_guard = Lock()
+
+
+@contextmanager
+def _transfer_lock(target_file):
+    """
+    按目标路径加锁，替代原先的全局锁
+    """
+    key = os.path.normcase(os.path.abspath(str(target_file)))
+    with _target_locks_guard:
+        entry = _target_locks.get(key)
+        if entry is None:
+            entry = [Lock(), 0]
+            _target_locks[key] = entry
+        entry[1] += 1
+    entry[0].acquire()
+    try:
+        yield
+    finally:
+        entry[0].release()
+        with _target_locks_guard:
+            entry[1] -= 1
+            if entry[1] <= 0 and _target_locks.get(key) is entry:
+                _target_locks.pop(key, None)
 
 
 class FileTransfer:
@@ -164,10 +195,12 @@ class FileTransfer:
         :param target_file: 目标文件路径
         :param rmt_mode: RmtMode转移方式
         """
-        with lock:
+        # Target ownership remains exclusive; distinct targets share a small
+        # FIFO I/O budget instead of starting unlimited large-file transfers.
+        with _transfer_lock(target_file), get_transfer_gate().slot():
             if rmt_mode == RmtMode.LINK:
                 # 更链接
-                if os.stat(file_item).st_dev != os.stat(os.path.dirname(target_file)).st_dev:
+                if isolated_stat(file_item).st_dev != isolated_stat(os.path.dirname(target_file)).st_dev:
                     log.error("【Rmt】硬链接源文件与目标目录不在同一文件系统")
                     return -1
                 retcode, retmsg = SystemUtils.link(file_item, target_file)
@@ -985,7 +1018,12 @@ class FileTransfer:
             self.mediaserver.refresh_library_by_items(refresh_library_items)
         # 启新进程下载字幕
         if download_subtitle_items:
-            self.threadhelper.start_thread(Subtitle().download_subtitle, (download_subtitle_items,))
+            try:
+                self.threadhelper.start_thread(Subtitle().download_subtitle, (download_subtitle_items,))
+            except TaskQueueFull:
+                # Media has already been published. Optional subtitle admission
+                # must not turn that successful transfer into a failed retry.
+                log.warn("【Rmt】字幕下载队列繁忙，媒体转移已完成，可稍后补下载字幕")
         # 总结
         log.info("【Rmt】%s 处理完成，总数：%s，失败：%s" % (in_path, total_count, failed_count))
         if alert_count > 0:

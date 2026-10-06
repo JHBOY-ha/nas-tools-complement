@@ -1,25 +1,29 @@
 import base64
 import datetime
+import io
 import os.path
 import re
 import shutil
+import socket
+import stat
 import sqlite3
 import tempfile
 import time
 import traceback
 import urllib
+import uuid
 import xml.dom.minidom
 from functools import wraps
 from math import floor
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Timer, Event
 from urllib import parse
 
-from flask import Flask, request, json, render_template, make_response, session, send_from_directory, send_file
+from flask import Flask, request, json, render_template, make_response, session, send_from_directory, send_file, g
 from flask.wrappers import Request as FlaskRequest
 from flask_compress import Compress
 from flask_login import LoginManager, login_user, login_required, current_user
-from werkzeug.exceptions import RequestEntityTooLarge
+from werkzeug.exceptions import RequestEntityTooLarge, RequestTimeout
 from werkzeug.http import parse_options_header
 
 import log
@@ -42,6 +46,8 @@ from app.subtitle import Subtitle
 from app.torrentremover import TorrentRemover
 from app.utils import DomUtils, SystemUtils, ExceptionUtils, StringUtils, PathUtils
 from app.utils.types import *
+from app.utils.workload import TaskQueueFull
+from app.utils.isolated_fs import IsolatedFile, fs_os
 from config import PT_TRANSFER_INTERVAL, Config, RMT_MEDIAEXT
 from web.action import WebAction
 from web.apiv1 import apiv1_bp
@@ -63,6 +69,9 @@ _SUBTITLE_UPLOAD_MULTIPART_BUFFER = 128 * 1024
 _SUBTITLE_UPLOAD_MAX_FIELD_BYTES = 64 * 1024
 _SUBTITLE_UPLOAD_MAX_PARTS = 64
 _SUBTITLE_UPLOAD_MAX_FILE_PARTS = 40
+# A wall-clock timer interrupts the server socket, including trickle traffic
+# that can repeatedly reset a per-read timeout.
+_SUBTITLE_UPLOAD_BODY_TIMEOUT_SECONDS = 120
 
 
 class _MultipartPartLimitStream:
@@ -222,6 +231,66 @@ class _NasToolsRequest(FlaskRequest):
     def _is_subtitle_upload(self):
         return self.path.rstrip("/") == "/subtitle/upload"
 
+    def _apply_body_read_timeout(self):
+        """Bound how long the client may take to send the multipart body.
+
+        Touch only the server's socket. A live stream that cannot be
+        interrupted is rejected instead of silently disabling the deadline.
+        Returns a callable that restores the previous timeout.
+        """
+        sock = self.environ.get("werkzeug.socket")
+        self._subtitle_body_expired = Event()
+        if sock is None:
+            raw = self.environ.get('wsgi.input')
+            raw = getattr(raw, '_stream', raw)
+            if type(raw) is io.BytesIO:
+                return lambda: None
+            if isinstance(raw, io.IOBase):
+                try:
+                    # EnvironBuilder and buffering gateways may supply a
+                    # completed regular file, never a live client connection.
+                    if stat.S_ISREG(os.fstat(raw.fileno()).st_mode):
+                        return lambda: None
+                except (OSError, io.UnsupportedOperation):
+                    pass
+            raise RequestTimeout('当前 WSGI 服务未提供可中断的上传连接，请使用受支持的服务配置')
+        try:
+            previous = sock.gettimeout()
+            sock.settimeout(_SUBTITLE_UPLOAD_BODY_TIMEOUT_SECONDS)
+        except (OSError, AttributeError):
+            raise RequestTimeout('无法设置上传读取总时限') from None
+
+        deadline_lock = Lock()
+        deadline_active = True
+
+        def expire():
+            with deadline_lock:
+                if not deadline_active:
+                    return
+                self._subtitle_body_expired.set()
+                try:
+                    sock.shutdown(socket.SHUT_RD)
+                except (OSError, AttributeError):
+                    pass
+
+        timer = Timer(_SUBTITLE_UPLOAD_BODY_TIMEOUT_SECONDS, expire)
+        timer.daemon = True
+        timer.start()
+
+        def restore():
+            nonlocal deadline_active
+            # cancel() alone cannot stop a callback that already started. Close
+            # the deadline under its lock before returning this socket to WSGI.
+            with deadline_lock:
+                deadline_active = False
+            timer.cancel()
+            try:
+                sock.settimeout(previous)
+            except (OSError, AttributeError):
+                pass
+
+        return restore
+
     def _load_form_data(self):
         is_subtitle_upload = self._is_subtitle_upload()
         if is_subtitle_upload:
@@ -254,7 +323,23 @@ class _NasToolsRequest(FlaskRequest):
                         _SUBTITLE_UPLOAD_HTTP_LIMIT
                     )
                 )
-        result = super()._load_form_data()
+        restore_timeout = self._apply_body_read_timeout() if is_subtitle_upload else None
+        try:
+            result = super()._load_form_data()
+            if is_subtitle_upload and self._subtitle_body_expired.is_set():
+                raise RequestTimeout('字幕上传超过总时限')
+        except (socket.timeout, TimeoutError):
+            raise RequestTimeout("字幕上传读取超时，客户端可能已停止发送数据")
+        except Exception:
+            if is_subtitle_upload and self._subtitle_body_expired.is_set():
+                raise RequestTimeout('字幕上传超过总时限') from None
+            raise
+        finally:
+            if restore_timeout is not None:
+                restore_timeout()
+        # Expiry can win the lock after parsing's first check but before restore.
+        if is_subtitle_upload and self._subtitle_body_expired.is_set():
+            raise RequestTimeout('字幕上传超过总时限')
         if is_subtitle_upload:
             # The multipart decoder's memory option protects its rolling
             # buffer, not submitted field values.  Bound all non-file fields
@@ -287,12 +372,17 @@ class _NasToolsRequest(FlaskRequest):
             self._subtitle_upload_file_parts = part_count
             if part_count > _SUBTITLE_UPLOAD_MAX_FILE_PARTS:
                 raise RequestEntityTooLarge("字幕上传文件组件超过 40 个")
-            incoming_root = os.path.join(Config().get_temp_path(), "subtitle-upload-incoming")
-            os.makedirs(incoming_root, exist_ok=True)
-            stream = tempfile.NamedTemporaryFile(
-                mode="w+b", prefix="subtitle-http-", suffix=".upload",
-                dir=incoming_root, delete=False
-            )
+            manager = getattr(self, '_subtitle_admission_manager', None)
+            incoming_root = getattr(manager, '_incoming_root', None)
+            if not isinstance(incoming_root, str):
+                incoming_root = os.path.join(Config().get_temp_path(), 'subtitle-upload-incoming')
+            fs_os.makedirs(incoming_root, exist_ok=True)
+            path = os.path.join(incoming_root, 'subtitle-http-%s.upload' % uuid.uuid4().hex)
+            # Inode-bound writes happen in bounded workers, while every actual
+            # file byte is charged to this request's ingress reservation.
+            stream = IsolatedFile(path, 'x+b', on_write=getattr(manager, 'account_upload_write', None))
+            if manager is not None:
+                manager.register_upload_stream(path)
             paths = getattr(self, "_subtitle_upload_temp_paths", None)
             if paths is None:
                 paths = []
@@ -322,8 +412,8 @@ class _NasToolsRequest(FlaskRequest):
                     pass
             for path in getattr(self, "_subtitle_upload_temp_paths", []):
                 try:
-                    if os.path.isfile(path):
-                        os.remove(path)
+                    if fs_os.path.isfile(path):
+                        fs_os.remove(path)
                 except OSError:
                     pass
 
@@ -333,6 +423,22 @@ App.request_class = _NasToolsRequest
 App.config['JSON_AS_ASCII'] = False
 App.secret_key = os.urandom(24)
 App.permanent_session_lifetime = datetime.timedelta(days=30)
+
+
+@App.teardown_appcontext
+def _release_db_session(error=None):
+    """
+    请求结束时归还数据库连接
+
+    werkzeug 每个请求一个新线程，而只读查询同样会签出连接并持有到事务结束；
+    不在此归还的话，每个请求线程都会泄漏一条连接，直到连接池耗尽。
+    """
+    from app.db.session_scope import release_db_connections
+    try:
+        release_db_connections()
+    except Exception as err:
+        log.error("【Db】请求结束归还数据库连接失败：%s" % str(err))
+    return False
 
 # 启用压缩
 Compress(App)
@@ -363,6 +469,9 @@ def add_header(r):
     r.headers["Pragma"] = "no-cache"
     r.headers["Expires"] = "0"
     """
+    # Acceptance is distinct from completion for browser and REST callers alike.
+    if getattr(g, 'action_task_accepted', False) and r.status_code == 200:
+        r.status_code = 202
     return r
 
 
@@ -1924,6 +2033,19 @@ def wechat():
             return make_response("ok", 200)
 
 
+def _queue_media_webhook(event_action, limit_action, payload):
+    """Reserve both callbacks together in the interactive queue before ack."""
+    try:
+        ThreadHelper().start_threads([
+            (event_action, (payload,)), (limit_action, (payload,))
+        ], pool='interactive')
+    except TaskQueueFull as error:
+        # A retriable response prevents silently losing half of a paired event
+        # when background traffic has exhausted admission capacity.
+        return str(error), 503, {'Retry-After': '5'}
+    return 'Ok'
+
+
 # Plex Webhook
 @App.route('/plex', methods=['POST'])
 def plex_webhook():
@@ -1932,9 +2054,8 @@ def plex_webhook():
         return '不允许的IP地址请求'
     request_json = json.loads(request.form.get('payload', {}))
     log.debug("收到Plex Webhook报文：%s" % str(request_json))
-    ThreadHelper().start_thread(WebhookEvent().plex_action, (request_json,))
-    ThreadHelper().start_thread(SpeedLimiter().plex_action, (request_json,))
-    return 'Ok'
+    return _queue_media_webhook(WebhookEvent().plex_action,
+                                SpeedLimiter().plex_action, request_json)
 
 
 # Jellyfin Webhook
@@ -1945,9 +2066,8 @@ def jellyfin_webhook():
         return '不允许的IP地址请求'
     request_json = request.get_json()
     log.debug("收到Jellyfin Webhook报文：%s" % str(request_json))
-    ThreadHelper().start_thread(WebhookEvent().jellyfin_action, (request_json,))
-    ThreadHelper().start_thread(SpeedLimiter().jellyfin_action, (request_json,))
-    return 'Ok'
+    return _queue_media_webhook(WebhookEvent().jellyfin_action,
+                                SpeedLimiter().jellyfin_action, request_json)
 
 
 @App.route('/emby', methods=['POST'])
@@ -1958,9 +2078,8 @@ def emby_webhook():
         return '不允许的IP地址请求'
     request_json = json.loads(request.form.get('data', {}))
     log.debug("收到Emby Webhook报文：%s" % str(request_json))
-    ThreadHelper().start_thread(WebhookEvent().emby_action, (request_json,))
-    ThreadHelper().start_thread(SpeedLimiter().emby_action, (request_json,))
-    return 'Ok'
+    return _queue_media_webhook(WebhookEvent().emby_action,
+                                SpeedLimiter().emby_action, request_json)
 
 
 # Telegram消息响应
@@ -2610,6 +2729,7 @@ def upload_subtitle():
         manager = _subtitle_tasks()
         manager.acquire_upload_admission(request.content_length)
         admission_acquired = True
+        request._subtitle_admission_manager = manager
         policy = manager.get_settings()
         batch_body_limit = (
             max(int(policy.get("batch_limit_mb") or 250), 1) * 1024 * 1024

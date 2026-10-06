@@ -213,16 +213,16 @@ class SubtitleDatabasePerformanceTest(TestCase):
         raw_dir = os.path.join(self.temp.name, 'raw'); os.makedirs(raw_dir)
         file = _File('sample.sub', b'x' * (8 * 1024 * 1024))
         with patch('app.helper.subtitle_tasks.time.monotonic', return_value=0), \
-                patch('app.helper.subtitle_tasks.shutil.disk_usage', return_value=SimpleNamespace(free=reserve + 100*1024*1024)) as usage:
+                patch('app.helper.subtitle_tasks.isolated_disk_usage', return_value=SimpleNamespace(free=reserve + 100*1024*1024)) as usage:
             self.manager._spool_files([file], raw_dir, policy)
             self.assertEqual(usage.call_count, 2)
         # A constant sampled value must not let successive writes spend the same free bytes.
         with patch('app.helper.subtitle_tasks.time.monotonic', return_value=0), \
-                patch('app.helper.subtitle_tasks.shutil.disk_usage', return_value=SimpleNamespace(free=reserve + 10*1024*1024)) as usage:
+                patch('app.helper.subtitle_tasks.isolated_disk_usage', return_value=SimpleNamespace(free=reserve + 10*1024*1024)) as usage:
             with self.assertRaises(TaskStorageInsufficient):
                 self.manager._spool_files([file], raw_dir, policy)
             self.assertEqual(usage.call_count, 1)
-        with patch('app.helper.subtitle_tasks.shutil.disk_usage', side_effect=[SimpleNamespace(free=10**12), SimpleNamespace(free=0)]):
+        with patch('app.helper.subtitle_tasks.isolated_disk_usage', side_effect=[SimpleNamespace(free=10**12), SimpleNamespace(free=0)]):
             with self.assertRaises(TaskStorageInsufficient):
                 self.manager._spool_files([_File('sample.srt', SRT)], raw_dir, policy)
 
@@ -255,17 +255,21 @@ class SubtitleFilePerformanceTest(TestCase):
 
             calls.clear()
 
-            class PublishingLock(Lock):
-                def __enter__(self):
-                    super().__enter__()
-                    # Simulate another request publishing while this one waits.
+            identity_calls = []
+            def changed_identity(_path):
+                identity_calls.append(_path)
+                # Claims now precede preflight. Inject the publication race
+                # after preflight rather than before its snapshot is captured.
+                if len(identity_calls) == 2:
                     service._opensubtitles_publication_generation += 1
+                return (1, 2, 3, 4, 5)
 
             with patch.object(service, 'opensubtitles', SimpleNamespace(languages=['zh-cn'])), \
-                    patch.object(service, '_opensubtitles_lock', PublishingLock()), \
+                    patch.object(service, '_opensubtitles_lock', Lock()), \
+                    patch.object(service.__class__, '_Subtitle__opensubtitles_path_identity', side_effect=changed_identity), \
                     patch.object(service.__class__, '_Subtitle__existing_opensubtitles_target', side_effect=existing):
                 self.assertTrue(service._Subtitle__download_opensubtitles_item(item)[0])
-                self.assertEqual(calls, [False, True])
+                self.assertEqual(calls, [False, False], 'Race rechecks must also keep NAS I/O outside the shared lock')
 
     def test_repair_hash_guard_detects_in_place_changes_with_preserved_mtime(self):
         # Digest propagation must not replace the checks before old-source deletion.

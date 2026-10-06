@@ -219,6 +219,24 @@ class ServiceNetworkTest(ClientResource):
         return WebAction().api_action(cmd='net_test', data=self.parser.parse_args().get("url"))
 
 
+@service.route('/task/<string:task_id>')
+class ServiceActionTask(ApiResource):
+    """Read/cancel owned action state under the original command's permission."""
+    def get(self, task_id):
+        return WebAction().api_action(cmd='get_action_task', data={'task_id': task_id})
+
+    def delete(self, task_id):
+        # Cancellation only removes queued work; running filesystem mutations
+        # are never advertised as safely interruptible or automatically replayed.
+        return WebAction().api_action(cmd='cancel_action_task', data={'task_id': task_id})
+
+
+@service.route('/tasks')
+class ServiceActionTasks(ApiResource):
+    def get(self):
+        return WebAction().api_action(cmd='get_action_tasks', data={})
+
+
 @service.route('/run')
 class ServiceRun(ClientResource):
     parser = reqparse.RequestParser()

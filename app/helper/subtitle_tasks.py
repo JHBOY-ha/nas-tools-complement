@@ -2,9 +2,7 @@ import datetime
 import errno
 import hashlib
 import json
-import os
 import re
-import shutil
 import stat
 import threading
 import time
@@ -16,6 +14,9 @@ from sqlalchemy import and_, func, or_, text as sql_text
 
 import log
 from app.db.main_db import MainDb
+from app.db.session_scope import release_db_connections
+from app.utils.isolated_fs import fs_os as os, isolated_open as open
+from app.utils.isolated_io import isolated_disk_usage, isolated_hash, isolated_remove_tree, get_io_pool
 from app.helper.subtitle_media_status import upsert_subtitle_rows
 from app.db.models import (
     SUBTITLEAUDITSTATE,
@@ -38,8 +39,10 @@ DEFAULT_POLICY = {
     "text_file_limit_mb": 20,
     "vobsub_limit_mb": 200,
     "batch_limit_mb": 250,
-    "staging_quota_mb": 2048,
-    "reserve_free_mb": 1024,
+    # Keep at least six times the 250 MiB batch ceiling while reducing the
+    # default staging footprint and doubling the volume's free-space margin.
+    "staging_quota_mb": 1536,
+    "reserve_free_mb": 2048,
     "max_batch_items": 20,
     "season_max_batch_items": 100,
     "llm_max_batch_items": 5,
@@ -166,6 +169,9 @@ class SubtitleTaskManager:
             os.path.abspath(self._staging_root), ".cleanup-markers"
         )
         self._lock = threading.RLock()
+        # Serialises cold-start only, so _submit_lock can be taken outside
+        # _lock and the lock order stays _submit_lock -> _lock everywhere.
+        self._start_lock = threading.Lock()
         # Re-entrant because the HTTP admission lease spans multipart parsing
         # and the definitive submit_upload transaction on the same thread.
         self._submit_lock = threading.RLock()
@@ -183,6 +189,10 @@ class SubtitleTaskManager:
         self._processors = {}
         self._progress_last = {}
         self._spooling_ids = set()
+        # Multipart ingress uses leases, never a lock held while reading a client.
+        self._admissions = {}
+        self._admission_local = threading.local()
+        self._owner_submit_locks = {}
         self._audit_snapshot_cache = {}
         self._last_persistent_cache_cleanup = 0
         self._last_cleanup = None
@@ -209,58 +219,65 @@ class SubtitleTaskManager:
     register_handler = register_processor
 
     def start(self):
-        with self._lock:
-            if self._started:
-                if not self._stop.is_set():
-                    return self
-                if self._background_threads_alive():
-                    raise SubtitleTaskError("字幕任务中心正在停止，请稍后重试")
-                self._started = False
-            self._db.init_db()
-            self._ensure_schema_columns()
-            os.makedirs(self._staging_root, exist_ok=True)
-            os.makedirs(self._cleanup_marker_root, exist_ok=True)
+        # Cold start is serialised by its own lock so that the ingress lease can
+        # be taken outside _lock.  submit_upload orders the pair as
+        # _submit_lock -> _lock; taking _submit_lock while holding _lock here
+        # would be the reverse and could deadlock (ABBA).
+        with self._start_lock:
+            with self._lock:
+                if self._started:
+                    if not self._stop.is_set():
+                        return self
+                    if self._background_threads_alive():
+                        raise SubtitleTaskError("字幕任务中心正在停止，请稍后重试")
+                    self._started = False
             os.makedirs(self._incoming_root, exist_ok=True)
             # No parser can be active while the cold-start manager owns the
             # ingress lease.  Remove every crash-left flat spool before quota
             # admission opens; periodic cleanup remains age-gated.
             with self._submit_lock:
                 self._cleanup_incoming_files(remove_all=True)
-            self._recover_tasks()
-            self._migrate_legacy_audit_history()
-            self.cleanup()
-            self._stop.clear()
-            self._started = True
-            self._worker = threading.Thread(
-                target=self._interactive_worker,
-                name="subtitle-task-worker",
-                daemon=True
-            )
-            self._heartbeat_worker = threading.Thread(
-                target=self._heartbeat_loop,
-                name="subtitle-task-heartbeat",
-                daemon=True
-            )
-            self._audit_worker = self._new_audit_worker()
-            try:
-                # Start the persistent audit worker first.  If the runtime
-                # cannot create it, no request can subsequently commit an
-                # audit row that has no dispatcher.
-                self._audit_worker.start()
-                self._worker.start()
-                self._heartbeat_worker.start()
-            except Exception as error:
-                self._stop.set()
+            with self._lock:
+                self._db.init_db()
+                self._ensure_schema_columns()
+                os.makedirs(self._staging_root, exist_ok=True)
+                os.makedirs(self._cleanup_marker_root, exist_ok=True)
+                os.makedirs(self._incoming_root, exist_ok=True)
+                self._recover_tasks()
+                self._migrate_legacy_audit_history()
+                self.cleanup()
+                self._stop.clear()
+                self._started = True
+                self._worker = threading.Thread(
+                    target=self._interactive_worker,
+                    name="subtitle-task-worker",
+                    daemon=True
+                )
+                self._heartbeat_worker = threading.Thread(
+                    target=self._heartbeat_loop,
+                    name="subtitle-task-heartbeat",
+                    daemon=True
+                )
+                self._audit_worker = self._new_audit_worker()
+                try:
+                    # Start the persistent audit worker first.  If the runtime
+                    # cannot create it, no request can subsequently commit an
+                    # audit row that has no dispatcher.
+                    self._audit_worker.start()
+                    self._worker.start()
+                    self._heartbeat_worker.start()
+                except Exception as error:
+                    self._stop.set()
+                    self._wake.set()
+                    self._audit_wake.set()
+                    self._started = self._background_threads_alive()
+                    if not self._started:
+                        self._worker = None
+                        self._heartbeat_worker = None
+                        self._audit_worker = None
+                    raise SubtitleTaskError(f"字幕任务后台线程启动失败：{str(error)}")
                 self._wake.set()
                 self._audit_wake.set()
-                self._started = self._background_threads_alive()
-                if not self._started:
-                    self._worker = None
-                    self._heartbeat_worker = None
-                    self._audit_worker = None
-                raise SubtitleTaskError(f"字幕任务后台线程启动失败：{str(error)}")
-            self._wake.set()
-            self._audit_wake.set()
         return self
 
     def _ensure_schema_columns(self):
@@ -290,6 +307,27 @@ class SubtitleTaskManager:
             self._db.session.execute(sql_text(
                 "CREATE INDEX IF NOT EXISTS INDX_SUBTITLE_AUDIT_STATE_SERVER_PATH_UPDATED "
                 "ON SUBTITLE_AUDIT_STATE (SERVER, SUBTITLE_PATH, UPDATED_AT)"
+            ))
+            # 现有索引都以 SERVER/SCOPE_KEY 前导，仅按路径失效审计状态无法命中。
+            self._db.session.execute(sql_text(
+                "CREATE INDEX IF NOT EXISTS INDX_SUBTITLE_AUDIT_STATE_PATH "
+                "ON SUBTITLE_AUDIT_STATE (SUBTITLE_PATH)"
+            ))
+            self._db.session.execute(sql_text(
+                "CREATE INDEX IF NOT EXISTS INDX_SUBTITLE_PROBE_CACHE_PAIR "
+                "ON SUBTITLE_PROBE_CACHE (PAIR_PATH)"
+            ))
+            self._db.session.execute(sql_text(
+                "CREATE INDEX IF NOT EXISTS INDX_SUBTITLE_TASK_CREATED "
+                "ON SUBTITLE_TASK (CREATED_AT)"
+            ))
+            self._db.session.execute(sql_text(
+                "CREATE INDEX IF NOT EXISTS INDX_SUBTITLE_TASK_FINISHED "
+                "ON SUBTITLE_TASK (FINISHED_AT)"
+            ))
+            self._db.session.execute(sql_text(
+                "CREATE INDEX IF NOT EXISTS INDX_SUBTITLE_TASK_QUEUE "
+                "ON SUBTITLE_TASK (TYPE, STATUS, PRIORITY, CREATED_AT)"
             ))
             self._db.commit()
         except Exception:
@@ -448,7 +486,7 @@ class SubtitleTaskManager:
         """Reject a staging quota that cannot fit on the configured volume."""
         try:
             os.makedirs(self._staging_root, exist_ok=True)
-            usage = shutil.disk_usage(self._staging_root)
+            usage = isolated_disk_usage(self._staging_root)
         except OSError as error:
             raise TaskStorageInsufficient(f"无法读取字幕暂存卷容量：{str(error)}")
         quota = int(policy["staging_quota_mb"]) * 1024 * 1024
@@ -548,6 +586,58 @@ class SubtitleTaskManager:
         return result, False
 
     def submit_upload(self, owner, files, payload, request_id=None, server=None):
+        """Bind direct callers to a reservation; HTTP callers keep their ingress lease."""
+        files = list(files or [])
+        if not files:
+            raise SubtitleTaskError("请选择字幕文件")
+        created = not getattr(self._admission_local, 'token', None)
+        token = None
+        if created:
+            sizes = []
+            incoming_paths = []
+            for item in files:
+                stream = getattr(item, 'stream', item)
+                if hasattr(stream, 'getbuffer'):
+                    sizes.append(len(stream.getbuffer()))
+                elif hasattr(stream, '_size'):
+                    sizes.append(stream._size)
+                else:
+                    trusted = self._trusted_incoming_path(stream)
+                    if trusted:
+                        sizes.append(os.stat(trusted).st_size)
+                        incoming_paths.append(trusted)
+                    else:
+                        sizes = []
+                        break
+            announced = sum(sizes) if sizes else None
+            mode = str((payload or {}).get('align_mode') or (payload or {}).get('align') or 'none').lower()
+            factor = _ALIGN_STAGING_FACTOR if mode in ('auto', 'offset', 'segmented', 'llm') else _STANDARD_STAGING_FACTOR
+            token = self.acquire_upload_admission(announced, incoming_paths=incoming_paths,
+                                                   reserve_factor=factor)
+        try:
+            return self._submit_upload_with_lease(owner, files, payload, request_id, server)
+        finally:
+            if created:
+                self.release_upload_admission(token)
+
+    @contextmanager
+    def _owner_submission(self, owner):
+        # Same-owner deduplication remains serialized, but another user's body
+        # and final spooling cannot be pinned behind this submission's I/O.
+        key = str(owner or '')
+        with self._lock:
+            entry = self._owner_submit_locks.setdefault(key, [threading.RLock(), 0])
+            entry[1] += 1
+        try:
+            with entry[0]:
+                yield
+        finally:
+            with self._lock:
+                entry[1] -= 1
+                if not entry[1]:
+                    self._owner_submit_locks.pop(key, None)
+
+    def _submit_upload_with_lease(self, owner, files, payload, request_id=None, server=None):
         self.start()
         owner = str(owner or "")
         files = list(files or [])
@@ -556,7 +646,7 @@ class SubtitleTaskManager:
         server = str(server or payload.get("server") or "").strip().lower()
         if not files:
             raise SubtitleTaskError("请选择字幕文件")
-        with self._submit_lock:
+        with self._owner_submission(owner):
             with self._lock:
                 if request_id:
                     prior = self._db.query(SUBTITLETASK).filter(
@@ -566,12 +656,13 @@ class SubtitleTaskManager:
                     ).order_by(SUBTITLETASK.CREATED_AT.desc()).first()
                     if prior:
                         return self._task_dict(prior, include_result=True, include_items=True), True
-                self._ensure_queue_capacity()
+                self._ensure_queue_capacity(exclude_token=getattr(self._admission_local, 'token', None))
                 policy = self.get_settings()
             task_id = str(uuid.uuid4())
             staging_dir = os.path.join(self._staging_root, task_id)
             raw_dir = os.path.join(staging_dir, "raw")
-            self._spooling_ids.add(task_id)
+            with self._lock:
+                self._spooling_ids.add(task_id)
             try:
                 os.makedirs(raw_dir, exist_ok=False)
                 reserve_factor = _ALIGN_STAGING_FACTOR \
@@ -580,20 +671,14 @@ class SubtitleTaskManager:
                     else _STANDARD_STAGING_FACTOR
                 existing_reserved, existing_future_reserved = \
                     self._active_staging_reservation_totals()
+                with self._lock:
+                    other_reserved = self._admission_reserved(exclude_token=getattr(self._admission_local, 'token', None))
+                existing_reserved += other_reserved
+                existing_future_reserved += other_reserved
                 incoming_total = self._incoming_spool_bytes()
-                current_incoming = 0
-                for upload_file in files:
-                    stream = getattr(upload_file, "stream", upload_file)
-                    incoming_path = self._trusted_incoming_path(stream)
-                    if incoming_path:
-                        try:
-                            current_incoming += os.path.getsize(incoming_path)
-                        except OSError:
-                            pass
-                # The current request is accounted by total_bytes * factor as
-                # it is adopted.  Only unrelated crash leftovers augment the
-                # existing quota reservation here.
-                existing_reserved += max(incoming_total - current_incoming, 0)
+                # Live ingress paths are excluded by the scanner and charged
+                # through leases; this result contains only crash leftovers.
+                existing_reserved += incoming_total + self._orphan_staging_bytes()
                 components, total_bytes = self._spool_files(
                     files, raw_dir, policy,
                     existing_reserved=existing_reserved,
@@ -645,16 +730,25 @@ class SubtitleTaskManager:
                 with self._lock:
                     reusable = self._find_reusable(owner, "upload", request_id, dedupe_key)
                     if reusable:
-                        self._remove_tree(staging_dir)
-                        return self._task_dict(reusable, include_result=True, include_items=True), True
-                    self._ensure_queue_capacity()
-                    if canonical_media:
-                        self._check_target_capacity(
-                            os.path.dirname(os.path.abspath(canonical_media)),
-                            payload.get("target_volume_key"),
-                            additional_bytes=payload.get("target_reserved_bytes") or 0,
-                            reserve_bytes=policy["reserve_free_mb"] * 1024 * 1024
+                        reusable_result = self._task_dict(
+                            reusable, include_result=True, include_items=True
                         )
+                    else:
+                        reusable_result = None
+                        self._ensure_queue_capacity(exclude_token=getattr(self._admission_local, 'token', None))
+                if reusable_result is not None:
+                    # 暂存删除是 NAS I/O，放在锁外。
+                    self._remove_tree(staging_dir)
+                    return reusable_result, True
+                # 目标卷容量检查含 statvfs 与逐活动任务 stat，放在锁外。
+                if canonical_media:
+                    self._check_target_capacity(
+                        os.path.dirname(os.path.abspath(canonical_media)),
+                        payload.get("target_volume_key"),
+                        additional_bytes=payload.get("target_reserved_bytes") or 0,
+                        reserve_bytes=policy["reserve_free_mb"] * 1024 * 1024
+                    )
+                with self._lock:
                     row = SUBTITLETASK(
                         ID=task_id,
                         TYPE="upload",
@@ -707,6 +801,9 @@ class SubtitleTaskManager:
                             UPDATED_AT=now
                         ))
                     self._db.commit()
+                    lease = self._admissions.get(getattr(self._admission_local, 'token', None))
+                    if lease:
+                        lease['submitted'] = True
                     result = self._task_dict(row, include_result=True, include_items=True)
                 self._wake.set()
                 return result, False
@@ -724,7 +821,8 @@ class SubtitleTaskManager:
                 self._remove_tree(staging_dir)
                 raise
             finally:
-                self._spooling_ids.discard(task_id)
+                with self._lock:
+                    self._spooling_ids.discard(task_id)
 
     def ensure_upload_admission(self, content_length=None):
         """Fail fast before Flask parses a multipart upload when resources are full.
@@ -734,54 +832,101 @@ class SubtitleTaskManager:
         guard prevents the common queue-full or exhausted-volume case from
         first consuming the complete HTTP body and a temporary file.
         """
+        token = self.acquire_upload_admission(content_length)
+        self.release_upload_admission(token)
+
+    def acquire_upload_admission(self, content_length=None, *, incoming_paths=None,
+                                 reserve_factor=_ALIGN_STAGING_FACTOR):
+        """Reserve queue/space under a short lock, then validate the volume outside it."""
         self.start()
-        with self._submit_lock:
-            self._ensure_upload_admission_locked(content_length)
-
-    def acquire_upload_admission(self, content_length=None):
-        """Hold the single multipart ingress slot through task submission."""
-        self.start()
-        self._submit_lock.acquire()
-        try:
-            self._ensure_upload_admission_locked(content_length)
-        except Exception:
-            self._submit_lock.release()
-            raise
-
-    def release_upload_admission(self):
-        self._submit_lock.release()
-
-    def _ensure_upload_admission_locked(self, content_length=None):
+        token = getattr(self._admission_local, 'token', None)
         with self._lock:
-            self._ensure_queue_capacity()
             policy = self.get_settings()
-            reserved, future_reserved = self._active_staging_reservation_totals()
-            reserved += self._incoming_spool_bytes()
-        quota = int(policy["staging_quota_mb"]) * 1024 * 1024
-        reserve = int(policy["reserve_free_mb"]) * 1024 * 1024
-        batch_limit = int(policy["batch_limit_mb"]) * 1024 * 1024
+            batch = int(policy['batch_limit_mb']) * 1024 * 1024
+            try:
+                announced = int(content_length) if content_length is not None else batch + _MULTIPART_OVERHEAD_BYTES
+            except (TypeError, ValueError):
+                announced = batch + _MULTIPART_OVERHEAD_BYTES
+            if announced < 0 or announced > batch + _MULTIPART_OVERHEAD_BYTES:
+                raise TaskUploadTooLarge('字幕批次总量超出限制')
+            prior = self._admissions.get(token)
+            if prior is None:
+                if len(self._admissions) >= 2:
+                    raise TaskQueueFull('已有两个上传正在接收，请稍后重试')
+                token = str(uuid.uuid4())
+                prior = {'reserved': 0, 'limit': 0, 'factor': 0, 'depth': 0, 'paths': set(),
+                         'written': 0, 'submitted': False, 'thread': threading.get_ident()}
+                self._admissions[token] = prior
+            prior['paths'].update(incoming_paths or [])
+            old = (prior['reserved'], prior['limit'], prior['factor'])
+            prior['limit'] = max(prior['limit'], announced)
+            # Direct decoded callers know alignment; multipart ingress keeps
+            # the sixfold worst case until its options have been parsed.
+            prior['factor'] = max(prior['factor'], reserve_factor)
+            prior['reserved'] = prior['limit'] * prior['factor']
         try:
-            announced = int(content_length) if content_length is not None else batch_limit
-        except (TypeError, ValueError):
-            announced = batch_limit
-        if announced < 0:
-            announced = 0
-        if announced > batch_limit + _MULTIPART_OVERHEAD_BYTES:
-            raise TaskUploadTooLarge("字幕批次总量超出限制")
-        # Multipart metadata is included in Content-Length.  Factor six
-        # covers worst-case encoding expansion, atomic rewrite temps, aligned
-        # copies, and the bounded extracted reference before the body reveals
-        # whether alignment was selected.
-        worst_new_reservation = announced * _ALIGN_STAGING_FACTOR
-        try:
-            os.makedirs(self._staging_root, exist_ok=True)
-            free = shutil.disk_usage(self._staging_root).free
-        except OSError as error:
-            raise TaskStorageInsufficient(f"无法读取字幕暂存卷容量：{str(error)}")
-        if reserved + worst_new_reservation > quota:
-            raise TaskStorageInsufficient("字幕暂存总额度不足")
-        if free - future_reserved - worst_new_reservation < reserve:
-            raise TaskStorageInsufficient("字幕暂存卷可用空间不足，已保留安全余量")
+            self._ensure_upload_admission_locked(content_length, token)
+        except Exception:
+            with self._lock:
+                if not prior['depth']:
+                    self._admissions.pop(token, None)
+                else:
+                    prior['reserved'], prior['limit'], prior['factor'] = old
+            raise
+        with self._lock:
+            prior['depth'] += 1
+            self._admission_local.token = token
+        return token
+
+    def release_upload_admission(self, token=None):
+        token = token or getattr(self._admission_local, 'token', None)
+        with self._lock:
+            lease = self._admissions.get(token)
+            if lease and lease['thread'] == threading.get_ident():
+                lease['depth'] -= 1
+                if lease['depth'] <= 0:
+                    self._admissions.pop(token, None)
+                    self._admission_local.token = None
+
+    def _admission_reserved(self, exclude_token=None):
+        return sum(value['reserved'] for key, value in self._admissions.items()
+                   if key != exclude_token and not value['submitted'])
+
+    def register_upload_stream(self, path):
+        """Track a request's spool once; its bytes are already covered by the lease."""
+        with self._lock:
+            lease = self._admissions.get(getattr(self._admission_local, 'token', None))
+            if lease:
+                lease['paths'].add(str(path))
+
+    def account_upload_write(self, count):
+        with self._lock:
+            lease = self._admissions.get(getattr(self._admission_local, 'token', None))
+            if lease:
+                if lease['written'] + count > lease['limit']:
+                    raise TaskUploadTooLarge('实际上传字节超过预占额度')
+                lease['written'] += count
+
+    def _ensure_upload_admission_locked(self, content_length=None, token=None):
+        # The name remains compatible, but no ingress or manager lock covers
+        # mkdir/scandir/statvfs. Provisional leases make parallel checks safe.
+        os.makedirs(self._staging_root, exist_ok=True)
+        free = isolated_disk_usage(self._staging_root).free
+        orphan_bytes = self._incoming_spool_bytes()
+        orphan_bytes += self._orphan_staging_bytes()
+        with self._lock:
+            self._ensure_queue_capacity(exclude_token=token)
+            policy = self.get_settings()
+            reserved, _ = self._active_staging_reservation_totals()
+            reserved += self._admission_reserved() + orphan_bytes
+            quota = int(policy['staging_quota_mb']) * 1024 * 1024
+            reserve = int(policy['reserve_free_mb']) * 1024 * 1024
+            if reserved > quota:
+                raise TaskStorageInsufficient('字幕暂存总额度不足')
+            # Charging full reservations rather than only future bytes is
+            # conservative when free-space measurement races an ongoing write.
+            if free - reserved < reserve:
+                raise TaskStorageInsufficient('字幕暂存卷可用空间不足，已保留安全余量')
 
     def _trusted_incoming_path(self, stream):
         """Return a request-spooled path only when it belongs to our flat inbox."""
@@ -802,19 +947,41 @@ class SubtitleTaskManager:
     def _incoming_spool_bytes(self):
         """Count the dedicated flat HTTP inbox without walking any directory."""
         total = 0
+        with self._lock:
+            active_paths = {path for lease in self._admissions.values() for path in lease['paths']}
         try:
             entries = os.scandir(self._incoming_root)
-        except OSError:
+        except FileNotFoundError:
             return 0
+        except OSError as error:
+            raise TaskStorageInsufficient('无法核对上传暂存占用，已拒绝准入') from error
         with entries:
             for entry in entries:
                 try:
                     if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
                         continue
+                    if entry.path in active_paths:
+                        continue
                     total += max(int(entry.stat(follow_symlinks=False).st_size), 0)
                 except OSError:
                     continue
         return total
+
+    def _orphan_staging_bytes(self):
+        """Charge uncertain failed submissions that have no task row yet."""
+        with self._lock:
+            # Read only existing IDs; no new table, migration or transaction.
+            known = {str(row[0]) for row in self._db.query(SUBTITLETASK.ID).filter(
+                SUBTITLETASK.TYPE == 'upload'
+            ).all()}
+            known.update(self._spooling_ids)
+        try:
+            return get_io_pool().execute('orphan_usage', path=self._staging_root,
+                                         known=list(known), timeout=10)
+        except FileNotFoundError:
+            return 0
+        except OSError as error:
+            raise TaskStorageInsufficient('无法核对未清理的任务暂存占用，已拒绝准入') from error
 
     def _cleanup_incoming_files(self, remove_all=False, now=None):
         """Clean only ordinary files from the dedicated flat HTTP inbox."""
@@ -862,13 +1029,15 @@ class SubtitleTaskManager:
             status_filter
         ).order_by(SUBTITLETASK.CREATED_AT.desc()).first()
 
-    def _ensure_queue_capacity(self):
+    def _ensure_queue_capacity(self, exclude_token=None):
         policy = self.get_settings()
         queued = self._db.query(SUBTITLETASK).filter(
             SUBTITLETASK.TYPE.in_(["upload", "repair"]),
             SUBTITLETASK.STATUS.in_(["queued", "recovering"])
         ).count()
-        if queued >= policy["max_upload_queue"]:
+        receiving = sum(1 for key, lease in self._admissions.items()
+                        if key != exclude_token and not lease['submitted'])
+        if queued + receiving >= policy["max_upload_queue"]:
             raise TaskQueueFull("字幕上传/修复等待队列已满")
 
     def get_task(self, task_id, owner=None, admin=False):
@@ -1048,7 +1217,7 @@ class SubtitleTaskManager:
                     # and derived-byte guards still run for every chunk.
                     if sampled_free is None or now - sampled_at >= 1 \
                             or total_bytes - sampled_bytes >= 64 * 1024 * 1024:
-                        sampled_free = shutil.disk_usage(self._staging_root).free
+                        sampled_free = isolated_disk_usage(self._staging_root).free
                         sampled_at, sampled_bytes = now, total_bytes
                     future_derived_bytes = total_bytes * (reserve_factor - 1)
                     pending_write = len(chunk) if writer is not None else 0
@@ -1108,7 +1277,7 @@ class SubtitleTaskManager:
                 "staged_identity": self._staging_identity(staged_stat)
             })
         # Catch external disk consumers once more before accepting the batch.
-        free = shutil.disk_usage(self._staging_root).free
+        free = isolated_disk_usage(self._staging_root).free
         if free - existing_future_reserved - total_bytes * (reserve_factor - 1) < reserve:
             raise TaskStorageInsufficient("字幕暂存卷可用空间不足，已保留安全余量")
         return components, total_bytes
@@ -1336,11 +1505,21 @@ class SubtitleTaskManager:
         return total, required_reserve
 
     def _check_target_capacity(self, path, volume_key, additional_bytes=0, reserve_bytes=0):
+        """锁内取预留快照，statvfs 在锁外完成（可能阻塞在 NAS 上）。"""
+        with self._lock:
+            active_reserved, active_reserve = self._active_target_reservations(volume_key)
+        self._assert_target_capacity(
+            path, active_reserved, active_reserve, reserve_bytes,
+            additional_bytes=additional_bytes
+        )
+
+    @staticmethod
+    def _assert_target_capacity(path, active_reserved, active_reserve,
+                                reserve_bytes, additional_bytes=0):
         try:
-            free = shutil.disk_usage(path).free
+            free = isolated_disk_usage(path).free
         except OSError as error:
             raise TaskStorageInsufficient(f"无法读取目标卷空间：{str(error)}")
-        active_reserved, active_reserve = self._active_target_reservations(volume_key)
         required = active_reserved + max(int(additional_bytes or 0), 0)
         reserve = max(int(reserve_bytes or 0), active_reserve)
         if free - required < reserve:
@@ -1355,42 +1534,138 @@ class SubtitleTaskManager:
                 SUBTITLETASK.ID == str(task_id)
             ).first()
             policy = _loads(row.POLICY, {}) if row else {}
-            self._check_target_capacity(
-                target_dir, volume_key, additional_bytes=0,
-                reserve_bytes=int(
-                    (policy or {}).get("reserve_free_mb") or DEFAULT_POLICY["reserve_free_mb"]
-                ) * 1024 * 1024
+            active_reserved, active_reserve = self._active_target_reservations(volume_key)
+        # 预留快照与 statvfs 之间可能有其它任务新增预留，本检查是发布前的
+        # just-in-time 安全边际，语义上本就是近似值。
+        self._assert_target_capacity(
+            target_dir, active_reserved, active_reserve,
+            int((policy or {}).get("reserve_free_mb") or DEFAULT_POLICY["reserve_free_mb"]) * 1024 * 1024
+        )
+
+    def _recover_repair_transaction(self, payload, task_id, default_message):
+        """尝试恢复中断的字幕修复事务；只依据精确清单，绝不扫描媒体目录。"""
+        media_file = payload.get("media_path") \
+            or payload.get("media_file") \
+            or payload.get("canonical_media_file")
+        if not media_file:
+            return default_message
+        try:
+            from app.subtitle import Subtitle
+            from app.helper.subtitle_task_processors import _TaskPathGuard
+            # Keep the lexical library path.  For media file symlinks the
+            # transaction manifest and subtitles live beside the link; the
+            # referent stored in the authorization snapshot is validation-only.
+            authorized_media = str(media_file)
+            path_guard = _TaskPathGuard(payload, {"repair": authorized_media})
+            path_guard.validate_media_paths()
+            recovery = Subtitle().recover_repair_transaction(
+                transaction_id=task_id,
+                media_file=authorized_media,
+                path_guard_check=path_guard
             )
+            if recovery.get("recovered"):
+                return "已恢复中断的字幕修复事务，请确认后重新发起"
+        except Exception as error:
+            # Do not guess or scan the media directory.  A failed
+            # exact-manifest recovery is retained for a later explicit repair.
+            ExceptionUtils.exception_traceback(error)
+        return default_message
 
     def _recover_tasks(self):
+        # 三段式：快照 → 锁外 I/O → 锁内重读提交。恢复过程包含全文件哈希、
+        # 临时文件删除、暂存校验与媒体库访问，原先整段持有 _lock，冷启动期间
+        # 任何任务查询或取消都会被阻塞。
         now = time.time()
         with self._lock:
-            rows = self._db.query(SUBTITLETASK).filter(
+            rows = self._db.query(
+                SUBTITLETASK.ID,
+                SUBTITLETASK.TYPE,
+                SUBTITLETASK.CANCEL_REQUESTED,
+                SUBTITLETASK.PAYLOAD
+            ).filter(
                 SUBTITLETASK.STATUS.in_(list(ACTIVE_STATES))
             ).all()
-            cleanup_ids = []
-            for row in rows:
-                self._checkpoint_recovered_active(row, now)
-                reconciliation = {"succeeded": 0}
-                if row.TYPE == "upload":
-                    reconciliation = self._reconcile_upload_outputs(
-                        row.ID, rollback_incomplete=bool(row.CANCEL_REQUESTED)
+            snapshots = [{
+                "id": str(row[0]),
+                "type": row[1],
+                "cancel_requested": bool(row[2]),
+                "payload": _loads(row[3], {}) or {},
+            } for row in rows]
+        if not snapshots:
+            return
+
+        outcomes = []
+        for snapshot in snapshots:
+            task_id = snapshot["id"]
+            task_type = snapshot["type"]
+            cancel_requested = snapshot["cancel_requested"]
+            reconciliation = {"succeeded": 0}
+            if task_type == "upload":
+                reconciliation = self._reconcile_upload_outputs(
+                    task_id, rollback_incomplete=cancel_requested
+                )
+                # The publisher records an exact hidden path and inode in its
+                # durable marker before copying.  Recovery can remove that one
+                # proven artifact without enumerating the media directory.
+                self._cleanup_upload_temp_artifacts(task_id)
+            if cancel_requested:
+                outcomes.append({
+                    "id": task_id, "action": "canceled",
+                    "succeeded": reconciliation["succeeded"],
+                    "cleanup_staging": task_type == "upload",
+                })
+                continue
+            if task_type != "upload":
+                message = "服务重启后未自动继续，请重新发起任务"
+                if task_type == "repair":
+                    message = self._recover_repair_transaction(
+                        snapshot["payload"], task_id, message
                     )
-                    # The publisher records an exact hidden path and inode in
-                    # its durable marker before copying.  Recovery can remove
-                    # that one proven artifact without enumerating the media
-                    # directory or guessing from a filename pattern.
-                    self._cleanup_upload_temp_artifacts(row.ID)
-                if row.CANCEL_REQUESTED:
-                    row.STATUS = "partial" if reconciliation["succeeded"] else "canceled"
+                outcomes.append({
+                    "id": task_id, "action": "interrupted",
+                    "message": message, "cleanup_staging": False,
+                })
+                continue
+            if self._upload_staging_valid(
+                    task_id,
+                    verified_output_item_ids=reconciliation.get("verified_item_ids")
+            ):
+                outcomes.append({
+                    "id": task_id, "action": "recovering", "cleanup_staging": False,
+                })
+            else:
+                # A broken staging manifest cannot complete a half-published
+                # VobSub pair; remove only components matching this task's
+                # persisted planned hashes.
+                self._reconcile_upload_outputs(task_id, rollback_incomplete=True)
+                outcomes.append({
+                    "id": task_id, "action": "staging_invalid",
+                    # 与原先一致：终态依据第一次对账的结果判定。
+                    "succeeded": reconciliation["succeeded"],
+                    "cleanup_staging": True,
+                })
+
+        cleanup_ids = []
+        with self._lock:
+            for outcome in outcomes:
+                row = self._db.query(SUBTITLETASK).filter(
+                    SUBTITLETASK.ID == outcome["id"]
+                ).first()
+                if not row or row.STATUS not in ACTIVE_STATES:
+                    continue
+                self._checkpoint_recovered_active(row, now)
+                action = outcome["action"]
+                if action == "canceled":
+                    succeeded = outcome["succeeded"]
+                    row.STATUS = "partial" if succeeded else "canceled"
                     row.PHASE = "complete"
                     row.MESSAGE = (
                         "取消请求已生效，崩溃前完成发布的字幕予以保留"
-                        if reconciliation["succeeded"] else "取消请求已在重启恢复时生效"
+                        if succeeded else "取消请求已在重启恢复时生效"
                     )
-                    if reconciliation["succeeded"]:
+                    if succeeded:
                         row.RESULT = _dumps({
-                            "success_count": reconciliation["succeeded"],
+                            "success_count": succeeded,
                             "failure_count": 0,
                             "stop_reason": "canceled_during_recovery",
                             "refresh": {
@@ -1400,150 +1675,139 @@ class SubtitleTaskManager:
                         })
                     row.FINISHED_AT = now
                     row.UPDATED_AT = now
-                    if row.TYPE == "upload":
+                    if outcome["cleanup_staging"]:
                         cleanup_ids.append(row.ID)
                     continue
-                if row.TYPE != "upload":
-                    restart_message = "服务重启后未自动继续，请重新发起任务"
-                    if row.TYPE == "repair":
-                        payload = _loads(row.PAYLOAD, {}) or {}
-                        media_file = payload.get("media_path") \
-                            or payload.get("media_file") \
-                            or payload.get("canonical_media_file")
-                        if media_file:
-                            try:
-                                from app.subtitle import Subtitle
-                                from app.helper.subtitle_task_processors import _TaskPathGuard
-                                # Keep the lexical library path.  For media
-                                # file symlinks the transaction manifest and
-                                # subtitles live beside the link; the
-                                # referent stored in the authorization
-                                # snapshot is validation-only.
-                                authorized_media = str(media_file)
-                                path_guard = _TaskPathGuard(
-                                    payload, {"repair": authorized_media}
-                                )
-                                path_guard.validate_media_paths()
-                                recovery = Subtitle().recover_repair_transaction(
-                                    transaction_id=row.ID,
-                                    media_file=authorized_media,
-                                    path_guard_check=path_guard
-                                )
-                                if recovery.get("recovered"):
-                                    restart_message = "已恢复中断的字幕修复事务，请确认后重新发起"
-                            except Exception as error:
-                                # Do not guess or scan the media directory.  A
-                                # failed exact-manifest recovery is retained for
-                                # a later explicit repair attempt.
-                                ExceptionUtils.exception_traceback(error)
+                if action == "interrupted":
                     row.STATUS = "interrupted"
                     row.PHASE = "complete"
-                    row.MESSAGE = restart_message
+                    row.MESSAGE = outcome["message"]
                     row.ERROR = _dumps("服务重启导致任务中断")
                     row.FINISHED_AT = now
                     row.UPDATED_AT = now
                     continue
-                if self._upload_staging_valid(
-                        row.ID,
-                        verified_output_item_ids=reconciliation.get("verified_item_ids")
-                ):
+                if action == "recovering":
                     row.STATUS = "recovering"
                     row.PHASE = "recovering"
                     row.MESSAGE = "正在从上传检查点恢复"
                     row.UPDATED_AT = now
-                else:
-                    # A broken staging manifest cannot complete a half-published
-                    # VobSub pair; remove only components matching this task's
-                    # persisted planned hashes.
-                    self._reconcile_upload_outputs(row.ID, rollback_incomplete=True)
-                    row.STATUS = "partial" if reconciliation["succeeded"] else "interrupted"
-                    row.PHASE = "complete"
-                    row.MESSAGE = (
-                        "部分字幕已在崩溃前发布，其余暂存清单损坏"
-                        if reconciliation["succeeded"] else "上传暂存清单缺失或损坏，无法恢复"
-                    )
-                    row.ERROR = _dumps("上传暂存文件缺失或哈希不匹配")
-                    if reconciliation["succeeded"]:
-                        row.RESULT = _dumps({
-                            "success_count": reconciliation["succeeded"],
-                            "failure_count": 0,
-                            "stop_reason": "staging_invalid_after_publish",
-                            "refresh": {
-                                "status": "skipped", "scope": "none",
-                                "message": "恢复不完整，未执行局部刷新"
-                            }
-                        })
-                    row.FINISHED_AT = now
-                    row.UPDATED_AT = now
-                    cleanup_ids.append(row.ID)
+                    continue
+                # staging_invalid
+                succeeded = outcome["succeeded"]
+                row.STATUS = "partial" if succeeded else "interrupted"
+                row.PHASE = "complete"
+                row.MESSAGE = (
+                    "部分字幕已在崩溃前发布，其余暂存清单损坏"
+                    if succeeded else "上传暂存清单缺失或损坏，无法恢复"
+                )
+                row.ERROR = _dumps("上传暂存文件缺失或哈希不匹配")
+                if succeeded:
+                    row.RESULT = _dumps({
+                        "success_count": succeeded,
+                        "failure_count": 0,
+                        "stop_reason": "staging_invalid_after_publish",
+                        "refresh": {
+                            "status": "skipped", "scope": "none",
+                            "message": "恢复不完整，未执行局部刷新"
+                        }
+                    })
+                row.FINISHED_AT = now
+                row.UPDATED_AT = now
+                cleanup_ids.append(row.ID)
             self._db.commit()
         for task_id in cleanup_ids:
-            self._cleanup_task_staging(task_id)
+            self._cleanup_task_staging(str(task_id))
 
     def _upload_staging_valid(self, task_id, verified_output_item_ids=None):
         verified_output_item_ids = {
             int(item_id) for item_id in (verified_output_item_ids or [])
         }
-        items = self._db.query(SUBTITLETASKITEM).filter(
-            SUBTITLETASKITEM.TASK_ID == task_id
-        ).all()
-        if not items:
-            return False
-        for item in items:
-            if item.STATUS == "succeeded":
+        # 锁内只取快照，全部哈希在锁外完成。
+        with self._lock:
+            items = self._db.query(SUBTITLETASKITEM).filter(
+                SUBTITLETASKITEM.TASK_ID == task_id
+            ).all()
+            if not items:
+                return False
+            snapshots = [{
+                "id": int(item.ID),
+                "status": item.STATUS,
+                "staged_path": str(item.STAGED_PATH or ""),
+                "content_hash": str(item.CONTENT_HASH or ""),
+                "companion_path": str(item.COMPANION_PATH or ""),
+                "companion_hash": str(item.COMPANION_HASH or ""),
+                "output": self._output_state_snapshot(item),
+            } for item in items]
+        for snapshot in snapshots:
+            if snapshot["status"] == "succeeded":
                 # _recover_tasks has just reconciled and hashed these outputs.
                 # Reuse that verified checkpoint instead of immediately
                 # rereading the same potentially large NAS file.
-                if int(item.ID) in verified_output_item_ids:
+                if snapshot["id"] in verified_output_item_ids:
                     continue
-                if self._upload_output_state(item)["complete"]:
+                if self._evaluate_output_state(snapshot["output"])["complete"]:
                     continue
-            if not self._file_matches(item.STAGED_PATH, item.CONTENT_HASH):
+            if not self._file_matches(snapshot["staged_path"], snapshot["content_hash"]):
                 return False
-            if item.COMPANION_PATH and not self._file_matches(item.COMPANION_PATH, item.COMPANION_HASH):
+            if snapshot["companion_path"] \
+                    and not self._file_matches(snapshot["companion_path"], snapshot["companion_hash"]):
                 return False
         return True
 
     @staticmethod
     def _file_matches(path, expected_hash):
-        if not path or not os.path.isfile(path) or not expected_hash:
+        if not path or not expected_hash:
             return False
-        digest = hashlib.sha256()
         try:
-            with open(path, "rb") as file_obj:
-                for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            return digest.hexdigest() == expected_hash
+            # Full-file evidence stays mandatory; only its execution moves to
+            # a bounded child, leaving application threads interruptible.
+            return isolated_hash(path) == expected_hash
         except OSError:
             return False
 
-    def _upload_output_state(self, item):
+    @staticmethod
+    def _output_state_snapshot(item):
+        """在锁内调用：把发布校验所需字段取成纯数据，不做任何文件 I/O。"""
+        if item is None:
+            return None
         planned = _loads(item.RESULT, {}) if item.RESULT else {}
         planned = planned if isinstance(planned, dict) else {}
-        primary_path = str(item.OUTPUT_PATH or "")
-        primary_hash = str(
-            item.OUTPUT_HASH or planned.get("planned_output_hash")
-            or planned.get("output_hash") or ""
-        )
         companion_path = str(item.OUTPUT_COMPANION_PATH or "")
-        companion_hash = str(
-            planned.get("planned_companion_hash")
-            or planned.get("companion_output_hash")
-            or (item.COMPANION_HASH if companion_path else "")
-            or ""
-        )
-        primary_ok = self._file_matches(primary_path, primary_hash)
-        companion_ok = not companion_path or self._file_matches(companion_path, companion_hash)
         return {
             "planned": planned,
-            "primary_path": primary_path,
-            "primary_hash": primary_hash,
-            "primary_ok": primary_ok,
+            "primary_path": str(item.OUTPUT_PATH or ""),
+            "primary_hash": str(
+                item.OUTPUT_HASH or planned.get("planned_output_hash")
+                or planned.get("output_hash") or ""
+            ),
             "companion_path": companion_path,
-            "companion_hash": companion_hash,
+            "companion_hash": str(
+                planned.get("planned_companion_hash")
+                or planned.get("companion_output_hash")
+                or (item.COMPANION_HASH if companion_path else "")
+                or ""
+            ),
+        }
+
+    def _evaluate_output_state(self, snapshot):
+        """在锁外调用：对快照做文件哈希校验（会读取 NAS 上的大文件）。"""
+        if snapshot is None:
+            return None
+        primary_ok = self._file_matches(snapshot["primary_path"], snapshot["primary_hash"])
+        companion_ok = not snapshot["companion_path"] or self._file_matches(
+            snapshot["companion_path"], snapshot["companion_hash"]
+        )
+        state = dict(snapshot)
+        state.update({
+            "primary_ok": primary_ok,
             "companion_ok": companion_ok,
             "complete": bool(primary_ok and companion_ok)
-        }
+        })
+        return state
+
+    def _upload_output_state(self, item):
+        """兼容入口；新代码应在锁内取 _output_state_snapshot 后在锁外求值。"""
+        return self._evaluate_output_state(self._output_state_snapshot(item))
 
     def verify_upload_item_output(self, task_id, item_id):
         """Recheck a succeeded checkpoint before the worker trusts it."""
@@ -1552,7 +1816,10 @@ class SubtitleTaskManager:
                 SUBTITLETASKITEM.TASK_ID == str(task_id),
                 SUBTITLETASKITEM.ID == int(item_id)
             ).first()
-            return bool(item and self._upload_output_state(item)["complete"])
+            snapshot = self._output_state_snapshot(item)
+        # 全文件哈希在锁外完成：并发取消可能删除目标，此时返回 False 是保守安全的。
+        state = self._evaluate_output_state(snapshot)
+        return bool(state and state["complete"])
 
     def trusted_upload_item_hashes(self, task_id, item_id):
         """Reuse intake hashes only while the immutable staged files keep their identity.
@@ -1571,21 +1838,29 @@ class SubtitleTaskManager:
                 return {"source": "", "companion": ""}
             result = _loads(item.RESULT, {}) if item.RESULT else {}
             result = result if isinstance(result, dict) else {}
-            source_ok = self._staged_identity_matches(
-                item.STAGED_PATH,
-                item.SIZE,
-                result.get("staged_identity")
-            )
-            companion_ok = not item.COMPANION_PATH or self._staged_identity_matches(
-                item.COMPANION_PATH,
-                item.COMPANION_SIZE,
-                result.get("companion_staged_identity")
-            )
-            return {
-                "source": str(item.CONTENT_HASH or "") if source_ok else "",
-                "companion": str(item.COMPANION_HASH or "")
-                if source_ok and companion_ok and item.COMPANION_PATH else ""
+            snapshot = {
+                "staged_path": item.STAGED_PATH,
+                "size": item.SIZE,
+                "content_hash": str(item.CONTENT_HASH or ""),
+                "companion_path": item.COMPANION_PATH,
+                "companion_size": item.COMPANION_SIZE,
+                "companion_hash": str(item.COMPANION_HASH or ""),
+                "staged_identity": result.get("staged_identity"),
+                "companion_staged_identity": result.get("companion_staged_identity"),
             }
+        # realpath/lstat 属于 NAS I/O，放在锁外。
+        source_ok = self._staged_identity_matches(
+            snapshot["staged_path"], snapshot["size"], snapshot["staged_identity"]
+        )
+        companion_ok = not snapshot["companion_path"] or self._staged_identity_matches(
+            snapshot["companion_path"], snapshot["companion_size"],
+            snapshot["companion_staged_identity"]
+        )
+        return {
+            "source": snapshot["content_hash"] if source_ok else "",
+            "companion": snapshot["companion_hash"]
+            if source_ok and companion_ok and snapshot["companion_path"] else ""
+        }
 
     def _staged_identity_matches(self, path, expected_size, expected_identity):
         identity = expected_identity if isinstance(expected_identity, dict) else {}
@@ -1616,9 +1891,13 @@ class SubtitleTaskManager:
         except (OSError, ValueError, TypeError):
             return False
 
-    def _upload_output_owned(self, item, path, expected_hash):
-        """Return true only when a durable staging marker proves ownership."""
-        state = self._upload_output_state(item)
+    def _upload_output_owned(self, state, path, expected_hash):
+        """Return true only when a durable staging marker proves ownership.
+
+        ``state`` is an already-evaluated output snapshot; this only reads the
+        marker file and stats the target, so callers must run it outside the
+        manager lock.
+        """
         marker_path = str((state["planned"] or {}).get("ownership_marker") or "")
         if not marker_path or not path or not expected_hash:
             return False
@@ -1662,30 +1941,84 @@ class SubtitleTaskManager:
             return False
 
     def _reconcile_upload_outputs(self, task_id, rollback_incomplete=False):
-        """Recover the publish-before-checkpoint crash window from planned hashes."""
-        recovered = 0
+        """Recover the publish-before-checkpoint crash window from planned hashes.
+
+        Three phases so no NAS I/O runs under the manager lock:
+        snapshot rows -> hash/stat/delete outside the lock -> re-read and commit.
+        Ownership is proven by the durable marker plus inode identity, not by
+        the lock, so moving the I/O out does not weaken the deletion guard.
+        """
+        # 1) 锁内快照
+        with self._lock:
+            items = self._db.query(SUBTITLETASKITEM).filter(
+                SUBTITLETASKITEM.TASK_ID == str(task_id)
+            ).all()
+            snapshots = [{
+                "id": int(item.ID),
+                "status": item.STATUS,
+                "output_path": item.OUTPUT_PATH,
+                "output_companion_path": item.OUTPUT_COMPANION_PATH or "",
+                "output_hash": item.OUTPUT_HASH,
+                "output": self._output_state_snapshot(item),
+            } for item in items]
+
+        # 2) 锁外 I/O：哈希校验、读取 ownership marker、删除已确认归属的文件
+        outcomes = []
         rolled_back = 0
+        for snapshot in snapshots:
+            state = self._evaluate_output_state(snapshot["output"])
+            if state["complete"]:
+                outcomes.append({"id": snapshot["id"], "action": "recovered",
+                                 "state": state, "snapshot": snapshot})
+                continue
+            removals = []
+            if rollback_incomplete and (state["primary_ok"] or state["companion_ok"]):
+                for path, expected_hash, matches in (
+                        (state["primary_path"], state["primary_hash"], state["primary_ok"]),
+                        (state["companion_path"], state["companion_hash"], state["companion_ok"])):
+                    if matches and self._upload_output_owned(state, path, expected_hash):
+                        try:
+                            os.remove(path)
+                            rolled_back += 1
+                            removals.append(path)
+                        except OSError:
+                            pass
+                outcomes.append({"id": snapshot["id"], "action": "canceled",
+                                 "state": state, "snapshot": snapshot})
+            elif snapshot["status"] == "succeeded":
+                outcomes.append({"id": snapshot["id"], "action": "invalidated",
+                                 "state": state, "snapshot": snapshot})
+            else:
+                outcomes.append({"id": snapshot["id"], "action": "unchanged",
+                                 "state": state, "snapshot": snapshot})
+
+        # 3) 锁内重读并提交
+        recovered = 0
         invalidated = 0
         verified = 0
         verified_item_ids = []
         changed = False
         with self._lock:
-            items = self._db.query(SUBTITLETASKITEM).filter(
-                SUBTITLETASKITEM.TASK_ID == str(task_id)
-            ).all()
-            for item in items:
-                state = self._upload_output_state(item)
-                if state["complete"]:
+            for outcome in outcomes:
+                item = self._db.query(SUBTITLETASKITEM).filter(
+                    SUBTITLETASKITEM.ID == outcome["id"],
+                    SUBTITLETASKITEM.TASK_ID == str(task_id)
+                ).first()
+                if not item:
+                    continue
+                action = outcome["action"]
+                snapshot = outcome["snapshot"]
+                if action == "recovered":
                     verified += 1
-                    verified_item_ids.append(int(item.ID))
+                    verified_item_ids.append(outcome["id"])
                     if item.STATUS == "succeeded":
                         continue
-                    result = dict(state["planned"] or {})
+                    result = dict(outcome["state"]["planned"] or {})
                     result.update({
-                        "canonical_subtitle": item.OUTPUT_PATH,
-                        "target_subtitle": item.OUTPUT_PATH,
-                        "companion_subtitle": item.OUTPUT_COMPANION_PATH or "",
-                        "output_hash": item.OUTPUT_HASH,
+                        "canonical_subtitle": snapshot["output_path"],
+                        "target_subtitle": snapshot["output_path"],
+                        "companion_subtitle": snapshot["output_companion_path"],
+                        "output_hash": snapshot["output_hash"],
                         "recovered_after_publish": True
                     })
                     item.STATUS = "succeeded"
@@ -1696,28 +2029,15 @@ class SubtitleTaskManager:
                     recovered += 1
                     changed = True
                     continue
-
-                if item.STATUS == "succeeded":
+                if action == "invalidated":
                     item.STATUS = "queued"
                     item.STAGE = "planned"
                     item.ERROR = "已完成检查点的发布文件缺失或哈希不匹配，等待安全恢复"
                     item.UPDATED_AT = time.time()
                     invalidated += 1
                     changed = True
-
-                if rollback_incomplete and (state["primary_ok"] or state["companion_ok"]):
-                    candidates = [
-                        (state["primary_path"], state["primary_hash"], state["primary_ok"]),
-                        (state["companion_path"], state["companion_hash"], state["companion_ok"])
-                    ]
-                    for path, expected_hash, matches in candidates:
-                        if matches and self._upload_output_owned(item, path, expected_hash):
-                            try:
-                                os.remove(path)
-                                rolled_back += 1
-                                changed = True
-                            except OSError:
-                                pass
+                    continue
+                if action == "canceled":
                     item.STATUS = "canceled"
                     item.STAGE = "canceled"
                     item.UPDATED_AT = time.time()
@@ -1767,6 +2087,9 @@ class SubtitleTaskManager:
                         pending_recovery = (task_id, error)
                     if self._stop.wait(1):
                         break
+                finally:
+                    # 常驻线程：每轮结束归还连接，否则本线程会永久占用一条。
+                    release_db_connections(self._db)
 
     def _heartbeat_loop(self):
         """Checkpoint active budgets independently of long ffmpeg/LLM/NFS steps."""
@@ -1799,6 +2122,8 @@ class SubtitleTaskManager:
             except Exception as error:
                 self._db.rollback()
                 ExceptionUtils.exception_traceback(error)
+            finally:
+                release_db_connections(self._db)
 
     def _interrupt_orphaned_audits_locked(self, reason, include_unclaimed=False):
         """Finalize audit rows that have no corresponding live execution claim."""
@@ -1827,6 +2152,7 @@ class SubtitleTaskManager:
         return changed
 
     def _claim_next_interactive(self):
+        cleanup_id = None
         with self._lock:
             row = self._db.query(SUBTITLETASK).filter(
                 SUBTITLETASK.TYPE.in_(["upload", "repair"]),
@@ -1843,18 +2169,22 @@ class SubtitleTaskManager:
                 row.FINISHED_AT = time.time()
                 row.UPDATED_AT = row.FINISHED_AT
                 self._db.commit()
-                self._cleanup_task_staging(row.ID)
-                return None
-            now = time.time()
-            row.STATUS = "running"
-            row.PHASE = "validating"
-            row.MESSAGE = "任务开始处理"
-            row.STARTED_AT = row.STARTED_AT or now
-            row.RUN_STARTED_AT = now
-            row.UPDATED_AT = now
-            self._db.commit()
-            self._executing_task_ids.add(str(row.ID))
-            return row.ID
+                # 暂存目录删除是 NAS I/O，放在锁外执行（与 finish_task 同构）。
+                cleanup_id = str(row.ID)
+            else:
+                now = time.time()
+                row.STATUS = "running"
+                row.PHASE = "validating"
+                row.MESSAGE = "任务开始处理"
+                row.STARTED_AT = row.STARTED_AT or now
+                row.RUN_STARTED_AT = now
+                row.UPDATED_AT = now
+                self._db.commit()
+                self._executing_task_ids.add(str(row.ID))
+                return row.ID
+        if cleanup_id:
+            self._cleanup_task_staging(cleanup_id)
+        return None
 
     def _start_audit_thread(self, task_id):
         # Kept as a compatibility shim for recovery call sites.  The task ID is
@@ -1926,6 +2256,8 @@ class SubtitleTaskManager:
                         pending_recovery = (task_id, error)
                     if self._stop.wait(1):
                         return
+                finally:
+                    release_db_connections(self._db)
 
     def _execute_task(self, task_id):
         try:
@@ -2172,7 +2504,10 @@ class SubtitleTaskManager:
         return value
 
     def cancel_task(self, task_id, owner=None, admin=False):
+        # 三段式：先持久化取消意图（原子性锚点）→ 锁外做发布结果对账 →
+        # 锁内重读后写终态。对账涉及全文件哈希与删除，不能在锁内执行。
         cleanup = False
+        needs_reconcile = False
         with self._lock:
             row = self._db.query(SUBTITLETASK).filter(SUBTITLETASK.ID == str(task_id)).first()
             if not row or (not admin and owner is not None and row.OWNER != str(owner)):
@@ -2180,13 +2515,45 @@ class SubtitleTaskManager:
             if row.STATUS in TERMINAL_STATES:
                 return self._task_dict(row, include_result=True, include_items=True)
             now = time.time()
+            # 取消意图先落库：即使随后的对账失败，取消也已经生效。
             row.CANCEL_REQUESTED = 1
-            if row.STATUS in ["queued", "recovering"]:
-                reconciliation = {"succeeded": 0}
-                if row.TYPE == "upload":
-                    reconciliation = self._reconcile_upload_outputs(
-                        row.ID, rollback_incomplete=True
-                    )
+            if row.STATUS in ["queued", "recovering"] or (
+                    row.STATUS == "canceling" and row.PHASE == "cancel_reconciling"):
+                needs_reconcile = row.TYPE == "upload"
+                if needs_reconcile:
+                    # Remove queued uploads from worker admission before releasing
+                    # the lock: their ownership markers must survive reconciliation.
+                    # Persist the phase so a failed reconciliation can be retried.
+                    row.STATUS = "canceling"
+                    row.PHASE = "cancel_reconciling"
+                    row.MESSAGE = "正在核对已发布字幕，完成后清理暂存"
+                else:
+                    row.STATUS = "canceled"
+                    row.PHASE = "complete"
+                    row.MESSAGE = "任务已在队列中取消"
+                    row.RESULT = _dumps({})
+                    row.FINISHED_AT = now
+            else:
+                row.STATUS = "canceling"
+                row.MESSAGE = "正在等待当前安全步骤停止"
+            row.UPDATED_AT = now
+            self._db.commit()
+
+        reconciliation = {"succeeded": 0}
+        if needs_reconcile:
+            reconciliation = self._reconcile_upload_outputs(
+                str(task_id), rollback_incomplete=True
+            )
+
+        with self._lock:
+            row = self._db.query(SUBTITLETASK).filter(SUBTITLETASK.ID == str(task_id)).first()
+            if not row:
+                return None
+            # 对账期间 worker 可能已把任务置为终态，此时以已落库的结果为准。
+            if row.STATUS in TERMINAL_STATES:
+                return self._task_dict(row, include_result=True, include_items=True)
+            if needs_reconcile:
+                now = time.time()
                 row.STATUS = "partial" if reconciliation["succeeded"] else "canceled"
                 row.PHASE = "complete"
                 row.MESSAGE = (
@@ -2203,12 +2570,9 @@ class SubtitleTaskManager:
                     }
                 } if reconciliation["succeeded"] else {})
                 row.FINISHED_AT = now
+                row.UPDATED_AT = now
                 cleanup = row.TYPE == "upload"
-            else:
-                row.STATUS = "canceling"
-                row.MESSAGE = "正在等待当前安全步骤停止"
-            row.UPDATED_AT = now
-            self._db.commit()
+                self._db.commit()
             value = self._task_dict(row, include_result=True, include_items=True)
         if cleanup:
             self._cleanup_task_staging(task_id)
@@ -3090,21 +3454,14 @@ class SubtitleTaskManager:
 
     @staticmethod
     def _remove_tree(path):
-        if not path or not os.path.lexists(path):
+        if not path:
             return True
-
-        def onerror(function, target, _exc):
-            try:
-                os.chmod(target, stat.S_IWRITE | stat.S_IREAD)
-                function(target)
-            except OSError:
-                pass
-
         try:
-            shutil.rmtree(path, onerror=onerror)
+            # The child rechecks the supplied inode before deleting. Timeout or
+            # stale identity is not absence: retain the task's cleanup evidence.
+            return isolated_remove_tree(path)
         except OSError:
             return False
-        return not os.path.lexists(path)
 
     def _migrate_legacy_audit_history(self):
         history_file = os.path.join(Config().get_config_path(), "subtitle-audit-history.json")

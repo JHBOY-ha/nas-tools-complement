@@ -1,6 +1,7 @@
 import base64
 import datetime
 import importlib
+import hmac
 import json
 import ntpath
 import os.path
@@ -13,7 +14,7 @@ from math import floor
 from urllib.parse import unquote
 
 import cn2an
-from flask import g, has_request_context
+from flask import g, has_request_context, copy_current_request_context, request
 from flask_login import logout_user, current_user
 from werkzeug.security import generate_password_hash
 
@@ -47,11 +48,14 @@ from app.utils import StringUtils, EpisodeFormat, RequestUtils, PathUtils, \
 from app.utils.types import RmtMode, OsType, SearchType, DownloaderType, SyncType, MediaType, MovieTypes, TvTypes
 from app.utils.security_utils import parse_episode_offset, parse_rule_dict, normalize_proxies, compile_ignore_pattern
 from app.utils.exclusive_publish import rename_exclusive
+from app.utils.workload import TaskQueueFull
+from app.helper.action_tasks import ActionTasks, COMMAND_TITLES
 from config import RMT_MEDIAEXT, TMDB_IMAGE_W500_URL, RMT_SUBEXT, Config
 from web.backend.search_torrents import search_medias_for_web, search_media_by_message
 from web.backend.web_utils import WebUtils
 from web.backend.special_confirmation import SpecialConfirmation, special_file
 from web.backend.action_permissions import ACTION_PERMISSIONS, action_allowed
+from web.backend.user import User
 
 
 class WebAction:
@@ -237,6 +241,14 @@ class WebAction:
             "save_user_script": self.__save_user_script,
             "run_directory_sync": self.__run_directory_sync
         }
+        # Status endpoints still verify ownership and the original operation's
+        # permission; their generic routing permission alone grants no data.
+        self._actions.update({
+            'get_action_task': self._action_task,
+            'get_action_tasks': self._action_task_list,
+            'find_action_task': self._find_action_task,
+            'cancel_action_task': self._cancel_action_task,
+        })
 
     def action(self, cmd, data=None):
         # API-key integrations are explicitly authenticated by require_auth.
@@ -251,7 +263,114 @@ class WebAction:
         if not func:
             return {"code": -1, "msg": "非授权访问！"}
         else:
-            return func(data)
+            try:
+                if has_request_context() and not getattr(g, '_action_task_worker', False) \
+                        and cmd in COMMAND_TITLES \
+                        and (cmd != 'special_confirmation' or (data or {}).get('stage') == 'confirm'):
+                    return self._enqueue_action(cmd, data or {}, func)
+                return func(data)
+            except TaskQueueFull as error:
+                # Preserve existing action responses while making rejected
+                # admission visible instead of falsely reporting "started".
+                return {"code": -1, "msg": str(error), "retmsg": str(error)}
+
+    @staticmethod
+    def _action_principal():
+        key = bool(getattr(g, 'api_key_authenticated', False))
+        user = getattr(g, 'api_user', None) or current_user
+        owner = 'api-key' if key else str(user.get_id())
+        admin = key or str(user.get_id()) == '0'
+        return owner, user, key, admin
+
+    def _enqueue_action(self, command, data, function):
+        if not isinstance(data, dict):
+            return {'code': -1, 'retcode': -1, 'msg': '操作参数必须是对象', 'retmsg': '操作参数必须是对象'}
+        owner, user, key, _admin = self._action_principal()
+        username = getattr(user, 'username', None)
+        original_key = (request.headers.get('Authorization') or '').split()
+        original_key = original_key[-1] if key and original_key else None
+        data = deepcopy(data)
+        if command == 'sch':
+            services = {'autoremovetorrents': TorrentRemover().auto_remove_torrents,
+                        'pttransfer': Downloader().transfer, 'ptsignin': Sites().signin,
+                        'sync': Sync().transfer_all_sync, 'rssdownload': Rss().rssdownload,
+                        'douban': DoubanSync().sync, 'subscribe_search_all': Subscribe().subscribe_search_all}
+            service = services.get(data.get('item'))
+            if service is None:
+                return {'code': -1, 'msg': '未知服务'}
+            # Execute the service itself, not its former "thread started" ack.
+            function = lambda _data: (service() or {'code': 0, 'retmsg': '服务执行结束'})
+        elif command == 'start_mediasync':
+            function = lambda _data: (MediaServer().sync_mediaserver() or {'code': 0, 'msg': '媒体库同步执行结束'})
+
+        @copy_current_request_context
+        def run():
+            g._action_task_worker = True
+            if key:
+                latest = (Config().get_config('security') or {}).get('api_key')
+                if not isinstance(latest, str) or not original_key \
+                        or not hmac.compare_digest(latest.encode(), original_key.encode()):
+                    return {'code': -1, 'retcode': -1, 'msg': '接口认证已失效，操作未执行', 'retmsg': '接口认证已失效，操作未执行'}
+                g.api_key_authenticated = True
+            else:
+                # A queued request cannot retain permissions revoked after
+                # admission. Use fresh identity and the original command policy.
+                fresh = User().get_user(username) if username else None
+                if not fresh or str(fresh.get_id()) != owner or not action_allowed(fresh, command):
+                    return {'code': -1, 'retcode': -1, 'msg': '用户或权限已失效，操作未执行', 'retmsg': '用户或权限已失效，操作未执行'}
+                g.api_user = fresh
+                g._login_user = fresh
+            return function(data)
+
+        try:
+            task, reused = ActionTasks().submit(
+                command, data, owner, run,
+                request_id=request.headers.get('Idempotency-Key') or request.headers.get('X-Request-ID')
+            )
+        except ValueError as error:
+            return {'code': -1, 'retcode': -1, 'msg': str(error), 'retmsg': str(error)}
+        except OSError:
+            return {'code': -1, 'retcode': -1, 'msg': '无法持久记录任务，操作未准入，请检查暂存卷',
+                    'retmsg': '无法持久记录任务，操作未准入，请检查暂存卷'}
+        g.action_task_accepted = True
+        return {'code': 0, 'retcode': 0, 'async': True, 'operation_type': 'background_action',
+                'task_id': task['task_id'], 'task': task, 'reused': reused,
+                'status_url': '/api/v1/service/task/' + task['task_id'],
+                'msg': '任务已排队，请查看执行结果', 'retmsg': '任务已排队，请查看执行结果'}
+
+    @staticmethod
+    def _visible_action_task(record):
+        if not record:
+            return False
+        owner, user, key, admin = WebAction._action_principal()
+        return bool((admin or record['owner'] == owner) and
+                    (key or action_allowed(user, record['command'])))
+
+    def _action_task(self, data):
+        record = ActionTasks().get((data or {}).get('task_id'))
+        if not self._visible_action_task(record):
+            return {'code': -1, 'msg': '任务不存在或无权查看'}
+        return {'code': 0, 'task': record}
+
+    def _find_action_task(self, data):
+        owner, _user, _key, _admin = self._action_principal()
+        record = ActionTasks().find(owner, (data or {}).get('request_id'))
+        if not self._visible_action_task(record):
+            return {'code': -1, 'msg': '尚未查到该请求的任务，执行结果未确认'}
+        return {'code': 0, 'task': record}
+
+    def _action_task_list(self, data):
+        owner, _user, _key, admin = self._action_principal()
+        records = ActionTasks().list(None if admin else owner)
+        return {'code': 0, 'tasks': [r for r in records if self._visible_action_task(r)]}
+
+    def _cancel_action_task(self, data):
+        record = ActionTasks().get((data or {}).get('task_id'))
+        if not self._visible_action_task(record):
+            return {'code': -1, 'msg': '任务不存在或无权取消'}
+        if not ActionTasks().cancel(record['task_id']):
+            return {'code': -1, 'msg': '任务已开始或结束，无法取消排队', 'task': ActionTasks().get(record['task_id'])}
+        return {'code': 0, 'task': ActionTasks().get(record['task_id'])}
 
     def api_action(self, cmd, data=None):
         result = self.action(cmd, data)
@@ -322,15 +441,21 @@ class WebAction:
         command = commands.get(msg)
         message = Message()
 
-        if command:
-            # 启动服务
-            ThreadHelper().start_thread(command.get("func"), ())
-            message.send_channel_msg(
-                channel=in_from, title="正在运行 %s ..." % command.get("desp"), user_id=user_id)
-        else:
-            # 站点检索或者添加订阅
-            ThreadHelper().start_thread(search_media_by_message,
-                                        (msg, in_from, user_id, user_name))
+        try:
+            if command:
+                # 启动服务
+                func = command.get("func")
+                ThreadHelper().start_thread(func, (), task_key=('service', func.__qualname__))
+                message.send_channel_msg(
+                    channel=in_from, title="正在运行 %s ..." % command.get("desp"), user_id=user_id)
+            else:
+                # 站点检索或者添加订阅
+                ThreadHelper().start_thread(search_media_by_message,
+                                            (msg, in_from, user_id, user_name))
+        except TaskQueueFull as error:
+            # Message ingress may consume its offset only once. Surface rejected
+            # admission to that user instead of letting it disappear in a 500.
+            message.send_channel_msg(channel=in_from, title=str(error), user_id=user_id)
 
     @staticmethod
     def set_config_value(cfg, cfg_key, cfg_value):
@@ -464,7 +589,10 @@ class WebAction:
         }
         sch_item = data.get("item")
         if sch_item and commands.get(sch_item):
-            ThreadHelper().start_thread(commands.get(sch_item), ())
+            # Coalesce repeated clicks while the same service is queued/running;
+            # message commands use the same key and do not create duplicate scans.
+            func = commands.get(sch_item)
+            ThreadHelper().start_thread(func, (), task_key=('service', func.__qualname__))
         return {"retmsg": "服务已启动", "item": sch_item}
 
     @staticmethod
@@ -1729,9 +1857,11 @@ class WebAction:
         rssid = data.get("rssid")
         page = data.get("page")
         if mtype == "MOV":
-            ThreadHelper().start_thread(Subscribe().subscribe_search_movie, (rssid,))
+            ThreadHelper().start_thread(Subscribe().subscribe_search_movie, (rssid,),
+                                        task_key=('subscribe', 'MOV', str(rssid)))
         else:
-            ThreadHelper().start_thread(Subscribe().subscribe_search_tv, (rssid,))
+            ThreadHelper().start_thread(Subscribe().subscribe_search_tv, (rssid,),
+                                        task_key=('subscribe', 'TV', str(rssid)))
         return {"code": 0, "page": page}
 
     @staticmethod
@@ -2809,7 +2939,9 @@ class WebAction:
         """
         开始媒体库同步
         """
-        ThreadHelper().start_thread(MediaServer().sync_mediaserver, ())
+        # A library sync can be long; repeat requests reuse its existing work.
+        ThreadHelper().start_thread(MediaServer().sync_mediaserver, (),
+                                    task_key=('service', 'MediaServer.sync_mediaserver'))
         return {"code": 0}
 
     @staticmethod

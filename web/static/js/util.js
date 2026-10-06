@@ -3,15 +3,23 @@
 NProgress.configure({ showSpinner: false });
 
 // Ajax主方法
-function ajax_post(cmd, params, handler, aync=true, show_progress=true) {
+function ajax_post(cmd, params, handler, aync=true, show_progress=true, taskState=null) {
     if (show_progress) {
         NProgress.start();
+    }
+    // The shared client preserves existing callbacks but invokes long-action
+    // handlers only after a terminal result, never after a 202 acknowledgement.
+    if (window.ActionTaskClient) {
+        // Optional state notifications drive live progress without treating
+        // acceptance as completion; existing terminal handlers stay unchanged.
+        return window.ActionTaskClient.request(cmd, params, handler, {async: aync, taskState,
+            accepted: function () { if (show_progress) NProgress.done(); }});
     }
     let data = {
         cmd: cmd,
         data: JSON.stringify(params)
     };
-    $.ajax({
+    return $.ajax({
         type: "POST",
         url: "do?random=" + Math.random(),
         dataType: "json",

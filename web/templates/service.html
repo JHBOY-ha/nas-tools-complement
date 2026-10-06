@@ -344,7 +344,12 @@
   function run_scheduler(id, name) {
     const data = {"item": id};
     ajax_post("sch", data, function (ret) {
-      show_success_modal(`${name} 服务启动成功，正在后台运行`);
+      // This callback now receives the actual terminal result, including cancel.
+      if (String(ret.code ?? ret.retcode) === "0") {
+        show_success_modal(`${name} 服务执行完成`);
+      } else {
+        show_fail_modal(ret.msg || ret.retmsg || `${name} 服务未完成，请查看后台操作结果`);
+      }
     });
   }
 
