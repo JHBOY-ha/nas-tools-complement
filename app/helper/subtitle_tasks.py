@@ -319,39 +319,9 @@ class SubtitleTaskManager:
                 self._db.session.execute(sql_text(
                     "ALTER TABLE SUBTITLE_TASK ADD COLUMN RUN_STARTED_AT FLOAT"
                 ))
-            self._db.session.execute(sql_text(
-                "CREATE INDEX IF NOT EXISTS INDX_SUBTITLE_AUDIT_STATE_UPDATED "
-                "ON SUBTITLE_AUDIT_STATE (UPDATED_AT)"
-            ))
-            self._db.session.execute(sql_text(
-                "CREATE INDEX IF NOT EXISTS INDX_SUBTITLE_AUDIT_STATE_SERVER_UPDATED "
-                "ON SUBTITLE_AUDIT_STATE (SERVER, UPDATED_AT)"
-            ))
-            self._db.session.execute(sql_text(
-                "CREATE INDEX IF NOT EXISTS INDX_SUBTITLE_AUDIT_STATE_SERVER_PATH_UPDATED "
-                "ON SUBTITLE_AUDIT_STATE (SERVER, SUBTITLE_PATH, UPDATED_AT)"
-            ))
-            # 现有索引都以 SERVER/SCOPE_KEY 前导，仅按路径失效审计状态无法命中。
-            self._db.session.execute(sql_text(
-                "CREATE INDEX IF NOT EXISTS INDX_SUBTITLE_AUDIT_STATE_PATH "
-                "ON SUBTITLE_AUDIT_STATE (SUBTITLE_PATH)"
-            ))
-            self._db.session.execute(sql_text(
-                "CREATE INDEX IF NOT EXISTS INDX_SUBTITLE_PROBE_CACHE_PAIR "
-                "ON SUBTITLE_PROBE_CACHE (PAIR_PATH)"
-            ))
-            self._db.session.execute(sql_text(
-                "CREATE INDEX IF NOT EXISTS INDX_SUBTITLE_TASK_CREATED "
-                "ON SUBTITLE_TASK (CREATED_AT)"
-            ))
-            self._db.session.execute(sql_text(
-                "CREATE INDEX IF NOT EXISTS INDX_SUBTITLE_TASK_FINISHED "
-                "ON SUBTITLE_TASK (FINISHED_AT)"
-            ))
-            self._db.session.execute(sql_text(
-                "CREATE INDEX IF NOT EXISTS INDX_SUBTITLE_TASK_QUEUE "
-                "ON SUBTITLE_TASK (TYPE, STATUS, PRIORITY, CREATED_AT)"
-            ))
+            # MainDb startup owns every model Index definition. Keeping this
+            # compatibility path limited to legacy columns prevents a second
+            # hard-coded CREATE INDEX source from preserving drift silently.
             self._db.commit()
         except Exception:
             self._db.rollback()

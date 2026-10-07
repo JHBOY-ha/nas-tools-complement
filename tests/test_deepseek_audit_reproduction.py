@@ -291,9 +291,17 @@ class DeepSeekReproduction(unittest.TestCase):
             with self.db.write_transaction():
                 self.db.insert(SUBTITLETASK(ID='outer', TYPE='audit', STATUS='queued',
                                            CREATED_AT=1, UPDATED_AT=1))
-                self.assertFalse(reject())
+                reject()  # Ignoring False still leaves the shared unit doomed.
+                self.db.insert(SUBTITLETASK(ID='after', TYPE='audit', STATUS='queued',
+                                           CREATED_AT=1, UPDATED_AT=1))
         self.assertEqual(self.db.query(SUBTITLETASK).count(), 0)
+        self.assertEqual(self.db.managed.coordinator.snapshot()['active'], 0)
+        with self.db.write_transaction():
+            self.db.insert(SUBTITLETASK(ID='next', TYPE='audit', STATUS='queued',
+                                       CREATED_AT=1, UPDATED_AT=1))
+        self.assertEqual(self.db.query(SUBTITLETASK).count(), 1)
         EVIDENCE['07'] = dict(standalone_rolled_back=True, nested_outer_rolled_back=True,
+                              ignored_false_rolled_back=True, writer_reusable=True,
                               production_helper_defect_claimed=False)
 
     @unittest.skipUnless(wal_runtime_supported(sqlite3.sqlite_version_info), 'Requires fixed SQLite for real WAL')
@@ -371,10 +379,16 @@ class DeepSeekReproduction(unittest.TestCase):
                 self.assertTrue(names <= found)
                 for name in names:
                     connection.exec_driver_sql('DROP INDEX "' + name + '"')
-                matches_with_missing = database._schema_matches(connection, versioned=True)
-                self.assertTrue(matches_with_missing)
+                # Table/constraint matching intentionally ignores ordinary
+                # query indexes; the separate checker must still report them.
+                self.assertTrue(database._schema_matches(connection, versioned=True))
+                self.assertFalse(database._query_indexes_match(connection))
+                self.assertEqual(database._ensure_query_indexes(connection), len(names))
+                matches_with_repaired = database._query_indexes_match(connection)
+                self.assertTrue(matches_with_repaired)
         EVIDENCE['09'] = dict(model_and_upgrade_include=sorted(names),
-                              schema_validator_ignores_these_indexes=matches_with_missing,
+                              structural_validator_ignores_missing_indexes=True,
+                              query_indexes_repaired=matches_with_repaired,
                               task_manager_started=False)
 
     def test_10_pending_restore_can_be_canceled_and_archive_explicitly_deleted(self):

@@ -52,7 +52,7 @@ I/O 与空间压力不能替代底层排查，参考 [btrfs 排查清单](btrfs-
 | 问题 | 当前实现 | 主要位置 |
 | --- | --- | --- |
 | SQLite 默认 5 秒锁等待，短暂竞争易失败 | `user.db`、`media.db` 连接等待设为 30 秒；签出连接达到池容量 80% 时告警，每个池每 60 秒最多一条 | `app/db/main_db.py`、`app/db/media_db.py` |
-| 字幕任务及历史查询缺少部分索引候选 | 模型、新迁移及字幕启动兜底共同补充 6 个索引；各索引收益依实际 SQL、统计信息及数据分布判断 | `app/db/models.py`、`app/helper/subtitle_tasks.py`、迁移 `f3b7c1d9e204` |
+| 字幕任务及历史查询缺少部分索引候选 | 主库模型中的全部显式索引是唯一运行时定义；启动阶段独立校验并补建缺失/漂移索引，不把索引缺失升级为表结构迁移 | `app/db/models.py`、`app/db/__init__.py` |
 | 刷流去重缓存只增不减，列表查找开销随记录增加 | 上限 5000 的 `OrderedDict` LRU，使用字典成员判断 | `app/brushtask.py` |
 | Telegram 发图请求未设置超时 | 设置连接/读取超时 `(5, 30)` | `app/message/client/telegram.py` |
 | 站点分页没有页数或耗时边界 | 3 处循环增加 100 页/300 秒边界；不宣称能即时打断正在执行的单页请求 | `app/sites/siteuserinfo/_base.py` |
@@ -64,11 +64,14 @@ I/O 与空间压力不能替代底层排查，参考 [btrfs 排查清单](btrfs-
 | --- | --- |
 | `SUBTITLE_TASK` | `CREATED_AT`；`FINISHED_AT`；`TYPE, STATUS, PRIORITY, CREATED_AT` |
 | `SUBTITLE_PROBE_CACHE` | `PAIR_PATH` |
-| `SUBTITLE_AUDIT_STATE` | `SUBTITLE_PATH` |
+| `SUBTITLE_AUDIT_STATE` | `SERVER, UPDATED_AT`；`SERVER, SUBTITLE_PATH, UPDATED_AT`；`SUBTITLE_PATH` |
 | `TRANSFER_HISTORY` | `DATE` |
 
 原 B0 索引迁移只新增索引，不删除业务记录或修改业务字段。已有 `(SERVER, PATH)`
 唯一索引保留；本轮另加单列 `PATH`、两个部分领取索引及版本存储索引，详见后文。
+启动时如果上述普通索引缺失或定义漂移，只在受控维护事务中按模型定义补建/拒绝启动，
+不触发整库备份、表重建或业务摘要；列顺序、排序方向、唯一性及部分索引谓词不一致
+会停止启动。
 回归确认原索引存在，但**不能据此认为六个
 索引都已证明必要，或上线后所有相关扫描和排序都会消失**。早期“四处热点命中
 索引”的记录没有充分说明统计信息条件，收益判断以下面的复核为准。
@@ -289,8 +292,9 @@ OpenSubtitles 共享锁只保护 claim/发布代次，令牌刷新合并、配�
 | 文件/网络子进程 | 阻塞调用不再占据主工作线程无限等待 | 增加有限 IPC/进程成本；不可中断 I/O 仍可能耗尽该类隔离容量 |
 
 1. **整体部署包含新的 schema。** `init_db()` 在业务可读前完成实例/卷/运行时检查、
-   必要备份和受控 Alembic 升级，目标版本为 `7e1c9a42b605`。旧 `run.py` 的随后
-   `update_db()` 幂等返回。部署方先核验实际 Python SQLite，再在同卷可丢弃库验收。
+   结构迁移所需备份和受控 Alembic 升级，目标版本为 `7e1c9a42b605`；缺失普通查询
+   索引走独立补建事务，不创建迁移备份。旧 `run.py` 的随后 `update_db()` 幂等返回。
+   部署方先核验实际 Python SQLite，再在同卷可丢弃库验收。
 2. **升级前保留可恢复备份。** 首次备份、表重建、索引、统计及完整性检查增加启动
    时间和空间。schema 回退要物化当前可见数据或恢复升级前副本，WAL 回退要关连接
    并 checkpoint；不能只回退代码，不能删除恢复文件来绕过限制。

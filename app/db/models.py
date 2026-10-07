@@ -5,6 +5,10 @@ from sqlalchemy.ext.declarative import declarative_base
 Base = declarative_base()
 BaseMedia = declarative_base()
 
+# Every explicit Index attached to Base.metadata is checked and repaired during
+# controlled main-database startup. Keeping the contract on the model avoids a
+# second, incomplete list of performance-critical indexes elsewhere.
+
 
 class CONFIGFILTERGROUP(Base):
     __tablename__ = 'CONFIG_FILTER_GROUP'
@@ -767,6 +771,9 @@ class SUBTITLEAUDITSTATE(Base):
               'SERVER', 'SUBTITLE_PATH', 'UPDATED_AT'),
         # 现有索引均以 SERVER/SCOPE_KEY 前导，按 SUBTITLE_PATH 单独失效路径
         # 时无法命中，只能整表扫描。
+        # All explicit indexes in this metadata are repaired separately from
+        # Alembic table migrations, so a missing index never triggers a full
+        # business-data backup and digest pass.
         Index('INDX_SUBTITLE_AUDIT_STATE_PATH', 'SUBTITLE_PATH'),
     )
 

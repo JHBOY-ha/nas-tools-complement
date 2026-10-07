@@ -1,4 +1,5 @@
 import os
+import re
 import log
 from config import Config
 from .main_db import MainDb
@@ -23,7 +24,9 @@ def init_db():
     from .settings import DatabaseSettings
     directory = Config().get_config_path()
     prepare(directory, DatabaseSettings.from_config())
-    # Back up before create_all changes even missing tables in an existing DB.
+    # Back up before create_all changes a structural schema.  Ordinary query
+    # indexes are deliberately checked/repaired after migration and do not
+    # turn an otherwise current database into a migration backup.
     from .main_db import _Database
     path = os.path.join(directory, 'user.db')
     if os.path.exists(path):
@@ -105,33 +108,32 @@ def update_db():
                 alembic_upgrade(alembic_cfg, 'head')
                 if not _schema_matches(connection, versioned=True) or before != _logical_states(connection):
                     raise DatabaseWriteError('迁移后 schema 或逻辑数据核对失败，事务已回滚')
+            # A current Alembic head can still have lost a model-owned query
+            # index. Repair every explicit Base Index in this already-controlled
+            # maintenance unit; this path intentionally does not calculate
+            # business digests.
+            _ensure_query_indexes(connection)
+            # _ensure_query_indexes validates the complete index contract. Keep
+            # the final pass structural so a repaired index is not reflected a
+            # second time during the same startup transaction.
+            if not _schema_matches(connection, versioned=True):
+                raise DatabaseWriteError('数据库 schema、查询索引或完整性约束核对失败，启动已停止')
     validate_database(db_location)
     complete(Config().get_config_path())
     log.console('数据库更新完成')
 
 
 def _schema_matches(connection, versioned):
+    """Check tables, columns and integrity constraints, not query indexes."""
     from .models import Base
     schema = inspect(connection)
     ignored = {'SUBTITLE_PUBLICATION', 'SUBTITLE_STATE_CLOCK', 'SUBTITLE_AUDIT_SCOPE_HEAD'}
     state_tables = {'SUBTITLE_AUDIT_STATE', 'SUBTITLE_MEDIA_STATUS'}
-    required_indexes = {
-        'SUBTITLE_TASK': {'INDX_SUBTITLE_TASK_INTERACTIVE_CLAIM': ('PRIORITY', 'CREATED_AT', 'ID'),
-                          'INDX_SUBTITLE_TASK_AUDIT_CLAIM': ('CREATED_AT', 'ID')},
-        'SUBTITLE_PROBE_CACHE': {'INDX_SUBTITLE_PROBE_CACHE_PATH': ('PATH',)},
-        'SUBTITLE_AUDIT_STATE': {'INDX_SUBTITLE_AUDIT_STATE_PUBLICATION': ('PUBLICATION_ID', 'ID')},
-        'SUBTITLE_MEDIA_STATUS': {'INDX_SUBTITLE_MEDIA_STATUS_PUBLICATION': ('PUBLICATION_ID', 'ID')},
-        'SUBTITLE_PUBLICATION': {'INDX_SUBTITLE_PUBLICATION_STATE': ('STATUS', 'CREATED_AT')},
-    }
     for name, table in Base.metadata.tables.items():
         if not versioned and name in ignored:
             continue
         if not schema.has_table(name):
             return False
-        if versioned and name in required_indexes:
-            actual_indexes = {value['name']: tuple(value['column_names']) for value in schema.get_indexes(name)}
-            if any(actual_indexes.get(key) != columns for key, columns in required_indexes[name].items()):
-                return False
         columns = {value['name']: value for value in schema.get_columns(name)}
         for column in table.columns:
             if not versioned and name in state_tables and column.name in ('PUBLICATION_ID', 'IS_DELETED'):
@@ -167,6 +169,218 @@ def _schema_matches(connection, versioned):
                         tuple(column.name for column in constraint.columns) not in actual_unique:
                     return False
     return True
+
+
+def _query_index_definitions():
+    """Return every explicit main-database model index in stable order."""
+    from .models import Base
+    return tuple(sorted(
+        (index for table in Base.metadata.tables.values()
+         for index in table.indexes),
+        key=lambda index: (index.table.name, index.name or '')
+    ))
+
+
+def _index_columns(index):
+    """Normalize model index expressions to the reflected column order."""
+    columns = []
+    for expression in index.expressions:
+        name = getattr(expression, 'name', None)
+        if not name:
+            # The only expression currently used by the model is
+            # ``PRIORITY DESC``. Keep the expression's leading column name so
+            # SQLAlchemy's model and SQLite's inspector compare the same order.
+            name = str(expression).strip().split()[0].strip('"`[]')
+        columns.append(name)
+    return tuple(columns)
+
+
+def _index_directions(index):
+    """Return SQLite's 0/1 ascending/descending flag for each model column."""
+    directions = []
+    for expression in index.expressions:
+        tokens = str(expression).strip().split()
+        directions.append(1 if tokens and tokens[-1].upper() == 'DESC' else 0)
+    return tuple(directions)
+
+
+def _normalize_sql_fragment(value):
+    """Normalize SQL outside quoted values without changing literal meaning."""
+    if value is None:
+        return None
+    source = str(value).strip()
+    if source.endswith(';'):
+        source = source[:-1].rstrip()
+    parts = []
+    outside = []
+    index = 0
+    while index < len(source):
+        character = source[index]
+        if character in ("'", '"', '`') or character == '[':
+            if outside:
+                parts.append(re.sub(r'\s+', ' ', ''.join(outside)).upper())
+                outside = []
+            closing = ']' if character == '[' else character
+            start = index
+            index += 1
+            while index < len(source):
+                if source[index] == closing:
+                    # SQL escapes quote characters by doubling them. Preserve
+                    # the complete quoted token so string case stays exact.
+                    if index + 1 < len(source) and source[index + 1] == closing:
+                        index += 2
+                        continue
+                    index += 1
+                    break
+                index += 1
+            parts.append(source[start:index])
+            continue
+        outside.append(character)
+        index += 1
+    if outside:
+        parts.append(re.sub(r'\s+', ' ', ''.join(outside)).upper())
+    return ''.join(parts).strip()
+
+
+def _index_where_from_sql(sql):
+    """Extract a partial-index predicate from one sqlite_master definition."""
+    if not sql:
+        return None
+    match = re.search(r'\bWHERE\b(.+)$', str(sql), flags=re.IGNORECASE | re.DOTALL)
+    return _normalize_sql_fragment(match.group(1)) if match else None
+
+
+def _pragma_identifier(identifier):
+    """Quote a model-owned identifier for SQLite PRAGMA statements."""
+    return '"%s"' % str(identifier).replace('"', '""')
+
+
+def _index_actual_directions(connection, index_name):
+    """Read explicit ASC/DESC flags; Inspector.get_indexes omits them."""
+    rows = connection.exec_driver_sql(
+        'PRAGMA index_xinfo(%s)' % _pragma_identifier(index_name)
+    )
+    # index_xinfo columns are seqno, cid, name, desc, coll, key.  The implicit
+    # rowid entry has key=0 and is not part of the model index definition.
+    return tuple(int(row[3]) for row in rows if row[5])
+
+
+def _query_index_reflection(connection, indexes):
+    """Collect one reflection snapshot for all model indexes on a connection."""
+    schema = inspect(connection)
+    table_names = sorted({index.table.name for index in indexes})
+    actual_by_table = {}
+    partial_by_name = {}
+    for table_name in table_names:
+        if not schema.has_table(table_name):
+            actual_by_table[table_name] = {}
+            continue
+        actual_by_table[table_name] = {
+            value['name']: value for value in schema.get_indexes(table_name)
+            if value.get('name')
+        }
+        rows = connection.exec_driver_sql(
+            'PRAGMA index_list(%s)' % _pragma_identifier(table_name)
+        )
+        for row in rows:
+            if len(row) < 2:
+                continue
+            # SQLite 3.8+ exposes partial as column 4. Older runtimes cannot
+            # create the partial indexes in this model, so False is conservative
+            # for ordinary indexes and a mismatch for expected partial ones.
+            partial_by_name[row[1]] = bool(row[4]) if len(row) > 4 else False
+    sql_by_name = {
+        row[0]: row[1] for row in connection.exec_driver_sql(
+            "SELECT name, sql FROM sqlite_master WHERE type='index'")
+    }
+    expected_names = {index.name for index in indexes if index.name}
+    directions_by_name = {}
+    for actual_indexes in actual_by_table.values():
+        for name in actual_indexes:
+            if name in expected_names and name not in directions_by_name:
+                directions_by_name[name] = _index_actual_directions(connection, name)
+    return {
+        'indexes': actual_by_table,
+        'partial': partial_by_name,
+        'sql': sql_by_name,
+        'directions': directions_by_name,
+    }
+
+
+def _query_index_mismatches(index, actual, reflection):
+    """Return definition differences while keeping SQL literals case-sensitive."""
+    expected_columns = _index_columns(index)
+    actual_columns = tuple(actual.get('column_names') or ())
+    expected_directions = _index_directions(index)
+    actual_directions = reflection['directions'].get(index.name, ())
+    expected_where = _normalize_sql_fragment(index.dialect_options['sqlite'].get('where'))
+    actual_where = _index_where_from_sql(reflection['sql'].get(index.name))
+    expected_partial = expected_where is not None
+    actual_partial = bool(reflection['partial'].get(index.name, False))
+    mismatches = []
+    if actual_columns != expected_columns:
+        mismatches.append('列顺序应为 (%s)，实际为 (%s)' % (
+            ', '.join(expected_columns), ', '.join(actual_columns) or '<无列>'))
+    if actual_directions != expected_directions:
+        mismatches.append('排序方向应为 %s，实际为 %s' %
+                          (expected_directions, actual_directions))
+    if bool(actual.get('unique')) != bool(index.unique):
+        mismatches.append('unique 应为 %s，实际为 %s' %
+                          (bool(index.unique), bool(actual.get('unique'))))
+    if actual_partial != expected_partial:
+        mismatches.append('partial 应为 %s，实际为 %s' %
+                          (expected_partial, actual_partial))
+    if actual_where != expected_where:
+        mismatches.append('WHERE 谓词不匹配，期望 %r，实际为 %r' %
+                          (expected_where, actual_where))
+    return mismatches
+
+
+def _query_index_state(connection, indexes=None):
+    """Reflect once, validate all definitions, and return only missing indexes."""
+    from .transactions import DatabaseWriteError
+    indexes = _query_index_definitions() if indexes is None else tuple(indexes)
+    reflection = _query_index_reflection(connection, indexes)
+    missing = []
+    for index in indexes:
+        actual = reflection['indexes'].get(index.table.name, {}).get(index.name)
+        if actual is None:
+            missing.append(index)
+            continue
+        mismatches = _query_index_mismatches(index, actual, reflection)
+        if mismatches:
+            raise DatabaseWriteError(
+                '查询索引定义不匹配：%s.%s；%s' %
+                (index.table.name, index.name, '；'.join(mismatches))
+            )
+    return missing
+
+
+def _query_indexes_match(connection):
+    """Check the model-owned query-index contract without changing the DB."""
+    return not _query_index_state(connection)
+
+
+def _ensure_query_indexes(connection):
+    """Create only missing model indexes after validating all existing ones."""
+    from .transactions import DatabaseWriteError
+    missing = _query_index_state(connection)
+    for index in missing:
+        try:
+            # checkfirst=False is intentional: the reflected same-name case
+            # was validated above, so CREATE must not silently accept a wrong
+            # definition through IF NOT EXISTS.
+            index.create(bind=connection, checkfirst=False)
+        except Exception as error:
+            # Keep the sanitized startup error actionable without exposing SQL
+            # parameters. DBAPI errors carry the useful disk/duplicate reason.
+            detail = getattr(error, 'orig', None) or error
+            detail = re.sub(r'\s+', ' ', str(detail).strip())
+            raise DatabaseWriteError(
+                '查询索引补建失败：%s.%s；原因：%s；请检查磁盘空间、数据库权限及同名索引' %
+                (index.table.name, index.name, detail or type(error).__name__)
+            ) from None
+    return len(missing)
 
 
 def _logical_states(connection):

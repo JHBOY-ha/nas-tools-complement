@@ -210,6 +210,9 @@ class ManagedDatabase:
             try:
                 yield current['session']
             except BaseException:
+                # Nested failures, including DbPersist's explicit False
+                # sentinel, poison the shared outer unit.  Returning from the
+                # inner decorator cannot make that unit committable again.
                 current['rollback_only'] = True
                 raise
             return
@@ -341,6 +344,9 @@ def write_transaction(db, required_bytes=0):
         try:
             yield db.session
         except BaseException:
+            # Test/injected stores follow the same all-or-nothing nested
+            # contract as ManagedDatabase; the outer scope checks this flag
+            # even when the inner caller ignores its False return.
             states[id(db)]['failed'] = True
             raise
         return

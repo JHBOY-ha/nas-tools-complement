@@ -14,8 +14,8 @@ depends_on = None
 
 
 # (index name, table, column list). CREATE INDEX IF NOT EXISTS keeps this
-# idempotent: fresh databases already get these from create_all, and the
-# subtitle task manager also creates the subtitle ones at startup.
+# idempotent: fresh databases already get these from create_all. Current
+# startup validation owns the complete model-index contract after migrations.
 _INDEXES = [
     ('INDX_SUBTITLE_TASK_CREATED', 'SUBTITLE_TASK', 'CREATED_AT'),
     ('INDX_SUBTITLE_TASK_FINISHED', 'SUBTITLE_TASK', 'FINISHED_AT'),

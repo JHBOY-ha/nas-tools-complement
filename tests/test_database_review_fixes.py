@@ -9,13 +9,14 @@ import sys
 import threading
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
+from sqlalchemy import inspect
 
 from tests.test_database_governance import DatabaseCase
 import app.db as database
 import app.db.main_db as main_db
 import app.db.media_db as media_db
 from app.db import backup, runtime
-from app.db.models import BaseMedia, SUBTITLETASK
+from app.db.models import Base, BaseMedia, SUBTITLETASK, SUBTITLEAUDITSTATE
 from app.db.transactions import DatabaseBusy, DatabaseWriteError
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,6 +56,164 @@ class DatabaseReviewFixTest(DatabaseCase):
                 patch.object(main_db, '_Database', self.db.managed), \
                 patch.object(runtime, 'complete'):
             yield
+
+    def drop_audit_query_indexes(self, names):
+        with self.db.managed.maintenance(foreign_keys=False) as connection:
+            with connection.begin():
+                connection.exec_driver_sql('BEGIN IMMEDIATE')
+                for name in names:
+                    connection.exec_driver_sql('DROP INDEX IF EXISTS "' + name + '"')
+
+    def audit_query_index_names(self):
+        return {
+            'INDX_SUBTITLE_AUDIT_STATE_SERVER_UPDATED',
+            'INDX_SUBTITLE_AUDIT_STATE_SERVER_PATH_UPDATED',
+            'INDX_SUBTITLE_AUDIT_STATE_PATH'
+        }
+
+    def documented_query_index_names(self):
+        # Cover the B0 list as well as the three audit-state indexes that were
+        # previously the only ordinary indexes repaired during startup.
+        return self.audit_query_index_names() | {
+            'INDX_SUBTITLE_TASK_QUEUE',
+            'INDX_SUBTITLE_TASK_CREATED',
+            'INDX_SUBTITLE_TASK_FINISHED',
+            'INDX_SUBTITLE_PROBE_CACHE_PAIR',
+            'INDX_TRANSFER_HISTORY_DATE',
+        }
+
+    def test_db_persist_return_values_do_not_use_truthiness_as_rollback(self):
+        @main_db.DbPersist(self.db)
+        def no_change():
+            return None
+
+        @main_db.DbPersist(self.db)
+        def row_count_zero():
+            return 0
+
+        @main_db.DbPersist(self.db)
+        def empty_result():
+            return []
+
+        with self.db.write_transaction():
+            self.db.insert(SUBTITLETASK(ID='before-values', TYPE='audit', STATUS='queued',
+                                       CREATED_AT=1, UPDATED_AT=1))
+            self.assertTrue(no_change())
+            self.assertEqual(row_count_zero(), 0)
+            self.assertEqual(empty_result(), [])
+            self.db.insert(SUBTITLETASK(ID='after-values', TYPE='audit', STATUS='queued',
+                                       CREATED_AT=1, UPDATED_AT=1))
+        self.assertEqual(self.db.query(SUBTITLETASK).count(), 2)
+
+    def test_missing_query_indexes_are_repaired_without_business_digest(self):
+        names = self.audit_query_index_names()
+        self.task('keep-record')
+        self.drop_audit_query_indexes(names)
+        with self.migration_context(), \
+                patch.object(database, '_logical_states', side_effect=AssertionError(
+                    'index-only startup must not hash business rows')) as hashes, \
+                patch.object(database, 'alembic_upgrade') as upgrade:
+            database.update_db()
+            upgrade.assert_not_called()
+            hashes.assert_not_called()
+        with self.db.managed.maintenance() as connection:
+            self.assertTrue(database._schema_matches(connection, versioned=True))
+            self.assertTrue(database._query_indexes_match(connection))
+        self.assertEqual(self.db.query(SUBTITLETASK).one().ID, 'keep-record')
+
+    def test_index_only_boot_does_not_create_migration_backup(self):
+        names = self.audit_query_index_names()
+        self.task('keep-boot-record')
+        self.drop_audit_query_indexes(names)
+        with self.migration_context(), \
+                patch.object(database.MediaDb, 'init_db'), \
+                patch.object(database.MainDb, 'init_db'), \
+                patch('app.db.backup.migration_backup') as backup_copy, \
+                patch.object(database, '_logical_states', side_effect=AssertionError(
+                    'index-only boot must not hash business rows')):
+            database.init_db()
+            backup_copy.assert_not_called()
+        with self.db.managed.maintenance() as connection:
+            self.assertTrue(database._query_indexes_match(connection))
+        self.assertEqual(self.db.query(SUBTITLETASK).one().ID, 'keep-boot-record')
+
+    def test_each_documented_missing_query_index_is_repaired(self):
+        names = self.documented_query_index_names()
+        for name in sorted(names):
+            self.drop_audit_query_indexes({name})
+            with self.migration_context():
+                database.update_db()
+            with self.db.managed.maintenance() as connection:
+                self.assertTrue(database._query_indexes_match(connection))
+
+        self.drop_audit_query_indexes(names)
+        with self.migration_context():
+            database.update_db()
+        with self.db.managed.maintenance() as connection:
+            self.assertTrue(database._query_indexes_match(connection))
+        self.assertEqual(self.db.query(SUBTITLETASK).count(), 0)
+
+    def test_same_name_wrong_query_index_definition_stops_startup(self):
+        name = 'INDX_SUBTITLE_AUDIT_STATE_PATH'
+        self.drop_audit_query_indexes({name})
+        with self.db.managed.maintenance(foreign_keys=False) as connection:
+            with connection.begin():
+                connection.exec_driver_sql('BEGIN IMMEDIATE')
+                connection.exec_driver_sql(
+                    'CREATE INDEX "%s" ON SUBTITLE_AUDIT_STATE (SERVER)' % name)
+        with self.migration_context(), self.assertRaisesRegex(DatabaseWriteError, name):
+            database.update_db()
+        with self.db.managed.maintenance() as connection:
+            actual = next(value for value in inspect(connection).get_indexes('SUBTITLE_AUDIT_STATE')
+                          if value['name'] == name)
+            self.assertEqual(actual['column_names'], ['SERVER'])
+
+    def test_same_name_case_only_partial_index_predicate_drift_stops_startup(self):
+        name = 'INDX_SUBTITLE_TASK_INTERACTIVE_CLAIM'
+        with self.db.managed.maintenance(foreign_keys=False) as connection:
+            with connection.begin():
+                connection.exec_driver_sql('BEGIN IMMEDIATE')
+                connection.exec_driver_sql('DROP INDEX IF EXISTS "' + name + '"')
+                connection.exec_driver_sql(
+                    "CREATE INDEX \"%s\" ON SUBTITLE_TASK "
+                    "(PRIORITY DESC, CREATED_AT, ID) "
+                    "WHERE TYPE IN ('UPLOAD','REPAIR') "
+                    "AND STATUS IN ('QUEUED','RECOVERING')" % name)
+        with self.migration_context(), self.assertRaisesRegex(DatabaseWriteError, 'WHERE'):
+            database.update_db()
+
+    def test_query_index_repair_failure_rolls_back_and_is_not_reported_as_success(self):
+        name = 'INDX_SUBTITLE_AUDIT_STATE_PATH'
+        self.drop_audit_query_indexes({name})
+        target = next(index for index in SUBTITLEAUDITSTATE.__table__.indexes if index.name == name)
+        with self.migration_context(), \
+                patch.object(target, 'create', side_effect=RuntimeError('injected index failure')):
+            with self.assertRaisesRegex(DatabaseWriteError, '查询索引补建失败.*injected index failure'):
+                database.update_db()
+        with self.db.managed.maintenance() as connection:
+            self.assertFalse(database._query_indexes_match(connection))
+
+    def test_repeated_startup_does_not_recreate_valid_query_indexes(self):
+        target = next(index for index in SUBTITLEAUDITSTATE.__table__.indexes
+                      if index.name == 'INDX_SUBTITLE_AUDIT_STATE_PATH')
+        with self.migration_context(), patch.object(target, 'create', wraps=target.create) as create:
+            database.update_db()
+            database.update_db()
+        create.assert_not_called()
+
+    def test_query_index_validation_uses_one_reflection_snapshot(self):
+        with self.db.managed.maintenance() as connection, \
+                patch.object(database, 'inspect', wraps=inspect) as reflected:
+            self.assertTrue(database._query_indexes_match(connection))
+        self.assertEqual(reflected.call_count, 1)
+
+    def test_every_explicit_model_index_is_in_the_startup_contract(self):
+        expected = {
+            index.name for table in Base.metadata.tables.values()
+            for index in table.indexes
+        }
+        actual = {index.name for index in database._query_index_definitions()}
+        self.assertEqual(actual, expected)
 
     def test_actual_migration_still_hashes_before_and_after(self):
         self.legacy()

@@ -197,7 +197,14 @@ class MainDb:
 
 class DbPersist(object):
     """
-    数据库持久化装饰器
+    数据库持久化装饰器。
+
+    返回值契约：``None`` 表示正常执行结束，对外统一返回 ``True``；明确的
+    ``False`` 表示本次操作被拒绝或失败，并撤销当前工作单元。嵌套调用中的
+    ``False`` 会把整个外层写事务标记为只能回滚，即使调用方忽略返回值或继续
+    执行其他方法，外层也不能提交。合法的重复操作、数据已经符合要求的无变化
+    操作应返回 ``True``（或保持 ``None`` 让装饰器转换为 ``True``）。除
+    ``False`` 外，``0``、空列表等由具体方法定义的返回值不会被装饰器解释为失败。
     """
 
     def __init__(self, db):
@@ -214,9 +221,15 @@ class DbPersist(object):
                 with write_transaction(db):
                     ret = f(*args, **kwargs)
                     if ret is False:
+                        # Use identity, not truthiness: 0 and empty containers
+                        # are method-level results, while False is the only
+                        # return value that requests a transactional rollback.
                         raise _PersistRejected()
                 return True if ret is None else ret
             except _PersistRejected:
+                # The surrounding write_transaction already rolled back this
+                # unit; for a nested call it also left the outer unit marked
+                # rollback-only before this exception was converted to False.
                 return False
             except (DatabaseBusy, DatabaseWriteError):
                 # Admission rejection/uncertain commit must reach the existing

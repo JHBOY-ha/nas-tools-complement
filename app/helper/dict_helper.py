@@ -17,6 +17,8 @@ class DictHelper:
         :return: True False
         """
         if not dtype or not key or not value:
+            # Invalid input is an explicit rejection and therefore rolls back
+            # an enclosing DbPersist transaction.
             return False
         if self.exists(dtype, key):
             return self._db.query(SYSTEMDICT).filter(SYSTEMDICT.TYPE == dtype,
@@ -58,6 +60,8 @@ class DictHelper:
         :return: True False
         """
         if not dtype or not key:
+            # Keep invalid arguments distinct from a valid delete that affects
+            # zero rows; the latter is returned as this method's row-count API.
             return False
         return self._db.query(SYSTEMDICT).filter(SYSTEMDICT.TYPE == dtype,
                                                  SYSTEMDICT.KEY == key).delete()
