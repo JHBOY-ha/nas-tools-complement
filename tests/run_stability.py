@@ -21,6 +21,7 @@ DATABASE_REVIEW_FIXES = (
     'tests.test_deepseek_audit_reproduction.DeepSeekReproduction.test_04_sync_rejection_preserves_previous_cache',
     'tests.test_deepseek_audit_reproduction.DeepSeekReproduction.test_06_failed_boots_reuse_identical_migration_backup',
     'tests.test_deepseek_audit_reproduction.DeepSeekReproduction.test_10_pending_restore_can_be_canceled_and_archive_explicitly_deleted',
+    'tests.test_deepseek_audit_reproduction.DeepSeekReproduction.test_11_baseline_snapshot_works_without_git_history',
     'tests.test_deepseek_audit_reproduction.DeepSeekReproduction.test_12_update_without_prepare_bootstraps_safely',
 )
 

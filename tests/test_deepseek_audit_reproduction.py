@@ -1,8 +1,8 @@
-"""Check the supplied DeepSeek review and regressions for the six selected fixes.
+"""Check the supplied DeepSeek review and regressions for the seven selected fixes.
 
 Run: python3 -m tests.run_stability tests.test_deepseek_audit_reproduction
-Cases 01/03/04/06/10/12 now assert fixed behavior; remaining cases document
-observed conditions or corrections to the report. Only the six corrected cases
+Cases 01/03/04/06/10/11/12 now assert fixed behavior; remaining cases document
+observed conditions or corrections to the report. Only the seven corrected cases
 are included in the default regression suite. All files
 and SQL writes use disposable directories. External services are mocked.
 """
@@ -216,9 +216,10 @@ class DeepSeekReproduction(unittest.TestCase):
         EVIDENCE['05a'] = 'Current code rejects an unknown future revision.'
 
     def test_05b_legacy_update_swallows_unknown_new_revision(self):
-        # Use the actual HEAD implementation and revision directory. Skip if
-        # HEAD has moved to the new implementation, rather than invent history.
-        old = subprocess.check_output(['git', 'show', 'HEAD:app/db/__init__.py'], cwd=ROOT, text=True)
+        # Use the checked-out implementation and revision directory. Skip if
+        # the working tree has moved to the new implementation; do not require
+        # a Git repository merely to inspect the source under test.
+        old = (ROOT / 'app/db/__init__.py').read_text(encoding='utf-8')
         if 'except Exception as e:' not in old or '_logical_states' in old:
             self.skipTest('HEAD no longer contains the pre-governance update_db')
         legacy_root = self.root / 'legacy'
@@ -409,28 +410,24 @@ class DeepSeekReproduction(unittest.TestCase):
         self.assertEqual(len(list((self.root / 'backup_file').glob('*.zip'))), 2)
         EVIDENCE['10'] = dict(archives=2, staged_restores=1, canceled_then_restaged=True)
 
-    def test_11_missing_baseline_commit_breaks_actual_loaders(self):
-        # A repository with no baseline object models an archive checkout or a
-        # shallow descendant. Not every shallow clone lacks the baseline HEAD.
+    def test_11_baseline_snapshot_works_without_git_history(self):
+        # The baseline is checked into the source tree, so an archive checkout
+        # or shallow descendant must not need the historical Git object.
         scratch = self.root / 'without-history'
         scratch.mkdir()
-        subprocess.run(['git', 'init', '-q', str(scratch)], check=True, capture_output=True)
         from scripts.verify_database_workload import load_baseline
-        with self.assertRaises(subprocess.CalledProcessError):
-            load_baseline(scratch)
+        models, manager_class = load_baseline(scratch)
+        self.assertIsNotNone(models.SUBTITLETASK)
+        self.assertEqual(manager_class.__name__, 'SubtitleTaskManager')
         from tests.test_database_migrations import DatabaseMigrationTest
         case = DatabaseMigrationTest('test_upgrade_preserves_original_ids_values_and_supports_repeat')
-        original = subprocess.check_output
-        def in_missing_history(*args, **kwargs):
-            return original(*args, **dict(kwargs, cwd=scratch))
         try:
-            with patch.object(subprocess, 'check_output', side_effect=in_missing_history):
-                with self.assertRaises(subprocess.CalledProcessError):
-                    case.setUp()
+            case.setUp()
         finally:
             case.doCleanups()
-        EVIDENCE['11'] = dict(workload_loader_failed=True, migration_setup_failed=True,
-                              trigger='baseline object absent, not shallow status alone')
+        EVIDENCE['11'] = dict(workload_loader_git_independent=True,
+                              migration_setup_git_independent=True,
+                              trigger='checked-in baseline snapshot')
 
     def test_12_update_without_prepare_bootstraps_safely(self):
         self.assertNotIn(str(self.root), runtime._prepared)

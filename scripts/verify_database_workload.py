@@ -1,4 +1,4 @@
-"""Compare immutable 8d84b13 and current audit paths on disposable databases.
+"""Compare the checked-in 8d84b13 baseline and current audit paths.
 
 The optional --scratch-root explicitly selects a test volume. Never open live
 configuration/databases. SQLite must contain the WAL-reset fix for acceptance.
@@ -7,12 +7,12 @@ import argparse
 import ast
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+import hashlib
 import json
 import os
 from pathlib import Path
 import sqlite3
 import statistics
-import subprocess
 import sys
 import tempfile
 import threading
@@ -25,9 +25,26 @@ def percentile(values):
     return round(values[min(len(values) - 1, int(len(values) * .95))] * 1000, 3) if values else None
 
 
-def load_baseline(root):
+BASELINE_REVISION = '8d84b13'
+BASELINE_ROOT = Path(__file__).resolve().parent / 'baselines' / BASELINE_REVISION
+
+
+def load_baseline(_root=None):
+    """Load the immutable benchmark snapshot without consulting Git history."""
+    manifest_path = BASELINE_ROOT / 'manifest.json'
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    if manifest.get('revision') != BASELINE_REVISION:
+        raise RuntimeError('基准快照版本清单不匹配：%s' % BASELINE_REVISION)
+
     def source(path):
-        return subprocess.check_output(['git', 'show', '8d84b13:' + path], cwd=root, text=True)
+        file_path = BASELINE_ROOT / path
+        value = file_path.read_text(encoding='utf-8')
+        expected = manifest['files'].get(path)
+        actual = hashlib.sha256(value.encode('utf-8')).hexdigest()
+        if expected != actual:
+            raise RuntimeError('基准快照校验失败：%s' % path)
+        return value
+
     models = types.ModuleType('_nas_db_baseline_models')
     exec(compile(source('app/db/models.py'), '8d84b13/models.py', 'exec'), models.__dict__)
     sys.modules[models.__name__] = models
@@ -51,8 +68,7 @@ def trial(path, rows, readers, writers, baseline):
     from app.db.settings import DatabaseSettings
     from app.db.publication import seed_legacy, filter_visible
     from app.helper.subtitle_tasks import SubtitleTaskManager
-    root = Path(__file__).resolve().parents[1]
-    models, manager_class = load_baseline(root) if baseline else (None, SubtitleTaskManager)
+    models, manager_class = load_baseline() if baseline else (None, SubtitleTaskManager)
     task_model = models.SUBTITLETASK if baseline else SUBTITLETASK
     metadata = models.Base.metadata if baseline else Base.metadata
     settings = DatabaseSettings(reserve_free_mb=256)

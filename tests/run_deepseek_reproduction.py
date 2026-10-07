@@ -47,14 +47,20 @@ def main():
     if changed:
         status = 1
     loaded = sys.modules.get(module)
+    try:
+        head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
+    except (OSError, subprocess.CalledProcessError):
+        # Source archives and shallow-less workspaces still produce useful
+        # evidence; Git metadata is provenance, not a test prerequisite.
+        head = 'unavailable'
     record = {
         'recorded_at': datetime.now(timezone.utc).isoformat(),
-        'head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
+        'head': head,
         'python': sys.version.split()[0], 'sqlite': sqlite3.sqlite_version,
         'exit_code': status, 'changed_during_run': changed,
         'source_sha256_before': before, 'source_sha256_after': after,
         'evidence': getattr(loaded, 'EVIDENCE', {}),
-        'meaning': 'Cases 01/03/04/06/10/12 verify fixes; other cases verify review observations.',
+        'meaning': 'Cases 01/03/04/06/10/11/12 verify fixes; other cases verify review observations.',
     }
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

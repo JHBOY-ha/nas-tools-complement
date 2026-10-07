@@ -1,0 +1,7 @@
+{
+  "revision": "8d84b13",
+  "files": {
+    "app/db/models.py": "8b3aab51164f692b6aac594d0155b4faa13d2a2349465d9124f843a85b589978",
+    "app/helper/subtitle_tasks.py": "afa6cc6c76943f18c297940d7a399c48a4d721cadcdcec49693870532051897f"
+  }
+}

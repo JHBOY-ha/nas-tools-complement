@@ -23,9 +23,14 @@ class DatabaseMigrationTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix='db-migration-')
         self.addCleanup(self.temp.cleanup)
         self.path = Path(self.temp.name) / 'user.db'
-        source = subprocess.check_output(['git', 'show', '8d84b13:app/db/models.py'], text=True)
+        # Keep the immutable legacy schema in the repository.  Migration tests
+        # must also run from source archives and shallow clones without Git
+        # object 8d84b13 being available locally.
+        source_path = Path(__file__).resolve().parents[1] / \
+            'scripts/baselines/8d84b13/app/db/models.py'
+        source = source_path.read_text(encoding='utf-8')
         self.legacy = {'__name__': 'legacy_database_fixture'}
-        # Immutable local commit is the schema oracle, not a copy of the new
+        # This checked-in snapshot is the schema oracle, not a copy of the new
         # implementation with its constraints removed to make a test pass.
         exec(compile(source, '8d84b13/models.py', 'exec'), self.legacy)
         engine = create_engine('sqlite:///' + str(self.path))
