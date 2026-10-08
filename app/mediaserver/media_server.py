@@ -223,22 +223,26 @@ class MediaServer:
             return
         return self.server.refresh_library_by_items(items)
 
-    def get_libraries(self):
+    def get_libraries(self, strict=False):
         """
-        获取媒体服务器所有媒体库列表
+        获取媒体服务器所有媒体库列表；严格模式用于同步，读取失败必须抛出。
         """
         if not self.server:
+            if strict:
+                raise RuntimeError('媒体服务器未配置')
             return []
-        return self.server.get_libraries()
+        return self.server.get_libraries(strict=True) if strict else self.server.get_libraries()
 
-    def get_items(self, parent):
+    def get_items(self, parent, strict=False):
         """
-        获取媒体库中的所有媒体
+        获取媒体库中的所有媒体；严格模式保留客户端的读取失败信号。
         :param parent: 上一级的ID
         """
         if not self.server:
+            if strict:
+                raise RuntimeError('媒体服务器未配置')
             return []
-        return self.server.get_items(parent)
+        return self.server.get_items(parent, strict=True) if strict else self.server.get_items(parent)
 
     def get_episodes(self, series_id):
         """
@@ -274,15 +278,21 @@ class MediaServer:
             try:
                 self.progress.update(ptype="mediasync", text="请稍候...")
                 counts = self.get_medias_count()
-                expected = (counts.get("MovieCount") or 0) + (counts.get("SeriesCount") or 0)
+                # 客户端用 {} 表示统计请求失败；只有明确的非负计数才是有效快照。
+                if not isinstance(counts, dict) or any(
+                        type(counts.get(key)) is not int or counts[key] < 0
+                        for key in ('MovieCount', 'SeriesCount')):
+                    raise RuntimeError('媒体库统计读取失败')
+                expected = counts['MovieCount'] + counts['SeriesCount']
                 total_count = movie_count = tv_count = staged_bytes = 0
                 settings = DatabaseSettings.from_config()
+                # Strict reads propagate failures, including failures after some items.
                 # Network calls never hold a writer slot. A disposable spool
                 # avoids retaining every library's payload in process memory.
                 with tempfile.TemporaryFile(mode='w+t', encoding='utf-8') as snapshot:
-                    for library in self.get_libraries():
+                    for library in self.get_libraries(strict=True):
                         self.progress.update(ptype="mediasync", text="正在获取 %s 数据..." % library.get("name"))
-                        for item in self.get_items(library.get("id")):
+                        for item in self.get_items(library.get("id"), strict=True):
                             if not item:
                                 continue
                             encoded = json.dumps(item, ensure_ascii=False) + '\n'

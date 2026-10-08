@@ -187,8 +187,8 @@ class DeepSeekReproduction(unittest.TestCase):
                 receiver = NS(server=True, mediadb=store, progress=progress,
                               _server_type=NS(value='emby'),
                               get_medias_count=lambda: dict(MovieCount=2, SeriesCount=0),
-                              get_libraries=lambda: [dict(id='lib', name='library')],
-                              get_items=lambda _id: [dict(id='new1', type='Movie'),
+                              get_libraries=lambda strict=False: [dict(id='lib', name='library')],
+                              get_items=lambda _id, strict=False: [dict(id='new1', type='Movie'),
                                                     dict(id='new2', type='Movie')])
                 original_insert = store.insert
                 calls = []

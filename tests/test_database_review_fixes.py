@@ -366,12 +366,14 @@ class DatabaseReviewFixTest(DatabaseCase):
                                 'sync_mediaserver', {'lock': threading.Lock(), 'log': Mock()})
         with patch.object(media_db, '_Database', self.db.managed):
             store = media_db.MediaDb()
+            # Each subcase starts from the same committed cache, independently.
+            store.empty()
             store.insert('emby', dict(id='old', type='Movie'))
             store.statistics('emby', 1, 1, 0)
             receiver = NS(server=True, mediadb=store, progress=Mock(), _server_type=NS(value='emby'),
                           get_medias_count=lambda: dict(MovieCount=2, SeriesCount=0),
-                          get_libraries=lambda: [dict(id='lib', name='Library')],
-                          get_items=lambda _id: [dict(id='a', type='Movie'), dict(id='b', type='Movie')])
+                          get_libraries=lambda strict=False: [dict(id='lib', name='Library')],
+                          get_items=lambda _id, strict=False: [dict(id='a', type='Movie'), dict(id='b', type='Movie')])
             yield fn, receiver, store
 
     def read_sync(self):
@@ -383,7 +385,7 @@ class DatabaseReviewFixTest(DatabaseCase):
 
     def test_sync_success_hides_partial_rows_and_fetches_without_writer_slot(self):
         with self.sync_context() as (sync, receiver, store):
-            def items(_id):
+            def items(_id, strict=False):
                 self.assertEqual(self.db.managed.coordinator.snapshot()['active'], 0)
                 return [dict(id='a', type='Movie'), dict(id='b', type='Movie')]
             receiver.get_items = items
@@ -411,6 +413,102 @@ class DatabaseReviewFixTest(DatabaseCase):
     def test_sync_empty_snapshot_can_commit_without_dividing_by_zero(self):
         with self.sync_context() as (sync, receiver, _store):
             receiver.get_medias_count = lambda: dict(MovieCount=0, SeriesCount=0)
-            receiver.get_items = lambda _id: []
+            receiver.get_items = lambda _id, strict=False: []
+            self.assertTrue(sync(receiver))
+            self.assertEqual(self.read_sync(), ([], 0))
+
+    def test_sync_rejects_missing_or_invalid_remote_counts(self):
+        # A failed counts request must not be confused with explicit zero counts.
+        with self.sync_context() as (sync, receiver, _store):
+            for counts in ({}, None, {'MovieCount': 0}, {'MovieCount': None, 'SeriesCount': 0},
+                           {'MovieCount': -1, 'SeriesCount': 0}, {'MovieCount': False, 'SeriesCount': 0}):
+                with self.subTest(counts=counts):
+                    receiver.get_medias_count = lambda: counts
+                    receiver.get_libraries = Mock(return_value=[])
+                    receiver.progress.reset_mock()
+                    self.assertFalse(sync(receiver))
+                    receiver.get_libraries.assert_not_called()
+                    self.assertEqual(self.read_sync(), ([('old',)], 1))
+                    receiver.progress.end.assert_called_once_with('mediasync')
+
+    def test_sync_http_client_failures_preserve_previous_snapshot(self):
+        from tests.test_sync_reliability import load_class
+        # Execute the actual client parsing/generator bodies; mock only HTTP.
+        for name, class_name in (('emby', 'Emby'), ('jellyfin', 'Jellyfin')):
+            for failure in ('counts', 'libraries', 'items', 'details', 'recursive', 'malformed',
+                            'complete', 'empty', 'no_libraries'):
+                with self.subTest(server=name, failure=failure), self.sync_context() as (sync, receiver, _store):
+                    def response(value):
+                        return NS(status_code=200, json=lambda: value)
+                    def request(url):
+                        if '/Items/Counts?' in url:
+                            return None if failure == 'counts' else response({
+                                'MovieCount': 0 if failure in ('empty', 'no_libraries') else 1,
+                                'SeriesCount': 0})
+                        if '/Library/' in url:
+                            if failure == 'libraries':
+                                return None
+                            return response([] if failure == 'no_libraries' else
+                                            [{'Id': 'lib', 'ItemId': 'lib', 'Name': 'Library'}])
+                        if '/Items/one?' in url:
+                            return None if failure == 'details' else response({'Id': 'one', 'Type': 'Movie'})
+                        if 'Id=folder' in url:
+                            return None
+                        if failure == 'items':
+                            return NS(status_code=503)
+                        if failure == 'malformed':
+                            return response({})
+                        items = [] if failure == 'empty' else [{'Id': 'one', 'Type': 'Movie'}]
+                        if failure == 'recursive':
+                            items.append({'Id': 'folder', 'Type': 'Folder'})
+                        return response({'Items': items})
+                    transport = NS(get_res=Mock(side_effect=request))
+                    cls = load_class('app/mediaserver/client/' + name + '.py', class_name,
+                                     ['get_medias_count', 'get_libraries', 'get_items', 'get_iteminfo',
+                                      '__get_' + name + '_librarys'],
+                                     {'RequestUtils': lambda: transport, 'log': Mock(),
+                                      'ExceptionUtils': Mock(), 'json': json})
+                    client = cls()
+                    client._host, client._apikey, client._user = 'https://offline.invalid/', 'test', 'user'
+                    client._libraries, client.server_type = [], name
+                    setattr(client, '_' + class_name + '__request_utils', lambda: transport)
+                    receiver.get_medias_count = client.get_medias_count
+                    receiver.get_libraries = client.get_libraries
+                    receiver.get_items = client.get_items
+                    success = failure in ('complete', 'empty', 'no_libraries')
+                    self.assertEqual(sync(receiver), success)
+                    expected = ([('one',)], 1) if failure == 'complete' else (
+                        ([], 0) if success else ([('old',)], 1))
+                    self.assertEqual(self.read_sync(), expected)
+                    receiver.progress.end.assert_called_once_with('mediasync')
+                    # The same failure still uses the legacy sentinel for UI callers.
+                    if failure == 'libraries':
+                        self.assertEqual(client.get_libraries(), [])
+
+    def test_sync_plex_failure_after_an_item_preserves_previous_snapshot(self):
+        from tests.test_sync_reliability import load_class
+        cls = load_class('app/mediaserver/client/plex.py', 'Plex', ['get_libraries', 'get_items'],
+                         {'ExceptionUtils': Mock(), 'json': json})
+        client = cls()
+        client._Plex__item_path = lambda item: '/media/movie.mkv'
+        client._Plex__provider_ids = lambda item: {}
+        def partial_items():
+            yield NS(key='new', librarySectionID='lib', type='movie', title='Movie', year=2026)
+            raise RuntimeError('remote connection lost')
+        library = NS(sections=Mock(return_value=[NS(key='lib', title='Library')]),
+                     sectionByID=Mock(return_value=NS(all=partial_items)))
+        client._plex = NS(library=library)
+        with self.sync_context() as (sync, receiver, _store):
+            receiver.get_libraries, receiver.get_items = client.get_libraries, client.get_items
+            self.assertFalse(sync(receiver))
+            self.assertEqual(self.read_sync(), ([('old',)], 1))
+            # List failure and a genuine empty server remain distinguishable.
+            library.sections.side_effect = RuntimeError('offline')
+            self.assertFalse(sync(receiver))
+            self.assertEqual(self.read_sync(), ([('old',)], 1))
+            self.assertEqual(client.get_libraries(), [])
+            library.sections.side_effect = None
+            library.sections.return_value = []
+            receiver.get_medias_count = lambda: {'MovieCount': 0, 'SeriesCount': 0}
             self.assertTrue(sync(receiver))
             self.assertEqual(self.read_sync(), ([], 0))
