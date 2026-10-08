@@ -338,9 +338,11 @@ class Sync(object):
         """
         if not _transfer_all_lock.acquire(blocking=False):
             log.warn("【Sync】已有全量同步正在进行，跳过本次触发")
-            return
+            # 不同 sid 也可能争用此锁；未执行必须与完成区分，供任务入口报告繁忙。
+            return False
         try:
             self.__transfer_all_sync(sid=sid)
+            return True
         finally:
             _transfer_all_lock.release()
 

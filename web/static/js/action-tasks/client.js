@@ -141,23 +141,51 @@
     }
     const key = command + '\n' + JSON.stringify(canonical(JSON.parse(JSON.stringify(parameters || {}))));
     const long = commands.has(command) && (command !== 'special_confirmation' || (parameters || {}).stage === 'confirm');
-    if (long && inflight.has(key)) return inflight.get(key);
-    const deferred = $.Deferred();
     const origin = document.getElementById('page_content');
     const view = origin && origin.firstElementChild;
+    if (long && inflight.has(key)) {
+      const existing = inflight.get(key);
+      existing.subscribe(view, handler, options);
+      return existing;
+    }
+    const deferred = $.Deferred();
+    const subscribers = new Map();
     const requestId = global.crypto && global.crypto.randomUUID ? global.crypto.randomUUID() :
       Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
     let xhr = null, aborted = false;
+    let accepted = false, latest = null;
+    function live(page) { return !aborted && !disposed && (!page || page.isConnected); }
     function progress(record) {
       // Progress shares the terminal callback's page lifetime guard.
-      if (!aborted && !disposed && (!view || view.isConnected) && options.taskState) options.taskState(record);
+      latest = record;
+      subscribers.forEach((subscriber, page) => {
+        if (live(page) && subscriber.options.taskState) subscriber.options.taskState(record);
+      });
     }
     const result = deferred.promise();
+    result.subscribe = function (page, callback, settings) {
+      // One subscription per view prevents duplicate-click feedback, while a
+      // replacement view receives its own completion and current progress.
+      subscribers.forEach((_subscriber, priorPage) => {
+        if (priorPage && !priorPage.isConnected) subscribers.delete(priorPage);
+      });
+      subscribers.set(page, {handler: callback, options: settings});
+      if (accepted && settings.accepted) settings.accepted();
+      if (latest && live(page) && settings.taskState) settings.taskState(latest);
+    };
+    result.subscribe(view, handler, options);
+    function acknowledge() {
+      accepted = true;
+      subscribers.forEach(subscriber => { if (subscriber.options.accepted) subscriber.options.accepted(); });
+    }
     result.abort = function () { aborted = true; if (xhr) xhr.abort(); inflight.delete(key); deferred.reject(null, 'abort'); };
     function finish(reply) {
       inflight.delete(key);
       if (aborted || disposed) return;
-      if (handler && (!view || view.isConnected)) handler(reply);
+      subscribers.forEach((subscriber, page) => {
+        if (live(page) && subscriber.handler) subscriber.handler(reply);
+      });
+      subscribers.clear();
       deferred.resolve(reply);
     }
     function recover() {
@@ -181,11 +209,11 @@
       async: options.async !== false, timeout: long ? 30000 : 0, headers: {'X-Request-ID': requestId},
       data: {cmd: command, data: JSON.stringify(parameters || {})}});
     xhr.done(reply => {
-      if (options.accepted) options.accepted();
+      acknowledge();
       if (reply && reply.async && reply.operation_type === 'background_action') watch(reply.task, finish, progress);
       else finish(reply);
     }).fail((response, reason) => {
-      if (options.accepted) options.accepted();
+      acknowledge();
       if (aborted || reason === 'abort') return;
       if (long) recover();
       else finish({code: -99, retcode: -99, msg: '网络错误，请检查登录或连接', retmsg: '网络错误，请检查登录或连接'});

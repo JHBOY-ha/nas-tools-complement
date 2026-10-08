@@ -299,7 +299,12 @@ class WebAction:
             if service is None:
                 return {'code': -1, 'msg': '未知服务'}
             # Execute the service itself, not its former "thread started" ack.
-            function = lambda _data: (service() or {'code': 0, 'retmsg': '服务执行结束'})
+            def function(_data):
+                result = service()
+                # 目录同步的 False 表示锁繁忙、未执行，不能转换成成功终态。
+                if result is False:
+                    return {'code': -1, 'retmsg': '服务未执行或执行失败，请查看日志后重试'}
+                return result or {'code': 0, 'retmsg': '服务执行结束'}
         elif command == 'start_mediasync':
             def function(_data):
                 # 同步失败和未执行都不能作为成功结果交给异步任务登记。
@@ -5017,5 +5022,7 @@ class WebAction:
         """
         执行单个目录的目录同步
         """
-        Sync().transfer_all_sync(sid=data.get("sid"))
+        # 保留并发准入结果，避免被跳过的目录同步在任务中心显示成功。
+        if Sync().transfer_all_sync(sid=data.get("sid")) is False:
+            return {"code": -1, "msg": "已有目录同步正在进行，本次未执行，请稍后重试"}
         return {"code": 0, "msg": "执行成功"}

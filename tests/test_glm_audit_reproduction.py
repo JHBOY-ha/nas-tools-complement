@@ -171,6 +171,14 @@ class AuditSecurityRegressionTest(unittest.TestCase):
         init = next(n for n in cls_node.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
         mapping = next(n.value for n in init.body if isinstance(n, ast.Assign) and isinstance(n.value, ast.Dict))
         self.dispatch_commands = {key.value for key in mapping.keys}
+        # Include incremental registrations without weakening the exact policy
+        # comparison; task-status commands are installed via _actions.update.
+        for node in ast.walk(init):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                    and node.func.attr == 'update' and isinstance(node.func.value, ast.Attribute) \
+                    and node.func.value.attr == '_actions' and node.args \
+                    and isinstance(node.args[0], ast.Dict):
+                self.dispatch_commands.update(key.value for key in node.args[0].keys)
         self.action._actions = {}
         for key, value in zip(mapping.keys, mapping.values):
             if isinstance(value, ast.Attribute) and value.attr in methods:

@@ -20,7 +20,7 @@ const root = path.resolve(__dirname, '..');
         const command = form.get('cmd'), data = JSON.parse(form.get('data') || '{}');
         if (offline && ['get_action_task', 'get_action_tasks'].includes(command)) return route.abort('connectionfailed');
         let response;
-        if (['run_directory_sync', 'start_mediasync', 'sch'].includes(command)) {
+        if (['run_directory_sync', 'start_mediasync', 'sch', 'run_userrss', 'run_brushtask', 'auto_remove_torrents'].includes(command)) {
           mutations += 1;
           const id = 'task-' + (++next);
           const row = {task_id: id, owner: '7', command, title: '目录同步', status: 'queued',
@@ -34,7 +34,7 @@ const root = path.resolve(__dirname, '..');
         else if (command === 'get_action_task') {
           const row = rows.get(data.task_id);
           if (row.status !== 'canceled') {
-            row.status = finish ? (fail ? 'failed' : 'succeeded') : 'running';
+            row.status = finish ? (fail ? (fail === 'canceled' ? 'canceled' : 'failed') : 'succeeded') : 'running';
             row.message = finish ? (fail ? '<img src=x onerror=alert(1)>失败' : '目录同步完成') : '正在执行';
             if (finish) row.result = {code: fail ? -1 : 0, retcode: fail ? -1 : 0, msg: row.message, retmsg: row.message};
           }
@@ -113,6 +113,52 @@ const root = path.resolve(__dirname, '..');
     await page.evaluate(() => run_scheduler('sync', '目录同步'));
     await page.waitForFunction(() => feedback.length === 2);
     assert.equal(await page.evaluate(() => feedback[1][1]), '目录同步 服务执行完成');
+
+    // Coalescing retains a single mutation while a replacement page subscribes
+    // independently; same-page repeated clicks still produce one callback.
+    finish = false;
+    const mutationsBeforeReattach = mutations;
+    await page.evaluate(() => {
+      window.oldCallbacks = 0; window.newCallbacks = 0; window.newProgress = 0; window.newAccepted = 0;
+      ActionTaskClient.request('run_directory_sync', {sid:'reattach'}, () => oldCallbacks++);
+    });
+    await page.waitForFunction(() => document.getElementById('action-task-list').textContent.includes('正在执行'));
+    await page.evaluate(() => {
+      document.getElementById('page_content').replaceChildren(document.createElement('div'));
+      const subscribe = () => ActionTaskClient.request('run_directory_sync', {sid:'reattach'}, () => newCallbacks++, {
+        accepted: () => newAccepted++, taskState: () => newProgress++
+      });
+      window.reattached = subscribe();
+      subscribe();
+    });
+    await page.waitForFunction(() => newAccepted === 2 && newProgress >= 2);
+    finish = true;
+    await page.waitForFunction(() => reattached.state() === 'resolved');
+    assert.equal(await page.evaluate(() => newCallbacks), 1);
+    assert.equal(await page.evaluate(() => oldCallbacks), 0);
+    assert.equal(mutations, mutationsBeforeReattach + 1);
+
+    // Exercise all three actual callers with success, failure and cancellation.
+    // Only success may offer the normal refresh callback.
+    const callers = [
+      ['rss/user_rss.html', 'run_userrss_now'],
+      ['site/brushtask.html', 'run_brushtask_now'],
+      ['download/torrent_remove.html', 'run_torrent_remove_now']
+    ];
+    for (const [template, functionName] of callers) {
+      const text = fs.readFileSync(path.join(root, 'web/templates', template), 'utf8');
+      const start = text.indexOf('  function ' + functionName + '(');
+      assert(start >= 0, functionName + ' must exist');
+      const handler = text.slice(start, text.indexOf('\n  }', start) + 4);
+      await page.addScriptTag({content: handler});
+      for (const outcome of [false, true, 'canceled']) {
+        fail = outcome; finish = true;
+        const beforeFeedback = await page.evaluate(() => feedback.length);
+        await page.evaluate(name => window[name]('test'), functionName);
+        await page.waitForFunction(n => feedback.length === n + 1, beforeFeedback);
+        assert.equal(await page.evaluate(() => feedback[feedback.length - 1][0]), outcome ? 'error' : 'ok');
+      }
+    }
 
     // Media progress must arrive while work is running, and late progress must
     // never overwrite the terminal error or restart polling after closing.
