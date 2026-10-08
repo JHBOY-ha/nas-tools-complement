@@ -301,7 +301,14 @@ class WebAction:
             # Execute the service itself, not its former "thread started" ack.
             function = lambda _data: (service() or {'code': 0, 'retmsg': '服务执行结束'})
         elif command == 'start_mediasync':
-            function = lambda _data: (MediaServer().sync_mediaserver() or {'code': 0, 'msg': '媒体库同步执行结束'})
+            def function(_data):
+                # 同步失败和未执行都不能作为成功结果交给异步任务登记。
+                result = MediaServer().sync_mediaserver()
+                if result is True:
+                    return {'code': 0, 'msg': '媒体库同步执行结束'}
+                if result is None:
+                    return {'code': -1, 'msg': '未配置媒体服务器，媒体库同步未执行'}
+                return {'code': -1, 'msg': '媒体库同步失败，保留上次数据，请重试'}
 
         @copy_current_request_context
         def run():

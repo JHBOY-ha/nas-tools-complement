@@ -190,9 +190,11 @@ class _ISiteUserInfo(metaclass=ABCMeta):
                 pages = 1
                 while next_page:
                     if pages >= MAX_PAGINATION_PAGES or time.monotonic() >= deadline:
+                        # 截断结果不是完整快照；刷新层通过 err_msg 保留历史统计和明细。
+                        self.err_msg = "做种分页达到页数或时间上限，采集不完整，保留上次数据"
                         log.warn("【Sites】%s 做种分页超出上限（%s 页），已停止翻页"
                                  % (self.site_name, pages))
-                        break
+                        return
                     next_page = self._parse_user_torrent_seeding_info(
                         self._get_page_content(urljoin(urljoin(self._base_url, seeding_page), next_page),
                                                self._torrent_seeding_params,
