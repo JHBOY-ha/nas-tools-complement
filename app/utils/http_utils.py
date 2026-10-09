@@ -108,7 +108,7 @@ class RequestUtils:
         except requests.exceptions.RequestException:
             return None
 
-    def get_res(self, url, params=None, allow_redirects=True, stream=False):
+    def get_res(self, url, params=None, allow_redirects=True, stream=False, raise_errors=False):
         try:
             if self._isolated:
                 from app.utils.isolated_network import bounded_request
@@ -138,6 +138,10 @@ class RequestUtils:
                                     allow_redirects=allow_redirects,
                                     stream=stream)
         except requests.exceptions.RequestException:
+            # Native diagnostics can inspect the exception type while existing
+            # callers retain the None sentinel and never receive URL-bearing errors.
+            if raise_errors:
+                raise
             return None
 
     def post_res(self, url, params=None, allow_redirects=True, files=None, json=None,

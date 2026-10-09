@@ -706,6 +706,48 @@ class AuditSecurityRegressionTest(unittest.TestCase):
         self.assertTrue(probe("example.invalid")["res"])
         generic.assert_called_once_with(timeout=5)
 
+    def test_02_tmdb_website_probe_preserves_http_failures_and_safe_error_types(self):
+        probe, client, ns, generic, namespace = self.tmdb_network_probe()
+        generic.return_value.get_res.return_value = SimpleNamespace(status_code=403, ok=False)
+        result = probe("www.themoviedb.org")
+        self.assertFalse(result["res"])
+        self.assertEqual(result["http_status"], 403)
+        self.assertIn("HTTP 403", result["msg"])
+        self.assertEqual(generic.call_args.kwargs["timeout"], client.REQUEST_TIMEOUT)
+        self.assertEqual(generic.call_args.kwargs["proxies"], self.config.get_proxies.return_value)
+        self.assertTrue(generic.return_value.get_res.call_args.kwargs["raise_errors"])
+        for error_type in (requests.exceptions.ReadTimeout, requests.exceptions.ProxyError):
+            generic.return_value.get_res.side_effect = error_type("http://audit-user:audit-secret@localhost:20171")
+            result = probe("www.themoviedb.org")
+            self.assertFalse(result["res"])
+            self.assertIn(error_type.__name__, result["msg"])
+            self.assertNotIn("audit-secret", str(result))
+        generic.return_value.get_res.side_effect = None
+        generic.return_value.get_res.return_value = SimpleNamespace(status_code=200, ok=True)
+        self.assertTrue(probe("www.themoviedb.org")["res"])
+        generic.reset_mock()
+        self.config.get_proxies.return_value = {"unsupported": "http://localhost:20171"}
+        self.assertFalse(probe("www.themoviedb.org")["res"])
+        generic.assert_not_called()
+        ns["requests"].request.assert_not_called()
+
+    def test_02_tmdb_website_fallback_honors_global_proxy_and_blocks_invalid_settings(self):
+        client, _ = self.tmdb_client()
+        proxy = {"https": "http://localhost:20171"}
+        self.config.get_proxies.return_value = proxy
+        factory = MagicMock()
+        factory.return_value.get_res.return_value = SimpleNamespace(status_code=200, text="")
+        namespace = dict(self.ns, TMDb=type(client), RequestUtils=factory,
+                         StringUtils=SimpleNamespace(is_chinese=lambda _: False))
+        media = load_source("app/media/media.py", {"__search_tmdb_web"}, namespace, "Media")()
+        self.assertIsNone(media._Media__search_tmdb_web("Example", MediaType.MOVIE))
+        factory.assert_called_once_with(proxies=proxy, timeout=client.REQUEST_TIMEOUT)
+        self.assertEqual(factory.return_value.get_res.call_args.kwargs["params"], {"query": "Example"})
+        factory.reset_mock()
+        self.config.get_proxies.return_value = {"unsupported": "http://localhost:20171"}
+        self.assertIsNone(media._Media__search_tmdb_web("Different Example", MediaType.MOVIE))
+        factory.assert_not_called()
+
     def test_02_legacy_proxy_normalization_still_blocks_invalid_urls(self):
         # Normalizing legacy endpoints must not permit embedded commands or nodes.
         for value in ("localhost:20171; printf marker", "http://bad host:20171",
@@ -1375,8 +1417,16 @@ class AuditSecurityRegressionTest(unittest.TestCase):
         self.assertEqual(transfer.check_ignore(["/library/Show [SP].mkv"])[0], ["/library/Show [SP].mkv"])
 
     def request_utils(self):
-        cls = load_source("app/utils/http_utils.py", {"__init__", "get"}, dict(self.ns, requests=requests), "RequestUtils")
+        cls = load_source("app/utils/http_utils.py", {"__init__", "get", "get_res"}, dict(self.ns, requests=requests), "RequestUtils")
         return cls
+
+    def test_11_response_diagnostics_opt_in_preserves_default_error_handling(self):
+        session = self.response_session()
+        session.get.side_effect = requests.exceptions.ReadTimeout("private proxy URL")
+        client = self.request_utils()(session=session)
+        self.assertIsNone(client.get_res("https://example.invalid"))
+        with self.assertRaises(requests.exceptions.ReadTimeout):
+            client.get_res("https://example.invalid", raise_errors=True)
 
     def response_session(self, content=b"ok", encoding=None, headers=None):
         session = MagicMock()
@@ -1412,10 +1462,12 @@ class AuditSecurityRegressionTest(unittest.TestCase):
         self.assertEqual(calls, [])
 
     def test_12_web_parse_error_uses_logging_without_stdout(self):
+        self.config.get_proxies.return_value = {}
         helper = MagicMock()
         helper.get_res.return_value.status_code = 200
         helper.get_res.return_value.text = "invalid response"
-        ns = dict(self.ns, StringUtils=SimpleNamespace(is_chinese=lambda _: False), RequestUtils=lambda **_: helper,
+        ns = dict(self.ns, TMDb=type(self.tmdb_client()[0]),
+                  StringUtils=SimpleNamespace(is_chinese=lambda _: False), RequestUtils=lambda **_: helper,
                   etree=SimpleNamespace(HTML=MagicMock(side_effect=ValueError("invalid HTML"))))
         cls = load_source("app/media/media.py", {"__search_tmdb_web"}, ns, "Media")
         with patch("sys.stdout", new_callable=io.StringIO) as output:
@@ -1424,9 +1476,11 @@ class AuditSecurityRegressionTest(unittest.TestCase):
         self.ns["log"].error.assert_called_once()
 
     def test_13_query_structure_characters_and_spaces_remain_intact(self):
+        self.config.get_proxies.return_value = {}
         helper = MagicMock()
         helper.get_res.return_value = None
-        ns = dict(self.ns, StringUtils=SimpleNamespace(is_chinese=lambda _: False), RequestUtils=lambda **_: helper)
+        ns = dict(self.ns, TMDb=type(self.tmdb_client()[0]),
+                  StringUtils=SimpleNamespace(is_chinese=lambda _: False), RequestUtils=lambda **_: helper)
         cls = load_source("app/media/media.py", {"__search_tmdb_web"}, ns, "Media")
         for title in ("Love & Peace", "Love Peace", "C++ #1 / 100%", "Quote's Title"):
             cls()._Media__search_tmdb_web(title, MediaType.MOVIE)

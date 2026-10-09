@@ -23,6 +23,7 @@ from app.media.meta.recognition_rules import DEFAULT_EPISODE_MAPPINGS, DEFAULT_N
 from app.media.tmdbv3api import TMDb, Search, Movie, TV, Person, Find, TMDbException, Discover, Trending, Episode, Genre
 from app.utils import PathUtils, EpisodeFormat, RequestUtils, NumberUtils, StringUtils, cacheman
 from app.utils.types import MediaType, MatchMode
+from app.utils.security_utils import normalize_proxies
 from config import Config, KEYWORD_BLACKLIST, KEYWORD_SEARCH_WEIGHT_3, KEYWORD_SEARCH_WEIGHT_2, KEYWORD_SEARCH_WEIGHT_1, \
     KEYWORD_STR_SIMILARITY_THRESHOLD, KEYWORD_DIFF_SCORE_THRESHOLD, TMDB_IMAGE_ORIGINAL_URL, DEFAULT_TMDB_PROXY, \
     TMDB_IMAGE_FACE_URL, TMDB_PEOPLE_PROFILE_URL, TMDB_IMAGE_W500_URL, ANIME_GENREIDS
@@ -628,7 +629,16 @@ class Media:
         log.info("【Meta】正在从TheDbMovie网站查询：%s ..." % file_media_name)
         # Requests encodes only the query value, preserving &/#/+ in titles.
         tmdb_url = "https://www.themoviedb.org/search"
-        res = RequestUtils(timeout=5).get_res(url=tmdb_url, params={"query": file_media_name})
+        # Website fallback must honor the same global proxy and request timeout
+        # as API recognition and the native website probe.
+        try:
+            proxies = normalize_proxies(Config().get_proxies())
+        except ValueError as err:
+            # Invalid explicit settings must not silently fall back to direct access.
+            log.error(f"【Meta】TMDB 网页代理配置无效：{err}")
+            return None
+        res = RequestUtils(proxies=proxies, timeout=TMDb.REQUEST_TIMEOUT).get_res(
+            url=tmdb_url, params={"query": file_media_name})
         if res and res.status_code == 200:
             html_text = res.text
             if not html_text:

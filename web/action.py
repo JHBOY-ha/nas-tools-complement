@@ -2404,6 +2404,26 @@ class WebAction:
             elapsed_ms = int((datetime.datetime.now() - start_time).total_seconds() * 1000)
             result["time"] = "%s 毫秒" % elapsed_ms
             return result
+        if hostname == "www.themoviedb.org":
+            # The HTML site is independent of API health. Keep its real status
+            # and expose safe diagnostics instead of collapsing every error to False.
+            try:
+                response = RequestUtils(proxies=normalize_proxies(Config().get_proxies()),
+                                        timeout=TMDb.REQUEST_TIMEOUT).get_res(target, raise_errors=True)
+                result = {"res": response is not None and response.ok}
+                if response is not None:
+                    result["http_status"] = response.status_code
+                if not result["res"]:
+                    result["msg"] = (f"TMDB 官网返回 HTTP {response.status_code}"
+                                     if response is not None else "TMDB 官网未收到响应")
+            except Exception as err:
+                # Error text can include authenticated proxy URLs; type names suffice.
+                result = {"res": False, "msg": f"TMDB 官网连接异常：{type(err).__name__}"}
+            if not result["res"]:
+                log.warn(f"【Network】{result['msg']}")
+            elapsed_ms = int((datetime.datetime.now() - start_time).total_seconds() * 1000)
+            result["time"] = "%s 毫秒" % elapsed_ms
+            return result
         if target.find("themoviedb") != -1 \
                 or target.find("telegram") != -1 \
                 or target.find("fanart") != -1 \
