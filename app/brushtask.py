@@ -174,11 +174,11 @@ class BrushTask(object):
         :param taskid: 刷流任务的ID
         """
         if not taskid:
-            return
+            return {"code": -1, "msg": "刷流任务编号无效"}
         # 任务信息
         taskinfo = self.get_brushtask_info(taskid)
         if not taskinfo:
-            return
+            return {"code": -1, "msg": "刷流任务已不存在，未执行"}
         # 任务属性
         seed_size = taskinfo.get("seed_size")
         task_name = taskinfo.get("name")
@@ -192,21 +192,21 @@ class BrushTask(object):
         site_info = self.sites.get_sites(siteid=site_id)
         if not site_info:
             log.error("【Brush】刷流任务 %s 的站点已不存在，无法刷流！" % task_name)
-            return
+            return {"code": -1, "msg": "刷流站点已不存在，未执行"}
         site_name = site_info.get("name")
         site_proxy = site_info.get("proxy")
 
         if not rss_url:
             log.error("【Brush】站点 %s 未配置RSS订阅地址，无法刷流！" % site_name)
-            return
+            return {"code": -1, "msg": "刷流 RSS 地址未配置，未执行"}
         if rss_free and not cookie:
             log.warn("【Brush】站点 %s 未配置Cookie，无法开启促销刷流" % site_name)
-            return
+            return {"code": -1, "msg": "促销刷流缺少 Cookie，未执行"}
         # 下载器参数
         downloader_cfg = self.get_downloader_info(taskinfo.get("downloader"))
         if not downloader_cfg:
             log.error("【Brush】任务 %s 下载器不存在，无法刷流！" % task_name)
-            return
+            return {"code": -1, "msg": "刷流下载器不存在，未执行"}
 
         log.info("【Brush】开始站点 %s 的刷流任务：%s..." % (site_name, task_name))
         # 检查是否达到保种体积
@@ -215,17 +215,21 @@ class BrushTask(object):
                                            seedsize=seed_size,
                                            downloadercfg=downloader_cfg,
                                            dlcount=rss_rule.get("dlcount")):
-            return
+            return {"code": 0, "msg": "刷流检查完成，当前额度或规则不允许新增下载"}
 
-        rss_result = Rss.parse_rssxml(rss_url)
+        # 严格读取保留错误信号；空订阅仍是正常完成。
+        rss_result = Rss.parse_rssxml(rss_url, strict=True)
+        if rss_result is None:
+            return {"code": -1, "msg": "刷流 RSS 获取或解析失败，请检查日志"}
         if len(rss_result) == 0:
             log.warn("【Brush】%s RSS未下载到数据" % site_name)
-            return
+            return {"code": 0, "msg": "刷流检查完成，暂无条目"}
         else:
             log.info("【Brush】%s RSS获取数据：%s" % (site_name, len(rss_result)))
 
         max_dlcount = rss_rule.get("dlcount")
         success_count = 0
+        failed_count = 0
         if max_dlcount:
             downloading_count = self.__get_downloading_count(downloader_cfg) or 0
             new_torrent_count = int(max_dlcount) - int(downloading_count)
@@ -284,10 +288,17 @@ class BrushTask(object):
                                                        dlcount=rss_rule.get("dlcount"),
                                                        downloadercfg=downloader_cfg):
                         break
+                else:
+                    failed_count += 1
             except Exception as err:
+                failed_count += 1
                 ExceptionUtils.exception_traceback(err)
                 continue
         log.info("【Brush】任务 %s 本次添加了 %s 个下载" % (task_name, success_count))
+
+        if failed_count:
+            return {"code": -1, "msg": "刷流部分下载或处理失败，请检查日志；已完成的操作不会回滚"}
+        return {"code": 0, "msg": "刷流检查完成，本次添加 %s 个下载" % success_count}
 
     def remove_tasks_torrents(self):
         """

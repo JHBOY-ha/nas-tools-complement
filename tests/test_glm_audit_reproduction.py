@@ -26,6 +26,7 @@ import subprocess
 import tempfile
 from threading import RLock
 import time
+import traceback
 from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
@@ -38,6 +39,7 @@ from flask_restx import Api, Resource, reqparse
 import jwt
 import regex
 import requests
+from lxml import etree
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -130,6 +132,7 @@ class AuditSecurityRegressionTest(unittest.TestCase):
             "subprocess": subprocess, "importlib": SimpleNamespace(import_module=MagicMock()),
             "ntpath": ntpath, "rename_exclusive": EXCLUSIVE.rename_exclusive,
             "Config": lambda: self.config, "ExceptionUtils": MagicMock(),
+            "default_user_agent": requests.utils.default_user_agent,
             "log": MagicMock(), "MediaType": MediaType, "hmac": hmac,
             "g": g, "has_request_context": has_request_context,
             "generate_password_hash": lambda password: "hashed:" + password,
@@ -547,6 +550,134 @@ class AuditSecurityRegressionTest(unittest.TestCase):
             namespace["basic"]()
             self.assertEqual(render.call_args.kwargs["Proxy"], "127.0.0.1:20171")
 
+    def test_02_proxy_form_roundtrip_preserves_advanced_rules(self):
+        # The single-address field must not erase rules when unrelated settings save.
+        for raw in (
+            {"all": "http://proxy:7890", "no_proxy": "localhost",
+             "https://www.themoviedb.org": "http://tmdb:7891"},
+            {"https://www.themoviedb.org": "http://tmdb:7891"},
+            {"http": "http://proxy:7890", "https": "http://other:7891"},
+        ):
+            cfg = {"app": {"proxies": deepcopy(raw)}}
+            shown = (raw.get("http") or raw.get("https") or raw.get("all") or "").replace("http://", "")
+            self.action.set_config_value(cfg, "app.proxies", shown)
+            self.assertEqual(cfg["app"]["proxies"], raw)
+            with self.assertRaisesRegex(ValueError, "高级代理"):
+                self.action.set_config_value(cfg, "app.proxies", "changed:7890")
+            self.assertEqual(cfg["app"]["proxies"], raw)
+        cfg = {"app": {"proxies": {"http": "http://proxy:7890", "https": "http://proxy:7890"}}}
+        self.action.set_config_value(cfg, "app.proxies", "new:7891")
+        self.assertEqual(cfg["app"]["proxies"], {"http": "http://new:7891", "https": "http://new:7891"})
+        self.action.set_config_value(cfg, "app.proxies", "")
+        self.assertFalse(any(cfg["app"]["proxies"].values()))
+        cfg["app"]["proxies"] = {"invalid": "bad"}
+        self.action.set_config_value(cfg, "app.proxies", "")
+        self.assertFalse(any(cfg["app"]["proxies"].values()))
+
+    def test_rss_strict_reads_distinguish_errors_from_empty_feeds(self):
+        import xml.dom.minidom
+        factory = MagicMock()
+        namespace = dict(self.ns, RequestUtils=factory, xml=xml,
+                         RssTitleUtils=SimpleNamespace(keepfriends_title=lambda title: title))
+        rss = load_source("app/rss.py", {"parse_rssxml"}, namespace, "Rss")
+        response = SimpleNamespace(text="<rss><channel/></rss>", apparent_encoding="utf-8")
+        factory.return_value.get_res.return_value = response
+        self.assertEqual(rss.parse_rssxml("https://example.invalid/rss", strict=True), [])
+        response.text = "<html><body>login</body></html>"
+        self.assertIsNone(rss.parse_rssxml("https://example.invalid/rss", strict=True))
+        response.text = "<broken"
+        self.assertIsNone(rss.parse_rssxml("https://example.invalid/rss", strict=True))
+        self.assertEqual(rss.parse_rssxml("https://example.invalid/rss"), [])
+        factory.return_value.get_res.return_value = None
+        self.assertIsNone(rss.parse_rssxml("https://example.invalid/rss", strict=True))
+        self.assertEqual(rss.parse_rssxml("https://example.invalid/rss"), [])
+        # The article-list caller keeps its historical empty-list response.
+        checker = load_source("app/rsschecker.py", {"__parse_userrss_result", "get_rss_articles"},
+                              dict(self.ns, RequestUtils=factory, etree=etree), "RssChecker")()
+        checker.get_userrss_parser = MagicMock(return_value=None)
+        checker.get_rsstask_info = MagicMock(return_value={"name": "test"})
+        self.assertIsNone(checker._RssChecker__parse_userrss_result({"name": "test"}))
+        self.assertEqual(checker.get_rss_articles("1"), [])
+        checker.get_userrss_parser.return_value = {"type": "XML", "format": '{"list": "//item"}'}
+        response.text = "<rss><channel/></rss>"
+        factory.return_value.get_res.return_value = response
+        self.assertEqual(checker._RssChecker__parse_userrss_result({"address": "https://example.invalid/rss"}), [])
+
+    def assert_rss_action_status(self, service, brush, expected):
+        # Run the actual Web wrapper and terminal classifier together.
+        from concurrent.futures import Future
+        name = "__run_brushtask" if brush else "__run_userrss"
+        namespace = {"BrushTask" if brush else "RssChecker": lambda: service}
+        action = load_source("web/action.py", {name}, namespace, "WebAction")
+        result = getattr(action, "_WebAction" + name)({"id": "1"})
+        cls = load_source("app/helper/action_tasks.py", {"_finished"},
+                          {"time": time, "json": json, "copy": SimpleNamespace(deepcopy=deepcopy)}, "ActionTasks")
+        tasks = cls()
+        tasks._lock = RLock()
+        tasks._records = {"test": {"owner": "0", "fingerprint": "test"}}
+        tasks._fingerprints = {}
+        tasks._futures = {}
+        tasks._save = MagicMock()
+        future = Future()
+        future.set_result(result)
+        tasks._finished("test", future)
+        self.assertEqual(tasks._records["test"]["status"], expected)
+        self.assertTrue(tasks._records["test"]["message"])
+
+    def test_userrss_outcome_reaches_task_center(self):
+        service = load_source("app/rsschecker.py", {"check_task_rss"},
+                              dict(self.ns, traceback=traceback), "RssChecker")()
+        service.get_rsstask_info = MagicMock(return_value=None)
+        self.assert_rss_action_status(service, False, "failed")
+        service.get_rsstask_info.return_value = {"name": "test"}
+        service._RssChecker__parse_userrss_result = MagicMock(return_value=None)
+        self.assert_rss_action_status(service, False, "failed")
+        service._RssChecker__parse_userrss_result.return_value = []
+        self.assert_rss_action_status(service, False, "succeeded")
+        service._RssChecker__parse_userrss_result.return_value = [{}]
+        service.downloader = MagicMock()
+        service.downloader.get_download_list.return_value = []
+        self.assert_rss_action_status(service, False, "succeeded")
+        # A malformed entry must not become a successful terminal status.
+        service._RssChecker__parse_userrss_result.return_value = [None]
+        self.assert_rss_action_status(service, False, "failed")
+
+    def test_brush_outcome_reaches_task_center(self):
+        rss = MagicMock()
+        namespace = dict(self.ns, Rss=rss)
+        service = load_source("app/brushtask.py", {"check_task_rss"}, namespace, "BrushTask")()
+        service.get_brushtask_info = MagicMock(return_value=None)
+        self.assert_rss_action_status(service, True, "failed")
+        task = {"name": "test", "rss_url": "https://example.invalid/rss", "rss_rule": {}}
+        service.get_brushtask_info.return_value = task
+        service.sites = MagicMock()
+        service.sites.get_sites.return_value = None
+        self.assert_rss_action_status(service, True, "failed")
+        service.sites.get_sites.return_value = {"name": "site"}
+        task["rss_url"] = ""
+        self.assert_rss_action_status(service, True, "failed")
+        task["rss_url"] = "https://example.invalid/rss"
+        task["free"] = True
+        self.assert_rss_action_status(service, True, "failed")
+        task["free"] = False
+        service.get_downloader_info = MagicMock(return_value=None)
+        self.assert_rss_action_status(service, True, "failed")
+        service.get_downloader_info.return_value = {"id": "downloader"}
+        service._BrushTask__is_allow_new_torrent = MagicMock(return_value=False)
+        self.assert_rss_action_status(service, True, "succeeded")
+        service._BrushTask__is_allow_new_torrent.return_value = True
+        rss.parse_rssxml.return_value = None
+        self.assert_rss_action_status(service, True, "failed")
+        rss.parse_rssxml.return_value = []
+        self.assert_rss_action_status(service, True, "succeeded")
+        rss.parse_rssxml.return_value = [{"title": "torrent", "enclosure": "https://example.invalid/torrent"}]
+        service._BrushTask__remember_torrent = MagicMock(return_value=True)
+        service._BrushTask__check_rss_rule = MagicMock(return_value=True)
+        service._BrushTask__download_torrent = MagicMock(return_value=False)
+        self.assert_rss_action_status(service, True, "failed")
+        service._BrushTask__download_torrent.return_value = True
+        self.assert_rss_action_status(service, True, "succeeded")
+
     def test_02_unsupported_proxy_structures_remain_blocked(self):
         # Supporting legacy data must not execute dict expressions or hide conflicts.
         expression = "{'http': " + self.marker_expression("proxy-shape", "'http://localhost:20171'") + "}"
@@ -744,12 +875,52 @@ class AuditSecurityRegressionTest(unittest.TestCase):
                          StringUtils=SimpleNamespace(is_chinese=lambda _: False))
         media = load_source("app/media/media.py", {"__search_tmdb_web"}, namespace, "Media")()
         self.assertIsNone(media._Media__search_tmdb_web("Example", MediaType.MOVIE))
-        factory.assert_called_once_with(proxies=proxy, timeout=client.REQUEST_TIMEOUT)
+        factory.assert_called_once_with(headers=requests.utils.default_user_agent(),
+                                        proxies=proxy, timeout=client.REQUEST_TIMEOUT)
         self.assertEqual(factory.return_value.get_res.call_args.kwargs["params"], {"query": "Example"})
         factory.reset_mock()
         self.config.get_proxies.return_value = {"unsupported": "http://localhost:20171"}
         self.assertIsNone(media._Media__search_tmdb_web("Different Example", MediaType.MOVIE))
         factory.assert_not_called()
+
+    def test_02_tmdb_website_ua_isolated_from_global_and_site_settings(self):
+        # Exercise both entry points through the real HTTP helper, inspecting
+        # outgoing headers rather than only the mocked factory arguments.
+        old_ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/98.0.4758.102 Safari/537.36")
+        self.configuration["app"]["user_agent"] = old_ua
+        self.config.get_ua.return_value = old_ua
+        probe, client, _, _, namespace = self.tmdb_network_probe()
+        before = deepcopy(self.configuration)
+        helper = self.request_utils()
+        namespace["RequestUtils"] = helper
+        media_ns = dict(self.ns, TMDb=type(client), RequestUtils=helper, etree=etree,
+                        StringUtils=SimpleNamespace(is_chinese=lambda _: False))
+        media = load_source("app/media/media.py", {"__search_tmdb_web"}, media_ns, "Media")()
+        info = {"id": 123, "title": "Example", "media_type": MediaType.MOVIE}
+        media.get_tmdb_info = MagicMock(return_value=info)
+        response = requests.Response()
+        response.status_code = 200
+        response._content = b'<a data-id="123" href="/movie/123">Example</a>'
+        with patch.object(requests, "get", return_value=response) as transport:
+            self.assertTrue(probe("www.themoviedb.org")["res"])
+            self.assertEqual(media._Media__search_tmdb_web("Example & Test", MediaType.MOVIE), info)
+            for call in transport.call_args_list:
+                self.assertEqual(call.kwargs["headers"]["User-Agent"], requests.utils.default_user_agent())
+                self.assertEqual(call.kwargs["headers"]["Content-Type"],
+                                 "application/x-www-form-urlencoded; charset=UTF-8")
+                self.assertEqual(call.kwargs["proxies"], self.config.get_proxies.return_value)
+                self.assertEqual(call.kwargs["timeout"], client.REQUEST_TIMEOUT)
+                self.assertTrue(call.kwargs["verify"])
+            self.assertEqual(transport.call_args.kwargs["params"], {"query": "Example & Test"})
+            media.get_tmdb_info.assert_called_once_with(mtype=MediaType.MOVIE, tmdbid="123")
+            # Unrelated requests retain the global UA or their explicit site UA.
+            helper().get_res("https://example.invalid")
+            self.assertEqual(transport.call_args.kwargs["headers"]["User-Agent"], old_ua)
+            helper(headers="site-specific-ua").get_res("https://example.invalid")
+            self.assertEqual(transport.call_args.kwargs["headers"]["User-Agent"], "site-specific-ua")
+        self.assertEqual(self.configuration, before)
+        self.config.get_ua.assert_called()
 
     def test_02_legacy_proxy_normalization_still_blocks_invalid_urls(self):
         # Normalizing legacy endpoints must not permit embedded commands or nodes.

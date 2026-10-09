@@ -260,6 +260,31 @@ const root = path.resolve(__dirname, '..');
     assert.equal(await page.locator('#nettest_item_res_time_0').textContent(), '80 毫秒');
     assert.equal(await page.locator('#nettest_btn').textContent(), '测试');
 
+    // Exercise the actual settings callback: errors remain visible and the
+    // original proxy input survives a rejected save or a later successful retry.
+    const basicSource = fs.readFileSync(path.join(root, 'web/templates/setting/basic.html'), 'utf8');
+    const saveBasic = basicSource.slice(basicSource.indexOf('  function save_basic_config('), basicSource.indexOf('  // 测试LLM配置'));
+    await page.evaluate(source => {
+      document.getElementById('page_content').innerHTML = '<input id="review-proxy" value="new:7890"><button id="review_btn">保存</button><div id="review-error" role="alert"></div>';
+      window.input_select_GetVal = () => ({'app.proxies': document.getElementById('review-proxy').value});
+      window.ajax_post = (_cmd, _data, callback) => { window.saveReply = callback; };
+      window.show_fail_modal = message => { document.getElementById('review-error').textContent = message; };
+      (0, eval)(source);
+      document.getElementById('review_btn').onclick = () => save_basic_config('review');
+    }, saveBasic);
+    await page.locator('#review_btn').focus();
+    await page.keyboard.press('Enter');
+    assert.equal(await page.locator('#review_btn').isDisabled(), true);
+    const validationMessage = '当前包含高级代理规则，请在配置文件中修改代理 <img src=x onerror=alert(1)>';
+    await page.evaluate(message => window.saveReply({code: 1, msg: message}), validationMessage);
+    assert.equal(await page.locator('#review-error').textContent(), validationMessage);
+    assert.equal(await page.locator('#review-error img').count(), 0);
+    assert.equal(await page.locator('#review-proxy').inputValue(), 'new:7890');
+    assert.equal(await page.locator('#review_btn').isDisabled(), false);
+    await page.locator('#review_btn').click();
+    await page.evaluate(() => window.saveReply({code: 0}));
+    assert.equal(await page.locator('#review_btn').isDisabled(), false);
+
     assert.equal(await page.locator('#action-task-notice').getAttribute('aria-live'), 'polite');
     await page.screenshot({path:'/tmp/nas-action-tasks-mobile.png'});
     assert.deepEqual(errors, []);

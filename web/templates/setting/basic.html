@@ -1230,6 +1230,10 @@
       if (flag) {
         $("#" + type + "_btn").text("保存").attr("disabled", false);
       }
+      // 保存失败保留输入并显示原因，不能让高级代理规则保护变成无声拒绝。
+      if (!ret || ret.code !== 0) {
+        show_fail_modal((ret && ret.msg) || '设置保存失败，请检查配置后重试');
+      }
     });
   }
 

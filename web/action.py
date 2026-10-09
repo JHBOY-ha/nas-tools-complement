@@ -14,6 +14,7 @@ from math import floor
 from urllib.parse import unquote, urlsplit
 
 import cn2an
+from requests.utils import default_user_agent
 from flask import g, has_request_context, copy_current_request_context, request
 from flask_login import logout_user, current_user
 from werkzeug.security import generate_password_hash
@@ -485,9 +486,25 @@ class WebAction:
             return cfg
         # 代理
         if cfg_key == "app.proxies":
+            if cfg_value is not None and not isinstance(cfg_value, str):
+                raise ValueError("代理地址必须为文本")
+            valid_previous = True
+            try:
+                previous = normalize_proxies(cfg.get('app', {}).get('proxies'))
+            except ValueError:
+                # 非法历史配置仍允许通过设置页修正。
+                previous = {}
+                valid_previous = False
+            displayed = previous.get('http') or previous.get('https') or previous.get('all') or ''
+            if valid_previous and (cfg_value or '').strip() == displayed.replace('http://', ''):
+                # 表单会提交未编辑的字段；保留完整映射及原始存储格式。
+                return cfg
+            if (set(previous) - {'http', 'https'} or
+                    (previous.get('http') and previous.get('https') and
+                     previous['http'] != previous['https'])):
+                # 单地址输入无法表达主机规则、绕过项或不同协议出口，不静默丢弃。
+                raise ValueError("当前包含高级代理规则，请在配置文件中修改代理，避免丢失规则")
             if cfg_value:
-                if not isinstance(cfg_value, str):
-                    raise ValueError("代理地址必须为文本")
                 value = cfg_value.strip()
                 if "://" not in value:
                     value = "http://" + value
@@ -2408,7 +2425,9 @@ class WebAction:
             # The HTML site is independent of API health. Keep its real status
             # and expose safe diagnostics instead of collapsing every error to False.
             try:
-                response = RequestUtils(proxies=normalize_proxies(Config().get_proxies()),
+                # 官网独立使用 Requests UA，避免全局浏览器 UA 触发拒绝或影响其他站点。
+                response = RequestUtils(headers=default_user_agent(),
+                                        proxies=normalize_proxies(Config().get_proxies()),
                                         timeout=TMDb.REQUEST_TIMEOUT).get_res(target, raise_errors=True)
                 # HTTP reachability and page availability are separate outcomes.
                 result = {"res": response is not None and response.ok, "reachable": response is not None}
@@ -3149,13 +3168,12 @@ class WebAction:
 
     @staticmethod
     def __run_userrss(data):
-        RssChecker().check_task_rss(data.get("id"))
-        return {"code": 0}
+        # 业务层区分执行失败与正常空结果，任务中心直接保存真实终态。
+        return RssChecker().check_task_rss(data.get("id"))
 
     @staticmethod
     def __run_brushtask(data):
-        BrushTask().check_task_rss(data.get("id"))
-        return {"code": 0}
+        return BrushTask().check_task_rss(data.get("id"))
 
     @staticmethod
     def __list_site_resources(data):

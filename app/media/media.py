@@ -7,6 +7,7 @@ import traceback
 from functools import lru_cache
 
 import zhconv
+from requests.utils import default_user_agent
 from lxml import etree
 
 import log
@@ -637,7 +638,8 @@ class Media:
             # Invalid explicit settings must not silently fall back to direct access.
             log.error(f"【Meta】TMDB 网页代理配置无效：{err}")
             return None
-        res = RequestUtils(proxies=proxies, timeout=TMDb.REQUEST_TIMEOUT).get_res(
+        # 与官网测试使用相同的独立 UA，不要求用户修改其他站点的全局 UA。
+        res = RequestUtils(headers=default_user_agent(), proxies=proxies, timeout=TMDb.REQUEST_TIMEOUT).get_res(
             url=tmdb_url, params={"query": file_media_name})
         if res and res.status_code == 200:
             html_text = res.text
