@@ -1417,7 +1417,7 @@ def medialibrary():
 def basic():
     # Read canonical values so a legacy scalar cannot break settings rendering.
     proxies = Config().get_proxies()
-    proxy = proxies.get("http") if isinstance(proxies, dict) else None
+    proxy = (proxies.get("http") or proxies.get("https") or proxies.get("all")) if isinstance(proxies, dict) else None
     if proxy:
         proxy = proxy.replace("http://", "")
     RmtModeDict = WebAction().get_rmt_modes()

@@ -65,7 +65,8 @@ app:
   rmt_match_mode: normal
   # 【设置代理】，themoviedb、fanart、telegram等将使用代理访问，http和https均需配置，两项可以配置为一样
   # 地址未带协议时按http处理；socks5、socks5h(remote DNS)需带对应前缀。留空或false则不显式指定应用代理，仍可使用容器环境代理
-  # 兼容单一地址文本及 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY 字段，读取后统一为 http/https 映射；建议按下方结构配置
+  # 兼容单一地址文本及 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY 字段；支持 no_proxy 绕过列表和 scheme://hostname 主机规则
+  # 读取后规范化为 Requests 代理映射，建议一般用途按下方 http/https 结构配置
   # 示例：'http://127.0.0.1:7890' 'socks5://127.0.0.1:8018' 'socks5h://127.0.0.1:8018'
   proxies:
     http:

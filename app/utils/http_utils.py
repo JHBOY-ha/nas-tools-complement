@@ -45,7 +45,8 @@ class RequestUtils:
                 self._cookies = self.cookie_parse(cookies)
             else:
                 self._cookies = cookies
-        if proxies and isinstance(proxies, dict) and (proxies.get('http') or proxies.get('https')):
+        # Preserve full Requests maps, including all, no_proxy and host selectors.
+        if isinstance(proxies, dict) and any(proxies.values()):
             self._proxies = proxies
         if session:
             self._session = session

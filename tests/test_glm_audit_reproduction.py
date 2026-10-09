@@ -29,7 +29,7 @@ import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from cacheout import Cache
 from flask import Flask, g, has_request_context, render_template, request
@@ -413,9 +413,9 @@ class AuditSecurityRegressionTest(unittest.TestCase):
         self.assertNotIn(MARKER, os.environ)
 
     def tmdb_client(self):
-        ns = dict(self.ns, requests=MagicMock(), logger=MagicMock(), TMDbException=RuntimeError)
+        ns = dict(self.ns, requests=MagicMock(), logger=MagicMock(), TMDbException=RuntimeError, urlencode=urlencode)
         cls = load_source("app/media/tmdbv3api/tmdb.py", {
-            "proxies", "_validate_response", "cached_request", "_call"}, ns, "TMDb")
+            "proxies", "_validate_response", "_request", "test_connection", "cached_request", "_call"}, ns, "TMDb")
         client = cls()
         client.api_key, client.domain, client.language = "audit", "https://example.invalid/3", "en"
         client.obj_cached, client._remaining, client.debug = True, 40, False
@@ -508,9 +508,9 @@ class AuditSecurityRegressionTest(unittest.TestCase):
                 ("mapping implementation", UserDict(both), both),
                 ("uppercase keys", {"HTTP": proxy, "HTTPS": proxy}, both),
                 ("environment keys", {"HTTP_PROXY": proxy, "HTTPS_PROXY": proxy}, both),
-                ("all fallback", {"all": proxy}, both),
+                ("all fallback", {"all": proxy}, {"all": proxy}),
                 ("specific overrides all", {"ALL_PROXY": proxy, "https": "socks5h://localhost:1080"}, {
-                    "http": proxy, "https": "socks5h://localhost:1080"})):
+                    "all": proxy, "https": "socks5h://localhost:1080"})):
             with self.subTest(configuration=label):
                 client, ns = self.tmdb_client()
                 client.proxies = value
@@ -525,10 +525,12 @@ class AuditSecurityRegressionTest(unittest.TestCase):
         cls = load_source("config.py", {"get_proxies"}, {}, "Config")
         config = cls()
         proxy = "http://127.0.0.1:20171"
-        for raw in ("127.0.0.1:20171", UserDict({"ALL_PROXY": proxy}), {"HTTP": proxy, "HTTPS": proxy}):
+        for raw, expected in (("127.0.0.1:20171", {"http": proxy, "https": proxy}),
+                              (UserDict({"ALL_PROXY": proxy}), {"all": proxy}),
+                              ({"HTTP": proxy, "HTTPS": proxy}, {"http": proxy, "https": proxy})):
             app = {"proxies": raw}
             config.get_config = MagicMock(return_value=app)
-            self.assertEqual(config.get_proxies(), {"http": proxy, "https": proxy})
+            self.assertEqual(config.get_proxies(), expected)
             self.assertIs(app["proxies"], raw)
         # Invalid input must still reach TMDb's fail-closed setter for repair.
         raw = [proxy]
@@ -537,12 +539,13 @@ class AuditSecurityRegressionTest(unittest.TestCase):
 
     def test_02_basic_settings_display_uses_canonical_proxy(self):
         render = MagicMock()
-        self.config.get_proxies.return_value = {"http": "http://127.0.0.1:20171"}
         self.configuration["app"]["proxies"] = "127.0.0.1:20171"
         namespace = dict(self.ns, render_template=render, WebAction=MagicMock(), SystemConfig=MagicMock())
         load_source("web/main.py", {"basic"}, namespace)
-        namespace["basic"]()
-        self.assertEqual(render.call_args.kwargs["Proxy"], "127.0.0.1:20171")
+        for field in ("http", "https", "all"):
+            self.config.get_proxies.return_value = {field: "http://127.0.0.1:20171"}
+            namespace["basic"]()
+            self.assertEqual(render.call_args.kwargs["Proxy"], "127.0.0.1:20171")
 
     def test_02_unsupported_proxy_structures_remain_blocked(self):
         # Supporting legacy data must not execute dict expressions or hide conflicts.
@@ -571,6 +574,137 @@ class AuditSecurityRegressionTest(unittest.TestCase):
         self.assertNotIn("audit-password", message)
         ns["requests"].request.assert_not_called()
         client._session.request.assert_not_called()
+
+    def test_02_proxy_host_rules_preserve_requests_precedence(self):
+        # Expanding all into https would incorrectly override all://host rules.
+        proxies = SAFE.normalize_proxies({
+            "ALL_PROXY": "localhost:20171", "all://api.themoviedb.org": "localhost:20172",
+            "HTTPS://API.TMDB.ORG/": "localhost:20173"})
+        self.assertEqual(requests.utils.select_proxy("https://api.themoviedb.org/3", proxies),
+                         "http://localhost:20172")
+        self.assertEqual(requests.utils.select_proxy("https://api.tmdb.org/3", proxies),
+                         "http://localhost:20173")
+        self.assertEqual(requests.utils.select_proxy("https://example.invalid", proxies),
+                         "http://localhost:20171")
+        proxies["https"] = "http://localhost:20174"
+        self.assertEqual(requests.utils.select_proxy("https://api.themoviedb.org/3", proxies),
+                         "http://localhost:20174")
+        self.assertEqual(SAFE.normalize_proxies(proxies), proxies)
+
+    def test_02_no_proxy_metadata_uses_requests_bypass_semantics(self):
+        proxy = "http://localhost:20171"
+        for key in ("no", "NO_PROXY", "no_proxy"):
+            with self.subTest(field=key), patch.dict(os.environ, {"HTTPS_PROXY": proxy}, clear=True):
+                proxies = SAFE.normalize_proxies({key: "api.themoviedb.org, localhost"})
+                self.assertEqual(proxies, {"no_proxy": "api.themoviedb.org,localhost"})
+                session = requests.Session()
+                settings = session.merge_environment_settings(
+                    "https://api.themoviedb.org/3", dict(proxies), False, True, None)
+                self.assertIsNone(requests.utils.select_proxy("https://api.themoviedb.org/3", settings["proxies"]))
+                settings = session.merge_environment_settings(
+                    "https://example.invalid", dict(proxies), False, True, None)
+                self.assertEqual(settings["proxies"]["https"], proxy)
+
+    def test_02_unsupported_proxy_fields_are_identified_without_secrets(self):
+        # Field names are useful diagnostics; URL-shaped names must stay redacted.
+        for field, visible in (("unexpected_field", True),
+                               ("http://audit-user:audit-password@localhost:20171", False)):
+            client, ns = self.tmdb_client()
+            client.proxies = {field: "http://audit-user:audit-password@localhost:20171"}
+            args = ns["logger"].error.call_args.args
+            message = args[0] % args[1:]
+            if visible:
+                self.assertIn(field, message)
+            self.assertNotIn("audit-user", message)
+            self.assertNotIn("audit-password", message)
+            ns["requests"].request.assert_not_called()
+
+    def test_02_http_utils_preserves_complete_requests_proxy_maps(self):
+        for proxies in ({"all": "http://localhost:20171"}, {"no_proxy": "example.invalid"},
+                        {"https://example.invalid": "http://localhost:20172"}):
+            with self.subTest(fields=list(proxies)):
+                session = self.response_session()
+                self.assertEqual(self.request_utils()(proxies=proxies, session=session).get("https://example.invalid"), "ok")
+                self.assertEqual(session.get.call_args.kwargs["proxies"], proxies)
+
+    def test_02_all_proxy_remains_available_to_git_updates(self):
+        self.login_as("0")
+        proxy = "http://localhost:20171"
+        self.config.get_proxies.return_value = {"all": proxy}
+        self.action.restart_server = MagicMock()
+        with patch("subprocess.run", return_value=SimpleNamespace(returncode=0)) as run:
+            self.assertEqual(self.post("update_system", {}).json["code"], 0)
+        args = [call.args[0] for call in run.call_args_list]
+        self.assertIn(["git", "config", "--global", "http.proxy", proxy], args)
+        self.assertIn(["git", "config", "--global", "https.proxy", proxy], args)
+
+    def test_02_tmdb_probe_shares_transport_without_changing_running_settings(self):
+        client, ns = self.tmdb_client()
+        proxies = {"https": "http://localhost:20171", "no_proxy": "localhost"}
+        client.proxies = proxies
+        ns["requests"].request.return_value.json.return_value = {"images": {}}
+        previous = dict(os.environ)
+        self.assertTrue(type(client).test_connection("audit", proxies=proxies, domain="api.themoviedb.org"))
+        self.assertEqual(dict(os.environ), previous)
+        self.assertEqual(type(client).cached_request.cache_info().currsize, 0)
+        probe_kwargs = ns["requests"].request.call_args.kwargs
+        client.cache = True
+        self.assertEqual(client._call("/configuration", ""), {"images": {}})
+        self.assertEqual(ns["requests"].request.call_args.kwargs, probe_kwargs)
+
+    def tmdb_network_probe(self):
+        client, transport = self.tmdb_client()
+        self.configuration["app"]["rmt_tmdbkey"] = "audit"
+        self.config.get_proxies.return_value = {"https": "http://localhost:20171"}
+        generic = MagicMock()
+        namespace = dict(self.ns, TMDb=type(client), TMDbException=RuntimeError, datetime=datetime,
+                         urlsplit=urlsplit, RequestUtils=generic)
+        action = load_source("web/action.py", {"__net_test"}, namespace, "WebAction")
+        return action._WebAction__net_test, client, transport, generic, namespace
+
+    def test_02_web_tmdb_probe_uses_authenticated_endpoint_and_full_elapsed_time(self):
+        probe, client, ns, generic, namespace = self.tmdb_network_probe()
+        ns["requests"].request.return_value.json.return_value = {"images": {}}
+        start = datetime.datetime(2026, 1, 1)
+        namespace["datetime"] = SimpleNamespace(datetime=SimpleNamespace(now=MagicMock(
+            side_effect=[start, start + datetime.timedelta(seconds=2)] * 2)))
+        previous = dict(os.environ)
+        for host in ("api.themoviedb.org", "api.tmdb.org"):
+            result = probe(host)
+            self.assertTrue(result["res"])
+            self.assertEqual(result["time"], "2000 毫秒")
+            args, kwargs = ns["requests"].request.call_args
+            parsed = urlsplit(args[1])
+            self.assertEqual((parsed.hostname, parsed.path), (host, "/3/configuration"))
+            self.assertEqual(parse_qs(parsed.query)["api_key"], ["audit"])
+            self.assertEqual(kwargs["timeout"], client.REQUEST_TIMEOUT)
+            self.assertTrue(kwargs["verify"])
+            self.assertEqual(kwargs["proxies"], self.config.get_proxies.return_value)
+        generic.assert_not_called()
+        self.assertEqual(dict(os.environ), previous)
+        self.assertEqual(type(client).cached_request.cache_info().currsize, 0)
+
+    def test_02_web_tmdb_probe_reports_auth_and_network_errors_safely(self):
+        probe, client, ns, generic, namespace = self.tmdb_network_probe()
+        ns["requests"].request.return_value.status_code = 401
+        result = probe("api.themoviedb.org")
+        self.assertFalse(result["res"])
+        self.assertIn("认证", result["msg"])
+        self.assertIn("HTTP 401", result["msg"])
+        ns["requests"].request.side_effect = requests.ConnectionError("URL with api_key=audit-secret")
+        result = probe("api.themoviedb.org")
+        self.assertEqual(result["msg"], "ConnectionError")
+        self.assertNotIn("audit-secret", str(result))
+        self.configuration["app"]["rmt_tmdbkey"] = ""
+        ns["requests"].request.reset_mock()
+        result = probe("api.themoviedb.org")
+        self.assertFalse(result["res"])
+        self.assertIn("未配置", result["msg"])
+        ns["requests"].request.assert_not_called()
+        # Other targets retain the existing lightweight reachability probe.
+        generic.return_value.get_res.return_value = SimpleNamespace(ok=True)
+        self.assertTrue(probe("example.invalid")["res"])
+        generic.assert_called_once_with(timeout=5)
 
     def test_02_legacy_proxy_normalization_still_blocks_invalid_urls(self):
         # Normalizing legacy endpoints must not permit embedded commands or nodes.

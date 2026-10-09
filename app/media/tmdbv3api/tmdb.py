@@ -5,6 +5,7 @@ import json
 import os
 import time
 from functools import lru_cache
+from urllib.parse import urlencode
 
 import requests
 import requests.exceptions
@@ -169,15 +170,43 @@ class TMDb(object):
         return result
 
     @staticmethod
+    def _request(method, url, data, proxies, session=None):
+        """Share proxy parsing, TLS, timeout and response checks with API probes."""
+        proxy_dict = normalize_proxies(proxies)
+        transport = requests.request if session is None else session.request
+        response = transport(method, url, data=data, proxies=proxy_dict,
+                             verify=True, timeout=TMDb.REQUEST_TIMEOUT)
+        TMDb._validate_response(response)
+        return response
+
+    @classmethod
+    def test_connection(cls, api_key, proxies=None, domain="api.themoviedb.org"):
+        """Probe the authenticated API without cache or shared environment mutations."""
+        if not api_key:
+            raise TMDbException("TMDB API Key 未配置")
+        try:
+            proxy_dict = normalize_proxies(proxies)
+        except ValueError as err:
+            raise TMDbException(str(err)) from err
+        base = str(domain).rstrip("/")
+        if not base.startswith(("http://", "https://")):
+            base = "https://" + base
+        if not base.endswith("/3"):
+            base += "/3"
+        url = base + "/configuration?" + urlencode({"api_key": str(api_key), "language": "zh"})
+        response = cls._request("GET", url, None, proxy_dict)
+        result = cls._validate_response(response)
+        if not isinstance(result, dict) or not isinstance(result.get("images"), dict):
+            raise TMDbException("TMDB 配置接口返回的数据不完整")
+        return True
+
+    @staticmethod
     @lru_cache(maxsize=REQUEST_CACHE_MAXSIZE)
     def cached_request(method, url, data, proxies):
         # Safely read legacy dict repr as well as the new canonical JSON value.
         proxy_dict = normalize_proxies(parse_rule_dict(proxies if proxies and proxies != "None" else "{}"))
-        response = requests.request(method, url, data=data, proxies=proxy_dict,
-                                    verify=True, timeout=TMDb.REQUEST_TIMEOUT)
         # lru_cache does not retain exceptions: retry a failed URL on its next use.
-        TMDb._validate_response(response)
-        return response
+        return TMDb._request(method, url, data, proxy_dict)
 
     def cache_clear(self):
         return self.cached_request.cache_clear()
@@ -202,8 +231,7 @@ class TMDb(object):
             req = self.cached_request(method, url, data, self.proxies)
         else:
             proxy_dict = normalize_proxies(parse_rule_dict(self.proxies if self.proxies != "None" else "{}"))
-            req = self._session.request(method, url, data=data, proxies=proxy_dict,
-                                        timeout=TMDb.REQUEST_TIMEOUT, verify=True)
+            req = self._request(method, url, data, proxy_dict, session=self._session)
 
         # Apply the same HTTP, authentication and payload checks to both paths.
         json = self._validate_response(req)

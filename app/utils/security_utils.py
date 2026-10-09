@@ -92,6 +92,39 @@ def parse_rule_dict(value):
     return result
 
 
+def _normalize_proxy_field(field):
+    """Accept Requests selectors and describe unsupported names without URL secrets."""
+    if isinstance(field, str) and len(field) <= 2048:
+        key = field.strip().lower()
+        if "://" not in key and key.endswith("_proxy"):
+            key = key[:-6]
+        if key in ("http", "https", "all"):
+            return key
+        if key == "no":
+            return "no_proxy"
+        if "://" in key:
+            scheme, host = key.split("://", 1)
+            host = host[:-1] if host.endswith("/") else host
+            if host.startswith("[") and host.endswith("]"):
+                host = host[1:-1]
+            if scheme in ("http", "https", "all") and host:
+                try:
+                    try:
+                        ipaddress.ip_address(host)
+                    except ValueError:
+                        host = host.encode("idna").decode("ascii")
+                        if not re.fullmatch(r"[A-Za-z0-9_.-]+", host):
+                            raise ValueError()
+                    return f"{scheme}://{host}"
+                except (ValueError, UnicodeError):
+                    pass
+    # Only simple schema names are safe to reflect. A misplaced proxy URL may
+    # contain credentials, so all URL-shaped or control-bearing names are hidden.
+    safe_name = isinstance(field, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,63}", field)
+    label = repr(field) if safe_name else "[字段名已隐藏]"
+    raise ValueError(f"代理配置包含不支持的字段：{label}；支持 http/https/all、no_proxy 和 scheme://hostname")
+
+
 def normalize_proxies(proxies):
     """Normalize legacy proxy endpoints before validating supported URL formats."""
     if proxies is None or proxies is False:
@@ -114,15 +147,19 @@ def normalize_proxies(proxies):
         if value is None or value is False or (
                 isinstance(value, str) and len(value) <= 2048 and not value.strip()):
             continue
-        # Canonicalize protocol and Docker environment aliases without letting
-        # unknown nonempty fields silently change the selected proxy.
-        if not isinstance(key, str):
-            raise ValueError("代理配置字段名必须为文本")
-        key = key.strip().lower()
-        if key.endswith("_proxy"):
-            key = key[:-6]
-        if key not in ("http", "https", "all"):
-            raise ValueError("代理配置包含不支持的字段，仅支持 http/https/all 及其 *_proxy 形式")
+        key = _normalize_proxy_field(key)
+        if key == "no_proxy":
+            # This is a bounded bypass list, not a proxy URL. Requests removes
+            # ASCII spaces before checking domains, IPs, CIDRs and '*'.
+            if (not isinstance(value, str) or len(value) > 65536
+                    or any(ord(char) < 32 or ord(char) == 127 for char in value)):
+                raise ValueError("no_proxy 代理绕过列表格式无效")
+            value = value.replace(" ", "")
+            if key in result and result[key] != value:
+                raise ValueError("no_proxy 代理配置存在冲突")
+            if value:
+                result[key] = value
+            continue
         if not isinstance(value, str) or len(value) > 2048:
             raise ValueError(f"{key} 代理地址格式无效")
         # YAML startup bypasses the webpage, which strips boundary whitespace
@@ -154,12 +191,8 @@ def normalize_proxies(proxies):
         if key in result and result[key] != value:
             raise ValueError(f"{key} 代理配置存在冲突")
         result[key] = value
-    # Requests uses all as a fallback; expand it for callers such as git that
-    # consume only the canonical http and https fields.
-    fallback = result.pop("all", None)
-    if fallback:
-        for key in ("http", "https"):
-            result.setdefault(key, fallback)
+    # Preserve all and host selectors: expanding all into https would outrank
+    # all://host and change Requests' documented proxy selection semantics.
     return result
 
 

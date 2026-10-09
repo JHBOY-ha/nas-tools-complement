@@ -11,7 +11,7 @@ import signal
 import subprocess
 from copy import deepcopy
 from math import floor
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 import cn2an
 from flask import g, has_request_context, copy_current_request_context, request
@@ -31,6 +31,7 @@ from app.helper import DbHelper, ProgressHelper, ThreadHelper, \
 from app.indexer import Indexer
 from app.media import Category, Media, Bangumi, DouBan
 from app.media.meta import MetaInfo, MetaBase
+from app.media.tmdbv3api import TMDb, TMDbException
 from app.mediaserver import MediaServer
 from app.message import Message, MessageCenter
 from app.rss import Rss
@@ -1342,7 +1343,9 @@ class WebAction:
             else:
                 proxy = normalize_proxies(Config().get_proxies())
                 for protocol in ("http", "https"):
-                    value = proxy.get(protocol) or proxy.get("https" if protocol == "http" else "http")
+                    # Git's global proxy setting also accepts the all fallback.
+                    value = (proxy.get(protocol) or proxy.get("https" if protocol == "http" else "http")
+                             or proxy.get("all"))
                     if value:
                         subprocess.run(["git", "config", "--global", protocol + ".proxy", value], check=True)
                     else:
@@ -2380,6 +2383,27 @@ class WebAction:
             target = "https://" + target
 
         start_time = datetime.datetime.now()
+        try:
+            hostname = urlsplit(target).hostname
+        except ValueError:
+            hostname = None
+        if hostname in ("api.themoviedb.org", "api.tmdb.org"):
+            # API roots can return 401/404 without indicating a network failure.
+            # Probe the real authenticated endpoint through the SDK transport,
+            # without changing the running clients' domain, key or proxy state.
+            try:
+                TMDb.test_connection(
+                    api_key=Config().get_config("app").get("rmt_tmdbkey"),
+                    proxies=Config().get_proxies(), domain=hostname)
+                result = {"res": True}
+            except Exception as err:
+                # RequestException text may contain the API key in the URL.
+                message = str(err) if isinstance(err, TMDbException) else type(err).__name__
+                log.warn(f"【Network】TMDB API 测试失败：{message}")
+                result = {"res": False, "msg": message}
+            elapsed_ms = int((datetime.datetime.now() - start_time).total_seconds() * 1000)
+            result["time"] = "%s 毫秒" % elapsed_ms
+            return result
         if target.find("themoviedb") != -1 \
                 or target.find("telegram") != -1 \
                 or target.find("fanart") != -1 \
@@ -2390,7 +2414,7 @@ class WebAction:
         else:
             res = RequestUtils(timeout=5).get_res(target)
         seconds = int((datetime.datetime.now() -
-                      start_time).microseconds / 1000)
+                      start_time).total_seconds() * 1000)
         if not res:
             return {"res": False, "time": "%s 毫秒" % seconds}
         elif res.ok:
