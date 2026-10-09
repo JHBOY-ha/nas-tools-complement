@@ -7,6 +7,7 @@ are blocked or mocked and file operations use disposable temporary directories.
 """
 import ast
 import base64
+from collections import UserDict
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 import datetime
@@ -494,6 +495,69 @@ class AuditSecurityRegressionTest(unittest.TestCase):
                     stream=False, verify=True, cert=None)
                 self.assertEqual(settings["proxies"]["https"], proxy)
             ns["logger"].error.assert_not_called()
+
+    def test_02_proxy_structures_are_normalized_before_tmdb_requests(self):
+        proxy = "http://127.0.0.1:20171"
+        both = {"http": proxy, "https": proxy}
+        # Legacy configuration can contain a scalar or a non-dict Mapping.
+        for label, value, expected in (
+                ("address scalar", "127.0.0.1:20171", both),
+                ("URL scalar", proxy, both),
+                ("JSON mapping scalar", json.dumps(both), both),
+                ("literal mapping scalar", repr(both), both),
+                ("mapping implementation", UserDict(both), both),
+                ("uppercase keys", {"HTTP": proxy, "HTTPS": proxy}, both),
+                ("environment keys", {"HTTP_PROXY": proxy, "HTTPS_PROXY": proxy}, both),
+                ("all fallback", {"all": proxy}, both),
+                ("specific overrides all", {"ALL_PROXY": proxy, "https": "socks5h://localhost:1080"}, {
+                    "http": proxy, "https": "socks5h://localhost:1080"})):
+            with self.subTest(configuration=label):
+                client, ns = self.tmdb_client()
+                client.proxies = value
+                for cached in (True, False):
+                    client.cache = cached
+                    self.assertEqual(client._call("/configuration", ""), {"audit": True})
+                    transport = ns["requests"].request if cached else client._session.request
+                    self.assertEqual(transport.call_args.kwargs["proxies"], expected)
+                ns["logger"].error.assert_not_called()
+
+    def test_02_configuration_returns_canonical_proxy_structures(self):
+        cls = load_source("config.py", {"get_proxies"}, {}, "Config")
+        config = cls()
+        proxy = "http://127.0.0.1:20171"
+        for raw in ("127.0.0.1:20171", UserDict({"ALL_PROXY": proxy}), {"HTTP": proxy, "HTTPS": proxy}):
+            app = {"proxies": raw}
+            config.get_config = MagicMock(return_value=app)
+            self.assertEqual(config.get_proxies(), {"http": proxy, "https": proxy})
+            self.assertIs(app["proxies"], raw)
+        # Invalid input must still reach TMDb's fail-closed setter for repair.
+        raw = [proxy]
+        config.get_config.return_value = {"proxies": raw}
+        self.assertIs(config.get_proxies(), raw)
+
+    def test_02_basic_settings_display_uses_canonical_proxy(self):
+        render = MagicMock()
+        self.config.get_proxies.return_value = {"http": "http://127.0.0.1:20171"}
+        self.configuration["app"]["proxies"] = "127.0.0.1:20171"
+        namespace = dict(self.ns, render_template=render, WebAction=MagicMock(), SystemConfig=MagicMock())
+        load_source("web/main.py", {"basic"}, namespace)
+        namespace["basic"]()
+        self.assertEqual(render.call_args.kwargs["Proxy"], "127.0.0.1:20171")
+
+    def test_02_unsupported_proxy_structures_remain_blocked(self):
+        # Supporting legacy data must not execute dict expressions or hide conflicts.
+        expression = "{'http': " + self.marker_expression("proxy-shape", "'http://localhost:20171'") + "}"
+        for value in (["http://localhost:20171"], True, 123, {"unexpected": "http://localhost:20171"},
+                      {"http": "localhost:20171", "HTTP_PROXY": "other-host:20171"},
+                      "a" * 65537, {"http": " " * 2049}, expression):
+            with self.subTest(configuration_type=type(value).__name__):
+                client, ns = self.tmdb_client()
+                client.proxies = value
+                with self.assertRaisesRegex(RuntimeError, "代理配置无效"):
+                    client._call("/configuration", "")
+                ns["requests"].request.assert_not_called()
+                client._session.request.assert_not_called()
+                self.assertNotIn(MARKER, os.environ)
 
     def test_02_invalid_proxy_diagnostics_identify_field_without_credentials(self):
         client, ns = self.tmdb_client()

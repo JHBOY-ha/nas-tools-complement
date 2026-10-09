@@ -1415,7 +1415,9 @@ def medialibrary():
 @App.route('/basic', methods=['POST', 'GET'])
 @login_required
 def basic():
-    proxy = Config().get_config('app').get("proxies", {}).get("http")
+    # Read canonical values so a legacy scalar cannot break settings rendering.
+    proxies = Config().get_proxies()
+    proxy = proxies.get("http") if isinstance(proxies, dict) else None
     if proxy:
         proxy = proxy.replace("http://", "")
     RmtModeDict = WebAction().get_rmt_modes()

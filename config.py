@@ -178,7 +178,17 @@ class Config(object):
                     sys.path.append(module_path)
 
     def get_proxies(self):
-        return self.get_config('app').get("proxies")
+        # Import after Config initialization to avoid app.utils bootstrap cycles.
+        from app.utils.security_utils import normalize_proxies
+
+        proxies = self.get_config('app').get("proxies")
+        try:
+            # All HTTP consumers share the same legacy-format normalization.
+            return normalize_proxies(proxies)
+        except ValueError:
+            # Keep the original invalid value for TMDb's fail-closed setter so
+            # startup remains available and reports the actual validation error.
+            return proxies
 
     def get_ua(self):
         return self.get_config('app').get("user_agent") or DEFAULT_UA

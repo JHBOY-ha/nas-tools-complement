@@ -1,5 +1,6 @@
 """Parse untrusted configuration as bounded data, never executable Python."""
 import ast
+from collections.abc import Mapping
 from fractions import Fraction
 import ipaddress
 import json
@@ -95,14 +96,33 @@ def normalize_proxies(proxies):
     """Normalize legacy proxy endpoints before validating supported URL formats."""
     if proxies is None or proxies is False:
         return {}
-    if not isinstance(proxies, dict) or any(key not in ("http", "https") for key in proxies):
-        raise ValueError("代理配置必须为 http/https 字典")
+    if isinstance(proxies, str):
+        # Older configuration editors can persist a single URL or a dict repr.
+        # Use the bounded data parser for dict text; never execute expressions.
+        if len(proxies) > 65536:
+            raise ValueError("代理配置文本过长")
+        value = proxies.strip()
+        if not value:
+            return {}
+        proxies = parse_rule_dict(value) if value.startswith("{") else {"http": value, "https": value}
+    if not isinstance(proxies, Mapping):
+        raise ValueError(f"代理配置类型无效（{type(proxies).__name__}），应为地址文本或代理映射")
     result = {}
     for key, value in proxies.items():
         # The legacy SDK skips disabled entries, allowing Docker's environment
         # proxies to remain effective when no application proxy is configured.
-        if value is None or value is False:
+        if value is None or value is False or (
+                isinstance(value, str) and len(value) <= 2048 and not value.strip()):
             continue
+        # Canonicalize protocol and Docker environment aliases without letting
+        # unknown nonempty fields silently change the selected proxy.
+        if not isinstance(key, str):
+            raise ValueError("代理配置字段名必须为文本")
+        key = key.strip().lower()
+        if key.endswith("_proxy"):
+            key = key[:-6]
+        if key not in ("http", "https", "all"):
+            raise ValueError("代理配置包含不支持的字段，仅支持 http/https/all 及其 *_proxy 形式")
         if not isinstance(value, str) or len(value) > 2048:
             raise ValueError(f"{key} 代理地址格式无效")
         # YAML startup bypasses the webpage, which strips boundary whitespace
@@ -131,7 +151,15 @@ def normalize_proxies(proxies):
         except (ValueError, UnicodeError) as err:
             # Identify the failed field without echoing URLs or credentials.
             raise ValueError(f"{key} 代理地址格式无效") from err
+        if key in result and result[key] != value:
+            raise ValueError(f"{key} 代理配置存在冲突")
         result[key] = value
+    # Requests uses all as a fallback; expand it for callers such as git that
+    # consume only the canonical http and https fields.
+    fallback = result.pop("all", None)
+    if fallback:
+        for key in ("http", "https"):
+            result.setdefault(key, fallback)
     return result
 
 
