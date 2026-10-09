@@ -92,17 +92,28 @@ def parse_rule_dict(value):
 
 
 def normalize_proxies(proxies):
-    """Accept supported proxy URLs, including credentials and bracketed IPv6."""
-    if proxies is None:
+    """Normalize legacy proxy endpoints before validating supported URL formats."""
+    if proxies is None or proxies is False:
         return {}
     if not isinstance(proxies, dict) or any(key not in ("http", "https") for key in proxies):
         raise ValueError("代理配置必须为 http/https 字典")
     result = {}
     for key, value in proxies.items():
-        if value in (None, ""):
+        # The legacy SDK skips disabled entries, allowing Docker's environment
+        # proxies to remain effective when no application proxy is configured.
+        if value is None or value is False:
             continue
-        if not isinstance(value, str) or len(value) > 2048 or any(c.isspace() or ord(c) < 32 for c in value):
-            raise ValueError("代理地址格式无效")
+        if not isinstance(value, str) or len(value) > 2048:
+            raise ValueError(f"{key} 代理地址格式无效")
+        # YAML startup bypasses the webpage, which strips boundary whitespace
+        # and supplies http:// for bare host:port values accepted by Requests.
+        value = value.strip()
+        if not value:
+            continue
+        if "://" not in value:
+            value = "http://" + value
+        if len(value) > 2048 or any(c.isspace() or ord(c) < 32 for c in value):
+            raise ValueError(f"{key} 代理地址格式无效")
         try:
             parts = urlsplit(value)
             hostname = parts.hostname
@@ -118,8 +129,8 @@ def normalize_proxies(proxies):
                 if not re.fullmatch(r"[A-Za-z0-9_.-]+", hostname.encode("idna").decode("ascii")):
                     raise ValueError("代理主机无效")
         except (ValueError, UnicodeError) as err:
-            # Never echo a URL that may contain passwords in validation errors.
-            raise ValueError("代理地址格式无效") from err
+            # Identify the failed field without echoing URLs or credentials.
+            raise ValueError(f"{key} 代理地址格式无效") from err
         result[key] = value
     return result
 

@@ -413,13 +413,15 @@ class AuditSecurityRegressionTest(unittest.TestCase):
 
     def tmdb_client(self):
         ns = dict(self.ns, requests=MagicMock(), logger=MagicMock(), TMDbException=RuntimeError)
-        cls = load_source("app/media/tmdbv3api/tmdb.py", {"proxies", "cached_request", "_call"}, ns, "TMDb")
+        cls = load_source("app/media/tmdbv3api/tmdb.py", {
+            "proxies", "_validate_response", "cached_request", "_call"}, ns, "TMDb")
         client = cls()
         client.api_key, client.domain, client.language = "audit", "https://example.invalid/3", "en"
         client.obj_cached, client._remaining, client.debug = True, 40, False
         client._session = MagicMock()
         for transport in (ns["requests"].request, client._session.request):
             transport.return_value.headers = {}
+            transport.return_value.status_code = 200
             transport.return_value.json.return_value = {"audit": True}
         return client, ns
 
@@ -456,6 +458,142 @@ class AuditSecurityRegressionTest(unittest.TestCase):
         client.proxies = {"http": "http://localhost:8080"}
         client.proxies = None
         self.assertEqual(json.loads(client.proxies), {})
+
+    def test_02_legacy_yaml_proxies_reach_both_tmdb_transports(self):
+        import ruamel.yaml
+
+        # Startup reads YAML directly, bypassing the webpage's URL normalization.
+        for label, document, expected in (
+                ("bare endpoints", "http: 127.0.0.1:20171\nhttps: 172.17.0.1:20171\n", {
+                    "http": "http://127.0.0.1:20171", "https": "http://172.17.0.1:20171"}),
+                ("boundary whitespace", 'http: "  http://172.17.0.1:20171  "\n'
+                 'https: "  socks5h://localhost:1080  "\n', {
+                     "http": "http://172.17.0.1:20171", "https": "socks5h://localhost:1080"}),
+                ("disabled HTTP", "http: false\nhttps: http://172.17.0.1:20171\n", {
+                    "https": "http://172.17.0.1:20171"})):
+            with self.subTest(configuration=label):
+                client, ns = self.tmdb_client()
+                client.proxies = ruamel.yaml.YAML().load(document)
+                for cached in (True, False):
+                    client.cache = cached
+                    self.assertEqual(client._call("/movie/1", ""), {"audit": True})
+                    transport = ns["requests"].request if cached else client._session.request
+                    self.assertEqual(transport.call_args.kwargs["proxies"], expected)
+                    self.assertTrue(transport.call_args.kwargs["verify"])
+                ns["logger"].error.assert_not_called()
+
+    def test_02_disabled_app_proxy_preserves_docker_environment_proxy(self):
+        # An unset application proxy must still let Requests inherit Docker's proxy.
+        proxy = "http://172.17.0.1:20171"
+        with patch.dict(os.environ, {"HTTPS_PROXY": proxy}, clear=True):
+            client, ns = self.tmdb_client()
+            for disabled in (False, {"http": False, "https": "   "}):
+                client.proxies = disabled
+                settings = requests.Session().merge_environment_settings(
+                    "https://example.invalid/3/movie/1", json.loads(client.proxies),
+                    stream=False, verify=True, cert=None)
+                self.assertEqual(settings["proxies"]["https"], proxy)
+            ns["logger"].error.assert_not_called()
+
+    def test_02_invalid_proxy_diagnostics_identify_field_without_credentials(self):
+        client, ns = self.tmdb_client()
+        client.proxies = {"https": "http://audit-user:audit-password@localhost:bad-port"}
+        with self.assertRaisesRegex(RuntimeError, "代理配置无效"):
+            client._call("/movie/1", "")
+        args = ns["logger"].error.call_args.args
+        message = args[0] % args[1:] if len(args) > 1 else args[0]
+        self.assertIn("https", message)
+        self.assertNotIn("audit-user", message)
+        self.assertNotIn("audit-password", message)
+        ns["requests"].request.assert_not_called()
+        client._session.request.assert_not_called()
+
+    def test_02_legacy_proxy_normalization_still_blocks_invalid_urls(self):
+        # Normalizing legacy endpoints must not permit embedded commands or nodes.
+        for value in ("localhost:20171; printf marker", "http://bad host:20171",
+                      "http://localhost:70000", "http://localhost:20171/ui",
+                      "http://localhost:20171?command=test", "vless://node@localhost:443"):
+            with self.subTest(proxy=value):
+                client, ns = self.tmdb_client()
+                client.proxies = {"http": value}
+                for cached in (True, False):
+                    client.cache = cached
+                    with self.assertRaisesRegex(RuntimeError, "代理配置无效"):
+                        client._call("/movie/1", "")
+                ns["requests"].request.assert_not_called()
+                client._session.request.assert_not_called()
+
+    def test_02_tmdb_http_failure_is_retried_instead_of_cached(self):
+        # A transient failure must not outlive recovery of the same URL and proxy.
+        for status in (401, 403, 429, 503):
+            with self.subTest(status=status):
+                client, ns = self.tmdb_client()
+                client.cache = True
+                client.proxies = {"https": "http://127.0.0.1:20171"}
+                failed = SimpleNamespace(headers={}, status_code=status, json=lambda: {
+                    "success": False, "status_code": 9})
+                recovered = SimpleNamespace(headers={}, status_code=200, json=lambda: {"audit": True})
+                ns["requests"].request.side_effect = [failed, recovered]
+                with self.assertRaisesRegex(RuntimeError, f"HTTP {status}"):
+                    client._call("/configuration", "")
+                self.assertEqual(client._call("/configuration", ""), {"audit": True})
+                self.assertEqual(client._call("/configuration", ""), {"audit": True})
+                self.assertEqual(ns["requests"].request.call_count, 2)
+
+    def test_02_tmdb_invalid_payload_is_not_cached(self):
+        for payload in ({"success": False, "status_code": 7}, {"errors": ["bad request"]}, "unavailable", None):
+            with self.subTest(payload=payload):
+                client, ns = self.tmdb_client()
+                client.cache = True
+                client.proxies = {}
+                failed = SimpleNamespace(headers={}, status_code=200, json=lambda: payload)
+                recovered = SimpleNamespace(headers={}, status_code=200, json=lambda: {"audit": True})
+                ns["requests"].request.side_effect = [failed, recovered]
+                with self.assertRaises(RuntimeError):
+                    client._call("/configuration", "")
+                self.assertEqual(client._call("/configuration", ""), {"audit": True})
+                self.assertEqual(ns["requests"].request.call_count, 2)
+
+        # A 200 HTML error page must not poison the cache either.
+        client, ns = self.tmdb_client()
+        client.cache = True
+        client.proxies = {}
+        failed = SimpleNamespace(headers={}, status_code=200, json=MagicMock(side_effect=ValueError("HTML")))
+        recovered = SimpleNamespace(headers={}, status_code=200, json=lambda: {"audit": True})
+        ns["requests"].request.side_effect = [failed, recovered]
+        with self.assertRaisesRegex(RuntimeError, "JSON"):
+            client._call("/configuration", "")
+        self.assertEqual(client._call("/configuration", ""), {"audit": True})
+        self.assertEqual(ns["requests"].request.call_count, 2)
+
+    def test_02_tmdb_configuration_arrays_remain_supported(self):
+        # Generic SDK calls must preserve valid array responses such as languages.
+        client, ns = self.tmdb_client()
+        client.proxies = {}
+        languages = [{"iso_639_1": "en", "english_name": "English"}]
+        for cached, transport in ((True, ns["requests"].request), (False, client._session.request)):
+            client.cache = cached
+            transport.return_value.json.return_value = languages
+            self.assertEqual(client._call("/configuration/languages", ""), languages)
+
+    def test_02_tmdb_transports_classify_authentication_failure_identically(self):
+        client, ns = self.tmdb_client()
+        client.proxies = {"https": "http://127.0.0.1:20171"}
+        failed = SimpleNamespace(headers={}, status_code=401, json=lambda: {"success": False, "status_code": 7})
+        messages = []
+        for cached, transport in ((True, ns["requests"].request), (False, client._session.request)):
+            client.cache = cached
+            transport.return_value = failed
+            with self.assertRaises(RuntimeError) as error:
+                client._call("/configuration", "")
+            messages.append(str(error.exception))
+        self.assertEqual(messages[0], messages[1])
+        self.assertIn("认证", messages[0])
+        self.assertNotIn("api_key=", messages[0])
+        self.assertEqual(ns["requests"].request.call_args.kwargs["timeout"],
+                         client._session.request.call_args.kwargs["timeout"])
+        self.assertEqual(ns["requests"].request.call_args.kwargs["verify"],
+                         client._session.request.call_args.kwargs["verify"])
 
     def test_03_all_dispatch_commands_have_explicit_policy(self):
         self.assertEqual(self.dispatch_commands, set(POLICY.ACTION_PERMISSIONS))
