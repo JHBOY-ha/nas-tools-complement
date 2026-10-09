@@ -174,7 +174,7 @@
                 <span>{{ target }}</span>
                 <input name="nettest_item" value="{{ target }}|{{ loop.index0 }}" type="hidden">
               </td>
-              <td id="nettest_item_res_{{ loop.index0 }}"></td>
+              <td id="nettest_item_res_{{ loop.index0 }}" aria-live="polite" aria-atomic="true"></td>
               <td id="nettest_item_res_time_{{ loop.index0 }}"></td>
             </tr>
             {% endfor %}
@@ -212,7 +212,7 @@
                 <span>{{ target }}</span>
                 <input name="nettest_anime_item" value="{{ target }}|{{ loop.index0 }}" type="hidden">
               </td>
-              <td id="nettest_anime_item_res_{{ loop.index0 }}"></td>
+              <td id="nettest_anime_item_res_{{ loop.index0 }}" aria-live="polite" aria-atomic="true"></td>
               <td id="nettest_anime_item_res_time_{{ loop.index0 }}"></td>
             </tr>
             {% endfor %}
@@ -495,13 +495,20 @@
     let url = url_index.split("|")[0];
     let index = url_index.split("|")[1];
     ajax_post("net_test", decodeURI(url), function (ret) {
-      if (ret.res) {
-        $(`#${result_prefix}_res_${index}`).html('<span class="badge bg-green me-1 mb-1">是</span>');
-        $(`#${result_prefix}_res_time_${index}`).html(`<span class="text-green">${ret.time}</span>`);
-      } else {
-        $(`#${result_prefix}_res_${index}`).html('<span class="badge bg-red me-1 mb-1">否</span>');
-        $(`#${result_prefix}_res_time_${index}`).html(`<span class="text-red">${ret.time}</span>`);
+      ret = ret || {};
+      const result_cell = $(`#${result_prefix}_res_${index}`);
+      const time_cell = $(`#${result_prefix}_res_time_${index}`);
+      const responded = !ret.res && ret.reachable;
+      const tone = ret.res ? 'bg-green' : (responded ? 'bg-yellow text-dark' : 'bg-red');
+      result_cell.empty().append($('<span>').addClass(`badge me-1 mb-1 ${tone}`)
+        .text(ret.res ? '是' : (responded ? '已响应' : '否')));
+      // Keep backend diagnostics visible and literal; HTTP 403 must not become
+      // an unexplained "No", and message/time fields must never execute HTML.
+      if (!ret.res && ret.msg) {
+        result_cell.append($('<div>').addClass('text-body small text-wrap text-break').text(ret.msg));
       }
+      time_cell.empty().append($('<span>').addClass(ret.res ? 'text-green' : (responded ? 'text-body' : 'text-red'))
+        .text(ret.time || '—'));
       callBack(true)
     });
   }

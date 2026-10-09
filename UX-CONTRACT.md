@@ -61,3 +61,11 @@
 
 本次有意改变共享请求的完成时机，所有改造入口使用同一 owner。既有应用反馈弹窗保留；
 不新增浏览器 alert/confirm/prompt，不重做无关页面。
+
+## 只读网络诊断
+
+以 `web/action.py::__net_test` 的响应为依据，`res` 继续表示测试目标可用。
+官网的 `reachable=true` 仅表示收到了 HTTP 响应；若同时 `res=false`，使用
+既有警告徽标显示“已响应”，并展示拒绝状态，不显示成功。连接异常保留“否”。
+普通与动漫网络测试共用 `service.html::net_test_one`，原因和耗时只以文本节点
+渲染在原表格中，重试结果覆盖原反馈；更新通过 polite live region 通知且不抢焦点。

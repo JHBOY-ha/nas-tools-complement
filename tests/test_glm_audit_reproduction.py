@@ -712,7 +712,9 @@ class AuditSecurityRegressionTest(unittest.TestCase):
         result = probe("www.themoviedb.org")
         self.assertFalse(result["res"])
         self.assertEqual(result["http_status"], 403)
+        self.assertTrue(result["reachable"])
         self.assertIn("HTTP 403", result["msg"])
+        self.assertIn("拒绝访问", result["msg"])
         self.assertEqual(generic.call_args.kwargs["timeout"], client.REQUEST_TIMEOUT)
         self.assertEqual(generic.call_args.kwargs["proxies"], self.config.get_proxies.return_value)
         self.assertTrue(generic.return_value.get_res.call_args.kwargs["raise_errors"])
@@ -720,6 +722,7 @@ class AuditSecurityRegressionTest(unittest.TestCase):
             generic.return_value.get_res.side_effect = error_type("http://audit-user:audit-secret@localhost:20171")
             result = probe("www.themoviedb.org")
             self.assertFalse(result["res"])
+            self.assertFalse(result["reachable"])
             self.assertIn(error_type.__name__, result["msg"])
             self.assertNotIn("audit-secret", str(result))
         generic.return_value.get_res.side_effect = None

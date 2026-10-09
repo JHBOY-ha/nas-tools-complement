@@ -8,6 +8,8 @@ const root = path.resolve(__dirname, '..');
     const page = await browser.newPage({viewport: {width: 1100, height: 800}});
     const errors = [], rows = new Map();
     let next = 0, mutations = 0, progressReads = 0, finish = false, offline = false, fail = false;
+    let networkReply = {res: false, reachable: true, http_status: 403,
+      msg: 'TMDB 官网拒绝访问（HTTP 403）', time: '120 毫秒'};
     page.on('pageerror', error => errors.push(error.message));
     await page.route('http://tasks.test/**', async route => {
       const url = new URL(route.request().url());
@@ -43,7 +45,8 @@ const root = path.resolve(__dirname, '..');
           const row = rows.get(data.task_id); row.status = 'canceled'; row.message = '已取消';
           row.result = {code: -1, retcode: -1, msg: '已取消', retmsg: '已取消'};
           response = {code: 0, task: row};
-        } else response = {code: -1, msg: '不存在'};
+        } else if (command === 'net_test') response = networkReply;
+        else response = {code: -1, msg: '不存在'};
         return route.fulfill({json: response});
       }
       const file = path.join(root, 'web', url.pathname);
@@ -209,9 +212,57 @@ const root = path.resolve(__dirname, '..');
     await page.waitForTimeout(1200);
     assert.equal(await page.evaluate(() => refresh_sync_process_flag), false);
 
+    // The actual service renderer must expose HTTP rejection reasons as text,
+    // clear them on retry, and preserve the shared batch button lifecycle.
+    const networkStart = service.indexOf('  function run_net_test_batch(');
+    const networkEnd = service.indexOf('  // 网络测速', networkStart);
+    await page.addScriptTag({content: service.slice(networkStart, networkEnd)});
+    const tableStart = service.indexOf('      <div class="table-responsive">', service.indexOf('id="modal-nettest"'));
+    const tableEnd = service.indexOf('      <div class="modal-footer">', tableStart);
+    const networkTable = service.slice(tableStart, tableEnd)
+      .replace(/{%[\s\S]*?%}/g, '').replace(/{{\s*target\s*}}/g, 'www.themoviedb.org')
+      .replace(/{{\s*loop.index0\s*}}/g, '0');
+    await page.evaluate(markup => {
+      const section = document.createElement('section'); section.className = 'container-xl';
+      section.innerHTML = '<h2>网络连通性测试</h2><div class="card">' + markup +
+        '<div class="card-footer"><button type="button" id="nettest_btn" class="btn btn-primary">测试</button></div></div>';
+      document.getElementById('page_content').replaceChildren(section);
+      document.getElementById('nettest_btn').onclick = function () {
+        run_net_test_batch($(this), 'nettest_item', 'nettest_item');
+      };
+    }, networkTable);
+    assert.equal(await page.getByText('网络连通性测试', {exact: true}).count(), 1);
+    assert.equal(await page.locator('#nettest_item_res_0').count(), 1);
+    await page.setViewportSize({width: 1100, height: 800});
+    await page.locator('#nettest_btn').click();
+    await page.getByText(networkReply.msg, {exact: true}).waitFor();
+    assert.equal(await page.locator('#nettest_item_res_0 .bg-yellow').textContent(), '已响应');
+    assert.equal(await page.locator('#nettest_item_res_0 .bg-green').count(), 0, '403 cannot report page availability');
+    assert.equal(await page.locator('#nettest_item_res_0').getAttribute('aria-live'), 'polite');
+    assert.equal(await page.locator('#nettest_item_res_time_0').textContent(), '120 毫秒');
+    await page.waitForFunction(() => !document.getElementById('nettest_btn').disabled);
+    await page.locator('#page_content').screenshot({path: '/tmp/nas-network-test-desktop.png'});
+    await page.setViewportSize({width: 390, height: 720});
+    assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+    await page.locator('#page_content').screenshot({path: '/tmp/nas-network-test-mobile.png'});
+    networkReply = {res: false, msg: '<img src=x onerror="window.networkXss=true">禁止访问',
+      time: '<img src=x onerror="window.networkXss=true">'};
+    await page.locator('#nettest_btn').click();
+    await page.waitForFunction(() => document.getElementById('nettest_item_res_0').textContent.includes('<img'));
+    assert.equal(await page.locator('#nettest_item_res_0 img, #nettest_item_res_time_0 img').count(), 0);
+    assert.equal(await page.evaluate(() => Boolean(window.networkXss)), false);
+    networkReply = {res: true, time: '80 毫秒'};
+    await page.locator('#nettest_btn').focus();
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.getElementById('nettest_item_res_0').textContent === '是');
+    assert.equal(await page.locator('#nettest_item_res_0 .bg-green').count(), 1);
+    assert.equal(await page.locator('#nettest_item_res_0 .small').count(), 0);
+    assert.equal(await page.locator('#nettest_item_res_time_0').textContent(), '80 毫秒');
+    assert.equal(await page.locator('#nettest_btn').textContent(), '测试');
+
     assert.equal(await page.locator('#action-task-notice').getAttribute('aria-live'), 'polite');
     await page.screenshot({path:'/tmp/nas-action-tasks-mobile.png'});
     assert.deepEqual(errors, []);
-    console.log('PASS: accepted/running/completed, dedupe, safe results, offline recovery, stale page, keyboard, narrow layout');
+    console.log('PASS: accepted/running/completed, dedupe, safe results, offline recovery, stale page, keyboard, narrow layout, network failure diagnostics');
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode=1; });

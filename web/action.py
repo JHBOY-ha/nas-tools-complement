@@ -2410,15 +2410,21 @@ class WebAction:
             try:
                 response = RequestUtils(proxies=normalize_proxies(Config().get_proxies()),
                                         timeout=TMDb.REQUEST_TIMEOUT).get_res(target, raise_errors=True)
-                result = {"res": response is not None and response.ok}
+                # HTTP reachability and page availability are separate outcomes.
+                result = {"res": response is not None and response.ok, "reachable": response is not None}
                 if response is not None:
                     result["http_status"] = response.status_code
                 if not result["res"]:
-                    result["msg"] = (f"TMDB 官网返回 HTTP {response.status_code}"
-                                     if response is not None else "TMDB 官网未收到响应")
+                    if response is None:
+                        result["msg"] = "TMDB 官网未收到响应"
+                    elif response.status_code == 403:
+                        # A forbidden response proves reachability but denies page access.
+                        result["msg"] = "TMDB 官网拒绝访问（HTTP 403）"
+                    else:
+                        result["msg"] = f"TMDB 官网返回 HTTP {response.status_code}"
             except Exception as err:
                 # Error text can include authenticated proxy URLs; type names suffice.
-                result = {"res": False, "msg": f"TMDB 官网连接异常：{type(err).__name__}"}
+                result = {"res": False, "reachable": False, "msg": f"TMDB 官网连接异常：{type(err).__name__}"}
             if not result["res"]:
                 log.warn(f"【Network】{result['msg']}")
             elapsed_ms = int((datetime.datetime.now() - start_time).total_seconds() * 1000)
