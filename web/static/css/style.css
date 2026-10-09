@@ -162,6 +162,9 @@ body, .page {
 }
 
 #page_content {
+    /* 保留页面纵向弹性布局，避免 d-flex 的 !important 覆盖初始化的 hidden 状态。 */
+    display: flex;
+    flex-direction: column;
     transition: opacity 0.15s ease-in-out;
 }
 
