@@ -372,7 +372,31 @@ def execute(operation, arguments):
     raise ValueError('Unsupported I/O operation')
 
 
+def _restore_windows_pipes():
+    """Recover inherited pipes hidden by PyInstaller's windowed bootloader."""
+    if os.name != 'nt':
+        return
+    # console=False gives Python None streams even when Popen supplied pipes.
+    # Use the inherited Win32 handles, never allocate a console or open files.
+    import ctypes
+    from ctypes import wintypes
+    import msvcrt
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.GetStdHandle.argtypes = [wintypes.DWORD]
+    kernel.GetStdHandle.restype = wintypes.HANDLE
+    for name, number, flags, mode in (
+            ('stdin', -10, os.O_RDONLY, 'r'), ('stdout', -11, os.O_WRONLY, 'w')):
+        if getattr(sys, name) is not None:
+            continue
+        handle = kernel.GetStdHandle(number)
+        if handle in (None, ctypes.c_void_p(-1).value):
+            raise OSError('Missing inherited worker pipe')
+        descriptor = msvcrt.open_osfhandle(handle, flags | os.O_BINARY)
+        setattr(sys, name, os.fdopen(descriptor, mode, encoding='utf-8'))
+
+
 def main():
+    _restore_windows_pipes()
     # One process serves sequential requests. Messages are bounded and the
     # parent controls the wall-clock deadline, including blocking reads/DNS.
     while True:

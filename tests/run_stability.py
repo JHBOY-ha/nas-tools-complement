@@ -31,6 +31,8 @@ STABILITY_MODULES = (
     # Simulated workloads verify budgets without probing the production NAS.
     "tests.test_workload_limits",
     "tests.test_b4_hardening",
+    # Worker bootstrap must bypass application startup in frozen builds too.
+    "tests.test_worker_entrypoint",
     "tests.test_review_completion",
     # WAL itself has a mandatory fixed-runtime acceptance runner. These real
     # file/transaction/migration cases also run on the legacy DELETE fallback.

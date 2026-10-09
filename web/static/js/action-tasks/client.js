@@ -224,7 +224,10 @@
   if (refreshButton) refreshButton.addEventListener('click', function () {
     inflight.forEach(value => { if (value.resume) value.resume(); }); refresh();
   });
-  global.addEventListener('pagehide', () => {
+  global.addEventListener('pagehide', event => {
+    // BFCache freezes and resumes this same document, including its timers and
+    // pending callbacks. Keep them intact; only a real unload disposes the client.
+    if (event.persisted) return;
     disposed = true; watches.forEach(state => clearTimeout(state.timer));
   });
   global.ActionTaskClient = {request, watch, refresh};

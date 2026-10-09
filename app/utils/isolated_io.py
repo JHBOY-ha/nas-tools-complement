@@ -35,8 +35,12 @@ class IsolationPool:
         atexit.register(self.close)
 
     def _spawn(self):
+        # A frozen sys.executable is the application itself; its early worker
+        # command bypasses normal startup and uses the bundled standalone file.
+        command = ([sys.executable, '--nastool-io-worker'] if getattr(sys, 'frozen', False)
+                   else [sys.executable, str(Path(__file__).with_name('isolated_worker.py'))])
         process = subprocess.Popen(
-            [sys.executable, str(Path(__file__).with_name('isolated_worker.py'))],
+            command,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             close_fds=True, start_new_session=(os.name != 'nt')
         )

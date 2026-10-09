@@ -1,6 +1,16 @@
 import os
-import signal
 import sys
+
+# Frozen executables are not Python interpreters. Dispatch the private worker
+# before importing the application, acquiring its DB lease or starting the tray.
+# run_path also avoids app.utils.__init__, which imports application state.
+if sys.argv[1:] == ['--nastool-io-worker']:
+    import runpy
+    runpy.run_path(os.path.join(os.path.dirname(__file__), 'app', 'utils',
+                               'isolated_worker.py'), run_name='__main__')
+    raise SystemExit(0)
+
+import signal
 import threading
 import time
 import warnings

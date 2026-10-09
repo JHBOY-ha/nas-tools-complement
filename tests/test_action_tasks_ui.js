@@ -138,6 +138,29 @@ const root = path.resolve(__dirname, '..');
     assert.equal(await page.evaluate(() => oldCallbacks), 0);
     assert.equal(mutations, mutationsBeforeReattach + 1);
 
+    // Cached documents keep their pending callbacks/timers. Dispatch the real
+    // browser lifecycle events without rebuilding the page or replaying writes.
+    finish = false;
+    const beforeCache = mutations;
+    await page.evaluate(() => {
+      window.cacheCallbacks = 0;
+      window.cachedRequest = ActionTaskClient.request('run_directory_sync', {sid:'bfcache'}, () => cacheCallbacks++);
+    });
+    await page.waitForFunction(() => document.getElementById('action-task-list').textContent.includes('正在执行'));
+    await page.evaluate(() => {
+      window.dispatchEvent(new PageTransitionEvent('pagehide', {persisted:true}));
+      window.dispatchEvent(new PageTransitionEvent('pageshow', {persisted:true}));
+    });
+    finish = true;
+    await page.waitForFunction(() => cachedRequest.state() === 'resolved');
+    assert.equal(await page.evaluate(() => cacheCallbacks), 1);
+    assert.equal(mutations, beforeCache + 1, 'BFCache restoration must not replay the mutation');
+    await page.evaluate(() => {
+      window.afterCache = ActionTaskClient.request('version', {}, () => cacheCallbacks++);
+    });
+    await page.waitForFunction(() => afterCache.state() === 'resolved');
+    assert.equal(await page.evaluate(() => cacheCallbacks), 2, 'New ordinary requests must still deliver feedback');
+
     // Exercise all three actual callers with success, failure and cancellation.
     // Only success may offer the normal refresh callback.
     const callers = [
