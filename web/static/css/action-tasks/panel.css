@@ -1,0 +1,9 @@
+/* 抽屉复用 Tabler 的尺寸与层级；窄屏使用可视宽度，任务列表在抽屉内滚动。 */
+#action-task-panel {
+    --tblr-offcanvas-width: min(30rem, 100vw);
+}
+
+/* 保留 Tabler 徽标外观，将计数留在页头可视范围，避免顶部裁剪和挤入头像。 */
+[data-action-task-count] {
+    transform: translate(20%, -10%);
+}

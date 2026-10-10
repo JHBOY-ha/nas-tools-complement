@@ -11,24 +11,72 @@
   const panel = document.getElementById('action-task-panel');
   const list = document.getElementById('action-task-list');
   const notice = document.getElementById('action-task-notice');
-  let disposed = false;
+  const refreshButton = document.getElementById('action-task-refresh');
+  let disposed = false, reading = false, readComplete = false, readFailed = false;
+  let drawerTrigger = null, modalSession = null, lastFeedback = '', lastFeedbackAt = 0;
+
+  function recentRecords() {
+    return Array.from(records.values()).sort((a, b) => b.created_at - a.created_at).slice(0, 20);
+  }
+  // 两个入口读取同一份任务状态；新加载的服务页和延迟渲染的页头也能补齐摘要。
+  function renderSummary() {
+    const values = recentRecords();
+    const running = values.filter(record => record.status === 'running').length;
+    const queued = values.filter(record => record.status === 'queued').length;
+    const count = running + queued;
+    const summary = readFailed ? '状态待刷新' :
+      (!readComplete && !values.length ? '正在读取任务状态…' : `最近操作：执行中 ${running} 项 · 排队 ${queued} 项`);
+    document.querySelectorAll('[data-action-task-summary]').forEach(element => { element.textContent = summary; });
+    document.querySelectorAll('[data-action-task-count]').forEach(element => {
+      element.textContent = count > 99 ? '99+' : String(count); element.hidden = count === 0;
+    });
+    document.querySelectorAll('[data-action-task-open]').forEach(element => {
+      element.setAttribute('aria-label', '后台操作，' + summary);
+      element.setAttribute('aria-expanded', String(Boolean(panel && panel.classList.contains('show'))));
+    });
+  }
+
+  function openPanel(trigger) {
+    if (!panel || modalSession || document.querySelector('.modal.show, .modal.showing')) return;
+    drawerTrigger = trigger || document.activeElement;
+    refresh();
+    $(panel).offcanvas('show');
+  }
 
   function raw(command, data, requestId) {
     return $.ajax({type: 'POST', url: 'do', dataType: 'json', timeout: 30000, cache: false,
       headers: requestId ? {'X-Request-ID': requestId} : {},
       data: {cmd: command, data: JSON.stringify(data || {})}});
   }
-  function announce(message) {
+  function announce(message, feedback = true) {
     if (notice) notice.textContent = message || '';
-    if (panel) panel.hidden = false;
+    const toast = document.getElementById('action-task-toast');
+    const now = global.performance.now();
+    // 只对当前可见提示做两秒去重；隐藏后的新任务和较晚的同文案仍应获得反馈。
+    const duplicate = toast && (toast.classList.contains('show') || toast.classList.contains('showing')) &&
+      message === lastFeedback && now - lastFeedbackAt < 2000;
+    // 关闭抽屉时只给简短反馈，不自动打开任务列表或抢走当前页面的焦点。
+    if (feedback && message && !duplicate && panel && !panel.classList.contains('show')) {
+      const output = document.getElementById('action-task-toast-text');
+      if (output && toast) {
+        output.textContent = message;
+        lastFeedback = message; lastFeedbackAt = now;
+        $(toast).toast('show');
+      }
+    }
   }
-  function button(text, action) {
+  function button(text, action, taskId, kind) {
     const value = document.createElement('button');
-    value.type = 'button'; value.className = 'btn btn-sm btn-outline-secondary';
+    value.type = 'button'; value.className = 'btn btn-sm';
+    value.dataset.actionTaskId = taskId; value.dataset.actionTaskKind = kind;
     value.textContent = text; value.addEventListener('click', action); return value;
   }
+  function taskButton(taskId, kind) {
+    return list && Array.from(list.querySelectorAll('[data-action-task-id]')).find(element =>
+      element.dataset.actionTaskId === taskId && element.dataset.actionTaskKind === kind);
+  }
   function showResult(record) {
-    const focus = document.activeElement;
+    if (modalSession) return;
     const title = document.getElementById('action-task-result-title');
     const output = document.getElementById('action-task-result-text');
     if (!output) return;
@@ -36,19 +84,79 @@
     output.textContent = record.message + '\n\n任务编号：' + record.task_id +
       (record.result ? '\n\n' + JSON.stringify(record.result, null, 2) : '');
     $('#action-task-result').modal('show');
-    $('#action-task-result').one('hidden.bs.modal', function () {
-      const target = focus && focus.isConnected ? focus : document.getElementById('action-task-refresh');
-      // Run after Bootstrap's hidden/focus-trap cleanup has completed.
-      if (target) setTimeout(() => target.focus(), 0);
-    });
+  }
+  function focusDrawerEntry() {
+    const target = drawerTrigger && drawerTrigger.isConnected ? drawerTrigger : document.querySelector('[data-action-task-open]');
+    if (target) target.focus();
+  }
+  function restoreDrawerFocus(session) {
+    const target = session.focus && session.focus.isConnected ? session.focus :
+      taskButton(session.taskId, session.kind) || taskButton(session.taskId, 'result') || refreshButton;
+    if (target) target.focus();
+  }
+  function nextModal(session) {
+    if (disposed || modalSession !== session) return;
+    // 既有反馈按钮可能继续打开业务对话框，等其关闭后再恢复任务界面。
+    const visibleModal = document.querySelector('.modal.show, .modal.showing');
+    if (visibleModal) {
+      $(visibleModal).one('hidden.bs.modal', () => setTimeout(() => nextModal(session), 0));
+      return;
+    }
+    const target = session.queue.shift();
+    if (target) {
+      session.active = target;
+      $(target).one('hidden.bs.modal', function () {
+        session.active = null;
+        // 等待 Bootstrap 清理遮罩、滚动锁与焦点陷阱，再继续下一个界面。
+        setTimeout(() => nextModal(session), 0);
+      });
+      $(target).modal('show');
+    } else if (session.restore) {
+      $(panel).one('shown.bs.offcanvas', function () {
+        // 恢复动画期间也可能收到其他任务的终态提示，仍按同一队列串行显示。
+        if (session.queue.length) suspendDrawer(session);
+        else { modalSession = null; restoreDrawerFocus(session); }
+      });
+      $(panel).offcanvas('show');
+    } else {
+      modalSession = null;
+      focusDrawerEntry();
+    }
+  }
+  function suspendDrawer(session) {
+    $(panel).one('hidden.bs.offcanvas', () => setTimeout(() => nextModal(session), 0));
+    if (panel.classList.contains('hiding')) return;
+    const hide = () => $(panel).offcanvas('hide');
+    if (panel.classList.contains('showing')) $(panel).one('shown.bs.offcanvas', hide);
+    else hide();
+  }
+  function coordinateModal(event) {
+    const initial = !modalSession;
+    if (initial) {
+      if (!panel || !panel.matches('.show, .showing, .hiding')) return;
+      const focus = panel.contains(document.activeElement) ? document.activeElement : refreshButton;
+      modalSession = {queue: [], active: null, restore: !panel.classList.contains('hiding'), focus,
+        taskId: focus && focus.dataset.actionTaskId, kind: focus && focus.dataset.actionTaskKind};
+    }
+    // 已被选中的模态框可以正常显示；其他请求等当前界面关闭后再显示。
+    if (modalSession.active === event.target) return;
+    event.preventDefault();
+    if (!modalSession.queue.includes(event.target)) modalSession.queue.push(event.target);
+    if (initial) suspendDrawer(modalSession);
   }
   function render() {
     if (!list) return;
+    const focus = list.contains(document.activeElement) ? document.activeElement : null;
+    const focusId = focus && focus.dataset.actionTaskId, focusKind = focus && focus.dataset.actionTaskKind;
     list.replaceChildren();
-    const values = Array.from(records.values()).sort((a, b) => b.created_at - a.created_at).slice(0, 20);
+    list.setAttribute('aria-busy', String(reading));
+    renderSummary();
+    const values = recentRecords();
     if (!values.length) {
       const empty = document.createElement('div');
-      empty.className = 'list-group-item text-muted'; empty.textContent = '暂无后台操作'; list.appendChild(empty);
+      empty.className = 'list-group-item text-reset opacity-75';
+      empty.textContent = reading ? '正在读取后台操作…' : (readFailed ? '任务列表暂不可用，请刷新状态' : '暂无后台操作');
+      list.appendChild(empty);
       return;
     }
     values.forEach(record => {
@@ -56,9 +164,9 @@
       row.className = 'list-group-item d-flex flex-wrap align-items-center gap-2'; row.setAttribute('role', 'listitem');
       const content = document.createElement('div'); content.className = 'flex-fill text-break';
       const title = document.createElement('strong'); title.textContent = record.title;
-      const status = document.createElement('span'); status.className = 'ms-2 text-muted';
+      const status = document.createElement('span'); status.className = 'ms-2 text-reset opacity-75';
       status.textContent = labels[record.status] || record.status;
-      const message = document.createElement('div'); message.className = 'small text-muted text-break';
+      const message = document.createElement('div'); message.className = 'small text-reset opacity-75 text-break';
       message.textContent = record.message && record.message !== labels[record.status] ? record.message :
         '已用时 ' + Math.max(0, Math.floor(Date.now() / 1000 - record.created_at)) + ' 秒';
       content.append(title, status, message); row.appendChild(content);
@@ -68,16 +176,20 @@
             if (reply.task) update(reply.task);
             if (reply.code !== 0) announce(reply.msg || '任务已开始，无法取消排队');
           }).fail(() => announce('取消状态未确认，请刷新任务状态'));
-        }));
+        }, record.task_id, 'cancel'));
       }
-      row.appendChild(button('查看结果', () => showResult(record)));
+      row.appendChild(button('查看结果', () => showResult(record), record.task_id, 'result'));
       list.appendChild(row);
     });
+    // 保留键盘用户正在操作的任务按钮，避免每秒轮询让焦点落回页面背景。
+    if (focusId) {
+      const target = taskButton(focusId, focusKind) || taskButton(focusId, 'result') || refreshButton;
+      if (target) target.focus({preventScroll: true});
+    }
   }
   function update(record) {
     records.set(record.task_id, record);
     if (records.size > 100) records.delete(records.keys().next().value);
-    if (panel) panel.hidden = false;
     render();
   }
   function watch(record, complete, progress) {
@@ -120,12 +232,28 @@
     } else { poll(); }
   }
   function refresh() {
+    if (reading || disposed) return;
+    reading = true; readFailed = false;
+    // 禁用刷新按钮前将焦点留在抽屉，保证等待期间仍能使用 Tab 和 Escape。
+    const restoreRefresh = refreshButton && refreshButton === document.activeElement;
+    if (restoreRefresh && panel) panel.focus({preventScroll: true});
+    if (refreshButton) { refreshButton.disabled = true; refreshButton.setAttribute('aria-busy', 'true'); }
+    render();
+    // 刷新只恢复查询；提交响应丢失时仍按原请求编号核对，不重复发送写操作。
+    inflight.forEach(value => { if (value.resume) value.resume(); });
     watches.forEach(state => { if (state.resume) { const resume = state.resume; state.resume = null; state.failures = 0; resume(); } });
     raw('get_action_tasks', {}).done(reply => {
-      if (reply.code !== 0) { announce(reply.msg || '任务读取失败，请重新登录后重试'); return; }
+      if (reply.code !== 0) { readFailed = true; announce(reply.msg || '任务读取失败，请重新登录后重试'); return; }
+      announce('', false);
       (reply.tasks || []).forEach(record => { update(record); if (!terminal.has(record.status)) watch(record); });
       if (!reply.tasks || !reply.tasks.length) render();
-    }).fail(() => announce('无法读取后台操作，请检查网络或登录状态'));
+    }).fail(() => { readFailed = true; announce('无法读取后台操作，请检查网络或登录状态'); })
+      .always(() => {
+        reading = false; readComplete = true;
+        if (refreshButton) { refreshButton.disabled = false; refreshButton.removeAttribute('aria-busy'); }
+        render();
+        if (restoreRefresh && panel.classList.contains('show') && document.activeElement === panel) refreshButton.focus();
+      });
   }
   function request(command, parameters, handler, options) {
     options = options || {};
@@ -210,7 +338,10 @@
       data: {cmd: command, data: JSON.stringify(parameters || {})}});
     xhr.done(reply => {
       acknowledge();
-      if (reply && reply.async && reply.operation_type === 'background_action') watch(reply.task, finish, progress);
+      if (reply && reply.async && reply.operation_type === 'background_action') {
+        announce(reply.task.title + '：' + (labels[reply.task.status] || reply.task.status));
+        watch(reply.task, finish, progress);
+      }
       else finish(reply);
     }).fail((response, reason) => {
       acknowledge();
@@ -220,16 +351,22 @@
     });
     return result;
   }
-  const refreshButton = document.getElementById('action-task-refresh');
-  if (refreshButton) refreshButton.addEventListener('click', function () {
-    inflight.forEach(value => { if (value.resume) value.resume(); }); refresh();
-  });
+  if (panel) {
+    // 仅协调结果和终态反馈，避免延后等待/进度窗口的快速显示与关闭。
+    $(document).on('show.bs.modal', '#action-task-result, #system-success-modal, #system-fail-modal', coordinateModal);
+    $(panel).on('shown.bs.offcanvas hidden.bs.offcanvas', renderSummary);
+    $(panel).on('hidden.bs.offcanvas', function () {
+      if (!modalSession) setTimeout(focusDrawerEntry, 0);
+    });
+  }
   global.addEventListener('pagehide', event => {
     // BFCache freezes and resumes this same document, including its timers and
     // pending callbacks. Keep them intact; only a real unload disposes the client.
     if (event.persisted) return;
     disposed = true; watches.forEach(state => clearTimeout(state.timer));
   });
-  global.ActionTaskClient = {request, watch, refresh};
-  if (panel) refresh();
+  // 动态服务页和 Lit 页头只调用共享入口，不创建第二份记录或轮询器。
+  global.ActionTaskClient = {request, watch, refresh, renderSummary, open: openPanel};
+  // 等待 Bootstrap 注册 jQuery 插件，避免快速恢复的任务先于 toast 初始化结束。
+  if (panel) $(refresh);
 })(window);

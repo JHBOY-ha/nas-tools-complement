@@ -1,3 +1,4 @@
+{% import 'macro/svg.html' as SVG %}
 <div class="container-xl">
   <!-- Page title -->
   <div class="page-header d-print-none">
@@ -11,10 +12,27 @@
   </div>
 </div>
 <!-- 业务页面代码 -->
-{% if Count > 0 %}
 <div class="page-body">
   <div class="container-xl">
     <div class="d-grid gap-3 grid-normal-card">
+      <!-- 后台操作入口始终可用，未启用定时服务时也能查看自己的任务。 -->
+      <div class="card card-sm card-link-pop" id="service-action-tasks">
+        <div class="card-body">
+          <div class="row align-items-center">
+            <div class="col-auto">
+              <span class="bg-blue-lt avatar">{{ SVG.activity('') }}</span>
+            </div>
+            <div class="col">
+              <button type="button" class="btn btn-link p-0 text-reset text-start stretched-link"
+                      data-action-task-open onclick="ActionTaskClient.open(this)"
+                      aria-controls="action-task-panel" aria-haspopup="dialog">
+                后台操作
+              </button>
+              <div class="text-reset opacity-75" data-action-task-summary>正在读取任务状态…</div>
+            </div>
+          </div>
+        </div>
+      </div>
       {% for Scheduler in SchedulerTasks %}
       <div class="card card-sm card-link-pop">
         <div class="card-body">
@@ -43,22 +61,18 @@
       </div>
       {% endfor %}
     </div>
-  </div>
-</div>
-{% else %}
-<div class="page-body">
-  <div class="container-xl d-flex flex-column justify-content-center">
-    <div class="empty">
+    {% if Count == 0 %}
+    <div class="empty mt-3">
       <div class="empty-img"><img src="./static/img/sign_in.svg" height="128" alt="">
       </div>
-      <p class="empty-title">没有服务</p>
+      <p class="empty-title">没有启用其他服务</p>
       <p class="empty-subtitle text-muted">
-        没有开启任何后台服务。
+        可以通过后台操作查看已提交任务的状态和结果。
       </p>
     </div>
+    {% endif %}
   </div>
 </div>
-{% endif %}
 <div class="modal modal-blur fade" id="modal-nametest" tabindex="-1" role="dialog" aria-hidden="true"
   data-bs-backdrop="static" data-bs-keyboard="false">
   <div class="modal-dialog modal-lg modal-dialog-centered" role="document">
@@ -301,6 +315,8 @@
   </div>
 </div>
 <script type="text/javascript">
+  // 页面与历史缓存恢复后，使用全局任务客户端更新卡片，不额外创建轮询器。
+  window.ActionTaskClient?.renderSummary();
   // 显示服务提示框
   function show_service_modal(id, name) {
     if (id === "nametest") {

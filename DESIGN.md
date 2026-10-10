@@ -61,8 +61,13 @@ omitted:
 后台操作的状态协议与特殊集确认共用 `UX-CONTRACT.md`。新增全局任务反馈复用 Tabler
 card/list-group、按钮和 Bootstrap modal，沿用现有颜色、字体、圆角及自然文档滚动。
 接收与排队使用中性文字，真实终态才显示完成；任务结果以文本展示，完成不抢焦点。
-后台操作面板与业务内容共用 `navigation.html` 的 `.page-wrapper`，由 Tabler 统一避让
-左侧导航；面板位于可替换的 `#page_content` 外，页面切换时保留任务反馈与结果弹窗。
+后台操作入口归属服务页，以同一网格内的功能卡片展示执行中与排队数量；顶部搜索栏
+右侧提供同一抽屉的快捷入口，所有可提交任务的用户均能查看自己的任务。原页面底部
+不再常驻任务列表。抽屉与结果模态框位于 `navigation.html` 的主布局外，页面切换时
+保留任务状态。抽屉使用 Tabler/Bootstrap offcanvas，宽度最多 30rem，窄屏占满可视宽度；
+任务列表在抽屉正文滚动。提交与终态通过共享 toast 简短反馈，查看面板由用户主动打开。
+后台操作的次级文字复用正文色与 `opacity-75`，按钮使用 Tabler 默认中性样式，toast
+复用 `bg-body`，确保浅色和暗色主题下的任务状态可读，不新增颜色令牌。
 
 滚动表面由 `style.css` 全局基线统一：`--nt-scrollbar-thumb` 映射 Tabler muted，
 track 映射 bg-surface，hover/active 映射 body-color；宽度保持可操作，forced-colors
