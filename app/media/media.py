@@ -7,7 +7,6 @@ import traceback
 from functools import lru_cache
 
 import zhconv
-from requests.utils import default_user_agent
 from lxml import etree
 
 import log
@@ -617,12 +616,16 @@ class Media:
             log.info("【Meta】%s 在TMDB中未找到媒体信息!" % file_media_name)
             return info
 
-    @lru_cache(maxsize=128)
     def __search_tmdb_web(self, file_media_name, mtype: MediaType):
         """
         检索TMDB网站，直接抓取结果，结果只有一条时才返回
         :param file_media_name: 名称
         """
+        # UA 纳入缓存键，保存新配置后可重试旧 UA 下缓存的失败结果。
+        return self.__search_tmdb_web_cached(file_media_name, mtype, Config().get_tmdb_web_ua())
+
+    @lru_cache(maxsize=128)
+    def __search_tmdb_web_cached(self, file_media_name, mtype: MediaType, user_agent):
         if not file_media_name:
             return None
         if StringUtils.is_chinese(file_media_name):
@@ -638,8 +641,8 @@ class Media:
             # Invalid explicit settings must not silently fall back to direct access.
             log.error(f"【Meta】TMDB 网页代理配置无效：{err}")
             return None
-        # 与官网测试使用相同的独立 UA，不要求用户修改其他站点的全局 UA。
-        res = RequestUtils(headers=default_user_agent(), proxies=proxies, timeout=TMDb.REQUEST_TIMEOUT).get_res(
+        # 与官网测试共用可选配置，留空时使用 Requests 默认 UA。
+        res = RequestUtils(headers=user_agent, proxies=proxies, timeout=TMDb.REQUEST_TIMEOUT).get_res(
             url=tmdb_url, params={"query": file_media_name})
         if res and res.status_code == 200:
             html_text = res.text

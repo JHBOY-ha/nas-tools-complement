@@ -39,6 +39,7 @@ from flask_restx import Api, Resource, reqparse
 import jwt
 import regex
 import requests
+import ruamel.yaml
 from lxml import etree
 
 
@@ -122,6 +123,10 @@ class AuditSecurityRegressionTest(unittest.TestCase):
         }
         self.config.get_config.side_effect = lambda key=None: (
             self.configuration if key is None else self.configuration.get(key, {}))
+        # Exercise the real optional-UA fallback while keeping app startup isolated.
+        config_reader = load_source("config.py", {"get_tmdb_web_ua"},
+                                    {"default_user_agent": requests.utils.default_user_agent}, "Config")
+        self.config.get_tmdb_web_ua.side_effect = lambda: config_reader.get_tmdb_web_ua(self.config)
         # Extracted dispatch methods still need their real admission constants;
         # omitting newer imports would fail before reaching the policy itself.
         from app.helper.action_tasks import COMMAND_TITLES
@@ -132,7 +137,6 @@ class AuditSecurityRegressionTest(unittest.TestCase):
             "subprocess": subprocess, "importlib": SimpleNamespace(import_module=MagicMock()),
             "ntpath": ntpath, "rename_exclusive": EXCLUSIVE.rename_exclusive,
             "Config": lambda: self.config, "ExceptionUtils": MagicMock(),
-            "default_user_agent": requests.utils.default_user_agent,
             "log": MagicMock(), "MediaType": MediaType, "hmac": hmac,
             "g": g, "has_request_context": has_request_context,
             "generate_password_hash": lambda password: "hashed:" + password,
@@ -873,7 +877,8 @@ class AuditSecurityRegressionTest(unittest.TestCase):
         factory.return_value.get_res.return_value = SimpleNamespace(status_code=200, text="")
         namespace = dict(self.ns, TMDb=type(client), RequestUtils=factory,
                          StringUtils=SimpleNamespace(is_chinese=lambda _: False))
-        media = load_source("app/media/media.py", {"__search_tmdb_web"}, namespace, "Media")()
+        media = load_source("app/media/media.py", {"__search_tmdb_web", "__search_tmdb_web_cached"},
+                            namespace, "Media")()
         self.assertIsNone(media._Media__search_tmdb_web("Example", MediaType.MOVIE))
         factory.assert_called_once_with(headers=requests.utils.default_user_agent(),
                                         proxies=proxy, timeout=client.REQUEST_TIMEOUT)
@@ -896,7 +901,8 @@ class AuditSecurityRegressionTest(unittest.TestCase):
         namespace["RequestUtils"] = helper
         media_ns = dict(self.ns, TMDb=type(client), RequestUtils=helper, etree=etree,
                         StringUtils=SimpleNamespace(is_chinese=lambda _: False))
-        media = load_source("app/media/media.py", {"__search_tmdb_web"}, media_ns, "Media")()
+        media = load_source("app/media/media.py", {"__search_tmdb_web", "__search_tmdb_web_cached"},
+                            media_ns, "Media")()
         info = {"id": 123, "title": "Example", "media_type": MediaType.MOVIE}
         media.get_tmdb_info = MagicMock(return_value=info)
         response = requests.Response()
@@ -921,6 +927,80 @@ class AuditSecurityRegressionTest(unittest.TestCase):
             self.assertEqual(transport.call_args.kwargs["headers"]["User-Agent"], "site-specific-ua")
         self.assertEqual(self.configuration, before)
         self.config.get_ua.assert_called()
+
+    def test_02_tmdb_website_ua_is_optional_for_existing_configs(self):
+        self.assertEqual(self.config.get_tmdb_web_ua(), requests.utils.default_user_agent())
+        # YAML null, empty form input and whitespace all retain the existing default.
+        for value in (None, "", " \t ", False, 123):
+            with self.subTest(value=value):
+                self.configuration["app"]["tmdb_web_user_agent"] = value
+                self.assertEqual(self.config.get_tmdb_web_ua(), requests.utils.default_user_agent())
+        self.configuration["app"]["tmdb_web_user_agent"] = "  Custom TMDB UA/1.0  "
+        self.assertEqual(self.config.get_tmdb_web_ua(), "Custom TMDB UA/1.0")
+
+    def test_02_tmdb_website_ua_save_reload_and_cached_retry(self):
+        # Persist through the real save endpoint and reload YAML without touching user data.
+        config_cls = load_source("config.py", {"get_config", "save_config", "init_config"},
+                                 {"os": os, "ruamel": ruamel}, "Config")
+        settings = config_cls()
+        settings._config = deepcopy(self.configuration)
+        settings._config["app"].update(user_agent="Global UA/1.0", rmt_tmdbkey="audit")
+        self.config.get_ua.return_value = "Global UA/1.0"
+        self.config.get_config.side_effect = settings.get_config
+        self.config.save_config.side_effect = settings.save_config
+        probe, client, api_transport, _, namespace = self.tmdb_network_probe()
+        helper = self.request_utils()
+        namespace["RequestUtils"] = helper
+        media_ns = dict(self.ns, TMDb=type(client), RequestUtils=helper, etree=etree,
+                        StringUtils=SimpleNamespace(is_chinese=lambda _: False))
+        media = load_source("app/media/media.py", {"__search_tmdb_web", "__search_tmdb_web_cached"},
+                            media_ns, "Media")()
+        info = {"id": 123, "title": "Example", "media_type": MediaType.MOVIE}
+        media.get_tmdb_info = MagicMock(return_value=info)
+        response = requests.Response()
+        response.status_code = 403
+        response._content = b'<a data-id="123" href="/movie/123">Example</a>'
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(requests, "get", return_value=response) as transport:
+            settings._config_path = os.path.join(directory, "config.yaml")
+            self.assertFalse(probe("www.themoviedb.org")["res"])
+            self.assertIsNone(media._Media__search_tmdb_web("Example", MediaType.MOVIE))
+            self.assertEqual(transport.call_count, 2)
+            self.assertTrue(all(call.kwargs["headers"]["User-Agent"] == requests.utils.default_user_agent()
+                                for call in transport.call_args_list))
+
+            custom_ua = "Custom TMDB UA/1.0"
+            self.assertEqual(self.action._WebAction__update_config(
+                {"app.tmdb_web_user_agent": custom_ua})["code"], 0)
+            settings.init_config()
+            self.assertEqual(settings.get_config("app")["tmdb_web_user_agent"], custom_ua)
+            response.status_code = 200
+            self.assertTrue(probe("www.themoviedb.org")["res"])
+            # A new UA retries the same title, including a failure cached before saving.
+            self.assertEqual(media._Media__search_tmdb_web("Example", MediaType.MOVIE), info)
+            self.assertEqual(transport.call_count, 4)
+            self.assertTrue(all(call.kwargs["headers"]["User-Agent"] == custom_ua
+                                for call in transport.call_args_list[-2:]))
+            self.assertEqual(media._Media__search_tmdb_web("Example", MediaType.MOVIE), info)
+            self.assertEqual(transport.call_count, 4)
+
+            # A configured website UA must not leak into API or generic HTTP requests.
+            helper().get_res("https://example.invalid")
+            self.assertEqual(transport.call_args.kwargs["headers"]["User-Agent"], "Global UA/1.0")
+            helper(headers="site-specific-ua").get_res("https://example.invalid")
+            self.assertEqual(transport.call_args.kwargs["headers"]["User-Agent"], "site-specific-ua")
+            api_transport["requests"].request.return_value.json.return_value = {"images": {}}
+            self.assertTrue(probe("api.tmdb.org")["res"])
+            api_headers = api_transport["requests"].request.call_args.kwargs.get("headers", {})
+            self.assertNotEqual(api_headers.get("User-Agent"), custom_ua)
+
+            self.assertEqual(self.action._WebAction__update_config(
+                {"app.tmdb_web_user_agent": ""})["code"], 0)
+            settings.init_config()
+            self.assertTrue(probe("www.themoviedb.org")["res"])
+            self.assertEqual(media._Media__search_tmdb_web("Other Example", MediaType.MOVIE), info)
+            self.assertTrue(all(call.kwargs["headers"]["User-Agent"] == requests.utils.default_user_agent()
+                                for call in transport.call_args_list[-2:]))
 
     def test_02_legacy_proxy_normalization_still_blocks_invalid_urls(self):
         # Normalizing legacy endpoints must not permit embedded commands or nodes.
@@ -1643,7 +1723,7 @@ class AuditSecurityRegressionTest(unittest.TestCase):
         ns = dict(self.ns, TMDb=type(self.tmdb_client()[0]),
                   StringUtils=SimpleNamespace(is_chinese=lambda _: False), RequestUtils=lambda **_: helper,
                   etree=SimpleNamespace(HTML=MagicMock(side_effect=ValueError("invalid HTML"))))
-        cls = load_source("app/media/media.py", {"__search_tmdb_web"}, ns, "Media")
+        cls = load_source("app/media/media.py", {"__search_tmdb_web", "__search_tmdb_web_cached"}, ns, "Media")
         with patch("sys.stdout", new_callable=io.StringIO) as output:
             self.assertIsNone(cls()._Media__search_tmdb_web("Example", MediaType.MOVIE))
             self.assertEqual(output.getvalue(), "")
@@ -1655,7 +1735,7 @@ class AuditSecurityRegressionTest(unittest.TestCase):
         helper.get_res.return_value = None
         ns = dict(self.ns, TMDb=type(self.tmdb_client()[0]),
                   StringUtils=SimpleNamespace(is_chinese=lambda _: False), RequestUtils=lambda **_: helper)
-        cls = load_source("app/media/media.py", {"__search_tmdb_web"}, ns, "Media")
+        cls = load_source("app/media/media.py", {"__search_tmdb_web", "__search_tmdb_web_cached"}, ns, "Media")
         for title in ("Love & Peace", "Love Peace", "C++ #1 / 100%", "Quote's Title"):
             cls()._Media__search_tmdb_web(title, MediaType.MOVIE)
             prepared = requests.Request("GET", **helper.get_res.call_args.kwargs).prepare()

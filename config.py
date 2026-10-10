@@ -4,6 +4,7 @@ import shutil
 import sys
 from threading import Lock
 import ruamel.yaml
+from requests.utils import default_user_agent
 
 # 种子名/文件名要素分隔字符
 SPLIT_CHARS = r"\.|\s+|\(|\)|\[|]|-|\+|【|】|/|～|;|&|\||#|_|「|」|（|）|~"
@@ -192,6 +193,13 @@ class Config(object):
 
     def get_ua(self):
         return self.get_config('app').get("user_agent") or DEFAULT_UA
+
+    def get_tmdb_web_ua(self):
+        """仅供 TMDB 官网使用；旧配置或空值保持 Requests 默认 UA。"""
+        user_agent = (self.get_config('app') or {}).get("tmdb_web_user_agent")
+        if not isinstance(user_agent, str):
+            return default_user_agent()
+        return user_agent.strip() or default_user_agent()
 
     def get_config(self, node=None):
         if not node:

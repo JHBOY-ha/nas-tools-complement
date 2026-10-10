@@ -14,7 +14,6 @@ from math import floor
 from urllib.parse import unquote, urlsplit
 
 import cn2an
-from requests.utils import default_user_agent
 from flask import g, has_request_context, copy_current_request_context, request
 from flask_login import logout_user, current_user
 from werkzeug.security import generate_password_hash
@@ -2425,8 +2424,8 @@ class WebAction:
             # The HTML site is independent of API health. Keep its real status
             # and expose safe diagnostics instead of collapsing every error to False.
             try:
-                # 官网独立使用 Requests UA，避免全局浏览器 UA 触发拒绝或影响其他站点。
-                response = RequestUtils(headers=default_user_agent(),
+                # 与网页辅助识别共用官网 UA 配置，不影响 API 和其他站点。
+                response = RequestUtils(headers=Config().get_tmdb_web_ua(),
                                         proxies=normalize_proxies(Config().get_proxies()),
                                         timeout=TMDb.REQUEST_TIMEOUT).get_res(target, raise_errors=True)
                 # HTTP reachability and page availability are separate outcomes.
