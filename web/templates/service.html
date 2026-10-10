@@ -1,4 +1,20 @@
 {% import 'macro/svg.html' as SVG %}
+{# 普通和动漫测试共用出口摘要；次级文字复用正文色，保持暗色主题可读。 #}
+{% macro nettest_egress(prefix) %}
+      <div class="modal-body border-bottom py-3">
+        <dl class="row mb-0">
+          <div class="col-12 col-sm-6 mb-2 mb-sm-0">
+            <dt class="small text-body opacity-75">直连出口 IP</dt>
+            <dd id="{{ prefix }}_egress_direct" class="mb-0 text-break" aria-live="polite" aria-atomic="true">尚未测试</dd>
+          </div>
+          <div class="col-12 col-sm-6">
+            <dt class="small text-body opacity-75">代理出口 IP</dt>
+            <dd id="{{ prefix }}_egress_proxy" class="mb-0 text-break" aria-live="polite" aria-atomic="true">尚未测试</dd>
+          </div>
+        </dl>
+        <div class="small text-body opacity-75 mt-2">检测服务器公网出口；分流规则可能导致各站点出口不同。</div>
+      </div>
+{% endmacro %}
 <div class="container-xl">
   <!-- Page title -->
   <div class="page-header d-print-none">
@@ -172,6 +188,7 @@
         <h5 class="modal-title">网络连通性测试</h5>
         <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
       </div>
+      {{ nettest_egress('nettest_item') }}
       <div class="table-responsive">
         <table class="table table-vcenter card-table">
           <thead>
@@ -210,6 +227,7 @@
         <h5 class="modal-title">网络连通性测试-anime</h5>
         <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
       </div>
+      {{ nettest_egress('nettest_anime_item') }}
       <div class="table-responsive">
         <table class="table table-vcenter card-table">
           <thead>
@@ -325,9 +343,11 @@
       $('#modal-ruletest').modal('show');
     } else if (id === "nettest") {
       $('[id^="nettest_item_res"]').empty();
+      $('[id^="nettest_item_egress_"]').removeClass('text-red').text('尚未测试');
       $('#modal-nettest').modal('show');
     } else if (id === "nettest_anime") {
       $('[id^="nettest_anime_item_res"]').empty();
+      $('[id^="nettest_anime_item_egress_"]').removeClass('text-red').text('尚未测试');
       $('#modal-nettest-anime').modal('show');
     } else if (id === "speedtest") {
       $('[id^="speedtest_res_"], [id^="speedtest_transferred_"], [id^="speedtest_time_"]').empty();
@@ -487,20 +507,33 @@
   }
 
   function run_net_test_batch(btn_obj, hidden_name, result_prefix) {
-    let url_indexs = select_GetHiddenVAL(hidden_name);
-    let nettest_count_total = url_indexs.length;
-    let nettest_count_finished = 0;
-    btn_obj.text("测试中...").attr("disabled", true);
-    for (let url_index of url_indexs) {
-      net_test_one(url_index, result_prefix, ret => {
-        if (ret) {
-          nettest_count_finished++;
-          if (nettest_count_finished >= nettest_count_total) {
-            btn_obj.text("测试").attr("disabled", false);
-          }
-        }
-      });
+    const url_indexs = select_GetHiddenVAL(hidden_name);
+    // 两条出口查询与域名测试共同完成后恢复按钮，包括跳过及失败结果。
+    let remaining = url_indexs.length + 2;
+    btn_obj.text("测试中...").attr("disabled", true).attr("aria-busy", "true");
+    const finished = () => {
+      if (--remaining === 0) {
+        btn_obj.text("测试").attr("disabled", false).attr("aria-busy", "false");
+      }
+    };
+    for (const mode of ['direct', 'proxy']) {
+      net_test_egress(mode, result_prefix, finished);
     }
+    for (const url_index of url_indexs) {
+      net_test_one(url_index, result_prefix, finished);
+    }
+  }
+
+  // 出口结果只作为文本展示；查询失败不影响已有站点连通性结果。
+  function net_test_egress(mode, result_prefix, callBack) {
+    const result_cell = $(`#${result_prefix}_egress_${mode}`);
+    result_cell.removeClass('text-red').text('查询中...').attr('aria-busy', 'true');
+    ajax_post('egress_ip_test', {mode}, function (ret) {
+      ret = ret || {};
+      result_cell.text(ret.res ? ret.ip : (ret.msg || '出口 IP 查询失败，请重试'))
+        .toggleClass('text-red', !ret.res && !ret.skipped).attr('aria-busy', 'false');
+      callBack();
+    });
   }
 
   // 单个网络测试

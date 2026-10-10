@@ -10,6 +10,9 @@ const root = path.resolve(__dirname, '..');
     let next = 0, mutations = 0, progressReads = 0, finish = false, offline = false, fail = false;
     let networkReply = {res: false, reachable: true, http_status: 403,
       msg: 'TMDB 官网拒绝访问（HTTP 403）', time: '120 毫秒'};
+    let egressReplies = {direct: {res: true, ip: '8.8.8.8'},
+      proxy: {res: false, skipped: true, msg: '未配置适用的 HTTPS 代理'}};
+    let slowEgress = false, egressOffline = false;
     page.on('pageerror', error => errors.push(error.message));
     await page.route('http://tasks.test/**', async route => {
       const url = new URL(route.request().url());
@@ -46,6 +49,11 @@ const root = path.resolve(__dirname, '..');
           row.result = {code: -1, retcode: -1, msg: '已取消', retmsg: '已取消'};
           response = {code: 0, task: row};
         } else if (command === 'net_test') response = networkReply;
+        else if (command === 'egress_ip_test') {
+          if (egressOffline) return route.abort('connectionfailed');
+          if (slowEgress) await new Promise(resolve => setTimeout(resolve, 350));
+          response = egressReplies[data.mode];
+        }
         else response = {code: -1, msg: '不存在'};
         return route.fulfill({json: response});
       }
@@ -233,7 +241,11 @@ const root = path.resolve(__dirname, '..');
     await page.addScriptTag({content: service.slice(networkStart, networkEnd)});
     const tableStart = service.indexOf('      <div class="table-responsive">', service.indexOf('id="modal-nettest"'));
     const tableEnd = service.indexOf('      <div class="modal-footer">', tableStart);
-    const networkTable = service.slice(tableStart, tableEnd)
+    // 使用生产宏的摘要，覆盖实际线路状态和现有域名表格共用的按钮生命周期。
+    const egressStart = service.indexOf('      <div class="modal-body border-bottom py-3">');
+    const egressMarkup = service.slice(egressStart, service.indexOf('{% endmacro %}', egressStart))
+      .replace(/{{\s*prefix\s*}}/g, 'nettest_item');
+    const networkTable = egressMarkup + service.slice(tableStart, tableEnd)
       .replace(/{%[\s\S]*?%}/g, '').replace(/{{\s*target\s*}}/g, 'www.themoviedb.org')
       .replace(/{{\s*loop.index0\s*}}/g, '0');
     await page.evaluate(markup => {
@@ -255,6 +267,9 @@ const root = path.resolve(__dirname, '..');
     assert.equal(await page.locator('#nettest_item_res_0').getAttribute('aria-live'), 'polite');
     assert.equal(await page.locator('#nettest_item_res_time_0').textContent(), '120 毫秒');
     await page.waitForFunction(() => !document.getElementById('nettest_btn').disabled);
+    assert.equal(await page.locator('#nettest_item_egress_direct').textContent(), '8.8.8.8');
+    assert.equal(await page.locator('#nettest_item_egress_proxy').textContent(), '未配置适用的 HTTPS 代理');
+    assert.equal(await page.locator('#nettest_item_egress_proxy.text-red').count(), 0);
     await page.locator('#page_content').screenshot({path: '/tmp/nas-network-test-desktop.png'});
     await page.setViewportSize({width: 390, height: 720});
     assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
@@ -273,6 +288,35 @@ const root = path.resolve(__dirname, '..');
     assert.equal(await page.locator('#nettest_item_res_0 .small').count(), 0);
     assert.equal(await page.locator('#nettest_item_res_time_0').textContent(), '80 毫秒');
     assert.equal(await page.locator('#nettest_btn').textContent(), '测试');
+
+    // 慢查询期间保留忙碌状态；IPv6、错误文本、断网和重试都不能影响站点结果。
+    slowEgress = true;
+    egressReplies = {direct: {res: true, ip: '2001:4860:4860:1234:5678:1234:5678:8888'},
+      proxy: {res: false, msg: '<img src=x onerror="window.networkXss=true">查询失败'}};
+    await page.locator('#nettest_btn').click();
+    assert.equal(await page.locator('#nettest_item_egress_direct').textContent(), '查询中...');
+    assert.equal(await page.locator('#nettest_btn').getAttribute('aria-busy'), 'true');
+    await page.waitForFunction(() => !document.getElementById('nettest_btn').disabled);
+    assert.equal(await page.locator('#nettest_item_egress_direct').textContent(), egressReplies.direct.ip);
+    assert.equal(await page.locator('#nettest_item_egress_proxy.text-red').count(), 1);
+    assert.equal(await page.locator('#nettest_item_egress_proxy img').count(), 0);
+    assert.equal(await page.evaluate(() => Boolean(window.networkXss)), false);
+    assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+    await page.locator('#page_content').screenshot({path: '/tmp/nas-network-egress-mobile.png'});
+    slowEgress = false;
+    egressOffline = true;
+    await page.locator('#nettest_btn').click();
+    await page.waitForFunction(() => !document.getElementById('nettest_btn').disabled);
+    assert.equal(await page.locator('#nettest_item_egress_direct').textContent(), '网络错误，请检查登录或连接');
+    assert.equal(await page.locator('#nettest_item_res_0').textContent(), '是');
+    egressOffline = false;
+    egressReplies.proxy = {res: true, ip: '1.1.1.1'};
+    await page.locator('#nettest_btn').focus();
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => !document.getElementById('nettest_btn').disabled);
+    assert.equal(await page.locator('#nettest_item_egress_proxy').textContent(), '1.1.1.1');
+    assert.equal(await page.locator('#nettest_item_egress_proxy.text-red').count(), 0);
+    assert.equal(await page.locator('#nettest_item_egress_proxy').getAttribute('aria-live'), 'polite');
 
     // Exercise the actual settings callback: errors remain visible and the
     // original proxy input survives a rejected save or a later successful retry.

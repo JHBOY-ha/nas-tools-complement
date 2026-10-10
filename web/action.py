@@ -78,6 +78,8 @@ class WebAction:
         "app.indexer.client.prowlarr|Prowlarr": ("app.indexer.client.prowlarr", "Prowlarr"),
         "app.media.meta.llm_parser|LLMMetaParser": ("app.media.meta.llm_parser", "LLMMetaParser"),
     }
+    # 固定公网回显服务，客户端只选择线路，不能提交任意查询地址。
+    EGRESS_IP_URLS = ("https://api64.ipify.org?format=json", "https://api.ipify.org?format=json")
 
     def __init__(self):
         self.dbhelper = DbHelper()
@@ -136,6 +138,7 @@ class WebAction:
             "name_test": self.__name_test,
             "rule_test": self.__rule_test,
             "net_test": self.__net_test,
+            "egress_ip_test": self.__egress_ip_test,
             "speed_test": self.__speed_test,
             "add_filtergroup": self.__add_filtergroup,
             "restore_filtergroup": self.__restore_filtergroup,
@@ -2381,6 +2384,59 @@ class WebAction:
             "text": "匹配" if match_flag else "未匹配",
             "order": 100 - res_order if res_order else 0
         }
+
+    @staticmethod
+    def __egress_ip_test(data):
+        """从服务器查询直连或应用代理出口；不读取浏览器地址或泄露代理认证信息。"""
+        from ipaddress import ip_address
+        from time import monotonic
+
+        import requests
+
+        mode = data.get("mode") if isinstance(data, dict) else None
+        if mode not in ("direct", "proxy"):
+            return {"code": 1, "res": False, "msg": "不支持的出口 IP 测试线路"}
+        proxies = {}
+        targets = WebAction.EGRESS_IP_URLS
+        if mode == "proxy":
+            try:
+                proxies = normalize_proxies(Config().get_proxies())
+            except ValueError:
+                return {"code": 1, "res": False, "msg": "代理配置无效，请检查代理设置"}
+            # HTTP-only 或其他主机专用代理不能用于 HTTPS 查询，也不能悄悄回退直连。
+            targets = tuple(url for url in targets if requests.utils.select_proxy(url, proxies))
+            if not targets:
+                return {"code": 0, "res": False, "skipped": True, "msg": "未配置适用的 HTTPS 代理"}
+
+        started = monotonic()
+        error_kind = ""
+        with requests.Session() as session:
+            # 明确区分两条线路，避免容器 HTTP(S)_PROXY 环境变量覆盖直连结果。
+            session.trust_env = False
+            for url in targets:
+                try:
+                    with session.get(url, proxies=proxies, timeout=(3, 5), verify=True,
+                                     allow_redirects=False, stream=True) as response:
+                        response.raise_for_status()
+                        body = bytearray()
+                        for chunk in response.iter_content(1024):
+                            body.extend(chunk)
+                            if len(body) > 1024:
+                                raise ValueError("IP response too large")
+                        payload = json.loads(body)
+                        value = payload.get("ip") if isinstance(payload, dict) else None
+                        if not isinstance(value, str) or len(value) > 45 or "%" in value:
+                            raise ValueError("Invalid IP response")
+                        address = ip_address(value.strip())
+                        if not address.is_global:
+                            raise ValueError("Not a public IP address")
+                        return {"code": 0, "res": True, "ip": str(address),
+                                "time": f"{int((monotonic() - started) * 1000)} 毫秒"}
+                except (requests.RequestException, ValueError) as error:
+                    # 双栈查询失败时尝试 IPv4；异常正文可能含代理密码，只返回异常类型。
+                    error_kind = type(error).__name__
+        return {"code": 1, "res": False, "msg": f"出口 IP 查询失败（{error_kind}），请重试",
+                "time": f"{int((monotonic() - started) * 1000)} 毫秒"}
 
     @staticmethod
     def __net_test(data):

@@ -31,6 +31,8 @@ STABILITY_MODULES = (
     # Simulated workloads verify budgets without probing the production NAS.
     "tests.test_workload_limits",
     "tests.test_b4_hardening",
+    # 公网出口诊断使用离线回显，持续校验环境代理隔离和应用代理选择。
+    "tests.test_network_egress",
     # Worker bootstrap must bypass application startup in frozen builds too.
     "tests.test_worker_entrypoint",
     "tests.test_review_completion",

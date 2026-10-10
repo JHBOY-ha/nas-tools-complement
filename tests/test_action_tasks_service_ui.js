@@ -12,6 +12,9 @@ env.filters['hash'] = str
 context = dict(SiteFavicons={}, UserPris=['服务', '媒体整理'], GoPage='service', AppVersion='v2.8.3',
     UserName='test', SystemFlag='Docker', TMDBFlag=True, CustomScriptCfg={}, SyncMod='copy',
     Config={'app':{}, 'media':{}, 'pt':{}, 'llm':{}}, Count=1,
+    NetTestTargets=['www.themoviedb.org', 'api.themoviedb.org', 'api.tmdb.org', 'image.tmdb.org',
+                    'webservice.fanart.tv', 'api.telegram.org', 'qyapi.weixin.qq.com', 'api.opensubtitles.com'],
+    NetTestAnimeTargets=['bgm.tv', 'api.bgm.tv', 'www.comicat.org', 'mikanani.me'],
     SchedulerTasks=[dict(id='nametest', name='名称识别测试', color='blue', svg='', time='手动执行', state='OFF')])
 pages = {name: env.get_template(template).render(**context) for name, template in
     [('shell', 'navigation.html'), ('service', 'service.html'), ('basic', 'setting/basic.html')]}
@@ -55,6 +58,10 @@ const pages = JSON.parse(rendered.stdout);
           task.status = 'canceled'; task.message = '已取消'; task.result = {code: -1, msg: '已取消'};
           return route.fulfill({json: {code: 0, task}});
         }
+        // 普通和动漫弹窗都从服务器动作读取出口，不请求浏览器所在设备的公网地址。
+        if (command === 'net_test') return route.fulfill({json: {res: true, time: '80 毫秒'}});
+        if (command === 'egress_ip_test') return route.fulfill({json: {res: true,
+          ip: data.mode === 'direct' ? '2001:4860:4860:1234:5678:1234:5678:8888' : '1.1.1.1'}});
         return route.fulfill({json: {code: -1, msg: '布局测试未配置此接口'}});
       }
       const file = path.join(root, 'web', url.pathname);
@@ -305,6 +312,46 @@ const pages = JSON.parse(rendered.stdout);
     await page.locator('#system-success-modal').waitFor({state: 'hidden'});
     await page.waitForFunction(() => document.activeElement.matches('#service-action-tasks [data-action-task-open]'));
     assert.equal(await panel.isVisible(), false);
+    // 检查真实 Jinja 宏、两个测试弹窗及手机上的 IPv6 换行，沿用 Bootstrap 焦点行为。
+    for (const [id, prefix] of [['nettest', 'nettest_item'], ['nettest_anime', 'nettest_anime_item']]) {
+      for (const narrow of [false, true]) {
+        await page.setViewportSize(narrow ? {width: 390, height: 720} : {width: 1100, height: 900});
+        await page.evaluate(dark => {
+          document.body.classList.toggle('theme-dark', dark);
+          document.body.classList.toggle('theme-light', !dark);
+        }, narrow);
+        await page.evaluate(id => show_service_modal(id), id);
+        const modalId = id === 'nettest' ? 'modal-nettest' : 'modal-nettest-anime';
+        const modal = page.locator('#' + modalId);
+        await modal.waitFor({state: 'visible'});
+        await page.waitForFunction(id => !bootstrap.Modal.getInstance(document.getElementById(id))._isTransitioning, modalId);
+        assert.equal(await page.locator(`#${prefix}_egress_direct`).textContent(), '尚未测试');
+        const button = page.locator(`#${id}_btn`);
+        await button.focus();
+        await page.keyboard.press('Enter');
+        await page.waitForFunction(id => !document.getElementById(id).disabled, `${id}_btn`);
+        assert.equal(await page.locator(`#${prefix}_egress_direct`).textContent(), '2001:4860:4860:1234:5678:1234:5678:8888');
+        assert.equal(await page.locator(`#${prefix}_egress_proxy`).textContent(), '1.1.1.1');
+        assert.equal(await page.locator(`#${prefix}_res_0`).textContent(), '是');
+        assert(await modal.evaluate(element => element.scrollWidth <= element.clientWidth));
+        const captionContrast = await modal.evaluate(element => {
+          const rgb = color => color.match(/[\d.]+/g).slice(0, 3).map(Number);
+          const luminance = color => color.map(value => {
+            value /= 255; return value <= 0.04045 ? value / 12.92 : Math.pow((value + 0.055) / 1.055, 2.4);
+          }).reduce((sum, value, i) => sum + value * [0.2126, 0.7152, 0.0722][i], 0);
+          const background = rgb(getComputedStyle(element.querySelector('.modal-content')).backgroundColor);
+          const style = getComputedStyle(element.querySelector('dt'));
+          const opacity = Number(style.opacity);
+          const foreground = rgb(style.color).map((value, i) => value * opacity + background[i] * (1 - opacity));
+          const light = [luminance(foreground), luminance(background)].sort((a, b) => b - a);
+          return (light[0] + 0.05) / (light[1] + 0.05);
+        });
+        assert(captionContrast >= 4.5, 'Egress labels must remain readable in both themes');
+        await modal.screenshot({path: `/tmp/nas-egress-${id}-${narrow ? 'mobile-dark' : 'desktop'}.png`});
+        await modal.locator('[data-bs-dismiss="modal"]').first().click();
+        await modal.waitFor({state: 'hidden'});
+      }
+    }
     assert.deepEqual(errors, []);
     console.log('PASS: real service card, state recovery, shared counts, modal/focus queue, success/failure callbacks, bounded toast dedupe, SPA, narrow/dark/reduced-motion layout');
   } finally { await browser.close(); }

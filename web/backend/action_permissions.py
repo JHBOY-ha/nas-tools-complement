@@ -47,7 +47,8 @@ _COMMAND_GROUPS = {
         "get_douban_history", "delete_douban_history",
     ),
     "探索": ("get_recommend", "media_similar", "media_recommendations", "media_person", "person_medias"),
-    "服务": ("sch", "name_test", "rule_test", "net_test", "speed_test", "logging",
+    # 出口 IP 查询与站点连通性测试沿用相同的服务权限。
+    "服务": ("sch", "name_test", "rule_test", "net_test", "egress_ip_test", "speed_test", "logging",
              "clear_tmdb_cache", "delete_tmdb_cache", "modify_tmdb_cache", "send_custom_message"),
     "系统设置": (
         "add_filtergroup", "restore_filtergroup", "set_default_filtergroup", "del_filtergroup",
