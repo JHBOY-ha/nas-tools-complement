@@ -8,6 +8,31 @@
 #   move会直接移动原文件，会影响做种，请谨慎使用
 #   rclone需要自行映射rclone配置目录到容器中，或在容器内完成rclone配置
 app:
+  # 【数据库治理】：预算重启生效。auto 仅在已修复 SQLite 和本地卷探测通过时启用 WAL。
+  # FULL 固定保留提交持久性；写队列满或卷空间不足时明确拒绝，不放开并发绕过保护。
+  database:
+    journal_mode: auto
+    busy_timeout_seconds: 30
+    writer_queue_size: 64
+    writer_wait_seconds: 30
+    audit_batch_rows: 1000
+    wal_autocheckpoint_pages: 1000
+    wal_warning_mb: 64
+    wal_limit_mb: 256
+    # 小配置卷默认保留 256 MiB；启动/普通写入还需至少 4 MiB 工作空间。
+    reserve_free_mb: 256
+  # 【NAS 任务预算】：线程池/队列调整后重启生效；转移并发 1 更适合繁忙机械盘。
+  # 后台批任务与 Webhook 分池，Telegram 轮询独立；队列满时报繁忙，重复服务触发合并。
+  workload:
+    background_workers: 6
+    background_queue_size: 64
+    interactive_workers: 2
+    interactive_queue_size: 16
+    scheduler_workers: 6
+    scheduler_queue_size: 64
+    search_workers: 4
+    search_queue_size: 64
+    transfer_concurrency: 2
   # 【日志记录类型】：server、file、console
   # 如果是使用Docker安装建议设置为console，通过Docker管理器查看日志
   # 如果是使用群晖套件建议配置为 server，可将日志输出到群晖的日志中心便于查看
@@ -35,10 +60,15 @@ app:
   rmt_tmdbkey:
   # 【使用TMDB服务器域名】：api.themoviedb.org、api.tmdb.org，如api.themoviedb.org无法访问可偿试使用api.tmdb.org
   tmdb_domain: api.tmdb.org
+  # 【TMDB 官网 User-Agent】：留空使用 Requests 默认 UA，仅用于官网连通性测试和网页辅助识别，不影响 TMDB API 或其他站点
+  tmdb_web_user_agent: ""
   # 【TMDB匹配模式】：normal、strict，normal模式下如使用文件名/种子名中的年份无法匹配到媒体信息，会去掉年份再匹配一次；strict模式则严格按文件中年份匹配
   # normal模式下会提升识别成功率，但也可能会导致误识别率增加；strict模式可以降低误识别率，但可能导致很多文件名/种子名中年份不正确的无法被识别（特别是剧集，需要是首播年份）
   rmt_match_mode: normal
-  # 【设置代理】，themoviedb、fanart、telegram等将使用代理访问，http和https均需配置，可以是http也可以是socks5、socks5h(remote DNS) ，但需要带http或socks5前缀，两项可以配置为一样，留空则不启用
+  # 【设置代理】，themoviedb、fanart、telegram等将使用代理访问，http和https均需配置，两项可以配置为一样
+  # 地址未带协议时按http处理；socks5、socks5h(remote DNS)需带对应前缀。留空或false则不显式指定应用代理，仍可使用容器环境代理
+  # 兼容单一地址文本及 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY 字段；支持 no_proxy 绕过列表和 scheme://hostname 主机规则
+  # 读取后规范化为 Requests 代理映射，建议一般用途按下方 http/https 结构配置
   # 示例：'http://127.0.0.1:7890' 'socks5://127.0.0.1:8018' 'socks5h://127.0.0.1:8018'
   proxies:
     http:

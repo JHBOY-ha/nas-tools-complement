@@ -16,6 +16,9 @@ from app.utils import PathUtils, ExceptionUtils
 from app.utils.types import SyncType, OsType
 
 lock = threading.Lock()
+# 全量同步可被多个入口同时触发（Web 点击、消息命令、定时任务），重复执行会对
+# 同一批文件重复识别与硬链接。非阻塞互斥让后来者直接跳过，而不是排队重跑。
+_transfer_all_lock = threading.Lock()
 
 
 class FileMonitorHandler(FileSystemEventHandler):
@@ -333,6 +336,17 @@ class Sync(object):
         """
         全量转移Sync目录下的文件，WEB界面点击目录同步时获发
         """
+        if not _transfer_all_lock.acquire(blocking=False):
+            log.warn("【Sync】已有全量同步正在进行，跳过本次触发")
+            # 不同 sid 也可能争用此锁；未执行必须与完成区分，供任务入口报告繁忙。
+            return False
+        try:
+            self.__transfer_all_sync(sid=sid)
+            return True
+        finally:
+            _transfer_all_lock.release()
+
+    def __transfer_all_sync(self, sid=None):
         for monpath, target_dirs in self.sync_dir_config.items():
             if not monpath:
                 continue

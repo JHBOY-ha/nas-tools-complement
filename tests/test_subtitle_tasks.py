@@ -47,11 +47,22 @@ class _MemoryDb:
     def session(self):
         return self._session()
 
+    def remove_session(self):
+        # 与 MainDb/MediaDb 保持同一接口，供 release_db_connections 调用。
+        self._session.remove()
+
     def init_db(self):
-        Base.metadata.create_all(self.engine)
+        # Fixtures keep writable sessions for arranging states; reads still use
+        # the same publication predicate as production, so hidden rows cannot
+        # accidentally make an atomic-publication regression pass.
+        from app.db.publication import seed_legacy
+        with self.engine.begin() as connection:
+            Base.metadata.create_all(connection)
+            seed_legacy(connection)
 
     def query(self, *objects):
-        return self.session.query(*objects)
+        from app.db.publication import filter_visible
+        return filter_visible(self.session.query(*objects), objects)
 
     def insert(self, value):
         self.session.add(value)
@@ -84,9 +95,22 @@ class SubtitleTaskManagerTest(TestCase):
             db=_MemoryDb(),
             staging_root=os.path.join(self.temp.name, "staging")
         )
+        self._publication_engine = None
+        if self._testMethodName.startswith('test_post_publish'):
+            # Publication races need production-like independent connections.
+            # StaticPool shares one pysqlite statement cache across threads and
+            # can fail internally during concurrent session cleanup.
+            db = self.manager._db
+            db.engine.dispose()
+            db.engine = create_engine('sqlite:///' + os.path.join(self.temp.name, 'publication.db'),
+                                      connect_args={'check_same_thread': False})
+            db._session = scoped_session(sessionmaker(bind=db.engine, expire_on_commit=False))
+            self._publication_engine = db.engine
 
     def tearDown(self):
         self.manager.shutdown(wait=True)
+        if self._publication_engine is not None:
+            self._publication_engine.dispose()
         self.temp.cleanup()
 
     def test_empty_cleanup_releases_writer_for_other_connections(self):
@@ -207,7 +231,7 @@ class SubtitleTaskManagerTest(TestCase):
         self.assertEqual(too_large.exception.status_code, 413)
 
         usage = type("Usage", (), {"total": 10 ** 9, "used": 10 ** 9, "free": 0})()
-        with patch("app.helper.subtitle_tasks.shutil.disk_usage", return_value=usage):
+        with patch("app.helper.subtitle_tasks.isolated_disk_usage", return_value=usage):
             with self.assertRaises(TaskStorageInsufficient) as insufficient:
                 self.manager.submit_upload(
                     "user", [_File("small.srt", SRT)], self.payload()
@@ -223,13 +247,16 @@ class SubtitleTaskManagerTest(TestCase):
             release.wait(2)
             manager.finish_task(task_id, "succeeded", {})
 
-        reserve = 1024 * 1024 * 1024
+        # Test target-volume contention relative to the current policy floor,
+        # rather than pinning the previous one-GiB default.
+        from app.helper.subtitle_tasks import DEFAULT_POLICY
+        reserve = DEFAULT_POLICY['reserve_free_mb'] * 1024 * 1024
         usage = type("Usage", (), {
             "total": reserve * 4, "used": 0, "free": reserve + len(SRT) * 3
         })()
         self.manager.register_processor("upload", blocked)
         self.manager.start()
-        with patch("app.helper.subtitle_tasks.shutil.disk_usage", return_value=usage):
+        with patch("app.helper.subtitle_tasks.isolated_disk_usage", return_value=usage):
             first, _ = self.manager.submit_upload(
                 "user", [_File("first.srt", SRT)], self.payload()
             )
@@ -296,7 +323,7 @@ class SubtitleTaskManagerTest(TestCase):
             "free": 10 * 1024 * 1024 * 1024
         })()
 
-        with patch("app.helper.subtitle_tasks.shutil.disk_usage", return_value=usage):
+        with patch("app.helper.subtitle_tasks.isolated_disk_usage", return_value=usage):
             with self.assertRaises(TaskStorageInsufficient):
                 self.manager.ensure_upload_admission(80 * 1024 * 1024)
 
@@ -1049,7 +1076,7 @@ class SubtitleTaskManagerTest(TestCase):
             "used": 0,
             "free": 2 * 1024 * 1024 * 1024
         })()
-        with patch("app.helper.subtitle_tasks.shutil.disk_usage", return_value=usage):
+        with patch("app.helper.subtitle_tasks.isolated_disk_usage", return_value=usage):
             with self.assertRaises(SubtitleTaskError):
                 self.manager.update_settings({"staging_quota_mb": 2048, "reserve_free_mb": 1024})
 
@@ -1232,7 +1259,23 @@ class SubtitleTaskManagerTest(TestCase):
         ).first()
         row.STATUS = "recovering"
         self.manager._db.commit()
-        canceled = self.manager.cancel_task(task["task_id"], owner="user")
+        # A transient disk failure must retain both the cancellation intent and
+        # ownership evidence, and a second cancellation must retry the cleanup.
+        with patch.object(self.manager, "_reconcile_upload_outputs", side_effect=OSError("disk unavailable")):
+            with self.assertRaises(OSError):
+                self.manager.cancel_task(task["task_id"], owner="user")
+        self.assertEqual(self.manager.get_task(task["task_id"], owner="user")["status"], "canceling")
+        reconcile = self.manager._reconcile_upload_outputs
+
+        def claim_before_reconcile(*args, **kwargs):
+            # Deterministically interleave the dispatcher's next claim in the
+            # lock-free I/O window. It must not delete the marker first.
+            self.assertIsNone(self.manager._claim_next_interactive())
+            self.assertTrue(os.path.exists(os.path.join(task["payload"]["staging_dir"], "owned.json")))
+            return reconcile(*args, **kwargs)
+
+        with patch.object(self.manager, "_reconcile_upload_outputs", side_effect=claim_before_reconcile):
+            canceled = self.manager.cancel_task(task["task_id"], owner="user")
         self.assertEqual(canceled["status"], "canceled")
         self.assertFalse(os.path.exists(output_sub))
         self.assertFalse(os.path.exists(task["payload"]["staging_dir"]))
@@ -1297,7 +1340,7 @@ class SubtitleTaskManagerTest(TestCase):
                 self.manager, "_active_staging_reservation_totals",
                 return_value=(existing, existing)
         ), \
-                patch("app.helper.subtitle_tasks.shutil.disk_usage", return_value=usage):
+                patch("app.helper.subtitle_tasks.isolated_disk_usage", return_value=usage):
             with self.assertRaises(TaskStorageInsufficient):
                 self.manager.ensure_upload_admission(mib)
 
@@ -1314,7 +1357,7 @@ class SubtitleTaskManagerTest(TestCase):
         })()
         raw_dir = os.path.join(self.temp.name, "spool-space")
         os.makedirs(raw_dir)
-        with patch("app.helper.subtitle_tasks.shutil.disk_usage", return_value=usage):
+        with patch("app.helper.subtitle_tasks.isolated_disk_usage", return_value=usage):
             with self.assertRaises(TaskStorageInsufficient):
                 self.manager._spool_files(
                     [_File("subtitle.srt", SRT)], raw_dir, policy,
@@ -1420,7 +1463,7 @@ class SubtitleTaskManagerTest(TestCase):
     def test_remove_tree_reports_failure_when_directory_survives(self):
         path = os.path.join(self.temp.name, "undeleted")
         os.makedirs(path)
-        with patch("app.helper.subtitle_tasks.shutil.rmtree", return_value=None):
+        with patch("app.helper.subtitle_tasks.isolated_remove_tree", return_value=None):
             self.assertFalse(self.manager._remove_tree(path))
         self.assertTrue(os.path.isdir(path))
 

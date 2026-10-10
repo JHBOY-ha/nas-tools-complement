@@ -3,15 +3,23 @@
 NProgress.configure({ showSpinner: false });
 
 // Ajax主方法
-function ajax_post(cmd, params, handler, aync=true, show_progress=true) {
+function ajax_post(cmd, params, handler, aync=true, show_progress=true, taskState=null) {
     if (show_progress) {
         NProgress.start();
+    }
+    // The shared client preserves existing callbacks but invokes long-action
+    // handlers only after a terminal result, never after a 202 acknowledgement.
+    if (window.ActionTaskClient) {
+        // Optional state notifications drive live progress without treating
+        // acceptance as completion; existing terminal handlers stay unchanged.
+        return window.ActionTaskClient.request(cmd, params, handler, {async: aync, taskState,
+            accepted: function () { if (show_progress) NProgress.done(); }});
     }
     let data = {
         cmd: cmd,
         data: JSON.stringify(params)
     };
-    $.ajax({
+    return $.ajax({
         type: "POST",
         url: "do?random=" + Math.random(),
         dataType: "json",
@@ -46,6 +54,9 @@ function ajax_backup(handler) {
     let xhr = new XMLHttpRequest()
     xhr.open('POST', downloadURL, true);
     xhr.responseType = 'arraybuffer';
+    // Two bounded database snapshots can take time; completion always releases
+    // the caller's busy button, including transport failure/timeout.
+    xhr.timeout = 300000;
     xhr.onload = function () {
         if (this.status === 200) {
             let type = xhr.getResponseHeader('Content-Type')
@@ -65,7 +76,6 @@ function ajax_backup(handler) {
             } else {
                 let URL = window.URL || window.webkitURL;
                 let objectUrl = URL.createObjectURL(blob);
-                console.log(objectUrl);
                 if (fileName) {
                     const a = document.createElement('a');
                     // safari doesn't support this yet
@@ -82,10 +92,15 @@ function ajax_backup(handler) {
                     window.location = objectUrl;
                 }
             }
+        } else {
+            show_fail_modal('备份未生成，请检查数据库状态和可用空间。');
         }
-        if (handler) {
-            handler();
-        }
+    };
+    xhr.onerror = xhr.ontimeout = xhr.onabort = function () {
+        show_fail_modal('备份下载未完成，请检查连接和服务状态。');
+    };
+    xhr.onloadend = function () {
+        if (handler) handler();
     };
     xhr.send();
 }

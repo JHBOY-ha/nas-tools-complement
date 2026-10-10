@@ -1,14 +1,20 @@
 import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import as_completed, TimeoutError as FutureTimeoutError
 
 import log
 from app.conf import ModuleConf
+from app.db.session_scope import with_db_session
 from app.helper import ProgressHelper, SubmoduleHelper
 from app.indexer.client import BuiltinIndexer
 from app.utils import ExceptionUtils, StringUtils
 from app.utils.commons import singleton
 from app.utils.types import SearchType, IndexerType
+from app.utils.workload import BoundedExecutor, TaskQueueFull
 from config import Config
+
+# 单次并行检索的整体时限。单个站点卡住不应拖垮整次检索；各站点请求自身仍有
+# 独立超时，这里的上限只是兜底。渲染类站点最坏约 55 秒，故取值高于它。
+SEARCH_TOTAL_TIMEOUT_SECONDS = 120
 
 
 @singleton
@@ -19,6 +25,13 @@ class Indexer(object):
     progress = None
 
     def __init__(self):
+        # All searches share this budget, including calls whose HTTP caller has
+        # already timed out. Slow sites cannot create another pool on each click.
+        self._search_executor = BoundedExecutor(
+            Config().get_workload_limit('search_workers'),
+            Config().get_workload_limit('search_queue_size'),
+            'nastool-search'
+        )
         self._indexer_schemas = SubmoduleHelper.import_submodules(
             'app.indexer.client',
             filter_func=lambda _, obj: hasattr(obj, 'schema')
@@ -141,34 +154,67 @@ class Indexer(object):
             log.info(f"【{self._client_type.value}】开始检索 %s，站点：%s ..." % (key_word, filter_args.get("site")))
             self.progress.update(ptype='search', text="开始检索 %s，站点：%s ..." % (key_word, filter_args.get("site")))
         else:
-            log.info(f"【{self._client_type.value}】开始并行检索 %s，线程数：%s ..." % (key_word, len(indexers)))
-            self.progress.update(ptype='search', text="开始并行检索 %s，线程数：%s ..." % (key_word, len(indexers)))
-        # 多线程
-        executor = ThreadPoolExecutor(max_workers=len(indexers))
+            concurrency = self._search_executor.snapshot()['max_workers']
+            log.info(f"【{self._client_type.value}】开始并行检索 %s，站点数：%s，共享并发上限：%s ..."
+                     % (key_word, len(indexers), concurrency))
+            self.progress.update(ptype='search', text="开始检索 %s，站点数：%s，并发上限：%s ..."
+                                 % (key_word, len(indexers), concurrency))
+        # Network searches use a separate, process-wide FIFO queue so a waiting
+        # background task cannot consume its own executor's remaining workers.
+        executor = self._search_executor
         all_task = []
-        for index in indexers:
-            order_seq = 100 - int(index.pri)
-            task = executor.submit(self._client.search,
-                                   order_seq,
-                                   index,
-                                   key_word,
-                                   filter_args,
-                                   match_media,
-                                   in_from)
-            all_task.append(task)
         ret_array = []
-        finish_count = 0
-        for future in as_completed(all_task):
-            result = future.result()
-            finish_count += 1
-            self.progress.update(ptype='search', value=round(100 * (finish_count / len(all_task))))
-            if result:
-                ret_array = ret_array + result
+        unfinished = 0
+        try:
+            for index in indexers:
+                order_seq = 100 - int(index.pri)
+                # 池内线程由 executor 复用，工作单元结束时归还数据库连接。
+                try:
+                    task = executor.submit(with_db_session(self._client.search),
+                                           order_seq,
+                                           index,
+                                           key_word,
+                                           filter_args,
+                                           match_media,
+                                           in_from)
+                except TaskQueueFull:
+                    unfinished += 1
+                    continue
+                all_task.append(task)
+            if unfinished:
+                log.warn("【%s】检索队列繁忙，%s 个站点未准入，请稍后重试"
+                         % (self._client_type.value, unfinished))
+            finish_count = 0
+            try:
+                for future in as_completed(all_task, timeout=SEARCH_TOTAL_TIMEOUT_SECONDS):
+                    try:
+                        result = future.result()
+                    except Exception as err:
+                        # 单个站点异常只丢弃该站点结果，不再中断整次检索。
+                        ExceptionUtils.exception_traceback(err)
+                        finish_count += 1
+                        unfinished += 1
+                        continue
+                    finish_count += 1
+                    self.progress.update(ptype='search', value=round(100 * (finish_count / len(all_task))))
+                    if result:
+                        ret_array = ret_array + result
+            except FutureTimeoutError:
+                pending = len([task for task in all_task if not task.done()])
+                unfinished += len(all_task) - finish_count
+                log.warn("【%s】检索 %s 有 %s 个站点超过 %s 秒未返回，已跳过等待"
+                         % (self._client_type.value, key_word, pending, SEARCH_TOTAL_TIMEOUT_SECONDS))
+        finally:
+            # Cancel only this call's queued work, never shut down the shared
+            # executor or cancel another user's search. Running requests keep
+            # their slots until their real work and session cleanup finish.
+            for task in all_task:
+                task.cancel()
         # 计算耗时
         end_time = datetime.datetime.now()
-        log.info(f"【{self._client_type.value}】所有站点检索完成，有效资源数：%s，总耗时 %s 秒"
-                 % (len(ret_array), (end_time - start_time).seconds))
-        self.progress.update(ptype='search', text="所有站点检索完成，有效资源数：%s，总耗时 %s 秒"
-                                                  % (len(ret_array), (end_time - start_time).seconds),
+        log.info(f"【{self._client_type.value}】检索结束，有效资源数：%s，未完成站点：%s，总耗时 %s 秒"
+                 % (len(ret_array), unfinished, (end_time - start_time).seconds))
+        self.progress.update(ptype='search', text="检索完成，有效资源数：%s，未完成站点：%s，总耗时 %s 秒"
+                                                  % (len(ret_array), unfinished, (end_time - start_time).seconds),
                              value=100)
         return ret_array

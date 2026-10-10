@@ -223,22 +223,26 @@ class MediaServer:
             return
         return self.server.refresh_library_by_items(items)
 
-    def get_libraries(self):
+    def get_libraries(self, strict=False):
         """
-        获取媒体服务器所有媒体库列表
+        获取媒体服务器所有媒体库列表；严格模式用于同步，读取失败必须抛出。
         """
         if not self.server:
+            if strict:
+                raise RuntimeError('媒体服务器未配置')
             return []
-        return self.server.get_libraries()
+        return self.server.get_libraries(strict=True) if strict else self.server.get_libraries()
 
-    def get_items(self, parent):
+    def get_items(self, parent, strict=False):
         """
-        获取媒体库中的所有媒体
+        获取媒体库中的所有媒体；严格模式保留客户端的读取失败信号。
         :param parent: 上一级的ID
         """
         if not self.server:
+            if strict:
+                raise RuntimeError('媒体服务器未配置')
             return []
-        return self.server.get_items(parent)
+        return self.server.get_items(parent, strict=True) if strict else self.server.get_items(parent)
 
     def get_episodes(self, series_id):
         """
@@ -258,51 +262,78 @@ class MediaServer:
 
     def sync_mediaserver(self):
         """
-        同步媒体库所有数据到本地数据库
+        暂存完整远端快照后原子替换，失败保留原缓存并结束进度条。
         """
+        import json
+        import tempfile
+        from app.db.runtime import check_free_space
+        from app.db.settings import DatabaseSettings
+        from app.db.transactions import DatabaseBusy, DatabaseWriteError
+
         if not self.server:
             return
         with lock:
-            # 开始进度条
             log.info("【MediaServer】开始同步媒体库数据...")
             self.progress.start("mediasync")
-            self.progress.update(ptype="mediasync", text="请稍候...")
-            # 汇总统计
-            medias_count = self.get_medias_count()
-            total_media_count = medias_count.get("MovieCount") + medias_count.get("SeriesCount")
-            total_count = 0
-            movie_count = 0
-            tv_count = 0
-            # 清空登记薄
-            self.mediadb.empty()
-            for library in self.get_libraries():
-                # 获取媒体库所有项目
-                self.progress.update(ptype="mediasync",
-                                     text="正在获取 %s 数据..." % (library.get("name")))
-                for item in self.get_items(library.get("id")):
-                    if not item:
-                        continue
-                    if self.mediadb.insert(self._server_type.value, item):
-                        total_count += 1
-                        if item.get("type") in ['Movie', 'movie']:
-                            movie_count += 1
-                        elif item.get("type") in ['Series', 'show']:
-                            tv_count += 1
-                        self.progress.update(ptype="mediasync",
-                                             text="正在同步 %s，已完成：%s / %s ..." % (
-                                                 library.get("name"), total_count, total_media_count),
-                                             value=round(100 * total_count / total_media_count, 1))
-            # 更新总体同步情况
-            self.mediadb.statistics(server_type=self._server_type.value,
-                                    total_count=total_count,
-                                    movie_count=movie_count,
-                                    tv_count=tv_count)
-            # 结束进度条
-            self.progress.update(ptype="mediasync",
-                                 value=100,
-                                 text="媒体库数据同步完成，同步数量：%s" % total_count)
-            self.progress.end("mediasync")
-            log.info("【MediaServer】媒体库数据同步完成，同步数量：%s" % total_count)
+            try:
+                self.progress.update(ptype="mediasync", text="请稍候...")
+                counts = self.get_medias_count()
+                # 客户端用 {} 表示统计请求失败；只有明确的非负计数才是有效快照。
+                if not isinstance(counts, dict) or any(
+                        type(counts.get(key)) is not int or counts[key] < 0
+                        for key in ('MovieCount', 'SeriesCount')):
+                    raise RuntimeError('媒体库统计读取失败')
+                expected = counts['MovieCount'] + counts['SeriesCount']
+                total_count = movie_count = tv_count = staged_bytes = 0
+                settings = DatabaseSettings.from_config()
+                # Strict reads propagate failures, including failures after some items.
+                # Network calls never hold a writer slot. A disposable spool
+                # avoids retaining every library's payload in process memory.
+                with tempfile.TemporaryFile(mode='w+t', encoding='utf-8') as snapshot:
+                    for library in self.get_libraries(strict=True):
+                        self.progress.update(ptype="mediasync", text="正在获取 %s 数据..." % library.get("name"))
+                        for item in self.get_items(library.get("id"), strict=True):
+                            if not item:
+                                continue
+                            encoded = json.dumps(item, ensure_ascii=False) + '\n'
+                            size = len(encoded.encode('utf-8'))
+                            if total_count % 1000 == 0 or size > 4 * 1024 * 1024:
+                                check_free_space(tempfile.gettempdir(), settings, max(size, 4 * 1024 * 1024),
+                                                 '媒体库同步暂存')
+                            snapshot.write(encoded)
+                            staged_bytes += size
+                            total_count += 1
+                            movie_count += item.get("type") in ('Movie', 'movie')
+                            tv_count += item.get("type") in ('Series', 'show')
+                            self.progress.update(ptype="mediasync", text="正在获取媒体库，已获取 %s 项" % total_count,
+                                                 value=min(90, round(90 * total_count / max(expected, 1), 1)))
+                    snapshot.seek(0)
+                    # Empty, inserts and statistics form one same-file commit.
+                    # Any rejected helper marks the outer transaction rollback-
+                    # only, so no observer sees an empty/partial replacement.
+                    with self.mediadb.write_transaction(required_bytes=staged_bytes * 4):
+                        if self.mediadb.empty() is False:
+                            raise DatabaseWriteError('媒体库旧快照替换失败')
+                        for line in snapshot:
+                            if self.mediadb.insert(self._server_type.value, json.loads(line)) is False:
+                                raise DatabaseWriteError('媒体库快照写入失败')
+                        if self.mediadb.statistics(server_type=self._server_type.value, total_count=total_count,
+                                                   movie_count=movie_count, tv_count=tv_count) is False:
+                            raise DatabaseWriteError('媒体库统计写入失败')
+                self.progress.update(ptype="mediasync", value=100,
+                                     text="媒体库数据同步完成，同步数量：%s" % total_count)
+                log.info("【MediaServer】媒体库数据同步完成，同步数量：%s" % total_count)
+                return True
+            except Exception as error:
+                # Capacity failures are actionable; arbitrary provider/SQL
+                # exceptions may contain credentials, so only expose the type.
+                reason = str(error) if isinstance(error, (DatabaseBusy, DatabaseWriteError)) else type(error).__name__
+                message = "媒体库同步失败，保留上次数据，请重试：%s" % reason
+                self.progress.update(ptype="mediasync", text=message)
+                log.error("【MediaServer】%s" % message)
+                return False
+            finally:
+                self.progress.end("mediasync")
 
     def check_item_exists(self, title, year=None, tmdbid=None):
         """

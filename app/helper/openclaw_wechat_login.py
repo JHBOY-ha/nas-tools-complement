@@ -38,7 +38,8 @@ def _headers():
 
 def fetch_qrcode(base_url):
     url = f"{base_url}/ilink/bot/get_bot_qrcode?bot_type={quote(BOT_TYPE)}"
-    r = requests.get(url, headers=_headers(), timeout=15, verify=False)
+    # QR login transports authentication material and requires trusted TLS.
+    r = requests.get(url, headers=_headers(), timeout=15, verify=True)
     r.raise_for_status()
     return r.json()
 
@@ -46,7 +47,7 @@ def fetch_qrcode(base_url):
 def poll_status(base_url, qrcode):
     url = f"{base_url}/ilink/bot/get_qrcode_status?qrcode={quote(qrcode)}"
     try:
-        r = requests.get(url, headers=_headers(), timeout=QR_POLL_TIMEOUT, verify=False)
+        r = requests.get(url, headers=_headers(), timeout=QR_POLL_TIMEOUT, verify=True)
         r.raise_for_status()
         return r.json()
     except requests.exceptions.Timeout:
@@ -68,7 +69,6 @@ def render_qr(content):
 
 
 def main():
-    requests.packages.urllib3.disable_warnings()
     base_url = DEFAULT_BASE_URL
     print(f"获取二维码 from {base_url} ...")
     qr = fetch_qrcode(base_url)

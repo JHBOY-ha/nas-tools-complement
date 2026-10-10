@@ -56,7 +56,7 @@ def main():
         config_path.write_text("app: {}\nmedia: {}\npt: {}\nllm:\n  enable: false\n", encoding="utf-8")
         # Configure isolation before importing any application module: Config and
         # database engines are created at import time in this project.
-        with patch.dict(os.environ, {"NASTOOL_CONFIG": str(config_path)}), \
+        with patch.dict(os.environ, {"NASTOOL_CONFIG": str(config_path), "NASTOOL_OFFLINE_TESTS": "1"}), \
                 patch.object(socket.socket, "connect", side_effect=deny_network), \
                 patch.object(socket.socket, "connect_ex", side_effect=deny_network), \
                 patch.object(socket, "getaddrinfo", side_effect=deny_network):

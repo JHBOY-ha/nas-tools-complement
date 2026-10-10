@@ -150,6 +150,24 @@ class OpenSubtitlesApiTest(TestCase):
         finally:
             os.remove(media_path)
 
+    def test_moviehash_follows_media_symlinks_without_relaxing_staging_streams(self):
+        from app.utils.isolated_fs import isolated_open
+        with tempfile.TemporaryDirectory() as directory:
+            media = Path(directory) / "movie.mkv"
+            media.write_bytes(bytes(range(256)) * 512)
+            link = Path(directory) / "linked.mkv"
+            try:
+                link.symlink_to(media)
+            except (OSError, NotImplementedError):
+                self.skipTest("Symlinks are unavailable on this platform")
+            # SOFTLINK media must retain the same exact-match lookup as a copy.
+            self.assertEqual("a0601fdf9f610000", self.module.OpenSubtitles.calculate_moviehash(str(link)))
+            if hasattr(os, "O_NOFOLLOW"):
+                with self.assertRaises(OSError):
+                    isolated_open(link, "rb")
+            media.unlink()
+            self.assertIsNone(self.module.OpenSubtitles.calculate_moviehash(str(link)))
+
     def test_movie_search_uses_numeric_imdb_id(self):
         MediaType = self.module.MediaType
         client = self._client()

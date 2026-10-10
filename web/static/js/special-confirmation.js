@@ -23,8 +23,13 @@
     const version = ++generation;
     if (request) request.abort();
     status(payload.stage === 'confirm' ? '正在重新识别并整理，请稍候…' : '正在查询 TMDB…');
-    request = $.ajax({type: 'POST', url: 'do', dataType: 'json', timeout: payload.stage === 'confirm' ? 0 : 60000,
-      data: {cmd: 'special_confirmation', data: JSON.stringify(Object.assign({}, current, payload))}})
+    const parameters = Object.assign({}, current, payload);
+    // Shared async writes settle on the terminal result; reads keep the existing
+    // abort/generation contract. Standalone fixtures can use legacy transport.
+    request = window.ActionTaskClient ? window.ActionTaskClient.request('special_confirmation', parameters) :
+      $.ajax({type: 'POST', url: 'do', dataType: 'json', timeout: payload.stage === 'confirm' ? 0 : 60000,
+        data: {cmd: 'special_confirmation', data: JSON.stringify(parameters)}});
+    request
       .done(function (result) {
         if (version !== generation) return;
         if (result.retcode !== 0) {

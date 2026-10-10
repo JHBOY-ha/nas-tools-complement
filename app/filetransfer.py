@@ -5,7 +5,9 @@ import re
 import shutil
 import traceback
 import uuid
+from contextlib import contextmanager
 from enum import Enum
+from functools import wraps
 from threading import Lock
 from time import sleep
 
@@ -22,10 +24,51 @@ from app.message import Message
 from app.subtitle import Subtitle
 from app.utils import EpisodeFormat, PathUtils, StringUtils, SystemUtils, ExceptionUtils
 from app.utils.types import MediaType, SyncType, RmtMode
+from app.utils.security_utils import compile_ignore_pattern
+from app.utils.workload import get_transfer_gate, TaskQueueFull
+from app.utils.isolated_io import isolated_stat
 from config import RMT_SUBEXT, RMT_MEDIAEXT, RMT_FAVTYPE, RMT_MIN_FILESIZE, DEFAULT_MOVIE_FORMAT, \
     DEFAULT_TV_FORMAT, Config
 
-lock = Lock()
+# 转移操作原先由一把全局锁串行化，导致一次大文件复制、或一次挂起的 rclone/mc
+# 云端传输，会阻塞所有转移任务（定时转移、目录同步、手工转移一起停摆）。
+# 改为按目标路径加锁：同一目标的并发转移仍然互斥，不同文件则可并行，既保留
+# 竞态保护又消除全局排队。条目在无人等待时移除，不会长期增长。
+_target_locks = {}
+_target_locks_guard = Lock()
+
+
+def _reserve_transfer_records(function):
+    """Retain record admission across file I/O without retaining a SQLite lock."""
+    @wraps(function)
+    def reserved(*args, **kwargs):
+        from app.db.main_db import MainDb
+        with MainDb().reserve_write():
+            return function(*args, **kwargs)
+    return reserved
+
+
+@contextmanager
+def _transfer_lock(target_file):
+    """
+    按目标路径加锁，替代原先的全局锁
+    """
+    key = os.path.normcase(os.path.abspath(str(target_file)))
+    with _target_locks_guard:
+        entry = _target_locks.get(key)
+        if entry is None:
+            entry = [Lock(), 0]
+            _target_locks[key] = entry
+        entry[1] += 1
+    entry[0].acquire()
+    try:
+        yield
+    finally:
+        entry[0].release()
+        with _target_locks_guard:
+            entry[1] -= 1
+            if entry[1] <= 0 and _target_locks.get(key) is entry:
+                _target_locks.pop(key, None)
 
 
 class FileTransfer:
@@ -59,6 +102,7 @@ class FileTransfer:
     _refresh_mediaserver = False
     _ignored_paths = []
     _ignored_files = ''
+    _ignore_config_error = ""
 
     def __init__(self):
         self.media = Media()
@@ -73,6 +117,17 @@ class FileTransfer:
 
     def init_config(self):
         media = Config().get_config('media')
+        # Compile both patterns before publishing either. Invalid startup/legacy
+        # settings pause transfers instead of crashing or silently removing filters.
+        self._ignore_config_error = ""
+        try:
+            ignored_paths = compile_ignore_pattern((media or {}).get('ignored_paths'))
+            ignored_files = compile_ignore_pattern((media or {}).get('ignored_files'))
+        except ValueError as err:
+            self._ignore_config_error = str(err)
+            log.error("【Rmt】%s，暂停整理直到配置修正" % self._ignore_config_error)
+        else:
+            self._ignored_paths, self._ignored_files = ignored_paths, ignored_files
         self._scraper_flag = media.get("nfo_poster")
         self._scraper_nfo = Config().get_config('scraper_nfo')
         self._scraper_pic = Config().get_config('scraper_pic')
@@ -123,18 +178,6 @@ class FileTransfer:
                 self._min_filesize = min_filesize * 1024 * 1024
             elif isinstance(min_filesize, str) and min_filesize.isdigit():
                 self._min_filesize = int(min_filesize) * 1024 * 1024
-            # 文件路径转移忽略词
-            ignored_paths = media.get('ignored_paths')
-            if ignored_paths:
-                if ignored_paths.endswith(";"):
-                    ignored_paths = ignored_paths[:-1]
-                self._ignored_paths = re.compile(r'%s' % re.sub(r';', r'|', ignored_paths))
-            # 文件名转移忽略词
-            ignored_files = media.get('ignored_files')
-            if ignored_files:
-                if ignored_files.endswith(";"):
-                    ignored_files = ignored_files[:-1]
-                self._ignored_files = re.compile(r'%s' % re.sub(r';', r'|', ignored_files))
             # 高质量文件覆盖
             self._filesize_cover = media.get('filesize_cover')
             # 电影重命名格式
@@ -163,10 +206,12 @@ class FileTransfer:
         :param target_file: 目标文件路径
         :param rmt_mode: RmtMode转移方式
         """
-        with lock:
+        # Target ownership remains exclusive; distinct targets share a small
+        # FIFO I/O budget instead of starting unlimited large-file transfers.
+        with _transfer_lock(target_file), get_transfer_gate().slot():
             if rmt_mode == RmtMode.LINK:
                 # 更链接
-                if os.stat(file_item).st_dev != os.stat(os.path.dirname(target_file)).st_dev:
+                if isolated_stat(file_item).st_dev != isolated_stat(os.path.dirname(target_file)).st_dev:
                     log.error("【Rmt】硬链接源文件与目标目录不在同一文件系统")
                     return -1
                 retcode, retmsg = SystemUtils.link(file_item, target_file)
@@ -402,7 +447,8 @@ class FileTransfer:
             log.error("【Rmt】%s %s到unknown失败，错误码 %s" % (file_item, rmt_mode.value, retcode))
         return retcode
 
-    def __transfer_file(self, file_item, new_file, rmt_mode, over_flag=False, old_file=None, protected=False):
+    def __transfer_file(self, file_item, new_file, rmt_mode, over_flag=False, old_file=None,
+                        protected=False, record_callback=None):
         """
         转移一个文件，同时处理字幕
         :param file_item: 原文件路径
@@ -411,9 +457,12 @@ class FileTransfer:
         :param over_flag: 是否覆盖，为True时会先删除再转移
         """
         file_name = os.path.basename(file_item)
-        if protected:
-            # Recheck/publish atomically at the actual write, not only during batch preflight.
-            publish_exclusive(file_item, new_file, rmt_mode, self.__transfer_command, lambda: True)
+        if protected or record_callback is not None:
+            # The real history acknowledgement belongs inside publication:
+            # MOVE sources and inode receipts survive a failed SQL commit.
+            if not callable(record_callback):
+                raise ValueError('受保护发布缺少数据库确认回调')
+            publish_exclusive(file_item, new_file, rmt_mode, self.__transfer_command, record_callback)
             return self.__transfer_subtitles(org_name=file_item, new_name=new_file, rmt_mode=rmt_mode)
         if not over_flag and os.path.exists(new_file):
             log.warn("【Rmt】文件已存在：%s" % new_file)
@@ -449,6 +498,7 @@ class FileTransfer:
                                          new_name=new_file,
                                          rmt_mode=rmt_mode)
 
+    @_reserve_transfer_records
     def transfer_media(self,
                        in_from: Enum,
                        in_path,
@@ -762,6 +812,30 @@ class FileTransfer:
                 new_file = ret_file_path
                 protected = any((media.note or {}).get(key, {}).get("status") == "confirmed"
                                 for key in ("fractional_episode", "special_episode"))
+                local_publication = (not bluray_disk_dir and not file_exist_flag and
+                                     rmt_mode in (RmtMode.LINK, RmtMode.COPY, RmtMode.MOVE, RmtMode.SOFTLINK))
+                record_during_publication = protected or local_publication
+                publication_recorded = False
+                from app.db.main_db import MainDb
+                from app.db.transactions import DatabaseBusy, DatabaseWriteError
+                if record_during_publication:
+                    # Metadata lookup is outside both SQLite admission and the
+                    # destination lock. The publication callback only writes SQL.
+                    media.set_tmdb_info(self.media.get_tmdb_info(mtype=media.type,
+                        tmdbid=media.tmdb_id, append_to_response="all"))
+                def record_transfer():
+                    nonlocal publication_recorded
+                    with MainDb().write_transaction():
+                        saved = self.dbhelper.insert_transfer_history(
+                            in_from=in_from, rmt_mode=rmt_mode, in_path=reg_path,
+                            out_path=new_file if not bluray_disk_dir else None,
+                            dest=dist_path, media_info=media)
+                        # This acknowledges media bytes only. Subtitles have not
+                        # run yet, so the monitor must still be allowed to retry.
+                        if saved is False:
+                            raise DatabaseWriteError('文件已落盘，记录未确认；请先核对，勿重复执行')
+                    publication_recorded = True
+                    return True
                 if protected and file_exist_flag and not os.path.samefile(file_item, ret_file_path):
                     raise ValueError("特殊集目标已存在不同文件，保留源文件")
                 # 已存在的文件数量
@@ -780,7 +854,19 @@ class FileTransfer:
                     if (file_exist_flag and rmt_mode == RmtMode.LINK
                             and os.path.samefile(file_item, ret_file_path)):
                         # A previous attempt may have published the file but
-                        # failed to persist its history. Retry just that record.
+                        # failed to persist history or transfer subtitles. Reuse
+                        # the media inode, but retry subtitles before blacklisting.
+                        ret = self.__transfer_subtitles(org_name=file_item,
+                                                        new_name=ret_file_path, rmt_mode=rmt_mode)
+                        if ret != 0:
+                            success_flag = False
+                            failed_count += 1
+                            alert_count += 1
+                            error_message = "字幕转移失败，错误码 %s" % ret
+                            alert_messages.append(error_message)
+                            if udf_flag:
+                                return __finish_transfer(False, error_message)
+                            continue
                         handler_flag = True
                         new_file = ret_file_path
                         ret_file_path = os.path.splitext(ret_file_path)[0]
@@ -795,7 +881,8 @@ class FileTransfer:
                                 ret = self.__transfer_file(file_item=file_item,
                                                            new_file=new_file,
                                                            rmt_mode=rmt_mode,
-                                                           over_flag=True, old_file=old_file, protected=protected)
+                                                           over_flag=True, old_file=old_file, protected=protected,
+                                                           record_callback=record_transfer if record_during_publication else None)
                                 if ret != 0:
                                     success_flag = False
                                     error_message = "文件转移失败，错误码 %s" % ret
@@ -875,7 +962,8 @@ class FileTransfer:
                         ret = self.__transfer_file(file_item=file_item,
                                                    new_file=new_file,
                                                    rmt_mode=rmt_mode,
-                                                   over_flag=False, protected=protected)
+                                                   over_flag=False, protected=protected,
+                                                   record_callback=record_transfer if record_during_publication else None)
                         if ret != 0:
                             success_flag = False
                             error_message = "文件转移失败，错误码 %s" % ret
@@ -894,9 +982,10 @@ class FileTransfer:
                 if refresh_item not in refresh_library_items:
                     refresh_library_items.append(refresh_item)
                 # 查询TMDB详情，需要全部数据
-                media.set_tmdb_info(self.media.get_tmdb_info(mtype=media.type,
-                                                             tmdbid=media.tmdb_id,
-                                                             append_to_response="all"))
+                if not record_during_publication:
+                    media.set_tmdb_info(self.media.get_tmdb_info(mtype=media.type,
+                                                                 tmdbid=media.tmdb_id,
+                                                                 append_to_response="all"))
                 # 下载字幕条目
                 subtitle_item = {"type": media.type,
                                  "file": ret_file_path,
@@ -909,20 +998,22 @@ class FileTransfer:
                                  "bluray": True if bluray_disk_dir else False,
                                  "imdbid": media.imdb_id}
                 # 转移历史记录
-                recorded = self.dbhelper.insert_transfer_history(
-                    in_from=in_from,
-                    rmt_mode=rmt_mode,
-                    in_path=reg_path,
-                    out_path=new_file if not bluray_disk_dir else None,
-                    dest=dist_path,
-                    media_info=media)
-                if recorded is not False:
-                    recorded = self.dbhelper.insert_transfer_blacklist(file_item)
+                try:
+                    # Mark the whole item processed only after media AND subtitle
+                    # stages succeed. Legacy paths still commit history with it.
+                    with MainDb().write_transaction():
+                        recorded = True if publication_recorded else record_transfer()
+                        if recorded is not False:
+                            recorded = self.dbhelper.insert_transfer_blacklist(file_item)
+                        if recorded is False:
+                            raise DatabaseWriteError('转移成功标记未确认，请核对后重试')
+                except (DatabaseBusy, DatabaseWriteError):
+                    recorded = False
                 if recorded is False:
                     success_flag = False
                     failed_count += 1
                     alert_count += 1
-                    error_message = "文件已落盘，但转移记录写入失败，等待重试"
+                    error_message = "文件已落盘，但转移记录未确认；请先核对，勿重复执行"
                     log.error("【Rmt】%s：%s" % (error_message, file_item))
                     if error_message not in alert_messages:
                         alert_messages.append(error_message)
@@ -984,7 +1075,12 @@ class FileTransfer:
             self.mediaserver.refresh_library_by_items(refresh_library_items)
         # 启新进程下载字幕
         if download_subtitle_items:
-            self.threadhelper.start_thread(Subtitle().download_subtitle, (download_subtitle_items,))
+            try:
+                self.threadhelper.start_thread(Subtitle().download_subtitle, (download_subtitle_items,))
+            except TaskQueueFull:
+                # Media has already been published. Optional subtitle admission
+                # must not turn that successful transfer into a failed retry.
+                log.warn("【Rmt】字幕下载队列繁忙，媒体转移已完成，可稍后补下载字幕")
         # 总结
         log.info("【Rmt】%s 处理完成，总数：%s，失败：%s" % (in_path, total_count, failed_count))
         if alert_count > 0:
@@ -1516,6 +1612,9 @@ class FileTransfer:
         """
         if not file_list:
             return [], ""
+        # Malformed persisted filters must never result in unfiltered transfers.
+        if self._ignore_config_error:
+            return [], "忽略词配置无效，暂停整理直到配置修正"
         #  过滤掉文件列表中文件路径包含文件路径转移忽略词的
         if self._ignored_paths:
             try:

@@ -219,13 +219,15 @@ class DbHelper:
         插入识别转移记录
         """
         if not media_info or not media_info.tmdb_info:
-            return
+            # The publication caller treats False as a hard metadata failure;
+            # do not let an invalid record look like a successful no-op.
+            return False
         if in_path:
             in_path = os.path.normpath(in_path)
             source_path = os.path.dirname(in_path)
             source_filename = os.path.basename(in_path)
         else:
-            return
+            return False
         if out_path:
             outpath = os.path.normpath(out_path)
             dest_path = os.path.dirname(outpath)
@@ -237,7 +239,9 @@ class DbHelper:
             season_episode = media_info.get_season_string()
         title = media_info.title
         if self.is_transfer_history_exists(source_path, source_filename, dest_path, dest_filename):
-            return
+            # Replaying an already recorded publication is a valid idempotent
+            # success, so it must not poison an enclosing transaction.
+            return True
         dest = dest or ""
         timestr = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))
         self._db.insert(
@@ -267,7 +271,10 @@ class DbHelper:
             EXTRATRANSFERHISTORY.DEST_PATH == destination).first()
         if row:
             if row.PARENT_ID != int(media.tmdb_id) or row.PARENT_TYPE != media.tmdb_info["media_type"].name:
+                # The destination is owned by a different media identity;
+                # this is a real publication conflict, not an idempotent hit.
                 return False
+            # Retrying the same published destination is a successful no-op.
             return True
         self._db.insert(EXTRATRANSFERHISTORY(
             DEST_PATH=destination, SOURCE_PATH=os.path.abspath(source),
@@ -512,9 +519,11 @@ class DbHelper:
         插入未识别记录
         """
         if not path:
-            return
+            return False
         if self.is_transfer_unknown_exists(path):
-            return
+            # A duplicate unknown-path marker is already in the requested
+            # state; callers may safely retry it as a successful no-op.
+            return True
         else:
             path = os.path.normpath(path)
             if dest:
@@ -527,6 +536,7 @@ class DbHelper:
                 STATE='N',
                 MODE=str(rmt_mode.value)
             ))
+        return True
 
     def is_transfer_in_blacklist(self, path):
         """
@@ -552,13 +562,16 @@ class DbHelper:
         插入黑名单记录
         """
         if not path:
-            return
+            return False
         if self.is_transfer_in_blacklist(path):
-            return
+            # Blacklisting the same path again is an allowed idempotent
+            # operation; callers should not treat it as a failed write.
+            return True
         else:
             self._db.insert(TRANSFERBLACKLIST(
                 PATH=os.path.normpath(path)
             ))
+        return True
 
     @DbPersist(_db)
     def truncate_transfer_blacklist(self, ):
@@ -1787,8 +1800,9 @@ class DbHelper:
                 NAME=item.get('name'),
                 SITE=item.get('site'),
                 FREELEECH=item.get('free'),
-                RSS_RULE=str(item.get('rss_rule')),
-                REMOVE_RULE=str(item.get('remove_rule')),
+                # New rows use JSON; readers still accept legacy literal dicts.
+                RSS_RULE=json.dumps(item.get('rss_rule') or {}, ensure_ascii=False),
+                REMOVE_RULE=json.dumps(item.get('remove_rule') or {}, ensure_ascii=False),
                 SEED_SIZE=item.get('seed_size'),
                 INTEVAL=item.get('interval'),
                 DOWNLOADER=item.get('downloader'),
@@ -1808,8 +1822,8 @@ class DbHelper:
                     "NAME": item.get('name'),
                     "SITE": item.get('site'),
                     "FREELEECH": item.get('free'),
-                    "RSS_RULE": str(item.get('rss_rule')),
-                    "REMOVE_RULE": str(item.get('remove_rule')),
+                    "RSS_RULE": json.dumps(item.get('rss_rule') or {}, ensure_ascii=False),
+                    "REMOVE_RULE": json.dumps(item.get('remove_rule') or {}, ensure_ascii=False),
                     "SEED_SIZE": item.get('seed_size'),
                     "INTEVAL": item.get('interval'),
                     "DOWNLOADER": item.get('downloader'),

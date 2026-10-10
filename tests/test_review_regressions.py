@@ -157,9 +157,14 @@ class ExclusivePublicationTest(unittest.TestCase):
             shutil.copyfile(source, destination)
             self.destination.write_bytes(b'competing video')
             return 0
+        # The protected API now requires its real persistence callback; a late
+        # competing inode must prevent publication before that callback runs.
+        record = MagicMock(return_value=True)
         with patch.object(transfer, '_FileTransfer__transfer_command', side_effect=copy_and_compete):
             with self.assertRaises(FileExistsError):
-                transfer._FileTransfer__transfer_file(str(self.source), str(self.destination), RmtMode.COPY, protected=True)
+                transfer._FileTransfer__transfer_file(str(self.source), str(self.destination), RmtMode.COPY,
+                                                       protected=True, record_callback=record)
+        record.assert_not_called()
         self.assertEqual(self.destination.read_bytes(), b'competing video')
         self.assertTrue(self.source.exists())
 

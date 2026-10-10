@@ -3,6 +3,7 @@ import json
 import re
 import time
 from copy import deepcopy
+from threading import RLock
 from urllib.parse import quote
 
 import log
@@ -21,6 +22,7 @@ class LLMMetaParser(object):
     基于 OpenAI 兼容接口的媒体识别增强器
     """
     _allowed_modes = {"conservative", "balanced"}
+    _parse_cache_maxsize = 256
     # 旧模式名迁移：保守＝原来的规则优先，平衡＝原来的 LLM 优先/混合
     _legacy_modes = {
         "rule_first": "conservative",
@@ -64,6 +66,7 @@ class LLMMetaParser(object):
         self._search_max_results = 3
         self._search_timeout = 8
         self._parse_cache = {}
+        self._parse_cache_lock = RLock()
         self._parse_cache_ttl = 60
         self.init_config()
 
@@ -93,7 +96,9 @@ class LLMMetaParser(object):
         self._search_timeout = self.__parse_int(
             config.get("search_timeout"), min_val=1, max_val=30, default=8
         )
-        self._parse_cache = {}
+        # Reconfiguration clears entries under the same lock as cache consumers.
+        with self._parse_cache_lock:
+            self._parse_cache = {}
         self._client = None
 
     def get_status(self, config=None):
@@ -216,17 +221,6 @@ class LLMMetaParser(object):
             self.__set_cached_parse_result(cache_key, {})
             return {}
 
-    def get_alias_candidates(self, title, subtitle=None):
-        """Expose existing Bangumi lookup as name hints, never authoritative IDs."""
-        if not self._search_context_enable or not title:
-            return []
-        names = []
-        for item in self.__search_bangumi_candidates(title):
-            for key in ("name_cn", "name"):
-                if item.get(key) and item[key] not in names:
-                    names.append(item[key])
-        return names
-
     def merge_into(self, meta_info, title, subtitle=None, mtype_hint=None):
         """
         将 LLM 识别结果与规则识别结果合并
@@ -330,6 +324,8 @@ class LLMMetaParser(object):
     def get_alias_candidates(self, title, subtitle=None, limit=6):
         """
         用 Bangumi 检索结果给出可以再查一次 TMDB 的候选名称（中文名优先）。
+
+        保留唯一实现及 limit 参数，避免分支合并产生同名方法覆盖。
 
         用于 TMDB 名称检索找不到作品、或找回的候选与作品身份冲突时的兜底：例如 zh-CN
         下用 “Hundred” 搜不到《百武装战记》(66109)，只能搜到同名剧集，而 Bangumi
@@ -1007,20 +1003,29 @@ class LLMMetaParser(object):
         )
 
     def __get_cached_parse_result(self, cache_key):
-        cache_item = self._parse_cache.get(cache_key)
-        if not cache_item:
-            return None
-        ts = cache_item.get("ts", 0)
-        if time.time() - ts > self._parse_cache_ttl:
-            self._parse_cache.pop(cache_key, None)
-            return None
-        return deepcopy(cache_item.get("result", {}))
+        with self._parse_cache_lock:
+            self.__prune_parse_cache(time.time())
+            cache_item = self._parse_cache.pop(cache_key, None)
+            if cache_item is None:
+                return None
+            # Dict insertion order provides LRU ordering even for cached failures.
+            self._parse_cache[cache_key] = cache_item
+            return deepcopy(cache_item.get("result", {}))
+
+    def __prune_parse_cache(self, now):
+        """Remove all expired entries during reads and writes, not just a hit key."""
+        for key, item in list(self._parse_cache.items()):
+            if now - item.get("ts", 0) >= self._parse_cache_ttl:
+                self._parse_cache.pop(key, None)
 
     def __set_cached_parse_result(self, cache_key, result):
-        self._parse_cache[cache_key] = {
-            "ts": time.time(),
-            "result": deepcopy(result or {})
-        }
+        with self._parse_cache_lock:
+            now = time.time()
+            self.__prune_parse_cache(now)
+            self._parse_cache.pop(cache_key, None)
+            while len(self._parse_cache) >= self._parse_cache_maxsize:
+                self._parse_cache.pop(next(iter(self._parse_cache)))
+            self._parse_cache[cache_key] = {"ts": now, "result": deepcopy(result or {})}
 
     def __search_tmdb_candidates(self, query, mtype_hint=None, year=None):
         app_conf = Config().get_config("app") or {}

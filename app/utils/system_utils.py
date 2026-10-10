@@ -4,13 +4,49 @@ import platform
 import shutil
 import subprocess
 
+import log
 from app.utils.path_utils import PathUtils
 from app.utils.exception_utils import ExceptionUtils
 from app.utils.types import OsType
-from config import WEBDRIVER_PATH
+from app.utils.isolated_io import get_io_pool, IsolatedIOTimeout
+from config import WEBDRIVER_PATH, Config
+
+# rclone/mc 等外部转移工具会连接云端，网络异常或凭据失效时会永久挂起；而调用方
+# 持有全局文件锁，因此一个挂起的进程会连带阻塞所有转移任务。合法的大文件传输
+# 可能耗时很久，故默认取值放宽，并允许用 app.external_transfer_timeout 覆盖。
+DEFAULT_EXTERNAL_TRANSFER_TIMEOUT = 3600
 
 
 class SystemUtils:
+
+    @staticmethod
+    def get_external_transfer_timeout():
+        """
+        外部转移命令的超时（秒），可用 app.external_transfer_timeout 覆盖
+        """
+        try:
+            configured = int(
+                (Config().get_config("app") or {}).get("external_transfer_timeout") or 0
+            )
+        except (TypeError, ValueError):
+            configured = 0
+        return configured if configured > 0 else DEFAULT_EXTERNAL_TRANSFER_TIMEOUT
+
+    @staticmethod
+    def __run_external_transfer(command):
+        """
+        运行外部转移命令并施加超时
+        :return: (returncode, message)；超时返回 -1，并提示目标可能残留不完整文件
+        """
+        timeout = SystemUtils.get_external_transfer_timeout()
+        try:
+            return get_io_pool('bulk').execute('external_command', command=command,
+                                               timeout_seconds=timeout, timeout=timeout), ""
+        except IsolatedIOTimeout:
+            message = "外部转移命令超过 %s 秒未完成，已终止；目标位置可能残留不完整文件，请人工确认" \
+                      % timeout
+            log.error("【System】%s 超时" % " ".join(str(part) for part in command[:2]))
+            return -1, message
 
     @staticmethod
     def __get_hidden_shell():
@@ -133,55 +169,41 @@ class SystemUtils:
         """
         复制
         """
-        try:
-            shutil.copy2(os.path.normpath(src), os.path.normpath(dest))
-            return 0, ""
-        except Exception as err:
-            ExceptionUtils.exception_traceback(err)
-            return -1, str(err)
+        return SystemUtils._isolated_transfer(src, dest, 'copy')
 
     @staticmethod
     def move(src, dest):
         """
         移动
         """
-        try:
-            tmp_file = os.path.normpath(os.path.join(os.path.dirname(src),
-                                                     os.path.basename(dest)))
-            shutil.move(os.path.normpath(src), tmp_file)
-            shutil.move(tmp_file, os.path.normpath(dest))
-            return 0, ""
-        except Exception as err:
-            ExceptionUtils.exception_traceback(err)
-            return -1, str(err)
+        return SystemUtils._isolated_transfer(src, dest, 'move')
 
     @staticmethod
     def link(src, dest):
         """
         硬链接
         """
-        try:
-            if platform.release().find("-z4-") >= 0:
-                # 兼容极空间Z4
-                tmp = os.path.normpath(os.path.join(PathUtils.get_parent_paths(dest, 2),
-                                                    os.path.basename(dest)))
-                os.link(os.path.normpath(src), tmp)
-                shutil.move(tmp, os.path.normpath(dest))
-            else:
-                os.link(os.path.normpath(src), os.path.normpath(dest))
-            return 0, ""
-        except Exception as err:
-            ExceptionUtils.exception_traceback(err)
-            return -1, str(err)
+        return SystemUtils._isolated_transfer(src, dest, 'link')
 
     @staticmethod
     def softlink(src, dest):
         """
         软链接
         """
+        return SystemUtils._isolated_transfer(src, dest, 'softlink')
+
+    @staticmethod
+    def _isolated_transfer(src, dest, mode):
+        """Keep local bulk I/O out of application threads; retain uncertain outputs."""
         try:
-            os.symlink(os.path.normpath(src), os.path.normpath(dest))
+            get_io_pool('bulk').execute('transfer', source=os.path.normpath(src),
+                                        target=os.path.normpath(dest), mode=mode,
+                                        timeout=SystemUtils.get_external_transfer_timeout())
             return 0, ""
+        except IsolatedIOTimeout:
+            # -2 means a mutation's result is uncertain, so protected publishers
+            # must keep their owned staging inode for later reconciliation.
+            return -2, '文件操作超过总时限，结果未确认；已保留源/暂存证据，请检查后重试'
         except Exception as err:
             ExceptionUtils.exception_traceback(err)
             return -1, str(err)
@@ -194,11 +216,8 @@ class SystemUtils:
         try:
             src = os.path.normpath(src)
             dest = dest.replace("\\", "/")
-            retcode = subprocess.run(['rclone', 'moveto',
-                                      src,
-                                      f'NASTOOL:{dest}'],
-                                     startupinfo=SystemUtils.__get_hidden_shell()).returncode
-            return retcode, ""
+            return SystemUtils.__run_external_transfer(
+                ['rclone', 'moveto', src, f'NASTOOL:{dest}'])
         except Exception as err:
             ExceptionUtils.exception_traceback(err)
             return -1, str(err)
@@ -211,11 +230,8 @@ class SystemUtils:
         try:
             src = os.path.normpath(src)
             dest = dest.replace("\\", "/")
-            retcode = subprocess.run(['rclone', 'copyto',
-                                      src,
-                                      f'NASTOOL:{dest}'],
-                                     startupinfo=SystemUtils.__get_hidden_shell()).returncode
-            return retcode, ""
+            return SystemUtils.__run_external_transfer(
+                ['rclone', 'copyto', src, f'NASTOOL:{dest}'])
         except Exception as err:
             ExceptionUtils.exception_traceback(err)
             return -1, str(err)
@@ -230,12 +246,8 @@ class SystemUtils:
             dest = dest.replace("\\", "/")
             if dest.startswith("/"):
                 dest = dest[1:]
-            retcode = subprocess.run(['mc', 'mv',
-                                      '--recursive',
-                                      src,
-                                      f'NASTOOL/{dest}'],
-                                     startupinfo=SystemUtils.__get_hidden_shell()).returncode
-            return retcode, ""
+            return SystemUtils.__run_external_transfer(
+                ['mc', 'mv', '--recursive', src, f'NASTOOL/{dest}'])
         except Exception as err:
             ExceptionUtils.exception_traceback(err)
             return -1, str(err)
@@ -250,12 +262,8 @@ class SystemUtils:
             dest = dest.replace("\\", "/")
             if dest.startswith("/"):
                 dest = dest[1:]
-            retcode = subprocess.run(['mc', 'cp',
-                                      '--recursive',
-                                      src,
-                                      f'NASTOOL/{dest}'],
-                                     startupinfo=SystemUtils.__get_hidden_shell()).returncode
-            return retcode, ""
+            return SystemUtils.__run_external_transfer(
+                ['mc', 'cp', '--recursive', src, f'NASTOOL/{dest}'])
         except Exception as err:
             ExceptionUtils.exception_traceback(err)
             return -1, str(err)

@@ -86,15 +86,17 @@ class _IMediaClient(metaclass=ABCMeta):
         pass
 
     @abstractmethod
-    def get_libraries(self):
+    def get_libraries(self, strict=False):
         """
+        strict=True 时读取失败须抛出异常，供全量快照同步使用。
         获取媒体服务器所有媒体库列表
         """
         pass
 
     @abstractmethod
-    def get_items(self, parent):
+    def get_items(self, parent, strict=False):
         """
+        strict=True 时包括递归读取失败在内的异常均须向上传递。
         获取媒体库中的所有媒体
         :param parent: 上一级的ID
         """

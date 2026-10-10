@@ -3,6 +3,7 @@ import regex as re
 from app.helper import DbHelper
 from app.utils.commons import singleton
 from app.utils.exception_utils import ExceptionUtils
+from app.utils.security_utils import evaluate_episode_offset
 
 
 @singleton
@@ -175,8 +176,8 @@ class WordsHelper:
             offset_order_flag = False
             for episode_num_str in episode_nums_str:
                 episode_num_int = int(episode_num_str)
-                offset_caculate = offset.replace("EP", str(episode_num_int))
-                episode_num_offset_int = eval(offset_caculate)
+                # Even old database entries must pass the bounded arithmetic parser.
+                episode_num_offset_int = evaluate_episode_offset(offset, episode_num_int)
                 # 向前偏移
                 if episode_num_int > episode_num_offset_int:
                     offset_order_flag = True

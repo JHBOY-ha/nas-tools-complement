@@ -1,8 +1,12 @@
 import ast
 import io
 import os
+import socket
+import stat
 import tempfile
 import types
+import uuid
+from threading import Event, Timer
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,13 +14,14 @@ from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
 from flask.wrappers import Request as FlaskRequest
-from werkzeug.exceptions import RequestEntityTooLarge
+from werkzeug.exceptions import RequestEntityTooLarge, RequestTimeout
 from werkzeug.http import parse_options_header
 from werkzeug.test import EnvironBuilder
 
 import tests.test_subtitle_upload  # optional dependency stubs
 import tests.test_media_library  # media/server dependency stubs
 from app.helper import subtitle_task_processors as processors
+from app.utils.isolated_fs import IsolatedFile, fs_os
 
 
 def _load_web_request_guards():
@@ -29,6 +34,8 @@ def _load_web_request_guards():
         "_SUBTITLE_UPLOAD_MAX_FIELD_BYTES",
         "_SUBTITLE_UPLOAD_MAX_PARTS",
         "_SUBTITLE_UPLOAD_MAX_FILE_PARTS",
+        # 读取 multipart body 的硬超时，由 _NasToolsRequest 使用。
+        "_SUBTITLE_UPLOAD_BODY_TIMEOUT_SECONDS",
     }
     body = []
     for node in tree.body:
@@ -46,9 +53,17 @@ def _load_web_request_guards():
     module = types.ModuleType("_subtitle_task_security_web_guards")
     module.__dict__.update({
         "os": os,
+        "socket": socket,
+        # The declarations now include a real total-time timer and inode-bound
+        # subprocess spooling; supply those dependencies without booting the UI.
+        "io": io, "stat": stat, "uuid": uuid, "Event": Event, "Timer": Timer,
+        # Deadline restoration and expiry share the production lock.
+        "Lock": __import__('threading').Lock,
+        "IsolatedFile": IsolatedFile, "fs_os": fs_os,
         "tempfile": tempfile,
         "FlaskRequest": FlaskRequest,
         "RequestEntityTooLarge": RequestEntityTooLarge,
+        "RequestTimeout": RequestTimeout,
         "parse_options_header": parse_options_header,
         "Config": lambda: None,
     })

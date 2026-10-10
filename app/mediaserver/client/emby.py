@@ -49,21 +49,31 @@ class Emby(_IMediaClient):
         """
         return True if self.get_medias_count() else False
 
-    def __get_emby_librarys(self):
+    def __get_emby_librarys(self, strict=False):
         """
         获取Emby媒体库列表
         """
         if not self._host or not self._apikey:
+            if strict:
+                raise RuntimeError("媒体库列表读取失败")
             return []
         req_url = "%semby/Library/SelectableMediaFolders?api_key=%s" % (self._host, self._apikey)
         try:
             res = RequestUtils().get_res(req_url)
-            if res:
-                return res.json()
+            if res is not None and res.status_code == 200:
+                values = res.json()
+                if strict and not isinstance(values, list):
+                    raise RuntimeError("媒体库列表响应无效")
+                return values
             else:
                 log.error(f"【{self.server_type}】Library/SelectableMediaFolders 未获取到返回数据")
+                if strict:
+                    raise RuntimeError("媒体库列表读取失败")
                 return []
         except Exception as e:
+            if strict:
+                # 同步必须区分请求失败和有效空库，不能吞掉读取异常。
+                raise RuntimeError("媒体库列表读取失败") from None
             ExceptionUtils.exception_traceback(e)
             log.error(f"【{self.server_type}】连接Library/SelectableMediaFolders 出错：" + str(e))
             return []
@@ -451,52 +461,76 @@ class Emby(_IMediaClient):
         # 刷新根目录
         return "/"
 
-    def get_libraries(self):
+    def get_libraries(self, strict=False):
         """
         获取媒体服务器所有媒体库列表
         """
         if self._host and self._apikey:
-            self._libraries = self.__get_emby_librarys()
+            self._libraries = self.__get_emby_librarys(strict=strict)
+        if strict and (not self._host or not self._apikey):
+            raise RuntimeError("媒体服务器未配置")
         libraries = []
         for library in self._libraries:
             libraries.append({"id": library.get("Id"), "name": library.get("Name")})
         return libraries
 
-    def get_iteminfo(self, itemid):
+    def get_iteminfo(self, itemid, strict=False):
         """
         获取单个项目详情
         """
         if not itemid:
+            if strict:
+                raise RuntimeError("媒体项目编号无效")
             return {}
         if not self._host or not self._apikey:
+            if strict:
+                raise RuntimeError("媒体服务器未配置")
             return {}
         req_url = "%semby/Users/%s/Items/%s?api_key=%s" % (self._host, self._user, itemid, self._apikey)
         try:
             res = RequestUtils().get_res(req_url)
             if res and res.status_code == 200:
-                return res.json()
+                value = res.json()
+                if strict and (not isinstance(value, dict) or value.get("Id") != itemid
+                               or value.get("Type") not in ("Movie", "Series")):
+                    raise RuntimeError("媒体项目详情无效")
+                return value
+            if strict:
+                raise RuntimeError("媒体项目详情读取失败")
         except Exception as e:
+            if strict:
+                # 递归目录或详情失败也必须阻止发布不完整快照。
+                raise RuntimeError("媒体库读取失败") from None
             ExceptionUtils.exception_traceback(e)
             return {}
 
-    def get_items(self, parent):
+    def get_items(self, parent, strict=False):
         """
         获取媒体服务器所有媒体库列表
         """
         if not parent:
+            if strict:
+                raise RuntimeError("媒体库编号无效")
             yield {}
         if not self._host or not self._apikey:
+            if strict:
+                raise RuntimeError("媒体服务器未配置")
             yield {}
         req_url = "%semby/Users/%s/Items?ParentId=%s&api_key=%s" % (self._host, self._user, parent, self._apikey)
         try:
             res = RequestUtils().get_res(req_url)
             if res and res.status_code == 200:
-                results = res.json().get("Items") or []
+                payload = res.json()
+                if strict and (not isinstance(payload, dict) or not isinstance(payload.get("Items"), list)):
+                    raise RuntimeError("媒体库项目响应无效")
+                results = payload.get("Items") or []
                 for result in results:
+                    if strict and (not isinstance(result, dict) or not result.get("Id") or not result.get("Type")):
+                        raise RuntimeError("媒体库项目无效")
                     if not result:
                         continue
                     if result.get("Type") in ["Movie", "Series"]:
-                        item_info = self.get_iteminfo(result.get("Id"))
+                        item_info = self.get_iteminfo(result.get("Id"), strict=strict)
                         yield {"id": result.get("Id"),
                                "library": item_info.get("ParentId"),
                                "type": item_info.get("Type"),
@@ -508,9 +542,14 @@ class Emby(_IMediaClient):
                                "path": item_info.get("Path"),
                                "json": json.dumps(item_info, ensure_ascii=False)}
                     elif "Folder" in result.get("Type"):
-                        for item in self.get_items(parent=result.get('Id')):
+                        for item in self.get_items(parent=result.get('Id'), strict=strict):
                             yield item
+            elif strict:
+                raise RuntimeError("媒体库项目读取失败")
         except Exception as e:
+            if strict:
+                # 递归目录或详情失败也必须阻止发布不完整快照。
+                raise RuntimeError("媒体库读取失败") from None
             ExceptionUtils.exception_traceback(e)
             log.error(f"【{self.server_type}】连接Users/Items出错：" + str(e))
         yield {}

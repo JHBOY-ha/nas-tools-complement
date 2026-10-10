@@ -1,15 +1,20 @@
 import base64
 import datetime
 import importlib
+import hmac
 import json
+import ntpath
 import os.path
 import re
 import shutil
 import signal
+import subprocess
+from copy import deepcopy
 from math import floor
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 import cn2an
+from flask import g, has_request_context, copy_current_request_context, request
 from flask_login import logout_user, current_user
 from werkzeug.security import generate_password_hash
 
@@ -26,6 +31,7 @@ from app.helper import DbHelper, ProgressHelper, ThreadHelper, \
 from app.indexer import Indexer
 from app.media import Category, Media, Bangumi, DouBan
 from app.media.meta import MetaInfo, MetaBase
+from app.media.tmdbv3api import TMDb, TMDbException
 from app.mediaserver import MediaServer
 from app.message import Message, MessageCenter
 from app.rss import Rss
@@ -41,16 +47,39 @@ from app.speedlimiter import SpeedLimiter
 from app.utils import StringUtils, EpisodeFormat, RequestUtils, PathUtils, \
     SystemUtils, ExceptionUtils, Torrent
 from app.utils.types import RmtMode, OsType, SearchType, DownloaderType, SyncType, MediaType, MovieTypes, TvTypes
+from app.utils.security_utils import parse_episode_offset, parse_rule_dict, normalize_proxies, compile_ignore_pattern
+from app.utils.exclusive_publish import rename_exclusive
+from app.utils.workload import TaskQueueFull
+from app.helper.action_tasks import ActionTasks, COMMAND_TITLES
 from config import RMT_MEDIAEXT, TMDB_IMAGE_W500_URL, RMT_SUBEXT, Config
 from web.backend.search_torrents import search_medias_for_web, search_media_by_message
 from web.backend.web_utils import WebUtils
 from web.backend.special_confirmation import SpecialConfirmation, special_file
+from web.backend.action_permissions import ACTION_PERMISSIONS, action_allowed
+from web.backend.user import User
 
 
 class WebAction:
     dbhelper = None
     _actions = {}
     TvTypes = ['TV', '电视剧']
+    # Exact legacy identifiers preserve existing settings buttons; the client
+    # cannot select an arbitrary Python module, class, or expression.
+    CONNECTION_TESTS = {
+        "app.downloader.client.qbittorrent|Qbittorrent": ("app.downloader.client.qbittorrent", "Qbittorrent"),
+        "app.downloader.client.transmission|Transmission": ("app.downloader.client.transmission", "Transmission"),
+        "app.downloader.client.client115|Client115": ("app.downloader.client.client115", "Client115"),
+        "app.downloader.client.aria2|Aria2": ("app.downloader.client.aria2", "Aria2"),
+        "app.downloader.client.pikpak|PikPak": ("app.downloader.client.pikpak", "PikPak"),
+        "app.mediaserver.client.emby|Emby": ("app.mediaserver.client.emby", "Emby"),
+        "app.mediaserver.client.jellyfin|Jellyfin": ("app.mediaserver.client.jellyfin", "Jellyfin"),
+        "app.mediaserver.client.plex|Plex": ("app.mediaserver.client.plex", "Plex"),
+        "app.indexer.client.jackett|Jackett": ("app.indexer.client.jackett", "Jackett"),
+        "app.indexer.client.prowlarr|Prowlarr": ("app.indexer.client.prowlarr", "Prowlarr"),
+        "app.media.meta.llm_parser|LLMMetaParser": ("app.media.meta.llm_parser", "LLMMetaParser"),
+    }
+    # 固定公网回显服务，客户端只选择线路，不能提交任意查询地址。
+    EGRESS_IP_URLS = ("https://api64.ipify.org?format=json", "https://api.ipify.org?format=json")
 
     def __init__(self):
         self.dbhelper = DbHelper()
@@ -109,6 +138,7 @@ class WebAction:
             "name_test": self.__name_test,
             "rule_test": self.__rule_test,
             "net_test": self.__net_test,
+            "egress_ip_test": self.__egress_ip_test,
             "speed_test": self.__speed_test,
             "add_filtergroup": self.__add_filtergroup,
             "restore_filtergroup": self.__restore_filtergroup,
@@ -215,13 +245,148 @@ class WebAction:
             "save_user_script": self.__save_user_script,
             "run_directory_sync": self.__run_directory_sync
         }
+        # Status endpoints still verify ownership and the original operation's
+        # permission; their generic routing permission alone grants no data.
+        self._actions.update({
+            'get_action_task': self._action_task,
+            'get_action_tasks': self._action_task_list,
+            'find_action_task': self._find_action_task,
+            'cancel_action_task': self._cancel_action_task,
+        })
 
     def action(self, cmd, data=None):
+        # API-key integrations are explicitly authenticated by require_auth.
+        # Browser sessions and JWT users share the same fail-closed policy.
+        if has_request_context():
+            if not isinstance(cmd, str) or cmd not in ACTION_PERMISSIONS:
+                return {"code": -1, "msg": "没有执行此操作的权限"}
+            user = getattr(g, "api_user", None) or current_user
+            if not getattr(g, "api_key_authenticated", False) and not action_allowed(user, cmd):
+                return {"code": -1, "msg": "没有执行此操作的权限"}
         func = self._actions.get(cmd)
         if not func:
             return {"code": -1, "msg": "非授权访问！"}
         else:
-            return func(data)
+            try:
+                if has_request_context() and not getattr(g, '_action_task_worker', False) \
+                        and cmd in COMMAND_TITLES \
+                        and (cmd != 'special_confirmation' or (data or {}).get('stage') == 'confirm'):
+                    return self._enqueue_action(cmd, data or {}, func)
+                return func(data)
+            except TaskQueueFull as error:
+                # Preserve existing action responses while making rejected
+                # admission visible instead of falsely reporting "started".
+                return {"code": -1, "msg": str(error), "retmsg": str(error)}
+
+    @staticmethod
+    def _action_principal():
+        key = bool(getattr(g, 'api_key_authenticated', False))
+        user = getattr(g, 'api_user', None) or current_user
+        owner = 'api-key' if key else str(user.get_id())
+        admin = key or str(user.get_id()) == '0'
+        return owner, user, key, admin
+
+    def _enqueue_action(self, command, data, function):
+        if not isinstance(data, dict):
+            return {'code': -1, 'retcode': -1, 'msg': '操作参数必须是对象', 'retmsg': '操作参数必须是对象'}
+        owner, user, key, _admin = self._action_principal()
+        username = getattr(user, 'username', None)
+        original_key = (request.headers.get('Authorization') or '').split()
+        original_key = original_key[-1] if key and original_key else None
+        data = deepcopy(data)
+        if command == 'sch':
+            services = {'autoremovetorrents': TorrentRemover().auto_remove_torrents,
+                        'pttransfer': Downloader().transfer, 'ptsignin': Sites().signin,
+                        'sync': Sync().transfer_all_sync, 'rssdownload': Rss().rssdownload,
+                        'douban': DoubanSync().sync, 'subscribe_search_all': Subscribe().subscribe_search_all}
+            service = services.get(data.get('item'))
+            if service is None:
+                return {'code': -1, 'msg': '未知服务'}
+            # Execute the service itself, not its former "thread started" ack.
+            def function(_data):
+                result = service()
+                # 目录同步的 False 表示锁繁忙、未执行，不能转换成成功终态。
+                if result is False:
+                    return {'code': -1, 'retmsg': '服务未执行或执行失败，请查看日志后重试'}
+                return result or {'code': 0, 'retmsg': '服务执行结束'}
+        elif command == 'start_mediasync':
+            def function(_data):
+                # 同步失败和未执行都不能作为成功结果交给异步任务登记。
+                result = MediaServer().sync_mediaserver()
+                if result is True:
+                    return {'code': 0, 'msg': '媒体库同步执行结束'}
+                if result is None:
+                    return {'code': -1, 'msg': '未配置媒体服务器，媒体库同步未执行'}
+                return {'code': -1, 'msg': '媒体库同步失败，保留上次数据，请重试'}
+
+        @copy_current_request_context
+        def run():
+            g._action_task_worker = True
+            if key:
+                latest = (Config().get_config('security') or {}).get('api_key')
+                if not isinstance(latest, str) or not original_key \
+                        or not hmac.compare_digest(latest.encode(), original_key.encode()):
+                    return {'code': -1, 'retcode': -1, 'msg': '接口认证已失效，操作未执行', 'retmsg': '接口认证已失效，操作未执行'}
+                g.api_key_authenticated = True
+            else:
+                # A queued request cannot retain permissions revoked after
+                # admission. Use fresh identity and the original command policy.
+                fresh = User().get_user(username) if username else None
+                if not fresh or str(fresh.get_id()) != owner or not action_allowed(fresh, command):
+                    return {'code': -1, 'retcode': -1, 'msg': '用户或权限已失效，操作未执行', 'retmsg': '用户或权限已失效，操作未执行'}
+                g.api_user = fresh
+                g._login_user = fresh
+            return function(data)
+
+        try:
+            task, reused = ActionTasks().submit(
+                command, data, owner, run,
+                request_id=request.headers.get('Idempotency-Key') or request.headers.get('X-Request-ID')
+            )
+        except ValueError as error:
+            return {'code': -1, 'retcode': -1, 'msg': str(error), 'retmsg': str(error)}
+        except OSError:
+            return {'code': -1, 'retcode': -1, 'msg': '无法持久记录任务，操作未准入，请检查暂存卷',
+                    'retmsg': '无法持久记录任务，操作未准入，请检查暂存卷'}
+        g.action_task_accepted = True
+        return {'code': 0, 'retcode': 0, 'async': True, 'operation_type': 'background_action',
+                'task_id': task['task_id'], 'task': task, 'reused': reused,
+                'status_url': '/api/v1/service/task/' + task['task_id'],
+                'msg': '任务已排队，请查看执行结果', 'retmsg': '任务已排队，请查看执行结果'}
+
+    @staticmethod
+    def _visible_action_task(record):
+        if not record:
+            return False
+        owner, user, key, admin = WebAction._action_principal()
+        return bool((admin or record['owner'] == owner) and
+                    (key or action_allowed(user, record['command'])))
+
+    def _action_task(self, data):
+        record = ActionTasks().get((data or {}).get('task_id'))
+        if not self._visible_action_task(record):
+            return {'code': -1, 'msg': '任务不存在或无权查看'}
+        return {'code': 0, 'task': record}
+
+    def _find_action_task(self, data):
+        owner, _user, _key, _admin = self._action_principal()
+        record = ActionTasks().find(owner, (data or {}).get('request_id'))
+        if not self._visible_action_task(record):
+            return {'code': -1, 'msg': '尚未查到该请求的任务，执行结果未确认'}
+        return {'code': 0, 'task': record}
+
+    def _action_task_list(self, data):
+        owner, _user, _key, admin = self._action_principal()
+        records = ActionTasks().list(None if admin else owner)
+        return {'code': 0, 'tasks': [r for r in records if self._visible_action_task(r)]}
+
+    def _cancel_action_task(self, data):
+        record = ActionTasks().get((data or {}).get('task_id'))
+        if not self._visible_action_task(record):
+            return {'code': -1, 'msg': '任务不存在或无权取消'}
+        if not ActionTasks().cancel(record['task_id']):
+            return {'code': -1, 'msg': '任务已开始或结束，无法取消排队', 'task': ActionTasks().get(record['task_id'])}
+        return {'code': 0, 'task': ActionTasks().get(record['task_id'])}
 
     def api_action(self, cmd, data=None):
         result = self.action(cmd, data)
@@ -292,15 +457,21 @@ class WebAction:
         command = commands.get(msg)
         message = Message()
 
-        if command:
-            # 启动服务
-            ThreadHelper().start_thread(command.get("func"), ())
-            message.send_channel_msg(
-                channel=in_from, title="正在运行 %s ..." % command.get("desp"), user_id=user_id)
-        else:
-            # 站点检索或者添加订阅
-            ThreadHelper().start_thread(search_media_by_message,
-                                        (msg, in_from, user_id, user_name))
+        try:
+            if command:
+                # 启动服务
+                func = command.get("func")
+                ThreadHelper().start_thread(func, (), task_key=('service', func.__qualname__))
+                message.send_channel_msg(
+                    channel=in_from, title="正在运行 %s ..." % command.get("desp"), user_id=user_id)
+            else:
+                # 站点检索或者添加订阅
+                ThreadHelper().start_thread(search_media_by_message,
+                                            (msg, in_from, user_id, user_name))
+        except TaskQueueFull as error:
+            # Message ingress may consume its offset only once. Surface rejected
+            # admission to that user instead of letting it disappear in a 500.
+            message.send_channel_msg(channel=in_from, title=str(error), user_id=user_id)
 
     @staticmethod
     def set_config_value(cfg, cfg_key, cfg_value):
@@ -317,13 +488,30 @@ class WebAction:
             return cfg
         # 代理
         if cfg_key == "app.proxies":
+            if cfg_value is not None and not isinstance(cfg_value, str):
+                raise ValueError("代理地址必须为文本")
+            valid_previous = True
+            try:
+                previous = normalize_proxies(cfg.get('app', {}).get('proxies'))
+            except ValueError:
+                # 非法历史配置仍允许通过设置页修正。
+                previous = {}
+                valid_previous = False
+            displayed = previous.get('http') or previous.get('https') or previous.get('all') or ''
+            if valid_previous and (cfg_value or '').strip() == displayed.replace('http://', ''):
+                # 表单会提交未编辑的字段；保留完整映射及原始存储格式。
+                return cfg
+            if (set(previous) - {'http', 'https'} or
+                    (previous.get('http') and previous.get('https') and
+                     previous['http'] != previous['https'])):
+                # 单地址输入无法表达主机规则、绕过项或不同协议出口，不静默丢弃。
+                raise ValueError("当前包含高级代理规则，请在配置文件中修改代理，避免丢失规则")
             if cfg_value:
-                if not cfg_value.startswith("http") and not cfg_value.startswith("sock"):
-                    cfg['app']['proxies'] = {
-                        "https": "http://%s" % cfg_value, "http": "http://%s" % cfg_value}
-                else:
-                    cfg['app']['proxies'] = {"https": "%s" %
-                                             cfg_value, "http": "%s" % cfg_value}
+                value = cfg_value.strip()
+                if "://" not in value:
+                    value = "http://" + value
+                # Validate before changing the live configuration or persistence.
+                cfg['app']['proxies'] = normalize_proxies({"http": value, "https": value})
             else:
                 cfg['app']['proxies'] = {"https": None, "http": None}
             return cfg
@@ -433,7 +621,10 @@ class WebAction:
         }
         sch_item = data.get("item")
         if sch_item and commands.get(sch_item):
-            ThreadHelper().start_thread(commands.get(sch_item), ())
+            # Coalesce repeated clicks while the same service is queued/running;
+            # message commands use the same key and do not create duplicate scans.
+            func = commands.get(sch_item)
+            ThreadHelper().start_thread(func, (), task_key=('service', func.__qualname__))
         return {"retmsg": "服务已启动", "item": sch_item}
 
     @staticmethod
@@ -873,89 +1064,84 @@ class WebAction:
         return succ_flag, ret_msg
 
     def __delete_history(self, data):
-        """
-        删除识别记录及文件
-        """
-        logids = data.get('logids')
-        flag = data.get('flag')
-        for logid in logids:
-            # 读取历史记录
-            paths = self.dbhelper.get_transfer_path_by_id(logid)
-            if paths:
-                # 删除记录
-                self.dbhelper.delete_transfer_log_by_id(logid)
-                # 根据flag删除文件
-                source_path = paths[0].SOURCE_PATH
-                source_filename = paths[0].SOURCE_FILENAME
-                dest = paths[0].DEST
-                dest_path = paths[0].DEST_PATH
-                dest_filename = paths[0].DEST_FILENAME
-                if flag in ["del_source", "del_all"]:
-                    del_flag, del_msg = self.delete_media_file(
-                        source_path, source_filename)
-                    if not del_flag:
-                        log.error(f"【History】{del_msg}")
+        """Validate the full batch, then delete files before committing history."""
+        flag = data.get("flag")
+        prepared = []
+        try:
+            for logid in data.get("logids") or []:
+                rows = self.dbhelper.get_transfer_path_by_id(logid)
+                if rows:
+                    prepared.append((logid, self.__history_delete_plan(rows[0], flag)))
+        except (ValueError, OSError) as err:
+            return {"retcode": 1, "retmsg": str(err)}
+        for logid, operations in prepared:
+            try:
+                for kind, path, filename in operations:
+                    if kind == "file":
+                        success, message = self.delete_media_file(path, filename)
+                        if not success:
+                            return {"retcode": 1, "retmsg": message}
+                    elif kind == "directory":
+                        shutil.rmtree(path)
                     else:
-                        log.info(f"【History】{del_msg}")
-                if flag in ["del_dest", "del_all"]:
-                    if dest_path and dest_filename:
-                        del_flag, del_msg = self.delete_media_file(
-                            dest_path, dest_filename)
-                        if not del_flag:
-                            log.error(f"【History】{del_msg}")
-                        else:
-                            log.info(f"【History】{del_msg}")
-                    else:
-                        meta_info = MetaInfo(title=source_filename)
-                        meta_info.title = paths[0].TITLE
-                        meta_info.category = paths[0].CATEGORY
-                        meta_info.year = paths[0].YEAR
-                        if paths[0].SEASON_EPISODE:
-                            meta_info.begin_season = int(
-                                str(paths[0].SEASON_EPISODE).replace("S", ""))
-                        if paths[0].TYPE == MediaType.MOVIE.value:
-                            meta_info.type = MediaType.MOVIE
-                        else:
-                            meta_info.type = MediaType.TV
-                        # 删除文件
-                        dest_path = FileTransfer().get_dest_path_by_info(dest=dest, meta_info=meta_info)
-                        if dest_path and dest_path.find(meta_info.title) != -1:
-                            rm_parent_dir = False
-                            if not meta_info.get_season_list():
-                                # 电影，删除整个目录
-                                try:
-                                    shutil.rmtree(dest_path)
-                                except Exception as e:
-                                    ExceptionUtils.exception_traceback(e)
-                            elif not meta_info.get_episode_string():
-                                # 电视剧但没有集数，删除季目录
-                                try:
-                                    shutil.rmtree(dest_path)
-                                except Exception as e:
-                                    ExceptionUtils.exception_traceback(e)
-                                rm_parent_dir = True
-                            else:
-                                # 有集数的电视剧，删除对应的集数文件
-                                for dest_file in PathUtils.get_dir_files(dest_path):
-                                    file_meta_info = MetaInfo(
-                                        os.path.basename(dest_file))
-                                    if file_meta_info.get_episode_list() and set(
-                                            file_meta_info.get_episode_list()
-                                    ).issubset(set(meta_info.get_episode_list())):
-                                        try:
-                                            os.remove(dest_file)
-                                        except Exception as e:
-                                            ExceptionUtils.exception_traceback(
-                                                e)
-                                rm_parent_dir = True
-                            if rm_parent_dir \
-                                    and not PathUtils.get_dir_files(os.path.dirname(dest_path), exts=RMT_MEDIAEXT):
-                                # 没有媒体文件时，删除整个目录
-                                try:
-                                    shutil.rmtree(os.path.dirname(dest_path))
-                                except Exception as e:
-                                    ExceptionUtils.exception_traceback(e)
+                        # Clean up only actually empty parents, preserving sidecars
+                        # or other files that the legacy record cannot identify.
+                        try:
+                            os.rmdir(path)
+                        except OSError:
+                            pass
+            except OSError:
+                return {"retcode": 1, "retmsg": "文件删除失败，历史记录已保留"}
+            # DbPersist commits here; never erase recovery evidence on validation failure.
+            if self.dbhelper.delete_transfer_log_by_id(logid) is False:
+                return {"retcode": 1, "retmsg": "文件已处理，但历史记录删除失败"}
         return {"retcode": 0}
+
+    def __history_delete_plan(self, row, flag):
+        """Reconstruct only unambiguous legacy targets; never guess a season range."""
+        operations = []
+        if flag in ("del_source", "del_all"):
+            operations.append(("file", row.SOURCE_PATH, row.SOURCE_FILENAME))
+        if flag not in ("del_dest", "del_all"):
+            return operations
+        if row.DEST_PATH and row.DEST_FILENAME:
+            operations.append(("file", row.DEST_PATH, row.DEST_FILENAME))
+            return operations
+        season = str(row.SEASON_EPISODE or "")
+        if season and not re.fullmatch(r"S\d{1,3}", season):
+            raise ValueError("历史记录缺少目标路径，无法安全删除季集范围；文件和记录已保留")
+        meta_info = MetaInfo(title=row.SOURCE_FILENAME, use_llm=False)
+        meta_info.title, meta_info.category, meta_info.year = row.TITLE, row.CATEGORY, row.YEAR
+        if season:
+            meta_info.begin_season, meta_info.end_season = int(season[1:]), None
+        meta_info.type = MediaType.MOVIE if row.TYPE == MediaType.MOVIE.value else MediaType.TV
+        if meta_info.type != MediaType.MOVIE and len(meta_info.get_season_list()) != 1:
+            raise ValueError("无法确认历史记录的单季目标，文件和记录已保留")
+        target = FileTransfer().get_dest_path_by_info(dest=row.DEST, meta_info=meta_info)
+        if not target or not row.DEST or not meta_info.title or meta_info.title not in target:
+            raise ValueError("无法确认历史记录的目标路径，文件和记录已保留")
+        root, resolved = os.path.realpath(row.DEST), os.path.realpath(target)
+        if resolved == root or os.path.commonpath((root, resolved)) != root:
+            raise ValueError("历史目标路径超出媒体目录，文件和记录已保留")
+        if not os.path.isdir(target):
+            raise ValueError("历史目标目录不存在，记录已保留")
+        if not meta_info.get_season_list() or not meta_info.get_episode_string():
+            operations.append(("directory", target, None))
+        else:
+            expected = set(meta_info.get_episode_list())
+            targets = []
+            for file_path in PathUtils.get_dir_files(target):
+                info = MetaInfo(os.path.basename(file_path), use_llm=False)
+                episodes = set(info.get_episode_list())
+                if episodes and episodes.issubset(expected):
+                    targets.append(("file", os.path.dirname(file_path), os.path.basename(file_path)))
+            if not targets:
+                raise ValueError("未找到可确认的历史目标文件，记录已保留")
+            operations.extend(targets)
+        parent = os.path.dirname(resolved)
+        if meta_info.get_season_list() and parent != root and os.path.commonpath((root, parent)) == root:
+            operations.append(("empty_directory", parent, None))
+        return operations
 
     @staticmethod
     def delete_media_file(filedir, filename):
@@ -965,33 +1151,29 @@ class WebAction:
         filedir = os.path.normpath(filedir).replace("\\", "/")
         file = os.path.join(filedir, filename)
         try:
-            if not os.path.exists(file):
-                return False, f"{file} 不存在"
-            os.remove(file)
+            # Missing targets are already deleted; other I/O errors must retain history.
+            try:
+                os.remove(file)
+            except FileNotFoundError:
+                return True, f"{file} 已不存在"
             nfoname = f"{os.path.splitext(filename)[0]}.nfo"
             nfofile = os.path.join(filedir, nfoname)
             if os.path.exists(nfofile):
                 os.remove(nfofile)
-            # 检查空目录并删除
+            # Only remove truly empty directories; sidecars and extras are not
+            # evidence that a directory can be recursively discarded.
+            parents = [filedir]
             if re.findall(r"^S\d{2}|^Season", os.path.basename(filedir), re.I):
-                # 当前是季文件夹，判断并删除
-                seaon_dir = filedir
-                if seaon_dir.count('/') > 1 and not PathUtils.get_dir_files(seaon_dir, exts=RMT_MEDIAEXT):
-                    shutil.rmtree(seaon_dir)
-                # 媒体文件夹
-                media_dir = os.path.dirname(seaon_dir)
-            else:
-                media_dir = filedir
-            # 检查并删除媒体文件夹，非根目录且目录大于二级，且没有媒体文件时才会删除
-            if media_dir != '/' \
-                    and media_dir.count('/') > 1 \
-                    and not re.search(r'[a-zA-Z]:/$', media_dir) \
-                    and not PathUtils.get_dir_files(media_dir, exts=RMT_MEDIAEXT):
-                shutil.rmtree(media_dir)
+                parents.append(os.path.dirname(filedir))
+            for parent in parents:
+                try:
+                    os.rmdir(parent)
+                except OSError:
+                    pass
             return True, f"{file} 删除成功"
         except Exception as e:
             ExceptionUtils.exception_traceback(e)
-            return True, f"{file} 删除失败"
+            return False, f"{file} 删除失败"
 
     @staticmethod
     def __logging(data):
@@ -1171,40 +1353,36 @@ class WebAction:
         """
         更新
         """
-        # 升级
-        if SystemUtils.is_synology():
-            if SystemUtils.execute('/bin/ps -w -x | grep -v grep | grep -w "nastool update" | wc -l') == '0':
-                # 调用群晖套件内置命令升级
-                os.system('nastool update')
-                # 重启
+        try:
+            # List arguments keep configuration out of shell command syntax.
+            if SystemUtils.is_synology():
+                if SystemUtils.execute('/bin/ps -w -x | grep -v grep | grep -w "nastool update" | wc -l') == '0':
+                    subprocess.run(["nastool", "update"], check=True)
+                    self.restart_server()
+            else:
+                proxy = normalize_proxies(Config().get_proxies())
+                for protocol in ("http", "https"):
+                    # Git's global proxy setting also accepts the all fallback.
+                    value = (proxy.get(protocol) or proxy.get("https" if protocol == "http" else "http")
+                             or proxy.get("all"))
+                    if value:
+                        subprocess.run(["git", "config", "--global", protocol + ".proxy", value], check=True)
+                    else:
+                        result = subprocess.run(["git", "config", "--global", "--unset", protocol + ".proxy"])
+                        # git returns 5 when the key does not exist.
+                        if result.returncode not in (0, 5):
+                            raise subprocess.CalledProcessError(result.returncode, result.args)
+                subprocess.run(["git", "clean", "-dffx"], check=True)
+                branch = "dev" if os.environ.get("NASTOOL_VERSION") == "dev" else "master"
+                subprocess.run(["git", "fetch", "--depth", "1", "origin",
+                                f"+refs/heads/{branch}:refs/remotes/origin/{branch}"], check=True)
+                subprocess.run(["git", "reset", "--hard", "origin/" + branch], check=True)
+                subprocess.run(["git", "submodule", "update", "--init", "--recursive"], check=True)
+                subprocess.run(["pip", "install", "-r", "/nas-tools/requirements.txt"], check=True)
                 self.restart_server()
-        else:
-            # 清除git代理
-            os.system("git config --global --unset http.proxy")
-            os.system("git config --global --unset https.proxy")
-            # 设置git代理
-            proxy = Config().get_proxies() or {}
-            http_proxy = proxy.get("http")
-            https_proxy = proxy.get("https")
-            if http_proxy or https_proxy:
-                os.system(
-                    f"git config --global http.proxy {http_proxy or https_proxy}")
-                os.system(
-                    f"git config --global https.proxy {https_proxy or http_proxy}")
-            # 清理
-            os.system("git clean -dffx")
-            # 升级
-            branch = "dev" if os.environ.get(
-                "NASTOOL_VERSION") == "dev" else "master"
-            # 显式 refspec：单分支克隆的仓库拉取其他分支时也能建立 origin/<branch>
-            os.system(
-                f"git fetch --depth 1 origin +refs/heads/{branch}:refs/remotes/origin/{branch}")
-            os.system(f"git reset --hard origin/{branch}")
-            os.system("git submodule update --init --recursive")
-            # 安装依赖
-            os.system('pip install -r /nas-tools/requirements.txt')
-            # 重启
-            self.restart_server()
+        except (ValueError, OSError, subprocess.CalledProcessError):
+            # Command details may contain proxy credentials; return a safe error.
+            return {"code": 1, "msg": "更新失败，请检查代理配置及更新环境"}
         return {"code": 0}
 
     def __reset_db_version(self, data):
@@ -1230,7 +1408,8 @@ class WebAction:
         """
         更新配置信息
         """
-        cfg = Config().get_config()
+        # A later invalid field must not partially mutate the live configuration.
+        cfg = deepcopy(Config().get_config())
         cfgs = dict(data).items()
         # 仅测试不保存
         config_test = False
@@ -1240,8 +1419,20 @@ class WebAction:
                 config_test = True
                 continue
             # 生效配置
-            cfg = self.set_config_value(cfg, key, value)
+            try:
+                cfg = self.set_config_value(cfg, key, value)
+            except ValueError as err:
+                return {"code": 1, "msg": str(err)}
 
+        try:
+            for key in ("ignored_paths", "ignored_files"):
+                compile_ignore_pattern((cfg.get("media") or {}).get(key))
+        except ValueError as err:
+            return {"code": 1, "msg": str(err)}
+
+        # Return validated temporary settings to the probe, without global mutation.
+        if config_test:
+            return {"code": 0, "config": cfg}
         # 保存配置
         if not config_test:
             Config().save_config(cfg)
@@ -1632,46 +1823,44 @@ class WebAction:
             "seasons": seasons
         }
 
-    @staticmethod
-    def __test_connection(data):
+    def __test_connection(self, data):
         """
         测试连通性
         """
-        # 支持两种传入方式：命令数组或单个命令，单个命令时xx|xx模式解析为模块和类，进行动态引入
-        command = data.get("command")
-        ret = None
-        if command:
+        command = (data or {}).get("command")
+        commands = command if isinstance(command, list) else [command]
+        # Validate the entire list before performing any network or config work.
+        if not commands or len(commands) > 12 or any(
+                not isinstance(item, str) or item not in self.CONNECTION_TESTS for item in commands):
+            return {"code": 1, "msg": "不支持的连通性测试"}
+        for item in commands:
+            module_name, class_name = self.CONNECTION_TESTS[item]
+            module_obj = None
             try:
-                module_obj = None
-                if isinstance(command, list):
-                    for cmd_str in command:
-                        ret = eval(cmd_str)
-                        if not ret:
-                            break
-                else:
-                    if command.find("|") != -1:
-                        module = command.split("|")[0]
-                        class_name = command.split("|")[1]
-                        module_obj = getattr(
-                            importlib.import_module(module), class_name)()
-                        if hasattr(module_obj, "init_config"):
-                            module_obj.init_config()
-                        temporary_config = data.get("config")
-                        if isinstance(temporary_config, dict):
-                            ret = module_obj.get_status(config=temporary_config)
-                        else:
-                            ret = module_obj.get_status()
-                    else:
-                        ret = eval(command)
-                # 重载配置
-                Config().init_config()
-                if module_obj:
-                    if hasattr(module_obj, "init_config"):
+                temporary_config = data.get("config")
+                factory = getattr(importlib.import_module(module_name), class_name)
+                # Service clients accept isolated constructor settings; LLM has
+                # its own per-probe configuration API and remains a singleton.
+                is_llm = class_name == "LLMMetaParser"
+                module_obj = (factory(config=temporary_config)
+                              if isinstance(temporary_config, dict) and not is_llm else factory())
+                if hasattr(module_obj, "init_config"):
+                    module_obj.init_config()
+                ret = (module_obj.get_status(config=temporary_config)
+                       if is_llm and isinstance(temporary_config, dict) else module_obj.get_status())
+                if not ret:
+                    return {"code": 1}
+            except Exception as err:
+                ExceptionUtils.exception_traceback(err)
+                return {"code": 1}
+            finally:
+                try:
+                    Config().init_config()
+                    if module_obj and hasattr(module_obj, "init_config"):
                         module_obj.init_config()
-            except Exception as e:
-                ret = None
-                ExceptionUtils.exception_traceback(e)
-            return {"code": 0 if ret else 1}
+                except Exception as err:
+                    ExceptionUtils.exception_traceback(err)
+                    return {"code": 1}
         return {"code": 0}
 
     def __user_manager(self, data):
@@ -1702,9 +1891,11 @@ class WebAction:
         rssid = data.get("rssid")
         page = data.get("page")
         if mtype == "MOV":
-            ThreadHelper().start_thread(Subscribe().subscribe_search_movie, (rssid,))
+            ThreadHelper().start_thread(Subscribe().subscribe_search_movie, (rssid,),
+                                        task_key=('subscribe', 'MOV', str(rssid)))
         else:
-            ThreadHelper().start_thread(Subscribe().subscribe_search_tv, (rssid,))
+            ThreadHelper().start_thread(Subscribe().subscribe_search_tv, (rssid,),
+                                        task_key=('subscribe', 'TV', str(rssid)))
         return {"code": 0, "page": page}
 
     @staticmethod
@@ -2028,6 +2219,12 @@ class WebAction:
         if not brushtask:
             return {"code": 1, "task": {}}
         site_info = Sites().get_sites(siteid=brushtask.SITE)
+        try:
+            # Legacy records remain readable, but expressions are never run.
+            rss_rule = parse_rule_dict(brushtask.RSS_RULE)
+            remove_rule = parse_rule_dict(brushtask.REMOVE_RULE)
+        except ValueError:
+            return {"code": 1, "msg": "刷流规则格式无效", "task": {}}
         task = {
             "id": brushtask.ID,
             "name": brushtask.NAME,
@@ -2037,8 +2234,8 @@ class WebAction:
             "downloader": brushtask.DOWNLOADER,
             "transfer": brushtask.TRANSFER,
             "free": brushtask.FREELEECH,
-            "rss_rule": eval(brushtask.RSS_RULE),
-            "remove_rule": eval(brushtask.REMOVE_RULE),
+            "rss_rule": rss_rule,
+            "remove_rule": remove_rule,
             "seed_size": brushtask.SEED_SIZE,
             "download_count": brushtask.DOWNLOAD_COUNT,
             "remove_count": brushtask.REMOVE_COUNT,
@@ -2189,6 +2386,59 @@ class WebAction:
         }
 
     @staticmethod
+    def __egress_ip_test(data):
+        """从服务器查询直连或应用代理出口；不读取浏览器地址或泄露代理认证信息。"""
+        from ipaddress import ip_address
+        from time import monotonic
+
+        import requests
+
+        mode = data.get("mode") if isinstance(data, dict) else None
+        if mode not in ("direct", "proxy"):
+            return {"code": 1, "res": False, "msg": "不支持的出口 IP 测试线路"}
+        proxies = {}
+        targets = WebAction.EGRESS_IP_URLS
+        if mode == "proxy":
+            try:
+                proxies = normalize_proxies(Config().get_proxies())
+            except ValueError:
+                return {"code": 1, "res": False, "msg": "代理配置无效，请检查代理设置"}
+            # HTTP-only 或其他主机专用代理不能用于 HTTPS 查询，也不能悄悄回退直连。
+            targets = tuple(url for url in targets if requests.utils.select_proxy(url, proxies))
+            if not targets:
+                return {"code": 0, "res": False, "skipped": True, "msg": "未配置适用的 HTTPS 代理"}
+
+        started = monotonic()
+        error_kind = ""
+        with requests.Session() as session:
+            # 明确区分两条线路，避免容器 HTTP(S)_PROXY 环境变量覆盖直连结果。
+            session.trust_env = False
+            for url in targets:
+                try:
+                    with session.get(url, proxies=proxies, timeout=(3, 5), verify=True,
+                                     allow_redirects=False, stream=True) as response:
+                        response.raise_for_status()
+                        body = bytearray()
+                        for chunk in response.iter_content(1024):
+                            body.extend(chunk)
+                            if len(body) > 1024:
+                                raise ValueError("IP response too large")
+                        payload = json.loads(body)
+                        value = payload.get("ip") if isinstance(payload, dict) else None
+                        if not isinstance(value, str) or len(value) > 45 or "%" in value:
+                            raise ValueError("Invalid IP response")
+                        address = ip_address(value.strip())
+                        if not address.is_global:
+                            raise ValueError("Not a public IP address")
+                        return {"code": 0, "res": True, "ip": str(address),
+                                "time": f"{int((monotonic() - started) * 1000)} 毫秒"}
+                except (requests.RequestException, ValueError) as error:
+                    # 双栈查询失败时尝试 IPv4；异常正文可能含代理密码，只返回异常类型。
+                    error_kind = type(error).__name__
+        return {"code": 1, "res": False, "msg": f"出口 IP 查询失败（{error_kind}），请重试",
+                "time": f"{int((monotonic() - started) * 1000)} 毫秒"}
+
+    @staticmethod
     def __net_test(data):
         target = str(data or "").strip()
         if not target:
@@ -2205,6 +2455,55 @@ class WebAction:
             target = "https://" + target
 
         start_time = datetime.datetime.now()
+        try:
+            hostname = urlsplit(target).hostname
+        except ValueError:
+            hostname = None
+        if hostname in ("api.themoviedb.org", "api.tmdb.org"):
+            # API roots can return 401/404 without indicating a network failure.
+            # Probe the real authenticated endpoint through the SDK transport,
+            # without changing the running clients' domain, key or proxy state.
+            try:
+                TMDb.test_connection(
+                    api_key=Config().get_config("app").get("rmt_tmdbkey"),
+                    proxies=Config().get_proxies(), domain=hostname)
+                result = {"res": True}
+            except Exception as err:
+                # RequestException text may contain the API key in the URL.
+                message = str(err) if isinstance(err, TMDbException) else type(err).__name__
+                log.warn(f"【Network】TMDB API 测试失败：{message}")
+                result = {"res": False, "msg": message}
+            elapsed_ms = int((datetime.datetime.now() - start_time).total_seconds() * 1000)
+            result["time"] = "%s 毫秒" % elapsed_ms
+            return result
+        if hostname == "www.themoviedb.org":
+            # The HTML site is independent of API health. Keep its real status
+            # and expose safe diagnostics instead of collapsing every error to False.
+            try:
+                # 与网页辅助识别共用官网 UA 配置，不影响 API 和其他站点。
+                response = RequestUtils(headers=Config().get_tmdb_web_ua(),
+                                        proxies=normalize_proxies(Config().get_proxies()),
+                                        timeout=TMDb.REQUEST_TIMEOUT).get_res(target, raise_errors=True)
+                # HTTP reachability and page availability are separate outcomes.
+                result = {"res": response is not None and response.ok, "reachable": response is not None}
+                if response is not None:
+                    result["http_status"] = response.status_code
+                if not result["res"]:
+                    if response is None:
+                        result["msg"] = "TMDB 官网未收到响应"
+                    elif response.status_code == 403:
+                        # A forbidden response proves reachability but denies page access.
+                        result["msg"] = "TMDB 官网拒绝访问（HTTP 403）"
+                    else:
+                        result["msg"] = f"TMDB 官网返回 HTTP {response.status_code}"
+            except Exception as err:
+                # Error text can include authenticated proxy URLs; type names suffice.
+                result = {"res": False, "reachable": False, "msg": f"TMDB 官网连接异常：{type(err).__name__}"}
+            if not result["res"]:
+                log.warn(f"【Network】{result['msg']}")
+            elapsed_ms = int((datetime.datetime.now() - start_time).total_seconds() * 1000)
+            result["time"] = "%s 毫秒" % elapsed_ms
+            return result
         if target.find("themoviedb") != -1 \
                 or target.find("telegram") != -1 \
                 or target.find("fanart") != -1 \
@@ -2215,7 +2514,7 @@ class WebAction:
         else:
             res = RequestUtils(timeout=5).get_res(target)
         seconds = int((datetime.datetime.now() -
-                      start_time).microseconds / 1000)
+                      start_time).total_seconds() * 1000)
         if not res:
             return {"res": False, "time": "%s 毫秒" % seconds}
         elif res.ok:
@@ -2751,32 +3050,33 @@ class WebAction:
 
     @staticmethod
     def __restory_backup(data):
-        """
-        解压恢复备份文件
-        """
-        filename = data.get("file_name")
-        if filename:
-            config_path = Config().get_config_path()
-            temp_path = Config().get_temp_path()
-            file_path = os.path.join(temp_path, filename)
-            try:
-                shutil.unpack_archive(file_path, config_path, format='zip')
-                return {"code": 0, "msg": ""}
-            except Exception as e:
-                ExceptionUtils.exception_traceback(e)
-                return {"code": 1, "msg": str(e)}
-            finally:
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-
-        return {"code": 1, "msg": "文件不存在"}
+        """Validate and stage a private restore; active database files stay open safely."""
+        from app.db.backup import stage_restore
+        from app.db.transactions import DatabaseBusy, DatabaseWriteError
+        filename = (data or {}).get('file_name')
+        if not isinstance(filename, str) or os.path.basename(filename) != filename or not filename.endswith('.zip'):
+            return {'code': 1, 'msg': '备份文件名无效'}
+        file_path = os.path.join(Config().get_temp_path(), filename)
+        if os.path.islink(file_path) or not os.path.isfile(file_path):
+            return {'code': 1, 'msg': '备份文件不存在或路径无效'}
+        try:
+            return stage_restore(file_path, Config().get_config_path())
+        except (DatabaseBusy, DatabaseWriteError) as error:
+            return {'code': 1, 'msg': str(error)}
+        except Exception:
+            return {'code': 1, 'msg': '备份校验或暂存失败，请检查备份及可用空间'}
+        finally:
+            if os.path.isfile(file_path) and not os.path.islink(file_path):
+                os.remove(file_path)
 
     @staticmethod
     def __start_mediasync(data):
         """
         开始媒体库同步
         """
-        ThreadHelper().start_thread(MediaServer().sync_mediaserver, ())
+        # A library sync can be long; repeat requests reuse its existing work.
+        ThreadHelper().start_thread(MediaServer().sync_mediaserver, (),
+                                    task_key=('service', 'MediaServer.sync_mediaserver'))
         return {"code": 0}
 
     @staticmethod
@@ -2923,13 +3223,12 @@ class WebAction:
 
     @staticmethod
     def __run_userrss(data):
-        RssChecker().check_task_rss(data.get("id"))
-        return {"code": 0}
+        # 业务层区分执行失败与正常空结果，任务中心直接保存真实终态。
+        return RssChecker().check_task_rss(data.get("id"))
 
     @staticmethod
     def __run_brushtask(data):
-        BrushTask().check_task_rss(data.get("id"))
-        return {"code": 0}
+        return BrushTask().check_task_rss(data.get("id"))
 
     @staticmethod
     def __list_site_resources(data):
@@ -3063,15 +3362,17 @@ class WebAction:
             back = data.get("new_back")
             offset = data.get("new_offset")
             whelp = data.get("new_help")
-            wtype = data.get("type")
+            wtype = str(data.get("type"))
+            if wtype not in ("1", "2", "3", "4"):
+                return {"code": 1, "msg": "识别词类型无效"}
             season = data.get("season")
             enabled = data.get("enabled")
             regex = data.get("regex")
             # 集数偏移格式检查
             if wtype in ["3", "4"]:
-                if not re.findall(r'EP', offset):
-                    return {"code": 1, "msg": "偏移集数格式有误"}
-                if re.findall(r'(?!-|\+|\*|/|[0-9]).', re.sub(r'EP', "", offset)):
+                try:
+                    parse_episode_offset(offset)
+                except ValueError:
                     return {"code": 1, "msg": "偏移集数格式有误"}
             if wid:
                 self.dbhelper.delete_custom_word(wid=wid)
@@ -3296,6 +3597,12 @@ class WebAction:
             string = base64.b64decode(import_code.encode(
                 "utf-8")).decode('utf-8').split("@@@@@@")
             import_dict = json.loads(string[0])
+            # Validate every selected offset before any group/word is inserted.
+            for id_info in ids_info:
+                group_id, word_id = id_info.split("_")
+                word = import_dict[group_id]["words"][word_id]
+                if int(word.get("type")) in (3, 4):
+                    parse_episode_offset(word.get("offset"))
             import_group_ids = [id_info.split("_")[0] for id_info in ids_info]
             group_id_dict = {}
             for import_group_id in import_group_ids:
@@ -4152,19 +4459,43 @@ class WebAction:
             "data": r
         }
 
-    @staticmethod
-    def __rename_file(data):
+    def __rename_file(self, data):
         """
         文件重命名
         """
         path = data.get("path")
         name = data.get("name")
-        if path and name:
-            try:
-                shutil.move(path, os.path.join(os.path.dirname(path), name))
-            except Exception as e:
-                ExceptionUtils.exception_traceback(e)
-                return {"code": -1, "msg": str(e)}
+        # Check the real parent, permitting library-file symlinks while excluding
+        # directory symlink escapes. The target is always a sibling basename.
+        if (not isinstance(path, str) or not isinstance(name, str) or not name
+                or name in (".", "..") or any(char in name for char in ("/", "\\", "\0"))
+                or os.path.isabs(name) or ntpath.splitdrive(name)[0]):
+            return {"code": -1, "msg": "文件名无效"}
+        media = Config().get_config("media") or {}
+        roots = []
+        for key in ("movie_path", "tv_path", "anime_path", "unknown_path"):
+            value = media.get(key)
+            if value:
+                roots.extend(value if isinstance(value, list) else [value])
+        for row in self.dbhelper.get_config_sync_paths():
+            roots.extend(value for value in (row.SOURCE, row.DEST, row.UNKNOWN) if value)
+        for row in Config().get_config("downloaddir") or []:
+            if isinstance(row, dict):
+                value = row.get("container_path") or row.get("save_path")
+                if value:
+                    roots.append(value)
+        parent = os.path.realpath(os.path.dirname(os.path.abspath(path)))
+        try:
+            if not any(os.path.commonpath((parent, os.path.realpath(root))) == os.path.realpath(root)
+                       for root in roots):
+                return {"code": -1, "msg": "文件不在已配置的媒体或同步目录内"}
+            target = os.path.join(parent, name)
+            if os.path.lexists(target):
+                return {"code": -1, "msg": "目标文件已存在"}
+            # Reuse the native no-replace operation, including concurrent targets.
+            rename_exclusive(os.path.join(parent, os.path.basename(path)), target)
+        except (OSError, ValueError):
+            return {"code": -1, "msg": "文件重命名失败"}
         return {"code": 0}
 
     def __delete_files(self, data):
@@ -4814,5 +5145,7 @@ class WebAction:
         """
         执行单个目录的目录同步
         """
-        Sync().transfer_all_sync(sid=data.get("sid"))
+        # 保留并发准入结果，避免被跳过的目录同步在任务中心显示成功。
+        if Sync().transfer_all_sync(sid=data.get("sid")) is False:
+            return {"code": -1, "msg": "已有目录同步正在进行，本次未执行，请稍后重试"}
         return {"code": 0, "msg": "执行成功"}

@@ -1,0 +1,40 @@
+{# 服务卡片与页头入口共用一个 Bootstrap 抽屉，任务更新不主动打开它。 #}
+<div class="offcanvas offcanvas-end" id="action-task-panel" tabindex="-1"
+     aria-labelledby="action-task-title" aria-describedby="action-task-summary">
+  <div class="offcanvas-header">
+    <div>
+      <h2 class="offcanvas-title" id="action-task-title">后台操作</h2>
+      <div class="text-reset opacity-75 small" id="action-task-summary" data-action-task-summary>正在读取任务状态…</div>
+    </div>
+    <button type="button" class="btn-close" onclick="$('#action-task-panel').offcanvas('hide')" aria-label="关闭后台操作"></button>
+  </div>
+  <div class="offcanvas-body p-0">
+    <div class="px-3 pb-2 d-flex align-items-center justify-content-between gap-2">
+      <span class="text-reset opacity-75 small">最近 20 条操作</span>
+      <button type="button" class="btn btn-sm" id="action-task-refresh" onclick="ActionTaskClient.refresh()">刷新状态</button>
+    </div>
+    <div class="px-3 pb-2 text-break" id="action-task-notice" role="status" aria-live="polite"></div>
+    <div class="list-group list-group-flush" id="action-task-list" role="list" aria-label="最近的后台操作"></div>
+  </div>
+</div>
+{# 结果模态框保持在抽屉外；客户端串行切换两层界面并恢复焦点。 #}
+<div class="modal modal-blur fade" id="action-task-result" tabindex="-1" aria-labelledby="action-task-result-title" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable" role="document">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="action-task-result-title">执行结果</h5>
+        <button type="button" class="btn-close" onclick="$('#action-task-result').modal('hide')" aria-label="关闭执行结果"></button>
+      </div>
+      <div class="modal-body"><pre class="text-wrap text-break mb-0" id="action-task-result-text"></pre></div>
+      <div class="modal-footer"><button type="button" class="btn" onclick="$('#action-task-result').modal('hide')">关闭</button></div>
+    </div>
+  </div>
+</div>
+<div class="toast-container position-fixed bottom-0 end-0 p-3" id="action-task-feedback">
+  <div class="toast bg-body" id="action-task-toast" role="status" aria-live="polite" aria-atomic="true" data-bs-delay="5000">
+    <div class="d-flex">
+      <div class="toast-body text-break" id="action-task-toast-text"></div>
+      <button type="button" class="btn-close me-2 m-auto" onclick="$('#action-task-toast').toast('hide')" aria-label="关闭任务提示"></button>
+    </div>
+  </div>
+</div>

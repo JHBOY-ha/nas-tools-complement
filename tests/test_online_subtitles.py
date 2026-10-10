@@ -34,7 +34,7 @@ class OnlineSubtitleTest(unittest.TestCase):
         params = {'token': 'SECRET', 'id': '123456'}
         for failure in (self.response(520), module.requests.ConnectTimeout()):
             with self.subTest(failure=type(failure).__name__):
-                with patch.object(module.requests, 'get', side_effect=[failure, self.response(payload={'status': 0})]) as get:
+                with patch.object(module, 'bounded_request', side_effect=[failure, self.response(payload={'status': 0})]) as get:
                     self.assertEqual(OnlineSubtitles()._json('https://api.assrt.net/v1/sub/detail', params), {'status': 0})
                 self.assertEqual(get.call_args.args[0], 'https://api.makedie.me/v1/sub/detail')
                 self.assertEqual(get.call_args.kwargs['params'], params)
@@ -47,18 +47,18 @@ class OnlineSubtitleTest(unittest.TestCase):
                 ('https://api.assrt.net/v1/sub/search', [self.response(520), self.response(520)], 2),
                 ('https://api.assrt.net/v1/sub/search', [self.response(payload=[])], 1)):
             with self.subTest(url=url, expected_calls=expected_calls):
-                with patch.object(module.requests, 'get', side_effect=responses) as get:
+                with patch.object(module, 'bounded_request', side_effect=responses) as get:
                     with self.assertRaises(ValueError):
                         OnlineSubtitles()._json(url, {'token': 'SECRET'})
                 self.assertEqual(get.call_count, expected_calls)
-        with patch.object(module.requests, 'get', return_value=self.response(payload={'status': 30900})) as get:
+        with patch.object(module, 'bounded_request', return_value=self.response(payload={'status': 30900})) as get:
             self.assertEqual(OnlineSubtitles()._json('https://api.assrt.net/v1/sub/search', {})['status'], 30900)
             self.assertEqual(get.call_count, 1)
 
     def test_assrt_http_520_upgrades_preserving_signed_url(self):
         service = OnlineSubtitles()
         url = 'http://file1.assrt.net:80/download/123/a%20b.srt?_=123&-=a%2Fb&api=1'
-        with patch.object(service, '_check_url') as check, patch.object(module.requests, 'get', side_effect=[self.response(520), self.response()]) as get:
+        with patch.object(service, '_check_url') as check, patch.object(module, 'bounded_request', side_effect=[self.response(520), self.response()]) as get:
             self.assertEqual(service._download(url), b'subtitle')
         upgraded = 'https://file1.assrt.net/download/123/a%20b.srt?_=123&-=a%2Fb&api=1'
         self.assertEqual([call.args[0] for call in get.call_args_list], [url, upgraded])
@@ -73,7 +73,7 @@ class OnlineSubtitleTest(unittest.TestCase):
                 ('http://file1.assrt.net.evil.example/sub', 520, 1),
                 ('http://example.com/sub', 520, 1)):
             with self.subTest(url=url, code=code):
-                with patch.object(service, '_check_url'), patch.object(service, '_report_download_failure'), patch.object(module.requests, 'get', side_effect=[self.response(code) for _ in range(count)]) as get:
+                with patch.object(service, '_check_url'), patch.object(service, '_report_download_failure'), patch.object(module, 'bounded_request', side_effect=[self.response(code) for _ in range(count)]) as get:
                     with self.assertRaisesRegex(ValueError, 'HTTP ' + str(code)):
                         service._download(url)
                 self.assertEqual(get.call_count, count)
@@ -99,7 +99,7 @@ class OnlineSubtitleTest(unittest.TestCase):
         # Exercise the real queue append, replacing only the configured logger.
         for response, expected in cases:
             with self.subTest(expected=expected):
-                with patch.object(service, 'cid', return_value=''), patch.object(module.requests, 'get', side_effect=[response]), patch.object(module.log.Logger, 'get_instance', return_value=Mock()), patch.object(module.log, 'LOG_QUEUE', []):
+                with patch.object(service, 'cid', return_value=''), patch.object(module, 'bounded_request', side_effect=[response]), patch.object(module.log.Logger, 'get_instance', return_value=Mock()), patch.object(module.log, 'LOG_QUEUE', []):
                     results, warnings = service.search('影片', '/private/SECRET.mkv', 'thunder')
                     self.assertFalse(results)
                     self.assertEqual(warnings, ['迅雷检索失败，请稍后重试'])
@@ -112,7 +112,7 @@ class OnlineSubtitleTest(unittest.TestCase):
 
     def test_thunder_empty_results_do_not_log_failure(self):
         service = OnlineSubtitles()
-        with patch.object(service, 'cid', return_value=''), patch.object(module.requests, 'get', return_value=self.response(payload={'code': 0, 'data': []})), patch.object(module.log, 'error') as error:
+        with patch.object(service, 'cid', return_value=''), patch.object(module, 'bounded_request', return_value=self.response(payload={'code': 0, 'data': []})), patch.object(module.log, 'error') as error:
             self.assertEqual(service.search('影片', '/media.mkv', 'thunder'), ([], []))
             error.assert_not_called()
 
@@ -185,29 +185,29 @@ class OnlineSubtitleTest(unittest.TestCase):
         self.assertIn('RAR', str(error.exception))
 
     def test_download_rejects_private_destination_and_redirect(self):
-        with patch.object(module.socket, 'getaddrinfo', return_value=[(None, None, None, None, ('127.0.0.1', 80))]):
+        with patch.object(module, 'resolve_addresses', return_value=[(None, None, None, None, ('127.0.0.1', 80))]):
             with self.assertRaises(ValueError):
                 OnlineSubtitles._check_url('http://localhost/sub.srt')
         response = Mock(is_redirect=True, headers={'Location': 'http://localhost/private'})
         response.__enter__ = Mock(return_value=response)
         response.__exit__ = Mock(return_value=False)
         service = OnlineSubtitles()
-        with patch.object(service, '_check_url', side_effect=[None, ValueError('private')]), patch.object(module.requests, 'get', return_value=response) as get:
+        with patch.object(service, '_check_url', side_effect=[None, ValueError('private')]), patch.object(module, 'bounded_request', return_value=response) as get:
             with self.assertRaises(ValueError):
                 service._download('https://example.com/subtitle')
             self.assertEqual(get.call_count, 1)
 
     def test_proxy_fake_ip_is_only_allowed_for_known_providers(self):
-        with patch.object(module.socket, 'getaddrinfo', return_value=[(None, None, None, None, ('198.18.0.38', 80))]):
+        with patch.object(module, 'resolve_addresses', return_value=[(None, None, None, None, ('198.18.0.38', 80))]):
             OnlineSubtitles._check_url('https://subtitle.v.geilijiasu.com/file.srt')
             with self.assertRaises(ValueError):
                 OnlineSubtitles._check_url('https://untrusted.example/file.srt')
-        with patch.object(module.socket, 'getaddrinfo', return_value=[(None, None, None, None, ('192.168.1.1', 80))]):
+        with patch.object(module, 'resolve_addresses', return_value=[(None, None, None, None, ('192.168.1.1', 80))]):
             with self.assertRaises(ValueError):
                 OnlineSubtitles._check_url('https://subtitle.v.geilijiasu.com/file.srt')
 
     def test_request_failure_does_not_expose_token(self):
-        with patch.object(module.requests, 'get', side_effect=module.requests.RequestException('url?token=SECRET')):
+        with patch.object(module, 'bounded_request', side_effect=module.requests.RequestException('url?token=SECRET')):
             with self.assertRaises(ValueError) as context:
                 OnlineSubtitles('SECRET')._json('https://api.assrt.net', {})
             self.assertNotIn('SECRET', str(context.exception))

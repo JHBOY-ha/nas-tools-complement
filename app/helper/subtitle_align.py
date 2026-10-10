@@ -56,7 +56,10 @@ class SubtitleAligner:
     _max_aligned_anchor_residual_ms = 2000
     _llm_translation_cache = {}
     _llm_translation_cache_ttl = 60 * 60
+    _llm_translation_cache_limit = 256
+    _translation_cache_lock = threading.RLock()
     _reference_cache_lock = threading.RLock()
+    _reference_cache_maintenance = {}
     _reference_cache_ttl = 30 * 24 * 60 * 60
     _reference_cache_version = "embedded-text-v1"
     _ffmpeg_version = None
@@ -277,9 +280,10 @@ class SubtitleAligner:
             })
             return result
         source["cues"] = aligned_cues
-        cls.write_file(subtitle_file, source)
+        output_hash = cls.write_file(subtitle_file, source)
         return {
             "applied": True,
+            "output_hash": output_hash,
             "skipped": False,
             "message": "自动对齐完成",
             "mode": mode,
@@ -308,6 +312,8 @@ class SubtitleAligner:
     def write_file(cls, path, data):
         ext = os.path.splitext(path)[-1].lower()
         text = cls.__format_vtt(data) if ext == ".vtt" else cls.__format_srt(data)
+        # Return the digest of the exact emitted UTF-8 bytes for task markers.
+        output_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
         target_dir = os.path.dirname(os.path.abspath(path)) or "."
         tmp_path = None
         try:
@@ -316,6 +322,7 @@ class SubtitleAligner:
                 file_obj.write(text)
             os.replace(tmp_path, path)
             tmp_path = None
+            return output_hash
         finally:
             if tmp_path and os.path.exists(tmp_path):
                 try:
@@ -532,7 +539,7 @@ class SubtitleAligner:
         manifest_file = os.path.join(cache_root, cache_key + ".json")
         if cache_max_bytes > 0:
             with cls._reference_cache_lock:
-                cls.__prune_reference_cache(cache_root, cache_max_bytes)
+                cls.__maintain_reference_cache(cache_root, cache_max_bytes)
                 try:
                     with open(manifest_file, "r", encoding="utf-8") as file_obj:
                         manifest = json.load(file_obj)
@@ -567,7 +574,9 @@ class SubtitleAligner:
                     }, file_obj, ensure_ascii=False, sort_keys=True)
                 os.replace(temp_cache, cache_file)
                 os.replace(temp_manifest, manifest_file)
-                cls.__prune_reference_cache(cache_root, cache_max_bytes)
+                cls.__maintain_reference_cache(
+                    cache_root, cache_max_bytes, added_bytes=os.path.getsize(cache_file)
+                )
             finally:
                 for path in [temp_cache, temp_manifest]:
                     if os.path.exists(path):
@@ -603,12 +612,45 @@ class SubtitleAligner:
         return cls._ffmpeg_version
 
     @classmethod
+    def __maintain_reference_cache(cls, cache_root, max_bytes, added_bytes=0):
+        """Throttle scans, but enforce the byte ceiling immediately after writes.
+
+        Replacements conservatively count as additions until the next scan;
+        this can trigger early cleanup, never suppress capacity enforcement.
+        Callers hold _reference_cache_lock.
+        """
+        now = time.monotonic()
+        state = cls._reference_cache_maintenance.get(cache_root)
+        total = (state[2] if state else 0) + added_bytes
+        if not state or now - state[0] >= 60 or state[1] != max_bytes or total > max_bytes:
+            total = cls.__prune_reference_cache(cache_root, max_bytes)
+            state = (now, max_bytes, total)
+        else:
+            state = (state[0], max_bytes, total)
+        cls._reference_cache_maintenance[cache_root] = state
+        while len(cls._reference_cache_maintenance) > 8:
+            cls._reference_cache_maintenance.pop(next(iter(cls._reference_cache_maintenance)))
+
+    @classmethod
     def __prune_reference_cache(cls, cache_root, max_bytes):
         if not os.path.isdir(cache_root):
-            return
+            return 0
         now = time.time()
         entries = []
         total = 0
+        def remove_pair(data_file, manifest_file):
+            try:
+                os.remove(data_file)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return False
+            try:
+                os.remove(manifest_file)
+            except OSError:
+                pass
+            return True
+
         for name in os.listdir(cache_root):
             if not name.endswith(".srt"):
                 continue
@@ -616,20 +658,18 @@ class SubtitleAligner:
             manifest_file = os.path.splitext(data_file)[0] + ".json"
             try:
                 size = os.path.getsize(data_file)
+            except FileNotFoundError:
+                remove_pair(data_file, manifest_file)
+                continue
+            except OSError:
+                # Unknown or undeletable bytes must not vanish from the cached
+                # total, otherwise throttling would suppress eviction retries.
+                size = max_bytes + 1
+            try:
                 modified = os.path.getmtime(manifest_file)
             except OSError:
-                for path in [data_file, manifest_file]:
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-                continue
-            if now - modified > cls._reference_cache_ttl:
-                for path in [data_file, manifest_file]:
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
+                modified = 0
+            if now - modified > cls._reference_cache_ttl and remove_pair(data_file, manifest_file):
                 continue
             total += size
             entries.append((modified, size, data_file, manifest_file))
@@ -645,12 +685,9 @@ class SubtitleAligner:
         for _, size, data_file, manifest_file in sorted(entries):
             if total <= max_bytes:
                 break
-            for path in [data_file, manifest_file]:
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
-            total -= size
+            if remove_pair(data_file, manifest_file):
+                total -= size
+        return total
 
     @staticmethod
     def __stop_process(process):
@@ -997,18 +1034,31 @@ class SubtitleAligner:
 
     @classmethod
     def __get_translation_cache(cls, key):
-        cached = cls._llm_translation_cache.get(key)
-        if not cached:
-            return None
-        created_at, value = cached
-        if time.time() - created_at > cls._llm_translation_cache_ttl:
-            cls._llm_translation_cache.pop(key, None)
-            return None
-        return value
+        with cls._translation_cache_lock:
+            cls.__prune_translation_cache()
+            cached = cls._llm_translation_cache.pop(key, None)
+            if cached is None:
+                return None
+            cls._llm_translation_cache[key] = cached
+            return dict(cached[1])
 
     @classmethod
     def __set_translation_cache(cls, key, value):
-        cls._llm_translation_cache[key] = (time.time(), value)
+        with cls._translation_cache_lock:
+            cls.__prune_translation_cache()
+            cls._llm_translation_cache.pop(key, None)
+            cls._llm_translation_cache[key] = (time.time(), dict(value))
+            while len(cls._llm_translation_cache) > cls._llm_translation_cache_limit:
+                cls._llm_translation_cache.pop(next(iter(cls._llm_translation_cache)))
+
+    @classmethod
+    def __prune_translation_cache(cls):
+        # Expire all keys, including batches never requested again. Dict order
+        # records recent access, while timestamps retain the original TTL.
+        now = time.time()
+        for key, (created, _) in list(cls._llm_translation_cache.items()):
+            if now - created > cls._llm_translation_cache_ttl:
+                cls._llm_translation_cache.pop(key, None)
 
     @staticmethod
     def __clean_llm_subtitle_text(text):

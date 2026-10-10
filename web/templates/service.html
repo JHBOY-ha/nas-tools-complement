@@ -1,3 +1,20 @@
+{% import 'macro/svg.html' as SVG %}
+{# 普通和动漫测试共用出口摘要；次级文字复用正文色，保持暗色主题可读。 #}
+{% macro nettest_egress(prefix) %}
+      <div class="modal-body border-bottom py-3">
+        <dl class="row mb-0">
+          <div class="col-12 col-sm-6 mb-2 mb-sm-0">
+            <dt class="small text-body opacity-75">直连出口 IP</dt>
+            <dd id="{{ prefix }}_egress_direct" class="mb-0 text-break" aria-live="polite" aria-atomic="true">尚未测试</dd>
+          </div>
+          <div class="col-12 col-sm-6">
+            <dt class="small text-body opacity-75">代理出口 IP</dt>
+            <dd id="{{ prefix }}_egress_proxy" class="mb-0 text-break" aria-live="polite" aria-atomic="true">尚未测试</dd>
+          </div>
+        </dl>
+        <div class="small text-body opacity-75 mt-2">检测服务器公网出口；分流规则可能导致各站点出口不同。</div>
+      </div>
+{% endmacro %}
 <div class="container-xl">
   <!-- Page title -->
   <div class="page-header d-print-none">
@@ -11,10 +28,27 @@
   </div>
 </div>
 <!-- 业务页面代码 -->
-{% if Count > 0 %}
 <div class="page-body">
   <div class="container-xl">
     <div class="d-grid gap-3 grid-normal-card">
+      <!-- 后台操作入口始终可用，未启用定时服务时也能查看自己的任务。 -->
+      <div class="card card-sm card-link-pop" id="service-action-tasks">
+        <div class="card-body">
+          <div class="row align-items-center">
+            <div class="col-auto">
+              <span class="bg-blue-lt avatar">{{ SVG.activity('') }}</span>
+            </div>
+            <div class="col">
+              <button type="button" class="btn btn-link p-0 text-reset text-start stretched-link"
+                      data-action-task-open onclick="ActionTaskClient.open(this)"
+                      aria-controls="action-task-panel" aria-haspopup="dialog">
+                后台操作
+              </button>
+              <div class="text-reset opacity-75" data-action-task-summary>正在读取任务状态…</div>
+            </div>
+          </div>
+        </div>
+      </div>
       {% for Scheduler in SchedulerTasks %}
       <div class="card card-sm card-link-pop">
         <div class="card-body">
@@ -43,22 +77,18 @@
       </div>
       {% endfor %}
     </div>
-  </div>
-</div>
-{% else %}
-<div class="page-body">
-  <div class="container-xl d-flex flex-column justify-content-center">
-    <div class="empty">
+    {% if Count == 0 %}
+    <div class="empty mt-3">
       <div class="empty-img"><img src="./static/img/sign_in.svg" height="128" alt="">
       </div>
-      <p class="empty-title">没有服务</p>
+      <p class="empty-title">没有启用其他服务</p>
       <p class="empty-subtitle text-muted">
-        没有开启任何后台服务。
+        可以通过后台操作查看已提交任务的状态和结果。
       </p>
     </div>
+    {% endif %}
   </div>
 </div>
-{% endif %}
 <div class="modal modal-blur fade" id="modal-nametest" tabindex="-1" role="dialog" aria-hidden="true"
   data-bs-backdrop="static" data-bs-keyboard="false">
   <div class="modal-dialog modal-lg modal-dialog-centered" role="document">
@@ -158,6 +188,7 @@
         <h5 class="modal-title">网络连通性测试</h5>
         <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
       </div>
+      {{ nettest_egress('nettest_item') }}
       <div class="table-responsive">
         <table class="table table-vcenter card-table">
           <thead>
@@ -174,7 +205,7 @@
                 <span>{{ target }}</span>
                 <input name="nettest_item" value="{{ target }}|{{ loop.index0 }}" type="hidden">
               </td>
-              <td id="nettest_item_res_{{ loop.index0 }}"></td>
+              <td id="nettest_item_res_{{ loop.index0 }}" aria-live="polite" aria-atomic="true"></td>
               <td id="nettest_item_res_time_{{ loop.index0 }}"></td>
             </tr>
             {% endfor %}
@@ -196,6 +227,7 @@
         <h5 class="modal-title">网络连通性测试-anime</h5>
         <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
       </div>
+      {{ nettest_egress('nettest_anime_item') }}
       <div class="table-responsive">
         <table class="table table-vcenter card-table">
           <thead>
@@ -212,7 +244,7 @@
                 <span>{{ target }}</span>
                 <input name="nettest_anime_item" value="{{ target }}|{{ loop.index0 }}" type="hidden">
               </td>
-              <td id="nettest_anime_item_res_{{ loop.index0 }}"></td>
+              <td id="nettest_anime_item_res_{{ loop.index0 }}" aria-live="polite" aria-atomic="true"></td>
               <td id="nettest_anime_item_res_time_{{ loop.index0 }}"></td>
             </tr>
             {% endfor %}
@@ -301,6 +333,8 @@
   </div>
 </div>
 <script type="text/javascript">
+  // 页面与历史缓存恢复后，使用全局任务客户端更新卡片，不额外创建轮询器。
+  window.ActionTaskClient?.renderSummary();
   // 显示服务提示框
   function show_service_modal(id, name) {
     if (id === "nametest") {
@@ -309,9 +343,11 @@
       $('#modal-ruletest').modal('show');
     } else if (id === "nettest") {
       $('[id^="nettest_item_res"]').empty();
+      $('[id^="nettest_item_egress_"]').removeClass('text-red').text('尚未测试');
       $('#modal-nettest').modal('show');
     } else if (id === "nettest_anime") {
       $('[id^="nettest_anime_item_res"]').empty();
+      $('[id^="nettest_anime_item_egress_"]').removeClass('text-red').text('尚未测试');
       $('#modal-nettest-anime').modal('show');
     } else if (id === "speedtest") {
       $('[id^="speedtest_res_"], [id^="speedtest_transferred_"], [id^="speedtest_time_"]').empty();
@@ -344,7 +380,12 @@
   function run_scheduler(id, name) {
     const data = {"item": id};
     ajax_post("sch", data, function (ret) {
-      show_success_modal(`${name} 服务启动成功，正在后台运行`);
+      // This callback now receives the actual terminal result, including cancel.
+      if (String(ret.code ?? ret.retcode) === "0") {
+        show_success_modal(`${name} 服务执行完成`);
+      } else {
+        show_fail_modal(ret.msg || ret.retmsg || `${name} 服务未完成，请查看后台操作结果`);
+      }
     });
   }
 
@@ -370,9 +411,10 @@
 
   // 备份
   $("#backup_btn").unbind("click").click(function () {
-    $(this).text("备份中...").attr("disabled", true);
+    const backupButton = $(this);
+    backupButton.text("备份中...").attr("disabled", true).attr("aria-busy", "true");
     ajax_backup(function () {
-      $(this).attr("disabled", false).text("备份当前配置");
+      backupButton.attr("disabled", false).attr("aria-busy", "false").text("备份当前配置");
     });
   });
 
@@ -381,12 +423,15 @@
     if (!backup_dropzone || !backup_dropzone.files || !backup_dropzone.files[0]) {
       return;
     }
-    $(this).text("恢复中...").attr("disabled", true);
+    // Capture the trigger: AJAX callbacks do not retain the button as `this`.
+    const restoreButton = $(this);
+    restoreButton.text("恢复中...").attr("disabled", true).attr("aria-busy", "true");
     ajax_post("restory_backup", { file_name: backup_dropzone.files[backup_dropzone.files.length - 1].name }, function (ret) {
-      $(this).attr("disabled", false).text("恢复配置");
+      restoreButton.attr("disabled", false).attr("aria-busy", "false").text("恢复配置");
       $("#modal-backup").modal('hide');
       if (ret.code === 0) {
-        show_success_modal("备份恢复成功，请重启系统生效！");
+        // A staged restore is not an applied restore; keep restart explicit.
+        show_success_modal(ret.restart_required ? "备份已校验并暂存，重启后离线恢复生效。" : "备份恢复成功，请重启系统生效！");
       } else {
         show_fail_modal(`备份恢复失败：${ret.msg}`, function() {
           $("#modal-backup").modal('show');
@@ -462,20 +507,33 @@
   }
 
   function run_net_test_batch(btn_obj, hidden_name, result_prefix) {
-    let url_indexs = select_GetHiddenVAL(hidden_name);
-    let nettest_count_total = url_indexs.length;
-    let nettest_count_finished = 0;
-    btn_obj.text("测试中...").attr("disabled", true);
-    for (let url_index of url_indexs) {
-      net_test_one(url_index, result_prefix, ret => {
-        if (ret) {
-          nettest_count_finished++;
-          if (nettest_count_finished >= nettest_count_total) {
-            btn_obj.text("测试").attr("disabled", false);
-          }
-        }
-      });
+    const url_indexs = select_GetHiddenVAL(hidden_name);
+    // 两条出口查询与域名测试共同完成后恢复按钮，包括跳过及失败结果。
+    let remaining = url_indexs.length + 2;
+    btn_obj.text("测试中...").attr("disabled", true).attr("aria-busy", "true");
+    const finished = () => {
+      if (--remaining === 0) {
+        btn_obj.text("测试").attr("disabled", false).attr("aria-busy", "false");
+      }
+    };
+    for (const mode of ['direct', 'proxy']) {
+      net_test_egress(mode, result_prefix, finished);
     }
+    for (const url_index of url_indexs) {
+      net_test_one(url_index, result_prefix, finished);
+    }
+  }
+
+  // 出口结果只作为文本展示；查询失败不影响已有站点连通性结果。
+  function net_test_egress(mode, result_prefix, callBack) {
+    const result_cell = $(`#${result_prefix}_egress_${mode}`);
+    result_cell.removeClass('text-red').text('查询中...').attr('aria-busy', 'true');
+    ajax_post('egress_ip_test', {mode}, function (ret) {
+      ret = ret || {};
+      result_cell.text(ret.res ? ret.ip : (ret.msg || '出口 IP 查询失败，请重试'))
+        .toggleClass('text-red', !ret.res && !ret.skipped).attr('aria-busy', 'false');
+      callBack();
+    });
   }
 
   // 单个网络测试
@@ -486,13 +544,20 @@
     let url = url_index.split("|")[0];
     let index = url_index.split("|")[1];
     ajax_post("net_test", decodeURI(url), function (ret) {
-      if (ret.res) {
-        $(`#${result_prefix}_res_${index}`).html('<span class="badge bg-green me-1 mb-1">是</span>');
-        $(`#${result_prefix}_res_time_${index}`).html(`<span class="text-green">${ret.time}</span>`);
-      } else {
-        $(`#${result_prefix}_res_${index}`).html('<span class="badge bg-red me-1 mb-1">否</span>');
-        $(`#${result_prefix}_res_time_${index}`).html(`<span class="text-red">${ret.time}</span>`);
+      ret = ret || {};
+      const result_cell = $(`#${result_prefix}_res_${index}`);
+      const time_cell = $(`#${result_prefix}_res_time_${index}`);
+      const responded = !ret.res && ret.reachable;
+      const tone = ret.res ? 'bg-green' : (responded ? 'bg-yellow text-dark' : 'bg-red');
+      result_cell.empty().append($('<span>').addClass(`badge me-1 mb-1 ${tone}`)
+        .text(ret.res ? '是' : (responded ? '已响应' : '否')));
+      // Keep backend diagnostics visible and literal; HTTP 403 must not become
+      // an unexplained "No", and message/time fields must never execute HTML.
+      if (!ret.res && ret.msg) {
+        result_cell.append($('<div>').addClass('text-body small text-wrap text-break').text(ret.msg));
       }
+      time_cell.empty().append($('<span>').addClass(ret.res ? 'text-green' : (responded ? 'text-body' : 'text-red'))
+        .text(ret.time || '—'));
       callBack(true)
     });
   }

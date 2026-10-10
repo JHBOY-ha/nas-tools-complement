@@ -7,6 +7,8 @@ import re
 import shutil
 import tempfile
 import threading
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
+import requests
 import time
 import uuid
 from contextlib import nullcontext
@@ -17,6 +19,8 @@ from lxml import etree
 import log
 from app.conf import SiteConf
 from app.helper import OpenSubtitles
+from app.utils.isolated_network import current_deadline, network_operation
+from app.utils.isolated_io import isolated_stat
 from app.helper.subtitle_align import SubtitleAligner
 from app.helper.subtitle_health import SubtitleHealth
 from app.utils import RequestUtils, PathUtils, SystemUtils, StringUtils, ExceptionUtils
@@ -37,9 +41,10 @@ class Subtitle:
     _local_path = None
     _opensubtitles_enable = False
     _repair_lock = threading.RLock()
-    # The client shares a login token; serialize check/search/download/publication
-    # so concurrent requests cannot spend quota for the same missing subtitle.
+    # Protect only in-flight claims and publication generations. Network work
+    # runs outside this lock; the client separately guards token/quota state.
     _opensubtitles_lock = threading.RLock()
+    _opensubtitles_publication_generation = 0
     _opensubtitles_download_limit = 20 * 1024 * 1024
     _opensubtitles_download_chunk = 64 * 1024
     _jellyfin_iso639_2 = {
@@ -340,7 +345,8 @@ class Subtitle:
                     path: (
                         copied_hashes.get(path)
                         if path != normalized_primary or not validation.get("normalized")
-                        else self.__file_sha256(path, cancel_check=cancel_check)
+                        else validation.get("content_hash")
+                        or self.__file_sha256(path, cancel_check=cancel_check)
                     )
                     for path in normalized_files
                 },
@@ -375,7 +381,9 @@ class Subtitle:
             if not self.__artifact_marker_valid(
                     align_manifest, aligned_inputs, [aligned_primary],
                     cancel_check=cancel_check):
-                self.__atomic_copy_file(normalized_primary, aligned_primary, cancel_check=cancel_check)
+                aligned_copy_hash = self.__atomic_copy_file(
+                    normalized_primary, aligned_primary, cancel_check=cancel_check
+                )
                 operation = heavy_operation("interactive") if heavy_operation else nullcontext()
                 with operation:
                     alignment = SubtitleAligner.align_subtitle(
@@ -405,8 +413,10 @@ class Subtitle:
                 align_manifest = {
                     "inputs": aligned_inputs,
                     "outputs": {
-                        aligned_primary: self.__file_sha256(
-                            aligned_primary, cancel_check=cancel_check
+                        aligned_primary: (
+                            alignment.get("output_hash")
+                            or (aligned_copy_hash if not alignment.get("applied") else None)
+                            or self.__file_sha256(aligned_primary, cancel_check=cancel_check)
                         )
                     },
                     "alignment": alignment
@@ -1125,8 +1135,11 @@ class Subtitle:
                                 os.path.dirname(subtitle_file),
                                 f".{os.path.basename(subtitle_file)}.subtitle-repair-old-{backup_token}"
                             )
-                            work_hash = self.__file_sha256(
-                                work_file, cancel_check=operation_abort
+                            # Normalization owns the work copy and returns a
+                            # digest of its final bytes; retain source retirement checks.
+                            work_hash = validation.get("content_hash") or (
+                                source_digest[0] if not validation.get("normalized")
+                                else self.__file_sha256(work_file, cancel_check=operation_abort)
                             )
                             work_identity = self.__file_identity(work_file)
                             retire_source(subtitle_file, backup_primary, source_snapshot)
@@ -1192,8 +1205,9 @@ class Subtitle:
                                 remove_created_targets()
                                 raise
                         else:
-                            target_hash = self.__file_sha256(
-                                work_file, cancel_check=operation_abort
+                            target_hash = validation.get("content_hash") or (
+                                source_digest[0] if not validation.get("normalized")
+                                else self.__file_sha256(work_file, cancel_check=operation_abort)
                             )
                             guard_path(target_subtitle)
                             created_primary = self.__publish_file_no_replace(
@@ -1510,6 +1524,14 @@ class Subtitle:
             return f"{primary}-{region}"
         return token
 
+    @staticmethod
+    def __has_script_matches(pattern, text, minimum):
+        """Stop threshold-only language checks without allocating all matches."""
+        for count, _ in enumerate(re.finditer(pattern, text), 1):
+            if count >= minimum:
+                return True
+        return False
+
     @classmethod
     def __infer_subtitle_language(cls, subtitle_file, validation=None):
         """在文件名没有语言标记时，从规范化后的字幕正文推断常见语言。"""
@@ -1536,9 +1558,9 @@ class Subtitle:
                 text = "\n".join(dialogue)
         text = re.sub(r"\{[^}]*}|<[^>]*>|\\[NnH]", " ", text)
 
-        if len(re.findall(r"[\u3040-\u30ff]", text)) >= 3:
+        if cls.__has_script_matches(r"[\u3040-\u30ff]", text, 3):
             return "jpn"
-        if len(re.findall(r"[\uac00-\ud7af]", text)) >= 3:
+        if cls.__has_script_matches(r"[\uac00-\ud7af]", text, 3):
             return "kor"
 
         chinese_chars = re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", text)
@@ -1547,17 +1569,17 @@ class Subtitle:
             simplified_hits = sum(char in cls._simplified_chinese_chars for char in chinese_chars)
             return "zh-TW" if traditional_hits > simplified_hits else "zh-CN"
 
-        if len(re.findall(r"[\u0400-\u04ff]", text)) >= 3:
+        if cls.__has_script_matches(r"[\u0400-\u04ff]", text, 3):
             return "rus"
-        if len(re.findall(r"[\u0370-\u03ff]", text)) >= 3:
+        if cls.__has_script_matches(r"[\u0370-\u03ff]", text, 3):
             return "gre"
-        if len(re.findall(r"[\u0590-\u05ff]", text)) >= 3:
+        if cls.__has_script_matches(r"[\u0590-\u05ff]", text, 3):
             return "heb"
-        if len(re.findall(r"[\u0600-\u06ff]", text)) >= 3:
+        if cls.__has_script_matches(r"[\u0600-\u06ff]", text, 3):
             return "ara"
-        if len(re.findall(r"[\u0e00-\u0e7f]", text)) >= 3:
+        if cls.__has_script_matches(r"[\u0e00-\u0e7f]", text, 3):
             return "tha"
-        if len(re.findall(r"[a-zA-Z]", text)) >= 20:
+        if cls.__has_script_matches(r"[a-zA-Z]", text, 20):
             return "eng"
         return ""
 
@@ -2205,7 +2227,7 @@ class Subtitle:
     def __subtitle_target(self, item, language):
         return "%s.%s.srt" % (item.get("file"), self.__subtitle_language_suffix(language))
 
-    def __existing_opensubtitles_target(self, item):
+    def __existing_opensubtitles_target(self, item, language_evidence=None):
         media_base = str(item.get("file") or "")
         media_dir = os.path.dirname(media_base) or "."
         media_name = os.path.basename(media_base)
@@ -2213,34 +2235,43 @@ class Subtitle:
         if "ze" in wanted:
             wanted.add("zh-cn")
         try:
-            for file_name in os.listdir(media_dir):
-                stem, extension = os.path.splitext(file_name)
-                if extension.lower() not in RMT_SUBEXT or not (
-                        stem == media_name or stem.startswith("%s." % media_name)):
-                    continue
-                target = os.path.join(media_dir, file_name)
-                if not os.path.isfile(target):
-                    continue
-                # Inspect language tags after the media name, never the title itself.
-                suffix = stem[len(media_name):].lower().replace("_", "-")
-                # Emby appends collision numbers to the language tag (zh-CN(1)).
-                tokens = {re.sub(r"\([0-9]+\)$", "", token)
-                          for token in suffix.strip(".").split(".")}
-                aliases = {"eng": "en", "english": "en",
-                           "zh-hans": "zh-cn", "chs": "zh-cn", "cn": "zh-cn",
-                           "zh-hant": "zh-tw", "cht": "zh-tw", "tw": "zh-tw",
-                           "ze": "zh-cn"}
-                languages = {aliases.get(token, token) for token in tokens}
-                if not languages.intersection({"zh-cn", "zh-tw"}) and tokens.intersection(
-                        {"zh", "chi", "zho", "chinese"}):
-                    languages.update({"zh-cn", "zh-tw"})
-                if stem == media_name:
-                    inferred = self.__infer_subtitle_language(target).lower()
-                    languages = {aliases.get(inferred, inferred)}
-                if languages.intersection(wanted):
-                    return target
+            # Stream directory entries so a matching subtitle can stop the
+            # traversal immediately without materializing every media filename.
+            with os.scandir(media_dir) as entries:
+                return self.__find_opensubtitles_target(entries, media_name, wanted, language_evidence)
         except OSError:
-            pass
+            return None
+
+    def __find_opensubtitles_target(self, entries, media_name, wanted, language_evidence):
+        for entry in entries:
+            file_name = entry.name
+            stem, extension = os.path.splitext(file_name)
+            if extension.lower() not in RMT_SUBEXT or not (
+                    stem == media_name or stem.startswith("%s." % media_name)):
+                continue
+            target = entry.path
+            if not entry.is_file():
+                continue
+            # Inspect language tags after the media name, never the title itself.
+            suffix = stem[len(media_name):].lower().replace("_", "-")
+            # Emby appends collision numbers to the language tag (zh-CN(1)).
+            tokens = {re.sub(r"\([0-9]+\)$", "", token)
+                      for token in suffix.strip(".").split(".")}
+            aliases = {"eng": "en", "english": "en",
+                       "zh-hans": "zh-cn", "chs": "zh-cn", "cn": "zh-cn",
+                       "zh-hant": "zh-tw", "cht": "zh-tw", "tw": "zh-tw",
+                       "ze": "zh-cn"}
+            languages = {aliases.get(token, token) for token in tokens}
+            if not languages.intersection({"zh-cn", "zh-tw"}) and tokens.intersection(
+                    {"zh", "chi", "zho", "chinese"}):
+                languages.update({"zh-cn", "zh-tw"})
+            if stem == media_name:
+                if language_evidence is not None:
+                    language_evidence.append((target, self.__opensubtitles_path_identity(target)))
+                inferred = self.__infer_subtitle_language(target).lower()
+                languages = {aliases.get(inferred, inferred)}
+            if languages.intersection(wanted):
+                return target
         return None
 
     @staticmethod
@@ -2293,10 +2324,11 @@ class Subtitle:
         for _ in range(2):
             response = None
             try:
-                response = RequestUtils(
-                    headers=headers, proxies=Config().get_proxies(), timeout=30,
-                    verify=True
-                ).get_res(link, allow_redirects=False, stream=True)
+                response = RequestUtils(headers=headers, proxies=Config().get_proxies(), timeout=30,
+                                        verify=True, isolated=True, deadline=current_deadline(),
+                                        max_bytes=self._opensubtitles_download_limit).get_res(
+                    link, allow_redirects=False, stream=True
+                )
                 if response is None:
                     continue
                 status = response.status_code
@@ -2330,6 +2362,10 @@ class Subtitle:
                 if valid:
                     return text, ""
                 break
+            except ValueError:
+                return None, '字幕临时链接内容超过 20 MiB 上限'
+            except requests.RequestException:
+                continue
             finally:
                 if response is not None:
                     try:
@@ -2351,6 +2387,8 @@ class Subtitle:
                 temp_target = subtitle_file.name
                 subtitle_file.write(text)
             self.__publish_file_no_replace(temp_target, target)
+            with self._opensubtitles_lock:
+                self._opensubtitles_publication_generation += 1
             return True, target
         except FileExistsError:
             return False, "字幕已由其他请求发布，未覆盖：%s" % target
@@ -2384,12 +2422,69 @@ class Subtitle:
             messages.append("%s：%s" % (item.get("name"), message))
         return all(success for success, _ in results), "；".join(messages)
 
-    def __download_opensubtitles_item(self, item, selected_file_id=None):
-        with self._opensubtitles_lock:
-            return self.__download_opensubtitles_item_locked(item, selected_file_id)
+    @staticmethod
+    def __opensubtitles_path_identity(path):
+        try:
+            current = isolated_stat(path)
+            return (current.st_dev, current.st_ino, current.st_size,
+                    current.st_mtime_ns, current.st_ctime_ns)
+        except OSError:
+            return None
 
-    def __download_opensubtitles_item_locked(self, item, selected_file_id=None):
-        existing = self.__existing_opensubtitles_target(item)
+    @network_operation
+    def __download_opensubtitles_item(self, item, selected_file_id=None):
+        key = os.path.normcase(os.path.abspath(str(item.get('file') or '')))
+        with self._opensubtitles_lock:
+            inflight = getattr(self, '_opensubtitles_inflight', None)
+            if inflight is None:
+                inflight = self._opensubtitles_inflight = {}
+            prior = inflight.get(key)
+            owner = prior is None
+            if owner:
+                prior = inflight[key] = Future()
+        if not owner:
+            try:
+                return prior.result(timeout=current_deadline().remaining())
+            except FutureTimeoutError:
+                return False, '现有字幕下载尚未完成，请稍后查看任务结果'
+        try:
+            result = self.__download_opensubtitles_claimed(item, selected_file_id)
+        except BaseException as error:
+            prior.set_exception(error)
+            raise
+        else:
+            prior.set_result(result)
+            return result
+        finally:
+            with self._opensubtitles_lock:
+                if inflight.get(key) is prior:
+                    inflight.pop(key, None)
+
+    def __download_opensubtitles_claimed(self, item, selected_file_id=None):
+        directory = os.path.dirname(str(item.get("file") or "")) or "."
+        # Directory traversal/language detection can wait on NAS. Perform the
+        # normal preflight before taking the shared API token/quota lock, then
+        # repeat only if a publication or directory change invalidated it.
+        generation = self._opensubtitles_publication_generation
+        languages = tuple(self.opensubtitles.languages)
+        identity = self.__opensubtitles_path_identity(directory)
+        evidence = []
+        existing = self.__existing_opensubtitles_target(item, language_evidence=evidence)
+        # The target claim prevents duplicate downloads while all directory
+        # evidence and API/content requests run outside the shared state lock.
+        prechecked = identity is not None and identity == self.__opensubtitles_path_identity(directory) \
+            and generation == self._opensubtitles_publication_generation \
+            and languages == tuple(self.opensubtitles.languages) \
+            and all(before is not None and before == self.__opensubtitles_path_identity(path)
+                    for path, before in evidence)
+        return self.__download_opensubtitles_item_locked(
+            item, selected_file_id, prechecked=prechecked, existing=existing
+        )
+
+    def __download_opensubtitles_item_locked(self, item, selected_file_id=None,
+                                            prechecked=False, existing=None):
+        if not prechecked:
+            existing = self.__existing_opensubtitles_target(item)
         if existing:
             return True, "字幕已存在：%s" % existing
         log.info("【Subtitle】开始通过OpenSubtitles.com API检索字幕：%s" % item.get("name"))

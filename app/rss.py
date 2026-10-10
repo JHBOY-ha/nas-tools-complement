@@ -299,12 +299,13 @@ class Rss:
                                       rss_no_exists=rss_no_exists)
 
     @staticmethod
-    def parse_rssxml(url):
+    def parse_rssxml(url, strict=False):
         """
         解析RSS订阅URL，获取RSS中的种子信息
         :param url: RSS地址
         :return: 种子信息列表
         """
+        # 默认保留历史列表契约；后台刷流通过 strict 区分失败与合法空结果。
         _special_title_sites = {
             'pt.keepfrds.com': RssTitleUtils.keepfriends_title
         }
@@ -312,23 +313,26 @@ class Rss:
         # 开始处理
         ret_array = []
         if not url:
-            return []
+            return None if strict else []
         site_domain = StringUtils.get_url_domain(url)
         try:
             ret = RequestUtils().get_res(url)
             if not ret:
-                return []
+                return None if strict else []
             ret.encoding = ret.apparent_encoding
         except Exception as e2:
             ExceptionUtils.exception_traceback(e2)
             log.console(str(e2))
-            return []
+            return None if strict else []
         if ret:
             ret_xml = ret.text
             try:
                 # 解析XML
                 dom_tree = xml.dom.minidom.parseString(ret_xml)
                 rootNode = dom_tree.documentElement
+                # 登录页等合法 XML 不能伪装成空 RSS 的成功结果。
+                if strict and rootNode.localName not in ("rss", "RDF"):
+                    return None
                 items = rootNode.getElementsByTagName("item")
                 for item in items:
                     try:
@@ -371,11 +375,13 @@ class Rss:
                                     'pubdate': pubdate}
                         ret_array.append(tmp_dict)
                     except Exception as e1:
+                        if strict:
+                            return None
                         ExceptionUtils.exception_traceback(e1)
                         continue
             except Exception as e2:
                 ExceptionUtils.exception_traceback(e2)
-                return ret_array
+                return None if strict else ret_array
         return ret_array
 
     def check_torrent_rss(self,

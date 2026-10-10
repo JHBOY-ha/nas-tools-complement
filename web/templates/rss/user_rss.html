@@ -719,6 +719,11 @@
   // 立即运行任务
   function run_userrss_now(id) {
     ajax_post("run_userrss", { "id": id }, function (ret) {
+      // 回调收到真实终态；失败、取消或未执行不能展示完成提示。
+      if (String(ret.code ?? ret.retcode) !== "0") {
+        show_fail_modal(ret.msg || ret.retmsg || "任务未完成，请查看后台操作结果");
+        return;
+      }
       show_success_modal("任务运行完成！", function () {
         window_history_refresh();
       });

@@ -23,6 +23,7 @@ from app.media.meta.recognition_rules import DEFAULT_EPISODE_MAPPINGS, DEFAULT_N
 from app.media.tmdbv3api import TMDb, Search, Movie, TV, Person, Find, TMDbException, Discover, Trending, Episode, Genre
 from app.utils import PathUtils, EpisodeFormat, RequestUtils, NumberUtils, StringUtils, cacheman
 from app.utils.types import MediaType, MatchMode
+from app.utils.security_utils import normalize_proxies
 from config import Config, KEYWORD_BLACKLIST, KEYWORD_SEARCH_WEIGHT_3, KEYWORD_SEARCH_WEIGHT_2, KEYWORD_SEARCH_WEIGHT_1, \
     KEYWORD_STR_SIMILARITY_THRESHOLD, KEYWORD_DIFF_SCORE_THRESHOLD, TMDB_IMAGE_ORIGINAL_URL, DEFAULT_TMDB_PROXY, \
     TMDB_IMAGE_FACE_URL, TMDB_PEOPLE_PROFILE_URL, TMDB_IMAGE_W500_URL, ANIME_GENREIDS
@@ -615,19 +616,34 @@ class Media:
             log.info("【Meta】%s 在TMDB中未找到媒体信息!" % file_media_name)
             return info
 
-    @lru_cache(maxsize=128)
     def __search_tmdb_web(self, file_media_name, mtype: MediaType):
         """
         检索TMDB网站，直接抓取结果，结果只有一条时才返回
         :param file_media_name: 名称
         """
+        # UA 纳入缓存键，保存新配置后可重试旧 UA 下缓存的失败结果。
+        return self.__search_tmdb_web_cached(file_media_name, mtype, Config().get_tmdb_web_ua())
+
+    @lru_cache(maxsize=128)
+    def __search_tmdb_web_cached(self, file_media_name, mtype: MediaType, user_agent):
         if not file_media_name:
             return None
         if StringUtils.is_chinese(file_media_name):
             return {}
         log.info("【Meta】正在从TheDbMovie网站查询：%s ..." % file_media_name)
-        tmdb_url = "https://www.themoviedb.org/search?query=%s" % file_media_name
-        res = RequestUtils(timeout=5).get_res(url=tmdb_url)
+        # Requests encodes only the query value, preserving &/#/+ in titles.
+        tmdb_url = "https://www.themoviedb.org/search"
+        # Website fallback must honor the same global proxy and request timeout
+        # as API recognition and the native website probe.
+        try:
+            proxies = normalize_proxies(Config().get_proxies())
+        except ValueError as err:
+            # Invalid explicit settings must not silently fall back to direct access.
+            log.error(f"【Meta】TMDB 网页代理配置无效：{err}")
+            return None
+        # 与官网测试共用可选配置，留空时使用 Requests 默认 UA。
+        res = RequestUtils(headers=user_agent, proxies=proxies, timeout=TMDb.REQUEST_TIMEOUT).get_res(
+            url=tmdb_url, params={"query": file_media_name})
         if res and res.status_code == 200:
             html_text = res.text
             if not html_text:
@@ -666,7 +682,7 @@ class Media:
                 else:
                     log.info("【Meta】%s TMDB网站未查询到媒体信息！" % file_media_name)
             except Exception as err:
-                print(str(err))
+                log.error("【Meta】TMDB网页解析失败：%s" % str(err))
                 return None
         return None
 
@@ -2197,7 +2213,7 @@ class Media:
                         skipped.note["extra" if special["is_extra"] else "special_episode"] = special
                     skipped.skip_reason = "小数集识别失败，保留源文件：%s" % err
                     return_media_infos[file_path] = skipped
-                print(str(err))
+                # Keep the existing contextual log as the single error output.
                 log.error("【Rmt】发生错误：%s - %s" % (str(err), traceback.format_exc()))
         # 循环结束
         return return_media_infos
@@ -2212,7 +2228,8 @@ class Media:
         ret_infos = []
         for info in infos:
             tmdbid = info.get("id")
-            vote = round(float(info.get("vote_average")), 1) if info.get("vote_average") else 0,
+            # The API contract is a numeric score, including the missing-score case.
+            vote = round(float(info.get("vote_average")), 1) if info.get("vote_average") else 0
             image = TMDB_IMAGE_W500_URL % info.get("poster_path")
             overview = info.get("overview")
             if mtype:
@@ -2921,7 +2938,7 @@ class Media:
                     return []
                 return self.__dict_media_casts(self.tv.credits(tmdbid).get("cast"))
         except Exception as err:
-            print(str(err))
+            log.error("【Meta】演职人员查询失败：%s" % str(err))
         return []
 
     @staticmethod
@@ -2976,7 +2993,7 @@ class Media:
             else:
                 return self.genre.tv_list()
         except Exception as err:
-            print(str(err))
+            log.error("【Meta】媒体类型查询失败：%s" % str(err))
         return []
 
     @staticmethod
@@ -3310,7 +3327,7 @@ class Media:
         try:
             aka_names = self.person.details(person_id).get("also_known_as", []) or []
         except Exception as err:
-            print(str(err))
+            log.error("【Meta】人物中文名查询失败：%s" % str(err))
             return ""
         for aka_name in aka_names:
             if StringUtils.is_chinese(aka_name):
@@ -3333,7 +3350,7 @@ class Media:
             aka_names = self.person.details(person_id).get("also_known_as", []) or []
             return aka_names
         except Exception as err:
-            print(str(err))
+            log.error("【Meta】人物别名查询失败：%s" % str(err))
             return []
 
     def get_random_discover_backdrop(self):
@@ -3383,7 +3400,7 @@ class Media:
                 tmdbinfo = tmdbinfo[0]
                 return tmdbinfo.get("id")
         except Exception as err:
-            print(str(err))
+            log.error("【Meta】TMDB作品ID查询失败：%s" % str(err))
         return None
 
     @staticmethod

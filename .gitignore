@@ -37,3 +37,8 @@ docker/pm2.local.config.js
 
 # Local Codex preferences
 /.codex/config.toml
+
+# 本机验证结果与环境指纹由运行器生成，保留本地，不纳入版本控制。
+/docs/validation/
+docs/database-governance.md
+docs/deepseek-audit-reproduction.md
