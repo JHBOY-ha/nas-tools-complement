@@ -197,6 +197,33 @@ class SubtitleTaskManagerTest(TestCase):
         self.assertTrue(reused)
         self.assertEqual(duplicate["task_id"], task["task_id"])
 
+    def test_online_download_reuses_persisted_task_without_fetching_again(self):
+        self.manager.register_processor(
+            "upload", lambda manager, task_id: manager.finish_task(task_id, "succeeded", {"ok": True})
+        )
+        fetch = Mock(return_value=[_File("Movie.zh-cn.srt", SRT)])
+        task, reused = self.manager.submit_download_upload(
+            "user", fetch, self.payload(), request_id="online-ticket", server="emby"
+        )
+        self.assertFalse(reused)
+        self.wait_terminal(self.manager, task["task_id"])
+        duplicate, reused = self.manager.submit_download_upload(
+            "user", fetch, self.payload(), request_id="online-ticket", server="emby"
+        )
+        self.assertTrue(reused)
+        self.assertEqual(task["task_id"], duplicate["task_id"])
+        fetch.assert_called_once()
+        self.assertFalse(self.manager._admissions)
+
+    def test_online_download_queue_preflight_preserves_quota(self):
+        # Capacity rejection must happen before the remote download callback.
+        self.manager.start()
+        fetch = Mock()
+        with patch.object(self.manager, "acquire_upload_admission", side_effect=TaskQueueFull("队列已满")):
+            with self.assertRaises(TaskQueueFull):
+                self.manager.submit_download_upload("user", fetch, self.payload(), request_id="online-ticket")
+        fetch.assert_not_called()
+
     def test_queue_is_bounded_and_queued_cancel_cleans_staging(self):
         running = threading.Event()
         release = threading.Event()

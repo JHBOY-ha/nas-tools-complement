@@ -355,7 +355,11 @@ class OpenSubtitles:
         # OpenSubtitles canonicalizes unsorted GET parameters with HTTP 301.
         # Requests already encodes spaces as '+', as required by the API.
         params = dict(sorted(params.items()))
-        _, payload, error = self._request("GET", "/subtitles", params=params)
+        with self._state_lock:
+            authenticated = bool(self._token)
+        # The shared client may have switched to the VIP host after a manual
+        # download. That host requires its JWT on subsequent searches too.
+        _, payload, error = self._request("GET", "/subtitles", params=params, authenticated=authenticated)
         if error:
             return [], error
         return self._flatten_results(payload.get("data") or []), ""
@@ -434,8 +438,8 @@ class OpenSubtitles:
         ), reverse=True)
 
     @network_operation
-    def search_subtitles(self, item):
-        """Return ranked candidates without consuming a download quota."""
+    def search_subtitles(self, item, query=None):
+        """Return ranked candidates; explicit online queries can work without IMDb."""
         media_path = self._media_path(item)
         moviehash = self.calculate_moviehash(media_path)
         candidates = []
@@ -452,17 +456,19 @@ class OpenSubtitles:
 
         imdb_id = self._imdb_number(item.get("imdbid"))
         if item.get("type") == MediaType.TV:
-            if not imdb_id:
+            if not imdb_id and query is None:
                 return [], "电视剧缺少IMDb ID，无法准确检索字幕"
             params = {
-                "parent_imdb_id": imdb_id,
                 "season_number": item.get("season"),
                 "episode_number": item.get("episode"),
             }
+            # Only manual online searches may fall back to a title; automatic
+            # downloads retain their IMDb requirement and confidence checks.
+            params.update({"parent_imdb_id": imdb_id} if imdb_id else {"query": query})
         elif imdb_id:
             params = {"imdb_id": imdb_id}
         else:
-            params = {"query": item.get("name"), "year": item.get("year")}
+            params = {"query": query if query is not None else item.get("name"), "year": item.get("year")}
         candidates, error = self._search(params)
         if error:
             return [], error

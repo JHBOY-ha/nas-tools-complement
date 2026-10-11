@@ -1539,7 +1539,9 @@ def library_episodes():
 def _online_subtitle_service():
     from app.helper.online_subtitles import OnlineSubtitles
     config = Config().get_config("subtitle") or {}
-    return OnlineSubtitles((config.get("assrt") or {}).get("token"))
+    # Online/manual use shares saved credentials even if another automatic
+    # downloader is selected or the OpenSubtitles automatic switch is off.
+    return OnlineSubtitles((config.get("assrt") or {}).get("token"), opensubtitles=Subtitle().opensubtitles)
 
 
 def _online_subtitle_signer():
@@ -1595,17 +1597,22 @@ def library_online_subtitle_download():
         if payload.get("user") != str(current_user.get_id()):
             raise ValueError("搜索结果无效，请重新搜索")
         path = _online_subtitle_media_path(payload["path"])
-        name, content = _online_subtitle_service().files(payload["item"], data.get("member"))
-        if content is None:
-            return {"code": 0, "members": name}
+        quota_download = payload["item"].get("provider") == "opensubtitles"
+        if quota_download and data.get("confirm_quota") is not True:
+            raise ValueError("下载 OpenSubtitles 字幕将消耗一次账户配额，请确认后再下载")
+        if not quota_download:
+            name, content = _online_subtitle_service().files(payload["item"], data.get("member"))
+            if content is None:
+                return {"code": 0, "members": name}
         server = str((Config().get_config("media") or {}).get("media_server") or "emby").lower()
         if server not in ("emby", "jellyfin", "plex"):
             raise ValueError("全局影视服务器配置无效")
         # Reuse the master's bounded task pipeline: publication, validation,
         # targeted media refresh and SQLite status updates happen in its worker.
         manager = _subtitle_tasks()
-        manager.acquire_upload_admission(len(content))
-        admitted = True
+        if not quota_download:
+            manager.acquire_upload_admission(len(content))
+            admitted = True
         roots = _get_all_media_library_root_paths()
         authorization = _path_authorization_snapshot(path, roots)
         if not authorization:
@@ -1615,12 +1622,23 @@ def library_online_subtitle_download():
             "linked_target": True, "rmt_mode": "", "server": server, "align_mode": "none",
             "path_authorization": {"source": authorization, "target": authorization}
         }
-        identity = str(data.get("ticket") or "") + "\n" + str(data.get("member") or "")
+        # OpenSubtitles always returns one converted SRT, so irrelevant archive
+        # member input must not change its request identity and spend quota again.
+        identity = str(data.get("ticket") or "") + "\n" + ("" if quota_download else str(data.get("member") or ""))
+        request_id = "online-" + hashlib.sha256(identity.encode()).hexdigest()
+        if quota_download:
+            def download_files():
+                name, content = _online_subtitle_service().files(payload["item"])
+                return [FileStorage(stream=BytesIO(content), filename=name)]
+            task, reused = manager.submit_download_upload(
+                owner=_subtitle_task_owner(), files_factory=download_files, payload=task_payload,
+                server=server, request_id=request_id)
+            return _subtitle_task_response(task, reused, "字幕已下载并加入处理队列，可在任务中心查看进度")
         task, reused = manager.submit_upload(
             owner=_subtitle_task_owner(),
             files=[FileStorage(stream=BytesIO(content), filename=name)],
             payload=task_payload, server=server,
-            request_id="online-" + hashlib.sha256(identity.encode()).hexdigest())
+            request_id=request_id)
         return _subtitle_task_response(task, reused, "字幕已下载并加入处理队列，可在任务中心查看进度")
     except ValueError as error:
         return {"code": -1, "msg": str(error)}

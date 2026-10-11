@@ -246,6 +246,31 @@ class OpenSubtitlesApiTest(TestCase):
         self.assertIn("show+name", url)
         self.assertNotIn("%20", url)
 
+    def test_online_episode_query_fallback_keeps_automatic_imdb_requirement(self):
+        client = self._client()
+        item = {'type': self.module.MediaType.TV, 'file': 'missing', 'name': 'Show', 'season': 0, 'episode': 2}
+        with patch.object(client, 'calculate_moviehash', return_value=None), \
+                patch.object(client, '_search', return_value=([], '')) as search:
+            _, error = client.search_subtitles(item)
+            self.assertIn('IMDb', error)
+            search.assert_not_called()
+            _, error = client.search_subtitles(item, query='Show Special 1080p')
+        self.assertEqual(error, '')
+        search.assert_called_once_with({'season_number': 0, 'episode_number': 2, 'query': 'Show Special 1080p'})
+
+    def test_shared_vip_client_authenticates_subsequent_search_without_downloading(self):
+        client = self._client()
+        client._token = 'jwt-token'
+        client._base_url = 'https://vip-api.opensubtitles.com/api/v1'
+        transport = Mock()
+        transport.get_res.return_value = FakeResponse(payload={'data': []})
+        with patch.object(self.module, 'RequestUtils', return_value=transport) as request:
+            _, error = client._search({'query': 'Movie'})
+        self.assertEqual(error, '')
+        self.assertEqual(request.call_args.kwargs['headers']['Authorization'], 'Bearer jwt-token')
+        self.assertTrue(transport.get_res.call_args.args[0].startswith('https://vip-api.opensubtitles.com/'))
+        transport.post_res.assert_not_called()
+
     def test_hash_match_outranks_metadata_and_is_high_confidence(self):
         MediaType = self.module.MediaType
         client = self._client()

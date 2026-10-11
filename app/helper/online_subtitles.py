@@ -1,7 +1,7 @@
-"""Thunder / Assrt protocols based on MeiamSubtitles (Apache-2.0).
+"""Online subtitle sources, reusing the configured OpenSubtitles REST client.
 
-Reference: https://github.com/91270/MeiamSubtitles
-Implemented for NASTool; downloaded content is validated by Subtitle.upload_subtitle.
+Thunder / Assrt reference: https://github.com/91270/MeiamSubtitles (Apache-2.0).
+Downloaded content is published through the bounded subtitle task pipeline.
 """
 import hashlib
 import io
@@ -17,6 +17,8 @@ import requests
 import log
 from app.utils import ExceptionUtils
 from app.utils.isolated_network import bounded_request, resolve_addresses, current_deadline, network_operation
+from app.utils.types import MediaType
+from config import Config
 
 
 class SubtitleSourceError(ValueError):
@@ -27,8 +29,11 @@ class OnlineSubtitles:
     FORMATS = {"srt", "ass", "ssa", "vtt", "smi", "sub"}
     MAX_BYTES = 20 * 1024 * 1024
 
-    def __init__(self, token=""):
+    def __init__(self, token="", opensubtitles=None):
         self.token = str(token or "").strip()
+        # Share the configured client's JWT and quota admission with automatic
+        # downloads; manual searches do not depend on the automatic enable flag.
+        self.opensubtitles = opensubtitles
 
     @staticmethod
     def cid(path):
@@ -191,6 +196,8 @@ class OnlineSubtitles:
 
     @classmethod
     def match_result(cls, item, target):
+        if item.get("provider") == "opensubtitles":
+            return cls._match_opensubtitles(item, target)
         if item.get("hash_match"):
             return "文件特征匹配"
         text = " ".join(str(item.get(key) or "") for key in ("name", "video_name"))
@@ -214,6 +221,80 @@ class OnlineSubtitles:
         return "片名与年份匹配" if target["year"] in years else "片名匹配（年份未确认）"
 
     @classmethod
+    def _match_opensubtitles(cls, item, target):
+        """Use API identity/episode metadata even when release names are shortened."""
+        feature = item.get("feature") or {}
+        episode = "episode" in target
+        kind = str(feature.get("feature_type") or "").lower()
+        if kind and kind != ("episode" if episode else "movie"):
+            return ""
+        if episode:
+            # A hash hit must still respect explicit season/episode metadata.
+            for key in ("season", "episode"):
+                value = feature.get(key + "_number")
+                if value not in (None, ""):
+                    try:
+                        if int(value) != target[key]:
+                            return ""
+                    except (TypeError, ValueError):
+                        return ""
+        if item.get("hash_match"):
+            return "文件特征匹配"
+        if item.get("identity_match"):
+            return "剧名与季集匹配" if episode else "片名与年份匹配"
+        # Feature titles are authoritative search metadata; releases still
+        # participate when the API omits a parent title or episode numbers.
+        names = [item.get("name"), feature.get("parent_title"), feature.get("title"), feature.get("movie_name")]
+        if not any(cls._matches_title(name, target["titles"]) for name in names if name):
+            return ""
+        if episode:
+            try:
+                if int(feature.get("season_number")) == target["season"] \
+                        and int(feature.get("episode_number")) == target["episode"]:
+                    return "剧名与季集匹配"
+            except (TypeError, ValueError):
+                pass
+            return cls.match_result(dict(item, provider="", hash_match=False), target)
+        year = str(feature.get("year") or "")
+        if target["year"] and year:
+            return "片名与年份匹配" if year == target["year"] else ""
+        # Retain filename year/type validation when feature metadata is absent.
+        return cls.match_result(dict(item, provider="", hash_match=False,
+                                     video_name=next((name for name in names[1:] if name), "")), target)
+
+    def _search_opensubtitles(self, keyword, media_path, target, context):
+        client = self.opensubtitles
+        if client is None:
+            return [], "请在设置 → 字幕设置 → OpenSubtitles 中配置 API Key、用户名和密码"
+        configured, error = client.is_configured()
+        if not configured:
+            return [], error + "，请在设置 → 字幕设置 → OpenSubtitles 中配置"
+        context = context or {}
+        item = {"file": os.path.splitext(media_path)[0], "file_ext": os.path.splitext(media_path)[1],
+                "name": keyword, "year": target["year"],
+                "type": MediaType.TV if "episode" in target else MediaType.MOVIE,
+                "season": target.get("season"), "episode": target.get("episode"),
+                "imdbid": None if context.get("query_edited") else context.get("imdbid")}
+        candidates, error = client.search_subtitles(item, query=keyword)
+        if error:
+            return [], error
+        results, seen = [], set()
+        languages = {"zh-cn": "简体中文", "zh-tw": "繁体中文", "ze": "中英双语", "en": "英语"}
+        for candidate in candidates:
+            identity = str(candidate.get("file_id") or "")
+            if not identity or identity in seen:
+                continue
+            seen.add(identity)
+            language = candidate.get("language") or ""
+            results.append({"provider": "opensubtitles", "remote_id": identity,
+                            "name": candidate.get("release") or candidate.get("file_name") or keyword,
+                            "format": "srt", "language": languages.get(language, language or "未知"),
+                            "language_code": language, "hash_match": bool(candidate.get("moviehash_match")),
+                            "identity_match": bool(candidate.get("identity_match")),
+                            "feature": candidate.get("feature") or {}})
+        return results, ""
+
+    @classmethod
     def _member_matches(cls, name, target, parent_name):
         seasons, episodes = cls.episode_numbers(name)
         if not seasons:
@@ -226,7 +307,7 @@ class OnlineSubtitles:
 
     @network_operation
     def search(self, keyword, media_path, provider="all", context=None):
-        if provider not in ("all", "thunder", "assrt"):
+        if provider not in ("all", "thunder", "assrt", "opensubtitles"):
             raise ValueError("请选择有效的字幕来源")
         keyword = str(keyword or "").strip()
         if not keyword or len(keyword) > 200:
@@ -304,6 +385,14 @@ class OnlineSubtitles:
                                         "hash_match": False})
                 except (ValueError, TypeError, AttributeError):
                     warnings.append("Assrt 检索失败，请检查网络、Token 或接口配额")
+        if provider == "opensubtitles" or (provider == "all" and self.opensubtitles is not None):
+            try:
+                items, error = self._search_opensubtitles(keyword, media_path, target, context)
+                results.extend(items)
+                if error:
+                    warnings.append(error)
+            except (ValueError, TypeError, AttributeError, requests.RequestException):
+                warnings.append("OpenSubtitles 检索失败，请检查网络或账户配置")
         matched = []
         for item in results:
             label = self.match_result(item, target)
@@ -316,8 +405,12 @@ class OnlineSubtitles:
             warnings.append(f"已过滤 {rejected} 条片名、年份或季集不匹配／无法确认的结果")
         priorities = {"文件特征匹配": 4, "剧名与季集匹配": 3, "片名与年份匹配": 3,
                       "本季字幕包（需选择本集）": 2, "片名匹配（年份未确认）": 1}
-        matched.sort(key=lambda item: (priorities[item["match_label"]], "简体" in item["language"]), reverse=True)
-        limits = {"thunder": 20, "assrt": 15}
+        # The OpenSubtitles client has already applied the saved language
+        # preference; keep that order for equally matched manual candidates.
+        matched.sort(key=lambda item: (priorities[item["match_label"]],
+                                      0 if item["provider"] == "opensubtitles" else "简体" in item["language"]),
+                     reverse=True)
+        limits = {"thunder": 20, "assrt": 15, "opensubtitles": 20}
         selected = []
         for item in matched:
             if limits[item["provider"]] > 0:
@@ -339,7 +432,8 @@ class OnlineSubtitles:
             # Clash-style proxies resolve public hosts into this reserved Fake-IP range.
             # Only known provider domains may use it; LAN/loopback remain blocked.
             known_host = (parsed.hostname == "subtitle.v.geilijiasu.com" or parsed.hostname == "assrt.net"
-                          or parsed.hostname.endswith(".assrt.net"))
+                          or parsed.hostname.endswith(".assrt.net") or parsed.hostname == "opensubtitles.com"
+                          or parsed.hostname.endswith(".opensubtitles.com"))
             fake_ip_range = ipaddress.ip_network("198.18.0.0/15")
             for address in addresses:
                 ip = ipaddress.ip_address(address[4][0])
@@ -351,13 +445,13 @@ class OnlineSubtitles:
             raise ValueError("无法解析字幕下载地址") from None
 
     @network_operation
-    def _download(self, url):
+    def _download(self, url, proxies=None):
         https_fallback_used = False
         try:
             for _ in range(6):
                 self._check_url(url)
                 with bounded_request(url, deadline=current_deadline(), headers={"Referer": "https://assrt.net/", "User-Agent": "NASTool"},
-                                  stream=True, timeout=(5, 30), allow_redirects=False) as response:
+                                  stream=True, timeout=(5, 30), allow_redirects=False, proxies=proxies) as response:
                     if response.is_redirect:
                         url = urljoin(url, response.headers.get("Location", ""))
                         continue
@@ -418,7 +512,21 @@ class OnlineSubtitles:
         """Return choices for an archive, or a single selected file; never extract paths."""
         name = item["name"]
         url = item.get("url")
-        if item["provider"] == "assrt":
+        if item["provider"] == "opensubtitles":
+            if self.opensubtitles is None:
+                raise ValueError("请先配置 OpenSubtitles 账户")
+            configured, error = self.opensubtitles.is_configured(require_login=True)
+            if not configured:
+                raise ValueError(error)
+            payload, error = self.opensubtitles.download(item["remote_id"])
+            if error:
+                raise ValueError(error)
+            url = payload["link"]
+            # The API converts content to SRT. Keep the requested language in
+            # the filename so the existing upload processor names it correctly.
+            language = "zh-cn" if item.get("language_code") == "ze" else item.get("language_code") or "zh-cn"
+            name = os.path.splitext(name)[0] + "." + language + ".srt"
+        elif item["provider"] == "assrt":
             if not self.token:
                 raise ValueError("请先配置 Assrt API Token")
             data = self._json("https://api.assrt.net/v1/sub/detail", {"token": self.token, "id": item["remote_id"]})
@@ -426,7 +534,9 @@ class OnlineSubtitles:
             if data.get("status") != 0 or not subs or not subs[0].get("url"):
                 raise ValueError("Assrt 未返回下载地址，请重新搜索")
             url, name = subs[0]["url"], subs[0].get("filename") or name
-        content = self._download(url)
+        # OpenSubtitles file hosts must use the same configured proxy as its
+        # API client; other providers retain their existing environment policy.
+        content = self._download(url, proxies=Config().get_proxies()) if item["provider"] == "opensubtitles" else self._download(url)
         stream = io.BytesIO(content)
         archive = None
         if zipfile.is_zipfile(stream):

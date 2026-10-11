@@ -1232,7 +1232,8 @@ function open_library_online_movie(item_id) {
   const item = library_items_cache[item_id];
   if (item && item.target_path) {
     open_library_online_subtitles(item.title || item.original_title, item.target_path, {
-      title: item.title, original_title: item.original_title, year: item.year, media_type: "movie"
+      title: item.title, original_title: item.original_title, year: item.year, media_type: "movie",
+      imdbid: item.imdbid
     });
   }
 }
@@ -1246,7 +1247,7 @@ function open_library_online_episode(index) {
   $("#index-library-episodes-modal").modal("hide");
   open_library_online_subtitles(library_current_series_title, episode.path, {
     title: library_current_series_title, original_title: series.original_title, year: series.year,
-    media_type: "episode", season: episode.season, episode: episode.episode
+    media_type: "episode", season: episode.season, episode: episode.episode, imdbid: series.imdbid
   });
 }
 
@@ -1306,11 +1307,12 @@ function search_library_online_subtitles() {
       let html = (ret.warnings || []).map(function (warning) {
         return `<div class="alert alert-warning">${library_escape_html(warning)}</div>`;
       }).join("");
-      if (!library_online_results.length) { html += '<p class="text-muted">当前字幕源未返回符合目标片名和季集的字幕。可精简为单一片名检索，或配置 Assrt 后重试；请核对目标文件的季集编号。</p>'; }
+      if (!library_online_results.length) { html += '<p class="text-muted">当前字幕源未返回符合目标片名和季集的字幕。可精简为单一片名检索，或配置 Assrt / OpenSubtitles 后重试；请核对目标文件的季集编号。</p>'; }
       library_online_results.forEach(function (item, index) {
+        const provider = {thunder: "迅雷", assrt: "Assrt", opensubtitles: "OpenSubtitles"}[item.provider] || "未知来源";
         html += `<div class="border-bottom py-3">
           <div class="fw-bold text-break">${library_escape_html(item.name)}</div>
-          <div class="text-muted small mb-2">${item.provider === "thunder" ? "迅雷" : "Assrt"} · ${library_escape_html(item.language || "未知语言")} · ${library_escape_html(item.format)}  · ${library_escape_html(item.match_label || '')}</div>
+          <div class="text-muted small mb-2">${provider} · ${library_escape_html(item.language || "未知语言")} · ${library_escape_html(item.format)}  · ${library_escape_html(item.match_label || '')}</div>
           <div id="library_online_members_${index}"></div>
           <button type="button" class="btn btn-sm btn-primary library-online-download" onclick="download_library_online_subtitle(${index}, this)">下载并保存</button>
         </div>`;
@@ -1326,11 +1328,38 @@ function search_library_online_subtitles() {
   });
 }
 
-function download_library_online_subtitle(index, button) {
+function download_library_online_subtitle(index, button, quota_confirmed) {
   const item = library_online_results[index];
-  if (!item) { return; }
+  if (!item || $(button).prop("disabled") || $(button).data("confirming")) { return; }
   const generation = library_online_generation;
+  if (item.provider === "opensubtitles" && !quota_confirmed) {
+    // Serialize the existing Bootstrap dialogs so cancellation restores the
+    // search and neither focus trap is active behind the other dialog.
+    $(button).data("confirming", true).prop("disabled", true);
+    $("#library-online-subtitle-modal").one("hidden.bs.modal", function () {
+      if (generation !== library_online_generation) {
+        $(button).data("confirming", false).prop("disabled", false);
+        return;
+      }
+      let confirmed = false;
+      $("#system-confirm-modal").one("hidden.bs.modal", function () {
+        $(button).data("confirming", false).prop("disabled", false);
+        if (generation !== library_online_generation) { return; }
+        $("#library-online-subtitle-modal").one("shown.bs.modal", function () {
+          if (generation !== library_online_generation) { return; }
+          if (confirmed) { download_library_online_subtitle(index, button, true); }
+          else { $(button).trigger("focus"); }
+        }).modal("show");
+      });
+      show_confirm_modal("下载该 OpenSubtitles 字幕将消耗一次账户下载配额，是否下载并保存？", function () {
+        confirmed = true;
+        hide_confirm_modal();
+      });
+    }).modal("hide");
+    return;
+  }
   const payload = {ticket: item.ticket};
+  if (item.provider === "opensubtitles") { payload.confirm_quota = true; }
   const member = $(`#library_online_member_${index}`);
   if (member.length) { payload.member = member.val(); }
   $(".library-online-download").prop("disabled", true);

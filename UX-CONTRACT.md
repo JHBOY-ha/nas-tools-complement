@@ -79,6 +79,15 @@
 本次有意改变共享请求的完成时机，所有改造入口使用同一 owner。既有应用反馈弹窗保留；
 不新增浏览器 alert/confirm/prompt，不重做无关页面。
 
+## 字幕库在线字幕
+
+来源选择沿用 `rename/medialibrary.html` 的原生 select，接受系统弹出层的几何与键盘行为；
+结果、加载、错误与任务轮询复用 `media-library.js`、`subtitle-tasks.js` 和已有字幕接口。
+OpenSubtitles 搜索复用独立账户配置，下载前串行打开共享确认框说明一次配额消耗，取消后
+恢复搜索结果与按钮焦点。已签名的结果限定用户、视频和有效期；服务端先检查同一请求的
+已有任务并预留队列/空间，再申请下载链接，内容继续由统一字幕任务校验、保存及刷新。
+依据为 `app/helper/opensubtitles.py` 的搜索/下载协议及 `app/helper/subtitle_tasks.py` 的提交约束。
+
 ## 只读网络诊断
 
 以 `web/action.py::__net_test` 的响应为依据，`res` 继续表示测试目标可用。

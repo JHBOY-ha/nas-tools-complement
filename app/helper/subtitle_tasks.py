@@ -817,6 +817,27 @@ class SubtitleTaskManager:
                 with self._lock:
                     self._spooling_ids.discard(task_id)
 
+    def submit_download_upload(self, owner, files_factory, payload, request_id, server=None):
+        """Reuse a signed online request before performing a quota-consuming download."""
+        self.start()
+        owner = str(owner or "")
+        request_id = str(request_id or "").strip()
+        if not request_id:
+            raise SubtitleTaskError("在线字幕下载缺少请求编号")
+        # The reentrant per-owner lock also guards submit_upload. Concurrent
+        # retries cannot both download before their shared task is recorded.
+        with self._owner_submission(owner):
+            with self._lock:
+                prior = self._find_reusable(owner, "upload", request_id, None)
+                if prior:
+                    return self._task_dict(prior, include_result=True, include_items=True), True
+            token = self.acquire_upload_admission(reserve_factor=_STANDARD_STAGING_FACTOR)
+            try:
+                return self.submit_upload(owner=owner, files=files_factory(), payload=payload,
+                                          request_id=request_id, server=server)
+            finally:
+                self.release_upload_admission(token)
+
     def ensure_upload_admission(self, content_length=None):
         """Fail fast before Flask parses a multipart upload when resources are full.
 

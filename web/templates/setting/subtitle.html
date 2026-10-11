@@ -262,7 +262,8 @@
     <div class="modal-body">
       <p>迅雷无需配置。Assrt 按影片名称检索，需要 <a href="https://assrt.net/usercp.php" target="_blank" rel="noopener noreferrer">Assrt API Token</a>。</p>
       {# 复用统一问号与 tooltip；浮层挂在弹窗内避免遮挡，与输入框共用辅助说明。 #}
-      {% set online_subtitle_help = '迅雷无需配置；使用 Assrt 时，点击上方链接获取 API Token，填入后保存。使用入口：媒体整理 → 字幕库。电影点击“在线字幕”；电视剧、动漫先“选择剧集”，再点击“检索本集字幕”。可修改检索词并选择来源，检索后点击“下载并保存”；ZIP 包需选择匹配的字幕文件，暂不支持 RAR。下载进度在任务中心查看，完成后保存到视频旁，不覆盖已有字幕。视频须位于已配置的媒体库目录内且可读取；结果超过 30 分钟需重新检索。此配置不影响其他自动字幕下载器。' %}
+      {# OpenSubtitles 手动下载共用已有账户配置，不依赖自动下载器开关。 #}
+      {% set online_subtitle_help = '迅雷无需配置；使用 Assrt 时，点击上方链接获取 API Token，填入后保存；OpenSubtitles 在独立配置卡片中设置 API Key、账户和语言。使用入口：媒体整理 → 字幕库。电影点击“在线字幕”；电视剧、动漫先“选择剧集”，再点击“检索本集字幕”。可修改检索词并选择来源，检索后点击“下载并保存”；OpenSubtitles 需确认消耗一次下载配额，检索不消耗配额。ZIP 包需选择匹配的字幕文件，暂不支持 RAR。下载进度在任务中心查看，完成后保存到视频旁，不覆盖已有字幕。视频须位于已配置的媒体库目录内且可读取；结果超过 30 分钟需重新检索。此配置不影响其他自动字幕下载器。' %}
       <div class="form-label d-flex align-items-center gap-1">
         <label for="subtitle.assrt.token" class="mb-0">Assrt API Token</label>
         <button type="button" class="form-help subtitle-help border-0 p-0" data-bs-toggle="tooltip"
