@@ -85,12 +85,27 @@ def publish_exclusive(source, destination, mode, transfer, record):
         _publish_extra(source, destination, mode, transfer, record)
 
 
-def _publish_extra(source, destination, mode, transfer, record):
-    """The caller holds the destination lock until persistence and source cleanup."""
+def _publication_pending(source, destination):
+    """Derive the source-specific staging path shared by admission and recovery."""
     stat = os.stat(source)
     fingerprint = "%s:%s:%s" % (os.path.abspath(source), stat.st_size, stat.st_mtime_ns)
     token = hashlib.sha256(fingerprint.encode()).hexdigest()[:20]
-    pending = destination + "." + token + ".extra-pending"
+    return stat, os.path.abspath(destination) + "." + token + ".extra-pending"
+
+
+def has_pending_publication(source, destination):
+    """Route receipt candidates to the publisher; this does not authorize reuse.
+
+    Inode identities and bytes are still checked under the destination lock.
+    Even an invalid receipt must fail recovery instead of reporting a skip as success.
+    """
+    _, pending = _publication_pending(source, destination)
+    return os.path.lexists(pending) or os.path.lexists(pending + ".receipt")
+
+
+def _publish_extra(source, destination, mode, transfer, record):
+    """The caller holds the destination lock until persistence and source cleanup."""
+    stat, pending = _publication_pending(source, destination)
     receipt = pending + ".receipt"
     source_identity = [stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns]
     if os.path.lexists(destination):

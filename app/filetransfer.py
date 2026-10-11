@@ -764,7 +764,7 @@ class FileTransfer:
                         refresh_library_items.append(refresh)
                     continue
                 # 不启用洗版/强制整理时，按正式季集去重（包括已确认小数集）。
-                # 无历史记录的同 inode 重试仍由后续转移流程补写历史。
+                # 同 inode 的历史只证明媒体已发布，字幕可能仍待重试。
                 if rmt_mode == RmtMode.LINK and not udf_flag and not self._filesize_cover:
                     existing = self._existing_media_files(media)
                     already_exists = bool(existing) if media.type == MediaType.MOVIE else False
@@ -776,7 +776,8 @@ class FileTransfer:
                                 covered.update((s, e) for e in item.get_episode_list())
                         wanted = {(s, e) for s in media.get_season_list() for e in media.get_episode_list()}
                         already_exists = bool(wanted) and wanted.issubset(covered)
-                    if already_exists:
+                    same_source = any(os.path.samefile(file_item, path) for path, _ in existing)
+                    if already_exists and not same_source:
                         log.info("【Rmt】%s 已在媒体库其他路径入库，跳过重复硬链接" % file_name)
                         if self.dbhelper.insert_transfer_blacklist(file_item) is False:
                             success_flag = False
@@ -812,7 +813,12 @@ class FileTransfer:
                 new_file = ret_file_path
                 protected = any((media.note or {}).get(key, {}).get("status") == "confirmed"
                                 for key in ("fractional_episode", "special_episode"))
-                local_publication = (not bluray_disk_dir and not file_exist_flag and
+                from app.media.meta.extra_transfer import has_pending_publication
+                # Presence only selects recovery; publish_exclusive validates the
+                # source/target evidence under its lock before acknowledging history.
+                pending_publication = (not bluray_disk_dir and file_exist_flag
+                                       and has_pending_publication(file_item, ret_file_path))
+                local_publication = (not bluray_disk_dir and (not file_exist_flag or pending_publication) and
                                      rmt_mode in (RmtMode.LINK, RmtMode.COPY, RmtMode.MOVE, RmtMode.SOFTLINK))
                 record_during_publication = protected or local_publication
                 publication_recorded = False
@@ -836,8 +842,13 @@ class FileTransfer:
                             raise DatabaseWriteError('文件已落盘，记录未确认；请先核对，勿重复执行')
                     publication_recorded = True
                     return True
-                if protected and file_exist_flag and not os.path.samefile(file_item, ret_file_path):
+                if protected and file_exist_flag and not pending_publication and not os.path.samefile(file_item, ret_file_path):
                     raise ValueError("特殊集目标已存在不同文件，保留源文件")
+                if pending_publication and record_during_publication:
+                    # Feed the existing destination through exclusive publication,
+                    # not overwrite/skip or the subtitle-only same-inode shortcut.
+                    file_exist_flag = False
+                    ret_file_path = os.path.splitext(ret_file_path)[0]
                 # 已存在的文件数量
                 exist_filenum = 0
                 handler_flag = False
