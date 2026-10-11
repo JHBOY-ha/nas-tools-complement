@@ -2306,6 +2306,7 @@ class Subtitle:
     def __fetch_temporary_subtitle(self, link):
         """Read one HTTPS download through a strict 20 MiB streaming boundary.
 
+        Resolve bounded HTTPS redirects before counting a content attempt.
         Only transport/read failures and 5xx responses are transient.  Size,
         content-type, HTTP 4xx and subtitle-validation failures are final so a
         deterministic bad response is never fetched twice.
@@ -2321,7 +2322,9 @@ class Subtitle:
 
         headers = {"User-Agent": "NAS-Tools %s" % APP_VERSION, "Accept": "text/plain,*/*"}
         status = "N/A"
-        for _ in range(2):
+        attempts = 0
+        redirects = 0
+        while attempts < 2:
             response = None
             try:
                 response = RequestUtils(headers=headers, proxies=Config().get_proxies(), timeout=30,
@@ -2329,6 +2332,18 @@ class Subtitle:
                                         max_bytes=self._opensubtitles_download_limit).get_res(
                     link, allow_redirects=False, stream=True
                 )
+                if response is not None and response.status_code in OpenSubtitles.REDIRECT_STATUSES:
+                    target = OpenSubtitles.resolve_redirect(link, response.headers.get("Location"))
+                    if not target:
+                        return None, "字幕临时链接重定向地址不安全或缺失，已拒绝下载"
+                    if redirects >= OpenSubtitles.MAX_REDIRECTS:
+                        return None, "字幕临时链接重定向次数过多，已停止下载"
+                    # A CDN move only fetches content. Retain the destination
+                    # on retries without requesting another quota-bearing link.
+                    link = target
+                    redirects += 1
+                    continue
+                attempts += 1
                 if response is None:
                     continue
                 status = response.status_code
@@ -2365,6 +2380,7 @@ class Subtitle:
             except ValueError:
                 return None, '字幕临时链接内容超过 20 MiB 上限'
             except requests.RequestException:
+                attempts += 1
                 continue
             finally:
                 if response is not None:

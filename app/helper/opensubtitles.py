@@ -4,7 +4,7 @@ import struct
 import threading
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from difflib import SequenceMatcher
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 import requests
 
 from app.utils.http_utils import RequestUtils
@@ -26,6 +26,8 @@ class OpenSubtitles:
     API_ROOT = "https://api.opensubtitles.com/api/v1"
     DEFAULT_LANGUAGES = "zh-cn,ze,zh-tw"
     RELEASE_SIMILARITY_THRESHOLD = 0.75
+    MAX_REDIRECTS = 5
+    REDIRECT_STATUSES = (301, 302, 303, 307, 308)
     HASH_CHUNK_SIZE = 64 * 1024
     _MASK_64 = 0xFFFFFFFFFFFFFFFF
 
@@ -154,9 +156,28 @@ class OpenSubtitles:
         request = RequestUtils(headers=headers, proxies=Config().get_proxies(), timeout=15,
                                verify=True, isolated=True, deadline=current_deadline(),
                                max_bytes=4 * 1024 * 1024)
-        if method == 'POST':
-            return request.post_res(url, json=json_data, allow_redirects=False)
-        return request.get_res(url, params=params, allow_redirects=False)
+        for redirects in range(self.MAX_REDIRECTS + 1):
+            # Follow API moves explicitly: retain POST bodies/authentication,
+            # but never forward credentials to a different HTTPS origin.
+            if method == 'POST':
+                response = request.post_res(url, json=json_data, allow_redirects=False)
+            else:
+                response = request.get_res(url, params=params, allow_redirects=False)
+            if response is None or response.status_code not in self.REDIRECT_STATUSES \
+                    or redirects == self.MAX_REDIRECTS \
+                    or (method == 'POST' and response.status_code == 303):
+                return response
+            source_url = requests.Request(
+                method, url, params=params if method != 'POST' else None
+            ).prepare().url
+            target = self.resolve_redirect(source_url, response.headers.get('Location'), same_origin=True)
+            if not target:
+                return response
+            response.close()
+            url = target
+            # Location already contains the canonical query; do not append the
+            # original parameters a second time after a search-order redirect.
+            params = None
 
     @classmethod
     def _api_base_url(cls, value):
@@ -190,6 +211,32 @@ class OpenSubtitles:
             parsed.scheme.lower() == "https" and parsed.hostname
             and parsed.username is None and parsed.password is None
         )
+
+    @classmethod
+    def resolve_redirect(cls, url, location, same_origin=False):
+        """Resolve relative HTTPS redirects without downgrades or embedded credentials."""
+        location = str(location or '').strip()
+        if not location:
+            return None
+        try:
+            # urljoin repairs malformed absolute URLs such as https:///path;
+            # validate them first rather than silently inheriting the API host.
+            if urlsplit(location).scheme and not cls._https_url(location):
+                return None
+            target = urljoin(url, location)
+            if not cls._https_url(target):
+                return None
+            if same_origin:
+                source, destination = urlsplit(url), urlsplit(target)
+                # Only an omitted port defaults to 443; an explicit zero port
+                # must not be mistaken for the authenticated API's origin.
+                source_port = 443 if source.port is None else source.port
+                target_port = 443 if destination.port is None else destination.port
+                if (source.hostname, source_port) != (destination.hostname, target_port):
+                    return None
+            return target
+        except ValueError:
+            return None
 
     def _request(self, method, path, params=None, json_data=None, authenticated=False,
                  retry_server_error=True):
@@ -305,6 +352,9 @@ class OpenSubtitles:
             return [], error
         params = {key: value for key, value in params.items() if value not in (None, "")}
         params["languages"] = ",".join(sorted(self._languages))
+        # OpenSubtitles canonicalizes unsorted GET parameters with HTTP 301.
+        # Requests already encodes spaces as '+', as required by the API.
+        params = dict(sorted(params.items()))
         _, payload, error = self._request("GET", "/subtitles", params=params)
         if error:
             return [], error

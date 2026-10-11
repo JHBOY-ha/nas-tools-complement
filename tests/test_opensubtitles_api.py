@@ -218,6 +218,34 @@ class OpenSubtitlesApiTest(TestCase):
             "episode_number": 3,
         }], calls)
 
+    def test_search_sorts_hash_and_episode_parameters_for_api_canonical_urls(self):
+        client = self._client()
+        item = {
+            "type": self.module.MediaType.TV,
+            "file": "Show Name S02E03",
+            "file_ext": ".mkv",
+            "name": "Show Name",
+            "imdbid": "tt7654321",
+            "season": 2,
+            "episode": 3,
+        }
+        with patch.object(client, "calculate_moviehash", return_value="0123456789abcdef"), \
+                patch.object(client, "_raw_request", return_value=FakeResponse()) as request:
+            _, error = client.search_subtitles(item)
+
+        self.assertEqual("", error)
+        self.assertEqual(2, request.call_count)
+        for call in request.call_args_list:
+            # Both hash and metadata searches must avoid the API's query-order 301.
+            params = call.kwargs["params"]
+            self.assertEqual(sorted(params), list(params))
+            self.assertEqual("ze,zh-cn,zh-tw", params["languages"])
+        url = self.module.requests.Request(
+            "GET", client.API_ROOT + "/subtitles", params=request.call_args_list[0].kwargs["params"]
+        ).prepare().url
+        self.assertIn("show+name", url)
+        self.assertNotIn("%20", url)
+
     def test_hash_match_outranks_metadata_and_is_high_confidence(self):
         MediaType = self.module.MediaType
         client = self._client()
@@ -300,7 +328,7 @@ class OpenSubtitlesApiTest(TestCase):
         self.assertEqual("api-key", request_headers[0]["Api-Key"])
         self.assertEqual("Bearer jwt-token", request_headers[0]["Authorization"])
 
-    def test_api_requests_verify_tls_and_never_follow_redirects(self):
+    def test_api_transport_verifies_tls_and_leaves_redirect_validation_to_the_client(self):
         client = self._client()
         calls = []
 
@@ -320,6 +348,83 @@ class OpenSubtitlesApiTest(TestCase):
         self.assertTrue(ok, error)
         self.assertTrue(calls[0][1]["verify"])
         self.assertFalse(calls[1][1]["allow_redirects"])
+
+    def test_api_follows_same_origin_query_redirect_without_duplicating_parameters(self):
+        client = self._client()
+        redirect = FakeResponse(status_code=301, headers={
+            "Location": "?languages=zh-cn&query=Show+Name"
+        })
+        transport = Mock()
+        transport.get_res.side_effect = [redirect, FakeResponse(payload={"data": []})]
+        with patch.object(self.module, "RequestUtils", return_value=transport) as request:
+            _, _, error = client._request(
+                "GET", "/subtitles", params={"languages": "zh-cn", "query": "Show Name"}
+            )
+
+        self.assertEqual("", error)
+        self.assertEqual(2, transport.get_res.call_count)
+        last = transport.get_res.call_args
+        self.assertEqual(client.API_ROOT + "/subtitles?languages=zh-cn&query=Show+Name", last.args[0])
+        self.assertIsNone(last.kwargs["params"])
+        self.assertFalse(last.kwargs["allow_redirects"])
+        self.assertTrue(request.call_args.kwargs["verify"])
+        self.assertTrue(redirect.closed)
+
+    def test_api_download_redirect_preserves_post_body_and_authentication(self):
+        for status in (301, 302, 307, 308):
+            with self.subTest(status=status):
+                client = self._client()
+                client._token = "jwt-token"
+                redirect = FakeResponse(status_code=status, headers={"Location": "/api/v1/download/"})
+                transport = Mock()
+                transport.post_res.side_effect = [
+                    redirect, FakeResponse(payload={"link": "https://download.example/sub.srt"})
+                ]
+                with patch.object(self.module, "RequestUtils", return_value=transport) as request:
+                    payload, error = client.download(123)
+
+                self.assertEqual("", error)
+                self.assertEqual("https://download.example/sub.srt", payload["link"])
+                self.assertEqual(2, transport.post_res.call_count)
+                for call in transport.post_res.call_args_list:
+                    # Redirects must not silently turn a quota request into a GET.
+                    self.assertEqual({"file_id": 123, "sub_format": "srt"}, call.kwargs["json"])
+                    self.assertFalse(call.kwargs["allow_redirects"])
+                self.assertEqual(client.API_ROOT + "/download/", transport.post_res.call_args.args[0])
+                self.assertEqual("api-key", request.call_args.kwargs["headers"]["Api-Key"])
+                self.assertEqual("Bearer jwt-token", request.call_args.kwargs["headers"]["Authorization"])
+                transport.get_res.assert_not_called()
+                self.assertTrue(redirect.closed)
+
+    def test_api_redirect_does_not_forward_credentials_to_another_origin(self):
+        for target in (
+                "https://other.example/api/v1/download", "http://api.opensubtitles.com/api/v1/download",
+                "https://api.opensubtitles.com:444/api/v1/download",
+                "https://api.opensubtitles.com:0/api/v1/download",
+                "https://user:password@api.opensubtitles.com/api/v1/download", "https:///missing-host"):
+            with self.subTest(target=target):
+                client = self._client()
+                client._token = "jwt-token"
+                transport = Mock()
+                transport.post_res.return_value = FakeResponse(status_code=301, headers={"Location": target})
+                with patch.object(self.module, "RequestUtils", return_value=transport):
+                    payload, error = client.download(123)
+                self.assertIsNone(payload)
+                self.assertIn("HTTP 301", error)
+                self.assertEqual(1, transport.post_res.call_count)
+                transport.get_res.assert_not_called()
+
+    def test_api_redirects_have_a_finite_limit(self):
+        client = self._client()
+        responses = [FakeResponse(status_code=301, headers={"Location": "/api/v1/subtitles"})
+                     for _ in range(6)]
+        transport = Mock()
+        transport.get_res.side_effect = responses
+        with patch.object(self.module, "RequestUtils", return_value=transport):
+            _, _, error = client._request("GET", "/subtitles")
+        self.assertIn("HTTP 301", error)
+        self.assertEqual(6, transport.get_res.call_count)
+        self.assertTrue(all(response.closed for response in responses[:-1]))
 
     def test_login_rejects_insecure_or_hostless_base_url_and_clears_token(self):
         for base_url in ["http://api.opensubtitles.com", "https:///api/v1"]:
@@ -487,6 +592,118 @@ class OpenSubtitlesApiTest(TestCase):
         self.assertTrue(client.get_res.call_args.kwargs["stream"])
         self.assertFalse(client.get_res.call_args.kwargs["allow_redirects"])
         subtitle.opensubtitles.download.assert_not_called()
+
+    def test_temporary_link_follows_https_redirects_without_forwarding_api_credentials(self):
+        for status in (301, 302, 303, 307, 308):
+            with self.subTest(status=status):
+                subtitle = self._subtitle()
+                responses = [
+                    FakeResponse(status_code=status, headers={"Location": "/files/sub.srt"}),
+                    FakeResponse(status_code=302, headers={"Location": "https://cdn.example.test/sub.srt"}),
+                    FakeResponse(content=b"1\n00:00:01,000 --> 00:00:02,000\nHello\n"),
+                ]
+                transport = Mock()
+                transport.get_res.side_effect = responses
+                with patch.object(self.subtitle_module, "RequestUtils", return_value=transport) as request:
+                    text, error = subtitle._Subtitle__fetch_temporary_subtitle("https://example.test/sub")
+                self.assertEqual("", error)
+                self.assertIn("Hello", text)
+                self.assertEqual(["https://example.test/sub", "https://example.test/files/sub.srt",
+                                  "https://cdn.example.test/sub.srt"],
+                                 [call.args[0] for call in transport.get_res.call_args_list])
+                for call in request.call_args_list:
+                    self.assertTrue(call.kwargs["verify"])
+                    self.assertNotIn("Api-Key", call.kwargs["headers"])
+                    self.assertNotIn("Authorization", call.kwargs["headers"])
+                self.assertTrue(all(response.closed for response in responses))
+                subtitle.opensubtitles.download.assert_not_called()
+
+    def test_temporary_link_retries_the_redirect_destination_without_regenerating_a_link(self):
+        subtitle = self._subtitle()
+        responses = [
+            FakeResponse(status_code=301, headers={"Location": "/files/sub.srt"}),
+            FakeResponse(status_code=503),
+            FakeResponse(content=b"1\n00:00:01,000 --> 00:00:02,000\nHello\n"),
+        ]
+        transport = Mock()
+        transport.get_res.side_effect = responses
+        with patch.object(self.subtitle_module, "RequestUtils", return_value=transport):
+            text, error = subtitle._Subtitle__fetch_temporary_subtitle("https://example.test/sub")
+        self.assertEqual("", error)
+        self.assertIn("Hello", text)
+        self.assertEqual(["https://example.test/sub", "https://example.test/files/sub.srt",
+                          "https://example.test/files/sub.srt"],
+                         [call.args[0] for call in transport.get_res.call_args_list])
+        self.assertTrue(all(response.closed for response in responses))
+        subtitle.opensubtitles.download.assert_not_called()
+
+    def test_temporary_link_rejects_missing_or_unsafe_redirect_destinations(self):
+        for target in ("", "http://example.test/sub.srt", "file:///tmp/sub.srt", "https:///missing-host",
+                       "https://user:password@example.test/sub.srt", "https://example.test:invalid/sub.srt"):
+            with self.subTest(target=target):
+                subtitle = self._subtitle()
+                response = FakeResponse(status_code=301, headers={"Location": target})
+                transport = Mock()
+                transport.get_res.return_value = response
+                with patch.object(self.subtitle_module, "RequestUtils", return_value=transport):
+                    text, error = subtitle._Subtitle__fetch_temporary_subtitle("https://example.test/sub")
+                self.assertIsNone(text)
+                self.assertIn("重定向", error)
+                self.assertEqual(1, transport.get_res.call_count)
+                self.assertTrue(response.closed)
+
+    def test_temporary_link_redirects_have_a_finite_limit(self):
+        subtitle = self._subtitle()
+        responses = [FakeResponse(status_code=301, headers={"Location": "/sub"}) for _ in range(6)]
+        transport = Mock()
+        transport.get_res.side_effect = responses
+        with patch.object(self.subtitle_module, "RequestUtils", return_value=transport):
+            text, error = subtitle._Subtitle__fetch_temporary_subtitle("https://example.test/sub")
+        self.assertIsNone(text)
+        self.assertIn("重定向", error)
+        self.assertEqual(6, transport.get_res.call_count)
+        self.assertTrue(all(response.closed for response in responses))
+
+    def test_search_and_content_redirects_publish_subtitle_with_one_download_api_call(self):
+        subtitle = self._subtitle()
+        client = self._client()
+        client._token = "jwt-token"
+        subtitle.opensubtitles = client
+        content = "1\n00:00:01,000 --> 00:00:02,000\nHello\n"
+        responses = [
+            FakeResponse(status_code=301, headers={"Location": "?imdb_id=1234567&languages=ze,zh-cn,zh-tw"}),
+            FakeResponse(payload={"data": [{"attributes": {
+                "language": "zh-cn", "release": "Movie.2026.1080p-GROUP",
+                "feature_details": {"feature_type": "movie", "imdb_id": 1234567},
+                "files": [{"file_id": 42}],
+            }}]}),
+            FakeResponse(status_code=301, headers={"Location": "https://cdn.example.test/sub.srt"}),
+            FakeResponse(status_code=503),
+            FakeResponse(content=content.encode("utf-8")),
+        ]
+        transport = Mock()
+        transport.get_res.side_effect = responses
+        transport.post_res.return_value = FakeResponse(payload={
+            "link": "https://example.test/sub", "remaining": 4
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory) / "Movie.2026.1080p-GROUP"
+            item = {"type": self.module.MediaType.MOVIE, "file": str(base), "file_ext": ".mkv",
+                    "name": "Movie", "imdbid": "tt1234567"}
+            # Exercise both real client stages and publication; only the HTTP
+            # boundary is fake, so any second quota request is observable.
+            with patch.object(client, "calculate_moviehash", return_value=None), \
+                    patch.object(self.module, "RequestUtils", return_value=transport), \
+                    patch.object(self.subtitle_module, "RequestUtils", return_value=transport):
+                ok, message = subtitle.download_subtitle([item])
+            self.assertTrue(ok, message)
+            self.assertEqual(content, Path(str(base) + ".chi.zh-cn.srt").read_text(encoding="utf-8"))
+
+        transport.post_res.assert_called_once_with(
+            client.API_ROOT + "/download", json={"file_id": 42, "sub_format": "srt"}, allow_redirects=False
+        )
+        self.assertEqual(5, transport.get_res.call_count)
+        self.assertTrue(all(response.closed for response in responses if response.status_code != 200))
 
     def test_temporary_link_declared_oversize_closes_without_retry(self):
         subtitle = self._subtitle()
