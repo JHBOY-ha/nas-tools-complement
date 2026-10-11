@@ -205,6 +205,54 @@ body, .page {
     min-height: 0;
 }
 
+/* 仅文件管理使用可视区高度；扣除共享页头的 51px、page-body 外边距与安全区。 */
+.mediafile-browser {
+    height: calc(100vh - 51px - 2.5rem - env(safe-area-inset-top) - var(--safe-area-inset-top) - env(safe-area-inset-bottom));
+    height: calc(100dvh - 51px - 2.5rem - env(safe-area-inset-top) - var(--safe-area-inset-top) - env(safe-area-inset-bottom));
+    min-height: 0;
+}
+
+/* 完整的收缩链避免长目录撑高另一栏；窄屏继续复用现有的目录/文件切换。 */
+.mediafile-layout {
+    flex: 1;
+    flex-wrap: nowrap;
+    min-height: 0;
+}
+
+.mediafile-panel {
+    height: 100%;
+    min-height: 0;
+    min-width: 0;
+}
+
+.mediafile-directory,
+.mediafile-files {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 0;
+}
+
+.mediafile-directory-header,
+.mediafile-toolbar {
+    flex: 0 0 auto;
+}
+
+/* 两个原生滚动区域继承全局滚动条样式，边界滚动不会传递给页面。 */
+.mediafile-scroll {
+    flex: 1 1 auto;
+    min-height: 0;
+    min-width: 0;
+    overflow: auto;
+    overscroll-behavior: contain;
+    scrollbar-gutter: stable;
+}
+
+.mediafile-scroll:focus-visible {
+    outline: 2px solid var(--tblr-primary);
+    outline-offset: -2px;
+}
+
 .lit-library-result-bar {
     min-height: 2rem;
     display: flex;

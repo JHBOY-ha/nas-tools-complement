@@ -1,57 +1,63 @@
 {% import 'macro/svg.html' as SVG %}
 <div class="page-body">
   <div class="container-xl">
-    <div class="card bg-transparent border-0">
+    <div class="card bg-transparent border-0 mediafile-browser">
       <div class="ribbon ribbon-top g-cyan d-md-none">
         <a class="text-white" href="javascript:js_change_card()">
           切换
         </a>
       </div>
-      <div class="row g-0">
-        <div class="col-md-4 border-end js-change-card-a">
-          <div class="card-body">
-            <h4 class="subheader">目录</h4>
-            <div class="input-icon mb-2">
-              <span class="input-icon-addon">
-                {{ SVG.folders() }}
-              </span>
-              <input type="text" id="mediafile_path" value="{{ Dir }}" class="form-control" placeholder="/"
-                     aria-label="目录路径">
+      <div class="row g-0 mediafile-layout">
+        <div class="col-md-4 d-md-block border-end js-change-card-a mediafile-panel">
+          <div class="card-body mediafile-directory">
+            <!-- 路径与返回入口保持可见，长目录只在树区域内滚动。 -->
+            <div class="mediafile-directory-header">
+              <h4 class="subheader">目录</h4>
+              <div class="input-icon mb-2">
+                <span class="input-icon-addon">
+                  {{ SVG.folders() }}
+                </span>
+                <input type="text" id="mediafile_path" value="{{ Dir }}" class="form-control" placeholder="/"
+                       aria-label="目录路径">
+              </div>
+              <a href="javascript:return_to_parentdir()">
+                {{ SVG.arrow_back_up() }}
+                上级目录
+              </a>
             </div>
-            <a href="javascript:return_to_parentdir()">
-              {{ SVG.arrow_back_up() }}
-              上级目录
-            </a>
-            <div id="mediafile_tree"></div>
+            <div id="mediafile_tree" class="mediafile-scroll" tabindex="0" role="region" aria-label="文件夹目录"></div>
           </div>
         </div>
-        <div class="col d-md-block js-change-card-b" style="display: none;">
-          <div class="card-body border-0">
-            <div class="d-flex flex-column flex-md-row justify-content-md-between">
-              <div class="text-muted align-self-center">
-                共 <span id="mediafile_num">0</span> 个文件
-              </div>
-              <div class="align-self-center">
-                <button type="button" class="btn mediafile-task-action" data-subtitle-task-center aria-label="打开字幕任务中心">
-                  {{ SVG.check() }}
-                  字幕任务
-                  <span class="badge bg-primary text-white d-none" data-subtitle-task-count>0</span>
-                </button>
-                <a href="javascript:mediafile_transfer_all()" class="btn" title="转移当前目录">
-                  {{ SVG.transform() }}
-                  转移目录
-                </a>
-                <a href="javascript:mediafile_findlinks_all()" class="btn" title="查询所有文件硬链接">
-                  {{ SVG.link() }}
-                  所有硬链接
-                </a>
+        <div class="col d-md-block js-change-card-b mediafile-panel" style="display: none;">
+          <div class="mediafile-files">
+            <div class="card-body border-0 mediafile-toolbar">
+              <div class="d-flex flex-column flex-md-row justify-content-md-between">
+                <div class="text-muted align-self-center">
+                  共 <span id="mediafile_num">0</span> 个文件
+                </div>
+                <div class="align-self-center">
+                  <button type="button" class="btn mediafile-task-action" data-subtitle-task-center aria-label="打开字幕任务中心">
+                    {{ SVG.check() }}
+                    字幕任务
+                    <span class="badge bg-primary text-white d-none" data-subtitle-task-count>0</span>
+                  </button>
+                  <a href="javascript:mediafile_transfer_all()" class="btn" title="转移当前目录">
+                    {{ SVG.transform() }}
+                    转移目录
+                  </a>
+                  <a href="javascript:mediafile_findlinks_all()" class="btn" title="查询所有文件硬链接">
+                    {{ SVG.link() }}
+                    所有硬链接
+                  </a>
+                </div>
               </div>
             </div>
-          </div>
-          <div class="card-body border-0">
-            <input type="hidden" id="mediafile_current_dir">
-            <input type="hidden" id="mediafile_current_files">
-            <div class="d-grid gap-3" id="mediafile_file_container">
+            <!-- 文件区域独立滚动，切换目录不受左侧树的高度和滚动位置影响。 -->
+            <div class="card-body border-0 mediafile-scroll" id="mediafile_file_scroll" tabindex="0" role="region" aria-label="文件夹内容">
+              <input type="hidden" id="mediafile_current_dir">
+              <input type="hidden" id="mediafile_current_files">
+              <div class="d-grid gap-3" id="mediafile_file_container">
+              </div>
             </div>
           </div>
         </div>
@@ -191,12 +197,13 @@
 </div>
 <script type="text/javascript" src="../static/js/subtitle-tasks.js"></script>
 <script type="text/javascript">
-  const mediafile_config_media_server = "{{ MediaServerType or 'emby' }}".toLowerCase();
-  const mediafile_default_media_server = ["emby", "jellyfin", "plex"].includes(mediafile_config_media_server)
+  // SPA 会重复载入此脚本；内联操作依赖的全局状态使用 var，允许返回页面时重新初始化。
+  var mediafile_config_media_server = "{{ MediaServerType or 'emby' }}".toLowerCase();
+  var mediafile_default_media_server = ["emby", "jellyfin", "plex"].includes(mediafile_config_media_server)
       ? mediafile_config_media_server
       : "emby";
-  let mediafile_subtitle_upload_task_id = "";
-  let mediafile_subtitle_upload_request = null;
+  var mediafile_subtitle_upload_task_id = "";
+  var mediafile_subtitle_upload_request = null;
 
   SubtitleTasks.init();
 
@@ -214,6 +221,7 @@
 
   //刷新文件列表
   function refresh_files(folder) {
+    const folder_changed = folder && folder !== $("#mediafile_current_dir").val();
     if (folder) {
       $("#mediafile_current_dir").val(folder);
     } else {
@@ -241,6 +249,10 @@
           );
         $("#mediafile_current_files").val(JSON.stringify(files))
         }
+      }
+      // 新目录从首个文件开始展示；同目录刷新与目录树保留各自的滚动位置。
+      if (folder_changed) {
+        $("#mediafile_file_scroll").scrollTop(0);
       }
     });
   }
@@ -341,7 +353,8 @@
   }
 
   // 下载字幕
-  let subtitle_candidate_context = null;
+  // 候选上下文同样随页面载入重置，避免 SPA 返回时发生全局词法变量重复声明。
+  var subtitle_candidate_context = null;
 
   function mediafile_subtitle(name, id) {
     let path = $(`#mediafilepath_${id}`).val();

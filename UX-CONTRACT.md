@@ -16,7 +16,7 @@
 
 | Capability | Canonical owner | Source of truth | Allowed variants | Verification |
 |---|---|---|---|---|
-| Scrollbar | Tabler 与应用样式的原生滚动 | `web/static/css/tabler.min.css`、`DESIGN.md` | 自然文档滚动、结果模态框内部滚动 | 窄屏与键盘浏览器检查 |
+| Scrollbar | Tabler 与应用样式的原生滚动 | `web/static/css/tabler.min.css`、`web/static/css/style.css`、`DESIGN.md` | 自然文档滚动、结果模态框内部滚动、文件管理目录树与文件内容独立滚动 | 窄屏与键盘浏览器检查 |
 | Toast | 共享任务反馈与已有反馈模态框 | `web/static/js/action-tasks/client.js`、`web/templates/navigation.html` | 中性排队、成功、失败、结果未确认 | live region 与浏览器检查 |
 | CRUD | 共享请求及任务状态协议 | `web/static/js/util.js`、`web/static/js/action-tasks/client.js`、`web/action.py` | 接受、查询、取消排队、恢复读取 | Python 与浏览器全流程回归 |
 
