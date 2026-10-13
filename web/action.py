@@ -305,7 +305,7 @@ class WebAction:
             # Execute the service itself, not its former "thread started" ack.
             def function(_data):
                 result = service()
-                # 目录同步的 False 表示锁繁忙、未执行，不能转换成成功终态。
+                # 目录同步的 False 包括锁繁忙和逐文件/记录失败，均须保留失败终态。
                 if result is False:
                     return {'code': -1, 'retmsg': '服务未执行或执行失败，请查看日志后重试'}
                 return result or {'code': 0, 'retmsg': '服务执行结束'}
@@ -5145,7 +5145,8 @@ class WebAction:
         """
         执行单个目录的目录同步
         """
-        # 保留并发准入结果，避免被跳过的目录同步在任务中心显示成功。
+        # 与服务入口共用 Sync 的汇总结果；False 也可能是已经执行后的部分
+        # 失败，不能一律声称“未执行”，更不能让 ActionTasks 保存成功终态。
         if Sync().transfer_all_sync(sid=data.get("sid")) is False:
-            return {"code": -1, "msg": "已有目录同步正在进行，本次未执行，请稍后重试"}
+            return {"code": -1, "msg": "目录同步未完成：任务繁忙或部分文件处理失败，请查看日志后重试"}
         return {"code": 0, "msg": "执行成功"}

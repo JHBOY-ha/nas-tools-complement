@@ -763,27 +763,6 @@ class FileTransfer:
                     if refresh not in refresh_library_items:
                         refresh_library_items.append(refresh)
                     continue
-                # 不启用洗版/强制整理时，按正式季集去重（包括已确认小数集）。
-                # 同 inode 的历史只证明媒体已发布，字幕可能仍待重试。
-                if rmt_mode == RmtMode.LINK and not udf_flag and not self._filesize_cover:
-                    existing = self._existing_media_files(media)
-                    already_exists = bool(existing) if media.type == MediaType.MOVIE else False
-                    if media.type != MediaType.MOVIE and media.get_episode_list():
-                        covered = set()
-                        for _, season_episode in existing:
-                            item = MetaInfo(season_episode or '', mtype=MediaType.TV, use_llm=False)
-                            for s in item.get_season_list():
-                                covered.update((s, e) for e in item.get_episode_list())
-                        wanted = {(s, e) for s in media.get_season_list() for e in media.get_episode_list()}
-                        already_exists = bool(wanted) and wanted.issubset(covered)
-                    same_source = any(os.path.samefile(file_item, path) for path, _ in existing)
-                    if already_exists and not same_source:
-                        log.info("【Rmt】%s 已在媒体库其他路径入库，跳过重复硬链接" % file_name)
-                        if self.dbhelper.insert_transfer_blacklist(file_item) is False:
-                            success_flag = False
-                            failed_count += 1
-                            error_message = "防重复处理记录写入失败，等待重试"
-                        continue
                 # 当前文件大小
                 media.size = os.path.getsize(file_item)
                 # 目的目录，有输入target_dir时，往这个目录放
@@ -808,6 +787,29 @@ class FileTransfer:
 
                 # 判断文件是否已存在，返回：目录存在标志、目录名、文件存在标志、文件名
                 dir_exist_flag, ret_dir_path, file_exist_flag, ret_file_path = self.__is_media_exists(dist_path, media)
+                # 先解析本次目标，再判断是否允许补重试；其他目录中的同 inode
+                # 只证明已入库，不能让字幕重试绕过去重并重新发布到另一个目录。
+                if rmt_mode == RmtMode.LINK and not udf_flag and not self._filesize_cover:
+                    existing = self._existing_media_files(media)
+                    already_exists = bool(existing) if media.type == MediaType.MOVIE else False
+                    if media.type != MediaType.MOVIE and media.get_episode_list():
+                        covered = set()
+                        for _, season_episode in existing:
+                            item = MetaInfo(season_episode or '', mtype=MediaType.TV, use_llm=False)
+                            for s in item.get_season_list():
+                                covered.update((s, e) for e in item.get_episode_list())
+                        wanted = {(s, e) for s in media.get_season_list() for e in media.get_episode_list()}
+                        already_exists = bool(wanted) and wanted.issubset(covered)
+                    retry_target = file_exist_flag and os.path.samefile(file_item, ret_file_path)
+                    if already_exists and not retry_target:
+                        log.info("【Rmt】%s 已在媒体库其他路径入库，跳过重复硬链接" % file_name)
+                        if self.dbhelper.insert_transfer_blacklist(file_item) is False:
+                            success_flag = False
+                            failed_count += 1
+                            error_message = "防重复处理记录写入失败，等待重试"
+                        continue
+                    # 当前目标的同 inode 继续走下方字幕/历史补齐流程，只有完整
+                    # 成功后才写处理黑名单；没有历史的首次发布恢复也保留该路径。
                 # 新文件后缀
                 file_ext = os.path.splitext(file_item)[-1]
                 new_file = ret_file_path

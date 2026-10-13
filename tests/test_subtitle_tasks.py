@@ -96,10 +96,11 @@ class SubtitleTaskManagerTest(TestCase):
             staging_root=os.path.join(self.temp.name, "staging")
         )
         self._publication_engine = None
-        if self._testMethodName.startswith('test_post_publish'):
-            # Publication races need production-like independent connections.
-            # StaticPool shares one pysqlite statement cache across threads and
-            # can fail internally during concurrent session cleanup.
+        if self._testMethodName.startswith('test_post_publish') or self._testMethodName == \
+                'test_worker_recovers_when_exception_state_read_also_fails_once':
+            # 发布竞态和异常恢复都包含 worker 回滚与外部状态查询交错，需与
+            # 生产一样使用独立连接；StaticPool 共享同一 pysqlite 语句缓存，
+            # 并发清理会触发驱动内部 KeyError，掩盖真正要验证的恢复行为。
             db = self.manager._db
             db.engine.dispose()
             db.engine = create_engine('sqlite:///' + os.path.join(self.temp.name, 'publication.db'),

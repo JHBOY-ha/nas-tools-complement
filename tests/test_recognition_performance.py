@@ -212,6 +212,8 @@ class HttpCacheCountTest(unittest.TestCase):
         self.sdk.cache_clear()
         self.addCleanup(self.sdk.cache_clear)
         response = MagicMock()
+        # 真实 HTTP 边界先验证状态码再缓存；补齐响应契约，保留调用次数断言。
+        response.status_code = 200
         response.headers = {}
         response.json.return_value = {'id': 1, 'name': 'Show', 'genres': [], 'episodes': [],
                                       'alternative_titles': {'results': [{'iso_3166_1': 'CN', 'title': '作品'}]}}

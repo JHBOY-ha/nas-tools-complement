@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 class CompletionRegressionTest(TestCase):
     def test_sync_real_async_results(self):
         import web.action as module
+        import app.sync as sync_module
         from flask import Flask, g
         from flask_login import UserMixin
         from app.helper.action_tasks import ActionTasks
@@ -24,25 +25,42 @@ class CompletionRegressionTest(TestCase):
         user = Principal()
         app = Flask(__name__)
         app.secret_key = 'offline-test'
-        # Exercise admission, copied request context and the real completion callback.
+        # 保留准入、请求上下文、目录逐文件汇总及终态回调，只替换目录枚举和
+        # 文件操作边界。第一项失败、第二项成功，防止末项成功掩盖整批失败。
         for command, result, status, message in (
                 ('start_mediasync', True, 'succeeded', '执行结束'),
                 ('start_mediasync', False, 'failed', '同步失败'),
                 ('start_mediasync', None, 'failed', '未执行'),
+                ('run_directory_sync', False, 'failed', '目录同步未完成'),
+                ('run_directory_sync', True, 'succeeded', '执行成功'),
                 ('sch', False, 'failed', '服务未执行'),
-                ('sch', True, 'succeeded', '执行结束')):
+                ('sch', True, 'succeeded', '执行结束'),
+                ('sch', 'history_failure', 'failed', '服务未执行')):
             with self.subTest(command=command, result=result), tempfile.TemporaryDirectory() as root, ExitStack() as stack:
                 # Service selection constructs unrelated singleton services;
                 # mock those boundaries but retain real dispatch and completion.
                 for name in ('TorrentRemover', 'Downloader', 'Sites', 'Rss', 'DoubanSync', 'Subscribe'):
                     stack.enter_context(patch.object(module, name))
-                sync = stack.enter_context(patch.object(module, 'Sync'))
-                sync.return_value.transfer_all_sync.return_value = result
+                sync_type = sync_module.Sync.__closure__[0].cell_contents
+                sync = sync_type.__new__(sync_type)
+                sync.sync_dir_config = {'/test/source': {
+                    'id': 'source', 'target': '/test/target', 'onlylink': command == 'sch'}}
+                sync.filetransfer, sync.dbhelper = Mock(), Mock()
+                sync.filetransfer.transfer_media.side_effect = [(result is True, 'transfer result'), (True, '')]
+                sync.filetransfer.link_sync_file.side_effect = [(-1 if result is False else 0, ''), (0, '')]
+                sync.dbhelper.is_sync_in_history.return_value = False
+                sync.dbhelper.insert_sync_history.side_effect = [result != 'history_failure', True]
+                stack.enter_context(patch.object(module, 'Sync', return_value=sync))
+                paths = ['/test/source/first.mkv', '/test/source/second.mkv']
+                for listing in ('get_dir_files', 'get_dir_level1_medias'):
+                    stack.enter_context(patch.object(sync_module.PathUtils, listing, return_value=paths))
+                stack.enter_context(patch.object(sync_module.PathUtils, 'is_invalid_path', return_value=False))
                 executor = BoundedExecutor(1, 8, 'media-sync-test')
                 helper = SimpleNamespace(start_thread=lambda fn, args, **kw: executor.submit(fn, *args))
                 registry = ActionTasks.__closure__[0].cell_contents(root=root, helper=helper)
                 action = module.WebAction.__new__(module.WebAction)
-                action._actions = {command: Mock()}
+                action._actions = {command: action._WebAction__run_directory_sync
+                                   if command == 'run_directory_sync' else Mock()}
                 try:
                     with patch.object(module, 'ActionTasks', return_value=registry), \
                             patch.object(module, 'User') as users, \
@@ -52,7 +70,7 @@ class CompletionRegressionTest(TestCase):
                         with app.test_request_context('/do'):
                             g.api_user = user
                             g._login_user = user
-                            reply = action.action(command, {'item': 'sync'} if command == 'sch' else {})
+                            reply = action.action(command, {'item': 'sync'} if command == 'sch' else {'sid': 'source'})
                         self.assertTrue(reply['async'])
                         deadline = time.monotonic() + 3
                         while time.monotonic() < deadline:
@@ -64,7 +82,12 @@ class CompletionRegressionTest(TestCase):
                         self.assertEqual(record['result']['code'], 0 if result is True else -1)
                         self.assertIn(message, record['result'].get('msg') or record['result'].get('retmsg'))
                         if command == 'sch':
-                            sync.return_value.transfer_all_sync.assert_called_once()
+                            self.assertEqual(sync.filetransfer.link_sync_file.call_count, 2)
+                            saved = [call.args[0] for call in sync.dbhelper.insert_sync_history.call_args_list]
+                            self.assertEqual(saved, paths[1:] if result is False else paths)
+                        elif command == 'run_directory_sync':
+                            self.assertEqual([call.kwargs['in_path'] for call in
+                                              sync.filetransfer.transfer_media.call_args_list], paths)
                         else:
                             servers.return_value.sync_mediaserver.assert_called_once()
                 finally:
@@ -176,7 +199,8 @@ class CompletionRegressionTest(TestCase):
                         time.sleep(.01)
                     self.assertEqual(record['status'], 'failed')
                     self.assertNotEqual(record['result']['code'], 0)
-                    self.assertIn('本次未执行', record['result']['msg'])
+                    # False 现在同时表示繁忙或处理失败；枚举记录证明此次确实未执行。
+                    self.assertIn('目录同步未完成', record['result']['msg'])
                     self.assertEqual(scanned, ['/test/a'])
                     release.set()
                     # Wait for the first real task's terminal callback before
