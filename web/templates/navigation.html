@@ -695,9 +695,9 @@
             </div>
           </div>
         </div>
-        <form class="dropzone mt-2" id="torrent_files" action="/upload">
+        <form class="dropzone mt-2" id="torrent_files" action="/upload/torrent">
           <div class="fallback">
-            <input name="file" type="file" accept="*.zip" />
+            <input name="file" type="file" accept=".torrent" />
           </div>
           <div class="dz-message">
             <h3 class="dropzone-msg-title">上传种子文件</h3>
@@ -906,7 +906,7 @@
       if (refresh_fail_count < 5) {
         setTimeout("refresh_process('"+type+"')", 200);
       }
-    }, true, false);
+    }, true, false, null, 'global');
   }
 
   // 显示全局进度框
@@ -2240,7 +2240,7 @@
       if (refresh_logging_flag === true) {
         refresh_logging_timer = window.setTimeout("refresh_logging(true)", 2000);
       }
-    }, true, false);
+    }, true, false, null, 'global');
   }
 
   //暂停实时日志
@@ -2310,7 +2310,7 @@
         }
         setTimeout("refresh_message('" + lst_time + "')", 10000);
       }
-    }, true, false);
+    }, true, false, null, 'global');
   }
 
   //检查系统是否在线
@@ -2321,7 +2321,7 @@
         } else {
           setTimeout("check_system_online()", 1000);
         }
-      }, true, false)
+      }, true, false, null, 'global')
   }
 
   //注销
@@ -2468,6 +2468,10 @@
     // 初始化DropZone
     torrent_dropzone = new Dropzone("#torrent_files");
     torrent_dropzone.options.acceptedFiles = ".torrent";
+    // Use the server's exclusive staging name while retaining the display title.
+    torrent_dropzone.on('success', function(file, response) {
+      if (response.code === 0 && response.filename) file.upload.filename = response.filename;
+    });
 
     // 单选框事件
     $('input[type=radio][name=rename_type]').change(function () {

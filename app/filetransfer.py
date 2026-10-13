@@ -462,8 +462,10 @@ class FileTransfer:
             # MOVE sources and inode receipts survive a failed SQL commit.
             if not callable(record_callback):
                 raise ValueError('受保护发布缺少数据库确认回调')
-            publish_exclusive(file_item, new_file, rmt_mode, self.__transfer_command, record_callback)
-            return self.__transfer_subtitles(org_name=file_item, new_name=new_file, rmt_mode=rmt_mode)
+            # 字幕完成前保留发布凭据；失败后可复用媒体 inode，而非再次转移。
+            return publish_exclusive(file_item, new_file, rmt_mode, self.__transfer_command, record_callback,
+                                     finalize=lambda: self.__transfer_subtitles(
+                                         org_name=file_item, new_name=new_file, rmt_mode=rmt_mode))
         if not over_flag and os.path.exists(new_file):
             log.warn("【Rmt】文件已存在：%s" % new_file)
             return 0
@@ -547,6 +549,10 @@ class FileTransfer:
         # 开始进度
         self.progress.start('filetransfer')
 
+        # 配置错误必须阻止整批处理；下载器会把成功结果视为可删除源数据。
+        if getattr(self, '_ignore_config_error', ''):
+            return __finish_transfer(False, "忽略词配置无效，暂停整理直到配置修正")
+
         # Report invalid manual input before scanning files or starting any transfer.
         try:
             season = EpisodeFormat.normalize_season(season)
@@ -591,10 +597,14 @@ class FileTransfer:
                     # Explicit special clips can be smaller than the ordinary media limit.
                     extras_enabled = ((Config().get_config("media") or {}).get("extras") or {}).get("enabled") is True
                     # 查找目录下的文件
-                    file_list = PathUtils.get_dir_files(in_path=in_path,
-                                                        episode_format=episode[0],
-                                                        exts=RMT_MEDIAEXT,
-                                                        filesize=0)
+                    try:
+                        file_list = PathUtils.get_dir_files(in_path=in_path,
+                                                            episode_format=episode[0],
+                                                            exts=RMT_MEDIAEXT,
+                                                            filesize=0, raise_errors=True)
+                    except OSError as error:
+                        # os.walk 默认吞掉子目录访问错误；不能把扫描失败当成空目录成功。
+                        return __finish_transfer(False, "目录扫描失败：%s" % error)
                     def eligible(path):
                         try:
                             return (os.path.getsize(path) >= now_filesize
@@ -607,7 +617,9 @@ class FileTransfer:
                     if len(file_list) == 0:
                         log.warn("【Rmt】%s 目录下未找到媒体文件，当前最小文件大小限制为 %s"
                                  % (in_path, StringUtils.str_filesize(now_filesize)))
-                        return __finish_transfer(False,
+                        # 监控目录没有合格媒体是正常跳过；下载整理仍需失败，
+                        # 不能据此授权下载器删除尚未处理的源数据。
+                        return __finish_transfer(in_from == SyncType.MON,
                                                  "目录下未找到媒体文件，当前最小文件大小限制为 %s"
                                                  % StringUtils.str_filesize(now_filesize))
             # 传入的是个文件
@@ -787,6 +799,10 @@ class FileTransfer:
 
                 # 判断文件是否已存在，返回：目录存在标志、目录名、文件存在标志、文件名
                 dir_exist_flag, ret_dir_path, file_exist_flag, ret_file_path = self.__is_media_exists(dist_path, media)
+                from app.media.meta.extra_transfer import has_pending_publication
+                # 凭据跨进程/重启保留直到字幕完成；完整历史且无凭据才能去重。
+                pending_publication = (not bluray_disk_dir and file_exist_flag
+                                       and has_pending_publication(file_item, ret_file_path))
                 # 先解析本次目标，再判断是否允许补重试；其他目录中的同 inode
                 # 只证明已入库，不能让字幕重试绕过去重并重新发布到另一个目录。
                 if rmt_mode == RmtMode.LINK and not udf_flag and not self._filesize_cover:
@@ -800,26 +816,23 @@ class FileTransfer:
                                 covered.update((s, e) for e in item.get_episode_list())
                         wanted = {(s, e) for s in media.get_season_list() for e in media.get_episode_list()}
                         already_exists = bool(wanted) and wanted.issubset(covered)
-                    retry_target = file_exist_flag and os.path.samefile(file_item, ret_file_path)
-                    if already_exists and not retry_target:
+                    # 有凭据时交给发布器校验；目标被外部替换也必须报错，不能
+                    # 因已有历史而跳过验证并抹去待重试状态。
+                    if already_exists and not pending_publication:
                         log.info("【Rmt】%s 已在媒体库其他路径入库，跳过重复硬链接" % file_name)
                         if self.dbhelper.insert_transfer_blacklist(file_item) is False:
                             success_flag = False
                             failed_count += 1
                             error_message = "防重复处理记录写入失败，等待重试"
                         continue
-                    # 当前目标的同 inode 继续走下方字幕/历史补齐流程，只有完整
-                    # 成功后才写处理黑名单；没有历史的首次发布恢复也保留该路径。
+                    # 有待完成凭据或尚无历史时继续补重试；完整历史不重复刮削通知。
                 # 新文件后缀
                 file_ext = os.path.splitext(file_item)[-1]
                 new_file = ret_file_path
                 protected = any((media.note or {}).get(key, {}).get("status") == "confirmed"
                                 for key in ("fractional_episode", "special_episode"))
-                from app.media.meta.extra_transfer import has_pending_publication
                 # Presence only selects recovery; publish_exclusive validates the
                 # source/target evidence under its lock before acknowledging history.
-                pending_publication = (not bluray_disk_dir and file_exist_flag
-                                       and has_pending_publication(file_item, ret_file_path))
                 local_publication = (not bluray_disk_dir and (not file_exist_flag or pending_publication) and
                                      rmt_mode in (RmtMode.LINK, RmtMode.COPY, RmtMode.MOVE, RmtMode.SOFTLINK))
                 record_during_publication = protected or local_publication
@@ -1431,6 +1444,9 @@ class FileTransfer:
         :param sync_transfer_mode: 明确的转移方式
         """
         new_file = in_file.replace(src_path, target_dir)
+        # 纯链接同步同样不能把无效过滤配置记为成功的同步历史。
+        if getattr(self, '_ignore_config_error', ''):
+            return -1, "忽略词配置无效，暂停整理直到配置修正"
         new_file_list, msg = self.check_ignore(file_list=[new_file])
         if not new_file_list:
             return 0, msg

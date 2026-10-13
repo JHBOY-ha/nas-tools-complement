@@ -270,7 +270,8 @@
     const key = command + '\n' + JSON.stringify(canonical(JSON.parse(JSON.stringify(parameters || {}))));
     const long = commands.has(command) && (command !== 'special_confirmation' || (parameters || {}).stage === 'confirm');
     const origin = document.getElementById('page_content');
-    const view = origin && origin.firstElementChild;
+    // Shell polling survives navigation; page callbacks retain stale-view protection.
+    const view = options.scope === 'global' ? null : origin && origin.firstElementChild;
     if (long && inflight.has(key)) {
       const existing = inflight.get(key);
       existing.subscribe(view, handler, options);

@@ -36,6 +36,8 @@ STABILITY_MODULES = (
     # Worker bootstrap must bypass application startup in frozen builds too.
     "tests.test_worker_entrypoint",
     "tests.test_review_completion",
+    # Review fixes cover deletion authorization, upload boundaries and publication retries.
+    "tests.test_opus_review_fixes",
     # WAL itself has a mandatory fixed-runtime acceptance runner. These real
     # file/transaction/migration cases also run on the legacy DELETE fallback.
     "tests.test_database_governance",

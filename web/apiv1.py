@@ -8,7 +8,7 @@ from app.utils import TokenCache
 from config import Config
 from web.action import WebAction
 from web.backend.user import User
-from web.security import require_api_auth, api_permission_required, login_required, generate_access_token
+from web.security import require_api_auth, api_permission_required, login_required, generate_access_token, _authorization_token
 
 apiv1_bp = Blueprint("apiv1",
                      __name__,
@@ -917,14 +917,15 @@ class SystemUpdate(ClientResource):
 
 
 @system.route('/logout')
-class SystemUpdate(ClientResource):
+class SystemLogout(ClientResource):
 
     @staticmethod
     def post():
         """
         注销
         """
-        token = request.headers.get("Authorization", default=None)
+        # 与认证使用同一解析规则，原始 JWT 和 Bearer JWT 都撤销实际缓存键。
+        token = _authorization_token()
         if token:
             TokenCache.delete(token)
         return {

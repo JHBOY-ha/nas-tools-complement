@@ -17,8 +17,10 @@ const feedback = navigation.slice(navigation.indexOf('  function show_success_mo
       const url=new URL(route.request().url());
       if (url.pathname==='/') return route.fulfill({contentType:'text/html; charset=utf-8', body:`<!doctype html><html lang="zh-CN"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/static/css/tabler.min.css"><body><main class="container-xl"><button id="backup_btn" class="btn btn-primary">备份当前配置</button><button id="restore_btn" class="btn btn-outline-primary">恢复配置</button></main>
 ${['success','fail'].map(kind=>`<div id="system-${kind}-modal" class="modal" tabindex="-1" aria-labelledby="system_${kind}_message"><div class="modal-dialog"><div class="modal-content"><div class="modal-body" id="system_${kind}_message"></div><div class="modal-footer"><button id="system_${kind}_modal_btn" class="btn btn-primary" data-bs-dismiss="modal">关闭</button></div></div></div></div>`).join('')}
-<script src="/static/js/jquery-3.3.1.min.js"></script><script src="/static/js/tabler.min.js"></script><script src="/static/js/nprogress.js"></script><script src="/static/js/util.js"></script><script>window.backup_dropzone={files:[{name:'backup.zip'}]}; window.FailureCount=0; ${feedback}; ${handlers};</script></body></html>`});
+<script src="/static/js/jquery-3.3.1.min.js"></script><script src="/static/js/tabler.min.js"></script><script src="/static/js/nprogress.js"></script><script src="/static/js/util.js"></script><script>window.backup_dropzone={files:[{name:'backup.zip',status:'success',serverFilename:'upload-private-backup.zip'}]}; window.FailureCount=0; ${feedback}; ${handlers};</script></body></html>`});
       if (url.pathname==='/do') {
+        // The restore action must consume the server allocation, not the display name.
+        assert.equal(JSON.parse(new URLSearchParams(route.request().postData()).get('data')).file_name, 'upload-private-backup.zip');
         restores+=1;
         await new Promise(resolve=>setTimeout(resolve,200));
         if (restoreMode==='offline') return route.abort('connectionfailed');

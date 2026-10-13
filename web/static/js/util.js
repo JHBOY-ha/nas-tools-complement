@@ -3,7 +3,7 @@
 NProgress.configure({ showSpinner: false });
 
 // Ajax主方法
-function ajax_post(cmd, params, handler, aync=true, show_progress=true, taskState=null) {
+function ajax_post(cmd, params, handler, aync=true, show_progress=true, taskState=null, scope='page') {
     if (show_progress) {
         NProgress.start();
     }
@@ -12,7 +12,8 @@ function ajax_post(cmd, params, handler, aync=true, show_progress=true, taskStat
     if (window.ActionTaskClient) {
         // Optional state notifications drive live progress without treating
         // acceptance as completion; existing terminal handlers stay unchanged.
-        return window.ActionTaskClient.request(cmd, params, handler, {async: aync, taskState,
+        // Global shell callbacks must not inherit the currently displayed page's lifetime.
+        return window.ActionTaskClient.request(cmd, params, handler, {async: aync, taskState, scope,
             accepted: function () { if (show_progress) NProgress.done(); }});
     }
     let data = {

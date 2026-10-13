@@ -57,6 +57,8 @@ from web.backend.wallpaper import get_login_wallpaper
 from web.backend.web_utils import WebUtils
 from web.backend.action_permissions import PAGE_ACTIONS, action_allowed
 from web.security import require_auth
+from html import escape
+from web.backend.uploads import save_upload, upload_directory
 
 # 配置文件锁
 ConfigLock = Lock()
@@ -1939,16 +1941,18 @@ def dirlist():
                 f = ff
             if os.path.isdir(ff):
                 r.append('<li class="directory collapsed"><a rel="%s/">%s</a></li>' % (
-                    ff.replace("\\", "/"), f.replace("\\", "/")))
+                    escape(ff.replace("\\", "/"), quote=True), escape(f.replace("\\", "/"))))
             else:
                 if ft != "HIDE_FILES_FILTER":
                     e = os.path.splitext(f)[1][1:]
                     r.append('<li class="file ext_%s"><a rel="%s">%s</a></li>' % (
-                        e, ff.replace("\\", "/"), f.replace("\\", "/")))
+                        escape(e, quote=True), escape(ff.replace("\\", "/"), quote=True),
+                        escape(f.replace("\\", "/"))))
         r.append('</ul>')
     except Exception as e:
         ExceptionUtils.exception_traceback(e)
-        r.append('加载路径失败: %s' % str(e))
+        # OS errors also contain user-supplied paths; they are text, never markup.
+        r.append('加载路径失败: %s' % escape(str(e)))
     r.append('</ul>')
     return make_response(''.join(r), 200)
 
@@ -2439,17 +2443,25 @@ def backup():
 @App.route('/upload', methods=['POST'])
 @login_required
 def upload():
+    """Backup staging remains administrator-only via PAGE_ACTIONS."""
+    return _save_web_upload('backup', '.zip')
+
+
+@App.route('/upload/torrent', methods=['POST'])
+@login_required
+def upload_torrent():
+    """Torrent intake uses download permission, independently of restore access."""
+    return _save_web_upload('torrent', '.torrent')
+
+
+def _save_web_upload(kind, extension):
     try:
-        files = request.files['file']
-        temp_path = Config().get_temp_path()
-        if not os.path.exists(temp_path):
-            os.makedirs(temp_path)
-        file_path = Path(temp_path) / files.filename
-        files.save(str(file_path))
-        return {"code": 0, "filepath": str(file_path)}
-    except Exception as e:
-        ExceptionUtils.exception_traceback(e)
-        return {"code": 1, "msg": str(e), "filepath": ""}
+        directory = upload_directory(Config().get_temp_path(), kind, current_user.get_id())
+        return save_upload(request.files['file'], directory, extension)
+    except (ValueError, KeyError):
+        return {"code": 1, "msg": "上传文件名或类型无效", "filepath": ""}, 400
+    except OSError:
+        return {"code": 1, "msg": "上传失败，请检查暂存目录", "filepath": ""}, 400
 
 
 def _get_all_media_library_root_paths():

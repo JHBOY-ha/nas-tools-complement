@@ -48,6 +48,7 @@ from app.utils import StringUtils, EpisodeFormat, RequestUtils, PathUtils, \
     SystemUtils, ExceptionUtils, Torrent
 from app.utils.types import RmtMode, OsType, SearchType, DownloaderType, SyncType, MediaType, MovieTypes, TvTypes
 from app.utils.security_utils import parse_episode_offset, parse_rule_dict, normalize_proxies, compile_ignore_pattern
+from web.backend.uploads import upload_directory, uploaded_path
 from app.utils.exclusive_publish import rename_exclusive
 from app.utils.workload import TaskQueueFull
 from app.helper.action_tasks import ActionTasks, COMMAND_TITLES
@@ -744,15 +745,22 @@ class WebAction:
 
         dl_dir = data.get("dl_dir")
         dl_setting = data.get("dl_setting")
-        files = data.get("files")
-        magnets = data.get("magnets")
+        files = data.get("files") or []
+        magnets = data.get("magnets") or []
         if not files and not magnets:
             return {"code": -1, "msg": "没有种子文件或磁链"}
-        for file_item in files:
-            if not file_item:
-                continue
-            file_name = file_item.get("upload", {}).get("filename")
-            file_path = os.path.join(Config().get_temp_path(), file_name)
+        # Validate the entire batch before adding downloads; clients cannot bypass
+        # upload confinement by submitting an absolute path or another user's name.
+        prepared = []
+        try:
+            owner = getattr(g, 'api_user', None) or current_user
+            directory = upload_directory(Config().get_temp_path(), 'torrent', owner.get_id())
+            for item in files:
+                name = item.get("upload", {}).get("filename")
+                prepared.append((item.get('name') or name, uploaded_path(directory, name, '.torrent')))
+        except (ValueError, AttributeError, TypeError):
+            return {"code": -1, "msg": "种子文件尚未上传成功或路径无效"}
+        for file_name, file_path in prepared:
             media_info = Media().get_media_info(title=file_name)
             __download(media_info, file_path)
         for magnet in magnets:
@@ -3053,11 +3061,15 @@ class WebAction:
         """Validate and stage a private restore; active database files stay open safely."""
         from app.db.backup import stage_restore
         from app.db.transactions import DatabaseBusy, DatabaseWriteError
-        filename = (data or {}).get('file_name')
-        if not isinstance(filename, str) or os.path.basename(filename) != filename or not filename.endswith('.zip'):
-            return {'code': 1, 'msg': '备份文件名无效'}
-        file_path = os.path.join(Config().get_temp_path(), filename)
-        if os.path.islink(file_path) or not os.path.isfile(file_path):
+        # Consume only this administrator's staged upload, never a client path.
+        try:
+            owner = getattr(g, 'api_user', None) or current_user
+            # The trusted integration key has the same restore authority as root;
+            # retain its REST workflow for backups uploaded by the administrator.
+            owner_id = '0' if getattr(g, 'api_key_authenticated', False) else owner.get_id()
+            directory = upload_directory(Config().get_temp_path(), 'backup', owner_id)
+            file_path = uploaded_path(directory, (data or {}).get('file_name'), '.zip')
+        except ValueError:
             return {'code': 1, 'msg': '备份文件不存在或路径无效'}
         try:
             return stage_restore(file_path, Config().get_config_path())

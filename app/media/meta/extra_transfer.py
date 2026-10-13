@@ -10,6 +10,7 @@ from app.utils.exclusive_publish import rename_exclusive
 from app.utils.workload import get_transfer_gate
 from app.utils.isolated_io import IsolatedIOTimeout, get_io_pool
 from app.utils.isolated_fs import fs_os as os, isolated_open as open
+from config import Config
 
 _publish_locks = {}
 _publish_locks_guard = Lock()
@@ -44,7 +45,14 @@ def _lock_destination(destination):
             get_io_pool('publication').session() as worker:
         # Keep the OS lock in a bounded child through persistence and source
         # cleanup; open/flock/NAS waits do not pin the application indefinitely.
-        token = worker.execute('lock', path=destination + '.extra-lock')
+        # 将永久锁放在共享配置目录，库中不再产生逐文件 .extra-lock。
+        # 使用真实父目录归一化符号链接别名；所有应用进程共用同一个锁 inode。
+        lock_root = os.path.join(Config().get_config_path(), 'publication-locks')
+        os.makedirs(lock_root, exist_ok=True)
+        key = os.path.normcase(os.path.join(os.path.realpath(os.path.dirname(destination)),
+                                           os.path.basename(destination)))
+        token = worker.execute('lock', path=os.path.join(
+            lock_root, hashlib.sha256(key.encode()).hexdigest() + '.lock'))
         try:
             yield
         finally:
@@ -70,7 +78,7 @@ def publish_extra(source, destination, mode, transfer, record):
     return publish_exclusive(source, destination, mode, transfer, record)
 
 
-def publish_exclusive(source, destination, mode, transfer, record):
+def publish_exclusive(source, destination, mode, transfer, record, finalize=None):
     """Shared protected publication for extras and evidence-bound episodes."""
     if mode not in (RmtMode.LINK, RmtMode.COPY, RmtMode.MOVE, RmtMode.SOFTLINK):
         raise ValueError("受保护内容仅支持本地硬链接、软链接、复制或移动，远程模式无法保证排他发布")
@@ -82,7 +90,7 @@ def publish_exclusive(source, destination, mode, transfer, record):
     # Reserve a future record slot before publication, without retaining the
     # SQLite writer lock while copying/hashing NAS files.
     with MainDb().reserve_write(), _lock_destination(destination):
-        _publish_extra(source, destination, mode, transfer, record)
+        return _publish_extra(source, destination, mode, transfer, record, finalize)
 
 
 def _publication_pending(source, destination):
@@ -103,7 +111,7 @@ def has_pending_publication(source, destination):
     return os.path.lexists(pending) or os.path.lexists(pending + ".receipt")
 
 
-def _publish_extra(source, destination, mode, transfer, record):
+def _publish_extra(source, destination, mode, transfer, record, finalize=None):
     """The caller holds the destination lock until persistence and source cleanup."""
     stat, pending = _publication_pending(source, destination)
     receipt = pending + ".receipt"
@@ -113,7 +121,7 @@ def _publish_extra(source, destination, mode, transfer, record):
         # A retained staging inode proves this exact source was published before a
         # database failure. Compare bytes for COPY/MOVE, never trust just the size.
         retry = (os.path.exists(pending) and os.path.samefile(pending, destination)
-                 and _compare(source, pending))
+                 and (os.path.samefile(source, pending) or _compare(source, pending)))
         if not same and not retry and os.path.isfile(receipt):
             # A no-replace rename consumes pending; its prewritten inode receipt survives crashes.
             with open(receipt, encoding="utf-8") as handle:
@@ -127,8 +135,16 @@ def _publish_extra(source, destination, mode, transfer, record):
     else:
         # Only an unpublished staging file may be discarded. A published inode is
         # an immutable retry receipt and is handled exclusively by the branch above.
-        if os.path.lexists(pending) and not _compare(source, pending):
+        if os.path.lexists(pending) and not (os.path.samefile(source, pending) or _compare(source, pending)):
             os.unlink(pending)
+        if mode == RmtMode.MOVE and not os.path.islink(source) and not os.path.lexists(pending):
+            # 同卷移动仅增加暂存硬链接，提交成功后移除源目录项，保留 inode
+            # 且不复制媒体字节。跨卷/不支持硬链接时才退回复制，失败仍保留源。
+            try:
+                os.link(source, pending)
+            except OSError as error:
+                if error.errno not in (errno.EXDEV, errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS, errno.EINVAL):
+                    raise
         if not os.path.lexists(pending):
             staging_mode = RmtMode.COPY if mode == RmtMode.MOVE else mode
             if staging_mode == RmtMode.COPY:
@@ -170,9 +186,16 @@ def _publish_extra(source, destination, mode, transfer, record):
     with MainDb().write_transaction():
         if record() is not True:
             raise OSError("Extras 已落盘但记录失败，保留源文件等待重试")
+    # 字幕 I/O 在 SQL 事务外执行。失败保留发布凭据（和 MOVE 源文件），
+    # 使重启后的同 inode 重试与已完整入库的文件有明确区别。
+    if finalize is not None:
+        result = finalize()
+        if result != 0:
+            return result
     if mode == RmtMode.MOVE and os.path.abspath(source) != os.path.abspath(destination):
         os.unlink(source)
     if os.path.lexists(pending):
         os.unlink(pending)
     if os.path.exists(receipt):
         os.unlink(receipt)
+    return 0

@@ -1,5 +1,7 @@
 """Offline special-content recognition and local extra publication regressions."""
 import importlib.util
+import errno
+from contextlib import contextmanager
 import os
 import shutil
 import subprocess
@@ -25,6 +27,19 @@ from app.media.meta.extra_transfer import publish_extra
 from app.utils.types import MediaType, RmtMode, SyncType, SearchType
 
 SAMPLE = '[Kamigami&VCB-Studio] Yahari Ore no Seishun Lovecome wa Machigatte Iru. [OVA][Ma10p_1080p][x265_flac].mkv'
+
+
+@contextmanager
+def move_copy_fallback(source):
+    """Exercise cross-volume MOVE copying even on the local single-volume fixture."""
+    from app.media.meta import extra_transfer
+    original = extra_transfer.os.link
+    def link(src, target, **kwargs):
+        if str(src) == str(source):
+            raise OSError(errno.EXDEV, 'simulated cross-volume move')
+        return original(src, target, **kwargs)
+    with patch.object(extra_transfer.os, 'link', side_effect=link):
+        yield
 
 
 class SpecialRecognitionTest(unittest.TestCase):
@@ -444,7 +459,7 @@ class ExtraTransferTest(unittest.TestCase):
                     if name == 'second-extra':
                         second_done.set()
 
-            with patch('app.filetransfer.SystemUtils.copy', side_effect=copy):
+            with patch('app.filetransfer.SystemUtils.copy', side_effect=copy), move_copy_fallback(source):
                 first = threading.Thread(target=run, name='first-extra')
                 second = threading.Thread(target=run, name='second-extra')
                 first.start()
@@ -493,9 +508,18 @@ else:
         script = '''
 import os
 import sys
+import errno
 from pathlib import Path
 from app.media.meta.extra_transfer import publish_extra
 from app.utils.types import RmtMode
+# Force the MOVE copy fallback; same-volume MOVE no longer calls the copier.
+from app.media.meta import extra_transfer
+original_link = extra_transfer.os.link
+def cross_volume_link(source, target, **kwargs):
+    if source == sys.argv[1]:
+        raise OSError(errno.EXDEV, 'simulated cross-volume move')
+    return original_link(source, target, **kwargs)
+extra_transfer.os.link = cross_volume_link
 def interrupted_copy(source, pending, mode):
     Path(pending).write_bytes(b'partial')
     os._exit(73)
@@ -517,17 +541,19 @@ publish_extra(sys.argv[1], sys.argv[2], RmtMode[sys.argv[3]], interrupted_copy, 
 
     def test_published_staging_receipt_is_never_rebuilt(self):
         dest = self.target / 'published.mkv'
-        with self.assertRaises(OSError):
-            publish_extra(str(self.source), str(dest), RmtMode.MOVE,
-                          self.t._FileTransfer__transfer_command, lambda: False)
-        dest.write_bytes(b'damaged published content')
-        record = MagicMock(return_value=True)
-        with self.assertRaises(ValueError):
-            publish_extra(str(self.source), str(dest), RmtMode.MOVE,
-                          self.t._FileTransfer__transfer_command, record)
-        self.assertEqual(b'damaged published content', dest.read_bytes())
-        self.assertEqual(b'extra-video', self.source.read_bytes())
-        record.assert_not_called()
+        # An independently copied destination can be damaged without changing source bytes.
+        with move_copy_fallback(self.source):
+            with self.assertRaises(OSError):
+                publish_extra(str(self.source), str(dest), RmtMode.MOVE,
+                              self.t._FileTransfer__transfer_command, lambda: False)
+            dest.write_bytes(b'damaged published content')
+            record = MagicMock(return_value=True)
+            with self.assertRaises(ValueError):
+                publish_extra(str(self.source), str(dest), RmtMode.MOVE,
+                              self.t._FileTransfer__transfer_command, record)
+            self.assertEqual(b'damaged published content', dest.read_bytes())
+            self.assertEqual(b'extra-video', self.source.read_bytes())
+            record.assert_not_called()
 
     def test_same_inode_retry_and_history_failure(self):
         self.t.dbhelper.insert_extra_transfer_history.return_value = False

@@ -423,10 +423,16 @@
     if (!backup_dropzone || !backup_dropzone.files || !backup_dropzone.files[0]) {
       return;
     }
+    // Restore consumes the successful server allocation, never an in-flight name.
+    const backupFile = backup_dropzone.files[backup_dropzone.files.length - 1];
+    if (backupFile.status !== 'success' || !backupFile.serverFilename) {
+      show_fail_modal('请等待备份上传成功后再恢复');
+      return;
+    }
     // Capture the trigger: AJAX callbacks do not retain the button as `this`.
     const restoreButton = $(this);
     restoreButton.text("恢复中...").attr("disabled", true).attr("aria-busy", "true");
-    ajax_post("restory_backup", { file_name: backup_dropzone.files[backup_dropzone.files.length - 1].name }, function (ret) {
+    ajax_post("restory_backup", { file_name: backupFile.serverFilename }, function (ret) {
       restoreButton.attr("disabled", false).attr("aria-busy", "false").text("恢复配置");
       $("#modal-backup").modal('hide');
       if (ret.code === 0) {
@@ -607,4 +613,8 @@
   // 初始化DropZone
   backup_dropzone = new Dropzone("#back_file");
   backup_dropzone.options.acceptedFiles = ".zip";
+  // Preserve the user's display name separately from the unique staged filename.
+  backup_dropzone.on('success', function(file, response) {
+    if (response.code === 0 && response.filename) file.serverFilename = response.filename;
+  });
 </script>

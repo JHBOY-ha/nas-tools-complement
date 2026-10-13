@@ -665,10 +665,11 @@ class HardlinkTests(unittest.TestCase):
             t.dbhelper.insert_transfer_blacklist.assert_called_once_with(str(source))
 
     def test_subtitle_failure_after_publication_retries_without_blacklisting(self):
+        from app.media.meta import extra_transfer
+        from app.utils.types import RmtMode
         self.ns['Subtitle'] = Mock()
-        # New-target admission evaluates all local transfer modes in the AST fixture.
-        self.ns['RmtMode'].COPY = 'copy'
-        self.ns['RmtMode'].SOFTLINK = 'softlink'
+        self.ns['RmtMode'] = RmtMode
+        self.mode = RmtMode.LINK
         t = self.transfer
         t.progress, t.message, t.threadhelper = Mock(), Mock(), Mock()
         t._filesize_cover = t._refresh_mediaserver = t._scraper_flag = t._movie_category_flag = False
@@ -686,21 +687,23 @@ class HardlinkTests(unittest.TestCase):
                   note={}, skip_reason=None, en_name='Film', cn_name='', begin_season=None,
                   begin_episode=None, imdb_id=None, set_tmdb_info=Mock(), tmdb_info={'id': 1},
                   get_title_string=lambda: 'Film (2026)')
-        def publish(source, target, _mode, _transfer, record):
-            # Mirror the publisher's durable media acknowledgement before subtitles.
+        # Execute the real publication receipt lifecycle, including subtitle failure.
+        self.ns['publish_exclusive'] = extra_transfer.publish_exclusive
+        def transfer(source, target, mode):
             os.link(source, target)
-            self.assertTrue(record())
-            rows.append(NS(DEST_PATH=str(Path(target).parent),
-                           DEST_FILENAME=Path(target).name, SEASON_EPISODE=''))
-            t.dbhelper.insert_transfer_blacklist.assert_not_called()
-        self.ns['publish_exclusive'] = publish
+            return 0
+        t._FileTransfer__transfer_command.side_effect = transfer
+        def record(**kwargs):
+            target = Path(kwargs['out_path'])
+            rows.append(NS(DEST_PATH=str(target.parent), DEST_FILENAME=target.name, SEASON_EPISODE=''))
+            return True
+        t.dbhelper.insert_transfer_history.side_effect = record
         with tempfile.TemporaryDirectory() as folder:
             source, target = Path(folder) / 'source.mkv', Path(folder) / 'target.mkv'
             source.write_bytes(b'media')
             t.media.get_media_info_on_files.return_value = {str(source): meta}
-            t._FileTransfer__is_media_exists = Mock(side_effect=[
-                (True, folder, False, str(target.with_suffix(''))),
-                (True, folder, True, str(target))])
+            t._FileTransfer__is_media_exists = lambda *_: (
+                True, folder, target.exists(), str(target if target.exists() else target.with_suffix('')))
             kwargs = dict(in_from='manual', in_path=str(source), files=[str(source)],
                           rmt_mode=self.mode, target_dir=folder)
             self.assertFalse(t.transfer_media(**kwargs)[0])
@@ -710,7 +713,14 @@ class HardlinkTests(unittest.TestCase):
             self.assertEqual(target.stat().st_ino, inode)
             self.assertEqual(t._FileTransfer__transfer_subtitles.call_count, 2)
             t.dbhelper.insert_transfer_blacklist.assert_called_once_with(str(source))
-            t._FileTransfer__transfer_command.assert_not_called()
+            t._FileTransfer__transfer_command.assert_called_once()
+            self.assertFalse(extra_transfer.has_pending_publication(str(source), str(target)))
+            # Even after a cache clear/re-submission, complete same-inode history
+            # must not repeat subtitles, metadata, scraping or notifications.
+            prior = (t.media.get_tmdb_info.call_count, t.message.send_transfer_movie_message.call_count)
+            self.assertTrue(t.transfer_media(**kwargs)[0])
+            self.assertEqual(t._FileTransfer__transfer_subtitles.call_count, 2)
+            self.assertEqual(prior, (t.media.get_tmdb_info.call_count, t.message.send_transfer_movie_message.call_count))
 
     def test_copy_move_pending_publication_recovers_before_existing_file_skip(self):
         import shutil
@@ -781,7 +791,11 @@ class HardlinkTests(unittest.TestCase):
                     self.assertEqual(target.read_bytes(), b'published content')
                     self.assertEqual(source.exists(), mode != RmtMode.MOVE)
                     self.assertEqual(list(Path(folder).glob('*.extra-pending*')), [])
-                    t._FileTransfer__transfer_command.assert_called_once()
+                    if mode == RmtMode.MOVE and receipt_kind == 'pending':
+                        # Same-volume MOVE preserves the inode without copying bytes.
+                        t._FileTransfer__transfer_command.assert_not_called()
+                    else:
+                        t._FileTransfer__transfer_command.assert_called_once()
                     t._FileTransfer__transfer_subtitles.assert_called_once()
                     t.dbhelper.insert_transfer_blacklist.assert_called_once_with(str(source))
 

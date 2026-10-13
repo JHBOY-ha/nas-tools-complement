@@ -72,6 +72,8 @@ PAGE_ACTIONS = {
     "indexer": "update_config", "library": "update_config", "mediaserver": "update_config",
     "notification": "get_message_client", "subtitle": "update_config", "users": "user_manager",
     "backup": "restory_backup", "upload": "restory_backup", "userdownloader": "get_downloader",
+    # Torrent intake must not inherit the administrator-only backup policy.
+    "upload_torrent": "download_torrent",
     "download_setting": "update_download_setting", "sites": "get_site", "sitelist": "get_sites",
     "brushtask": "brushtask_detail", "customwords": "get_customwords", "directorysync": "add_or_edit_sync_path",
     "dirlist": "get_download_dirs", "subscribe": "add_rss_media", "user_rss": "get_userrss_task",
