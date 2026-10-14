@@ -4,17 +4,23 @@ import os
 class PathUtils:
 
     @staticmethod
-    def get_dir_files(in_path, exts="", filesize=0, episode_format=None):
+    def get_dir_files(in_path, exts="", filesize=0, episode_format=None, raise_errors=False):
         """
         获得目录下的媒体文件列表List ，按后缀、大小、格式过滤
         """
         if not in_path:
             return []
+        # 整理入口需要区分真实空目录与 NAS/权限故障；其他调用保留历史行为。
+        if raise_errors:
+            os.stat(in_path)
         if not os.path.exists(in_path):
             return []
         ret_list = []
+        def scan_error(error):
+            if raise_errors:
+                raise error
         if os.path.isdir(in_path):
-            for root, dirs, files in os.walk(in_path):
+            for root, dirs, files in os.walk(in_path, onerror=scan_error):
                 for file in files:
                     cur_path = os.path.join(root, file)
                     # 检查路径是否合法

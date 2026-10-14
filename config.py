@@ -1,8 +1,10 @@
 import os
+import logging
 import shutil
 import sys
 from threading import Lock
 import ruamel.yaml
+from requests.utils import default_user_agent
 
 # 种子名/文件名要素分隔字符
 SPLIT_CHARS = r"\.|\s+|\(|\)|\[|]|-|\+|【|】|/|～|;|&|\||#|_|「|」|（|）|~"
@@ -41,6 +43,33 @@ BRUSH_REMOVE_TORRENTS_INTERVAL = 300
 META_DELETE_UNKNOWN_INTERVAL = 12
 # 定时刷新壁纸的间隔（小时）
 REFRESH_WALLPAPER_INTERVAL = 1
+# apscheduler 任务默认值。库默认的 misfire_grace_time 只有 1 秒，进程繁忙或
+# NAS I/O 阻塞时会静默丢弃本次执行；显式放宽，同时保持不重入与合并错过执行。
+SCHEDULER_JOB_DEFAULTS = {
+    'coalesce': True,
+    'max_instances': 1,
+    'misfire_grace_time': 60
+}
+# Single-process NAS budgets. Queue and worker changes take effect on restart;
+# interactive callbacks have their own capacity instead of waiting for scans.
+WORKLOAD_DEFAULTS = {
+    'background_workers': 6,
+    'background_queue_size': 64,
+    'interactive_workers': 2,
+    'interactive_queue_size': 16,
+    'scheduler_workers': 6,
+    'scheduler_queue_size': 64,
+    'search_workers': 4,
+    'search_queue_size': 64,
+    'transfer_concurrency': 2,
+}
+_WORKLOAD_RANGES = {
+    'background_workers': (1, 32), 'background_queue_size': (1, 256),
+    'interactive_workers': (1, 8), 'interactive_queue_size': (2, 128),
+    'scheduler_workers': (1, 20), 'scheduler_queue_size': (1, 256),
+    'search_workers': (1, 16), 'search_queue_size': (1, 256),
+    'transfer_concurrency': (1, 8),
+}
 # fanart的api，用于拉取封面图片
 FANART_MOVIE_API_URL = 'https://webservice.fanart.tv/v3/movies/%s?api_key=d2d31f9ecabea050fc7d68aa3146015f'
 FANART_TV_API_URL = 'https://webservice.fanart.tv/v3/tv/%s?api_key=d2d31f9ecabea050fc7d68aa3146015f'
@@ -150,15 +179,50 @@ class Config(object):
                     sys.path.append(module_path)
 
     def get_proxies(self):
-        return self.get_config('app').get("proxies")
+        # Import after Config initialization to avoid app.utils bootstrap cycles.
+        from app.utils.security_utils import normalize_proxies
+
+        proxies = self.get_config('app').get("proxies")
+        try:
+            # All HTTP consumers share the same legacy-format normalization.
+            return normalize_proxies(proxies)
+        except ValueError:
+            # Keep the original invalid value for TMDb's fail-closed setter so
+            # startup remains available and reports the actual validation error.
+            return proxies
 
     def get_ua(self):
         return self.get_config('app').get("user_agent") or DEFAULT_UA
+
+    def get_tmdb_web_ua(self):
+        """仅供 TMDB 官网使用；旧配置或空值保持 Requests 默认 UA。"""
+        user_agent = (self.get_config('app') or {}).get("tmdb_web_user_agent")
+        if not isinstance(user_agent, str):
+            return default_user_agent()
+        return user_agent.strip() or default_user_agent()
 
     def get_config(self, node=None):
         if not node:
             return self._config
         return self._config.get(node, {})
+
+    def get_workload_limit(self, name):
+        """Read a bounded NAS budget without accepting booleans or fractional counts."""
+        default = WORKLOAD_DEFAULTS[name]
+        workload = (self.get_config('app') or {}).get('workload') or {}
+        raw = workload.get(name, default) if isinstance(workload, dict) else default
+        minimum, maximum = _WORKLOAD_RANGES[name]
+        try:
+            value = int(str(raw))
+            if isinstance(raw, bool) or not minimum <= value <= maximum:
+                raise ValueError()
+        except (TypeError, ValueError):
+            # Standard logging avoids importing the application logger back
+            # into Config during bootstrap.
+            logging.getLogger(__name__).warning(
+                "【Config】app.workload.%s 配置无效，使用默认值 %s", name, default)
+            return default
+        return value
 
     def save_config(self, new_cfg):
         self._config = new_cfg

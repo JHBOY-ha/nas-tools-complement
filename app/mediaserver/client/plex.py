@@ -243,15 +243,20 @@ class Plex(_IMediaClient):
                 "message": "Plex 目标目录刷新失败"
             }
 
-    def get_libraries(self):
+    def get_libraries(self, strict=False):
         """
         获取媒体服务器所有媒体库列表
         """
         if not self._plex:
+            if strict:
+                raise RuntimeError("媒体服务器未配置")
             return []
         try:
             self._libraries = self._plex.library.sections()
         except Exception as err:
+            if strict:
+                # 全量同步不能将远端异常转换为空列表或提前结束的迭代器。
+                raise RuntimeError("媒体库读取失败") from None
             ExceptionUtils.exception_traceback(err)
             return []
         libraries = []
@@ -259,16 +264,22 @@ class Plex(_IMediaClient):
             libraries.append({"id": library.key, "name": library.title})
         return libraries
 
-    def get_items(self, parent):
+    def get_items(self, parent, strict=False):
         """
         获取媒体服务器所有媒体库列表
         """
         if not parent:
+            if strict:
+                raise RuntimeError("媒体库编号无效")
             yield {}
         if not self._plex:
+            if strict:
+                raise RuntimeError("媒体服务器未配置")
             yield {}
         try:
             section = self._plex.library.sectionByID(parent)
+            if strict and section is None:
+                raise RuntimeError("媒体库不存在")
             if section:
                 for item in section.all():
                     if not item:
@@ -289,6 +300,9 @@ class Plex(_IMediaClient):
                                "MediaStreams": []
                            }, ensure_ascii=False)}
         except Exception as err:
+            if strict:
+                # 全量同步不能将远端异常转换为空列表或提前结束的迭代器。
+                raise RuntimeError("媒体库读取失败") from None
             ExceptionUtils.exception_traceback(err)
         yield {}
 

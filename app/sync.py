@@ -16,6 +16,9 @@ from app.utils import PathUtils, ExceptionUtils
 from app.utils.types import SyncType, OsType
 
 lock = threading.Lock()
+# 全量同步可被多个入口同时触发（Web 点击、消息命令、定时任务），重复执行会对
+# 同一批文件重复识别与硬链接。非阻塞互斥让后来者直接跳过，而不是排队重跑。
+_transfer_all_lock = threading.Lock()
 
 
 class FileMonitorHandler(FileSystemEventHandler):
@@ -333,6 +336,21 @@ class Sync(object):
         """
         全量转移Sync目录下的文件，WEB界面点击目录同步时获发
         """
+        if not _transfer_all_lock.acquire(blocking=False):
+            log.warn("【Sync】已有全量同步正在进行，跳过本次触发")
+            # 不同 sid 也可能争用此锁；未执行必须与完成区分，供任务入口报告繁忙。
+            return False
+        try:
+            # WebAction 的单目录入口和服务入口都据此写后台任务终态；锁准入
+            # 成功不等于文件处理成功，必须保留内层汇总结果。
+            return self.__transfer_all_sync(sid=sid)
+        finally:
+            _transfer_all_lock.release()
+
+    def __transfer_all_sync(self, sid=None):
+        # 失败后仍处理其余文件，但后续成功不能抹去此前失败；正常忽略、已同步
+        # 和空目录仍视为完成。异常由调用方的任务边界报告失败。
+        success = True
         for monpath, target_dirs in self.sync_dir_config.items():
             if not monpath:
                 continue
@@ -353,10 +371,15 @@ class Sync(object):
                                                                 target_dir=target_path,
                                                                 sync_transfer_mode=sync_mode)
                     if ret != 0:
+                        success = False
                         log.warn("【Sync】%s 同步失败，错误码：%s" % (link_file, ret))
                     elif not msg:
-                        self.dbhelper.insert_sync_history(link_file, monpath, target_path)
-                        log.info("【Sync】%s 同步完成" % link_file)
+                        # 文件与同步记录均成功才确认完成，否则下次仍需核对重试。
+                        if self.dbhelper.insert_sync_history(link_file, monpath, target_path) is False:
+                            success = False
+                            log.error("【Sync】%s 文件已处理，但同步记录写入失败" % link_file)
+                        else:
+                            log.info("【Sync】%s 同步完成" % link_file)
             else:
                 for path in PathUtils.get_dir_level1_medias(monpath, RMT_MEDIAEXT):
                     if PathUtils.is_invalid_path(path):
@@ -367,7 +390,9 @@ class Sync(object):
                                                                     unknown_dir=unknown_path,
                                                                     rmt_mode=sync_mode)
                     if not ret:
+                        success = False
                         log.error("【Sync】%s 处理失败：%s" % (monpath, ret_msg))
+        return success
 
 
 def run_monitor():

@@ -2,39 +2,101 @@ import os
 import json
 import threading
 import time
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, scoped_session
 from sqlalchemy.pool import QueuePool
+from sqlalchemy.exc import DBAPIError
+import log
 from app.db.models import BaseMedia, MEDIASYNCITEMS, MEDIASYNCSTATISTIC
 from app.utils import ExceptionUtils
 from config import Config
+from .settings import DatabaseSettings
+from .transactions import ManagedDatabase, DatabaseBusy, DatabaseWriteError
+from .main_db import DbPersist
 
 lock = threading.Lock()
+# 与 user.db 一致：默认 5 秒 busy timeout 在慢盘并发写时太短。
+_SQLITE_BUSY_TIMEOUT_SECONDS = 30
+_POOL_WARN_RATIO = 0.8
+_pool_warn_at = [0.0]
+
 _Engine = create_engine(
     f"sqlite:///{os.path.join(Config().get_config_path(), 'media.db')}?check_same_thread=False",
     echo=False,
+    hide_parameters=True,
     poolclass=QueuePool,
     pool_pre_ping=True,
-    pool_size=50,
+    # 与 user.db 一致：容量与原先持平，泄漏改在工作单元结束时归还连接。
+    pool_size=20,
+    max_overflow=30,
+    pool_timeout=30,
+    pool_use_lifo=True,
     pool_recycle=60 * 10,
-    max_overflow=0
+    connect_args={"timeout": _SQLITE_BUSY_TIMEOUT_SECONDS}
 )
-_Session = scoped_session(sessionmaker(bind=_Engine,
-                                       autoflush=True,
-                                       autocommit=False))
+
+# Media cache writes share user.db's FIFO admission, but retain their own
+# connection/transaction: no cross-file atomicity is claimed.
+_Settings = DatabaseSettings.from_config()
+_WriteEngine = create_engine(_Engine.url, poolclass=QueuePool, pool_size=1,
+                             max_overflow=0, pool_pre_ping=True, hide_parameters=True,
+                             connect_args={'timeout': _Settings.busy_timeout_seconds})
+_Database = ManagedDatabase(_Engine, _WriteEngine, _Settings,
+                            path=os.path.join(Config().get_config_path(), 'media.db'))
+
+
+@event.listens_for(_Engine, "checkout")
+def _warn_on_pool_pressure(dbapi_connection, connection_record, connection_proxy):
+    """连接池接近耗尽时告警，用于量化会话泄漏（限量日志，避免刷屏）。"""
+    try:
+        capacity = _Engine.pool.size() + _Engine.pool._max_overflow
+        checked_out = _Engine.pool.checkedout()
+    except Exception:
+        return
+    if not capacity or checked_out < capacity * _POOL_WARN_RATIO:
+        return
+    now = time.monotonic()
+    if now - _pool_warn_at[0] < 60:
+        return
+    _pool_warn_at[0] = now
+    log.warn("【Db】media.db 连接池接近耗尽：%s/%s，可能存在未归还的会话" % (checked_out, capacity))
+
+
+_Session = _Database._reads
+
+
+def remove_session():
+    """
+    结束当前线程的会话并归还其签出的连接（语义同 user.db）
+    """
+    _Database.remove_session()
 
 
 class MediaDb:
 
     @property
     def session(self):
-        return _Session()
+        return _Database.session
+
+    def write_transaction(self, required_bytes=0):
+        return _Database.write_transaction(required_bytes=required_bytes)
+
+    def read_snapshot(self):
+        return _Database.read_snapshot()
+
+    @staticmethod
+    def remove_session():
+        remove_session()
 
     @staticmethod
     def init_db():
         with lock:
-            BaseMedia.metadata.create_all(_Engine)
+            with _Database.maintenance() as connection:
+                with connection.begin():
+                    connection.exec_driver_sql('BEGIN IMMEDIATE')
+                    BaseMedia.metadata.create_all(connection)
 
+    @DbPersist(None)
     def insert(self, server_type, iteminfo):
         if not server_type or not iteminfo:
             return False
@@ -55,13 +117,17 @@ class MediaDb:
                 PATH=iteminfo.get("path"),
                 JSON=iteminfo.get("json") if iteminfo.get("json") else json.dumps(iteminfo, ensure_ascii=False)
             ))
-            self.session.commit()
+            _Database.commit()
             return True
+        except DBAPIError:
+            # Let the transaction boundary redact SQL parameters and roll back.
+            raise
         except Exception as e:
             ExceptionUtils.exception_traceback(e)
             self.session.rollback()
         return False
 
+    @DbPersist(None)
     def empty(self, server_type=None, library=None):
         try:
             if server_type and library:
@@ -69,13 +135,16 @@ class MediaDb:
                                                           MEDIASYNCITEMS.LIBRARY == library).delete()
             else:
                 self.session.query(MEDIASYNCITEMS).delete()
-            self.session.commit()
+            _Database.commit()
             return True
+        except DBAPIError:
+            raise
         except Exception as e:
             ExceptionUtils.exception_traceback(e)
             self.session.rollback()
         return False
 
+    @DbPersist(None)
     def statistics(self, server_type, total_count, movie_count, tv_count):
         if not server_type:
             return False
@@ -90,8 +159,10 @@ class MediaDb:
                 UPDATE_TIME=time.strftime('%Y-%m-%d %H:%M:%S',
                                           time.localtime(time.time()))
             ))
-            self.session.commit()
+            _Database.commit()
             return True
+        except DBAPIError:
+            raise
         except Exception as e:
             ExceptionUtils.exception_traceback(e)
             self.session.rollback()

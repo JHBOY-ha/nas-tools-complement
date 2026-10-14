@@ -177,6 +177,11 @@
       if (!torrent_dropzone || !torrent_dropzone.files || !torrent_dropzone.files[0] && !magnet) {
         return;
       }
+      // Never submit unfinished or rejected uploads using the original client name.
+      if (torrent_dropzone.files.some(file => file.status !== 'success')) {
+        show_fail_modal('请等待种子上传成功后再添加下载');
+        return;
+      }
       $("#search_download_btn").text("处理中...").attr("disabled", true);
       const params = {
         "files": torrent_dropzone.files,

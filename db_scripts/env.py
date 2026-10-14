@@ -59,6 +59,16 @@ def run_migrations_online() -> None:
     and associate a connection with the context.
 
     """
+    supplied = config.attributes.get('connection')
+    if supplied is not None:
+        # Startup owns both FIFO admission and the explicit SQLite transaction.
+        # Do not open an engine or commit its transaction behind its back.
+        context.configure(connection=supplied, target_metadata=target_metadata,
+                          render_as_batch=True)
+        with context.begin_transaction():
+            context.run_migrations()
+        return
+
     connectable = engine_from_config(
         config.get_section(config.config_ini_section),
         prefix="sqlalchemy.",

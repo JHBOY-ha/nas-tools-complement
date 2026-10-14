@@ -177,13 +177,18 @@
   function test_indexer_config(type) {
     $(`#${type}_test_btn`).text("测试中...").attr("disabled", true);
     save_config(type, function (ret) {
+      // Validation failures must not probe the previously saved settings.
+      if (ret.code !== 0) {
+        $("#" + type + "_test_btn").text("测试失败！").attr("disabled", false);
+        return;
+      }
       let command;
       {% for Type, Indexer in IndexerConf.items() %}
       if (currType === "{{ Type }}") {
         command = "{{ Indexer.test_command }}";
       }
       {% endfor %}
-      ajax_post("test_connection", {"command": command}, function (ret) {
+      ajax_post("test_connection", {"command": command, "config": ret.config[type]}, function (ret) {
         if (ret.code === 0) {
           $(`#${currType}_test_btn`).text("测试成功").attr("disabled", false);
         } else {

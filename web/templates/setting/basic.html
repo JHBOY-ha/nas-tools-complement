@@ -208,6 +208,20 @@
                   </select>
                 </div>
               </div>
+              <!-- 官网 UA 随媒体设置保存，与系统全局 User-Agent 分开。 -->
+              <div class="col-lg">
+                <div class="mb-3">
+                  <label class="form-label" for="app.tmdb_web_user_agent">TMDB 官网 User-Agent
+                    <span class="form-help" id="tmdb_web_user_agent_help" tabindex="0"
+                          title="仅用于 TMDB 官网连通性测试和网页辅助识别，不影响 TMDB API 或其他站点。"
+                          aria-label="仅用于 TMDB 官网连通性测试和网页辅助识别，不影响 TMDB API 或其他站点。"
+                          data-bs-toggle="tooltip">?</span>
+                  </label>
+                  <input type="text" value="{{ Config.app.tmdb_web_user_agent or '' }}" class="form-control"
+                         id="app.tmdb_web_user_agent" placeholder="留空使用 Requests 默认 UA" autocomplete="off"
+                         aria-describedby="tmdb_web_user_agent_help">
+                </div>
+              </div>
               <div class="col-lg">
                 <div class="mb-3">
                   <label class="form-label required">TMDB匹配模式 <span class="form-help"
@@ -1229,6 +1243,10 @@
     ajax_post("update_config", params, function (ret) {
       if (flag) {
         $("#" + type + "_btn").text("保存").attr("disabled", false);
+      }
+      // 保存失败保留输入并显示原因，不能让高级代理规则保护变成无声拒绝。
+      if (!ret || ret.code !== 0) {
+        show_fail_modal((ret && ret.msg) || '设置保存失败，请检查配置后重试');
       }
     });
   }

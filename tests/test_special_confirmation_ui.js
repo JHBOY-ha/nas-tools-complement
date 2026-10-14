@@ -10,19 +10,24 @@ const root = path.resolve(__dirname, '..');
     const page = await browser.newPage({viewport: {width: 1100, height: 850}});
     const errors = [];
     page.on('pageerror', error => errors.push(error.stack || error.message));
-    let fail = false, empty = false, confirms = 0;
+    let fail = false, empty = false, confirms = 0, acceptedAt = 0;
     const work = {tmdb_id: 42, type: 'tv', title: '冰菓 <img src=x onerror=alert(1)>', date: '2012-04-22', overview: '作品简介', link: 'https://www.themoviedb.org/tv/42'};
     await page.route('http://review.test/**', async route => {
       const url = new URL(route.request().url());
       if (url.pathname === '/') {
-        return route.fulfill({contentType: 'text/html; charset=utf-8', body: `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/static/css/tabler.min.css"><body>${fs.readFileSync(path.join(root, 'web/templates/rename/special_confirmation.html'), 'utf8')}<script src="/static/js/jquery-3.3.1.min.js"></script><script src="/static/js/tabler.min.js"></script><script>window.navmenu=()=>{};window.show_success_modal=()=>{window.completed=true};</script><script src="/static/js/special-confirmation.js"></script></body></html>`});
+        return route.fulfill({contentType: 'text/html; charset=utf-8', body: `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/static/css/tabler.min.css"><body>${fs.readFileSync(path.join(root, 'web/templates/rename/special_confirmation.html'), 'utf8')}<script src="/static/js/jquery-3.3.1.min.js"></script><script src="/static/js/tabler.min.js"></script><script>window.navmenu=()=>{};window.show_success_modal=()=>{window.completed=true};</script><script src="/static/js/action-tasks/client.js"></script><script src="/static/js/special-confirmation.js"></script></body></html>`});
       }
       if (url.pathname === '/do') {
-        const payload = JSON.parse(new URLSearchParams(route.request().postData()).get('data'));
+        const form = new URLSearchParams(route.request().postData());
+        const payload = JSON.parse(form.get('data'));
+        if (form.get('cmd') === 'get_action_task') {
+          const done = Date.now() - acceptedAt >= 150;
+          return route.fulfill({json:{code:0,task:{task_id:'special-review-task',title:'确认特殊集转移',created_at:acceptedAt/1000,status:done?'succeeded':'running',message:done?'已完成':'正在执行',result:done?{retcode:0}:null}}});
+        }
         let result;
         if (payload.stage === 'search') result = fail ? {retcode: 2, retmsg: 'TMDB 查询失败，请重试'} : {retcode: 0, query: payload.query || 'Hyouka', fingerprint: ['1','2','3','1720000000000000000'], works: empty ? [] : [work]};
         else if (payload.stage === 'detail') result = {retcode: 0, work, seasons: [0,1], season: payload.season || 0, episodes: [{episode: 1, title: '特别篇', date: '2013-01-01', overview: '单集简介', link: work.link + '/season/0/episode/1'}]};
-        else { confirms++; await new Promise(resolve => setTimeout(resolve, 150)); result = {retcode: 0}; }
+        else { confirms++; acceptedAt=Date.now(); return route.fulfill({status:202,json:{async:true,operation_type:'background_action',task:{task_id:'special-review-task',title:'确认特殊集转移',created_at:acceptedAt/1000,status:'queued',message:'已排队'}}}); }
         return route.fulfill({json: result});
       }
       const file = path.join(root, 'web', url.pathname);

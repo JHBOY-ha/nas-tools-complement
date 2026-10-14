@@ -1,10 +1,16 @@
 import os
 import re
 import struct
+import threading
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from difflib import SequenceMatcher
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
+import requests
 
 from app.utils.http_utils import RequestUtils
+from app.utils.isolated_network import current_deadline, network_operation
+from app.utils.isolated_fs import fs_os, isolated_open
+from app.utils.isolated_io import isolated_stat
 from app.utils.types import MediaType
 from config import Config
 from version import APP_VERSION
@@ -20,10 +26,15 @@ class OpenSubtitles:
     API_ROOT = "https://api.opensubtitles.com/api/v1"
     DEFAULT_LANGUAGES = "zh-cn,ze,zh-tw"
     RELEASE_SIMILARITY_THRESHOLD = 0.75
+    MAX_REDIRECTS = 5
+    REDIRECT_STATUSES = (301, 302, 303, 307, 308)
     HASH_CHUNK_SIZE = 64 * 1024
     _MASK_64 = 0xFFFFFFFFFFFFFFFF
 
     def __init__(self, config=None):
+        self._state_lock = threading.RLock()
+        self._login_future = None
+        self._download_slot = threading.BoundedSemaphore(1)
         if config is None:
             config = (Config().get_config("subtitle") or {}).get("opensubtitles", {}) or {}
         self._api_key = str(config.get("api_key") or "").strip()
@@ -69,14 +80,22 @@ class OpenSubtitles:
     @classmethod
     def calculate_moviehash(cls, file_path):
         """Calculate the standard OpenSubtitles 64-bit movie hash."""
-        if not file_path or not os.path.isfile(file_path):
+        if not file_path:
             return None
-        file_size = os.path.getsize(file_path)
+        try:
+            # Media libraries may use SOFTLINK transfers. Resolve in the bounded
+            # worker, then retain isolated_open's no-follow/inode checks on the
+            # resolved file; staging streams still reject symlinks by default.
+            file_path = fs_os.path.realpath(file_path)
+            file_size = isolated_stat(file_path).st_size
+        except OSError:
+            return None
         if file_size < cls.HASH_CHUNK_SIZE * 2:
             return None
         value = file_size
         try:
-            with open(file_path, "rb") as media_file:
+            # Only the two hash windows are read, through bounded I/O workers.
+            with isolated_open(file_path, "rb") as media_file:
                 for offset in (0, file_size - cls.HASH_CHUNK_SIZE):
                     media_file.seek(offset)
                     chunk = media_file.read(cls.HASH_CHUNK_SIZE)
@@ -131,15 +150,34 @@ class OpenSubtitles:
     def _raw_request(self, method, url, params=None, json_data=None, authenticated=False):
         if not self._https_url(url):
             return None
-        request = RequestUtils(
-            headers=self._headers(authenticated=authenticated),
-            proxies=Config().get_proxies(),
-            timeout=15,
-            verify=True
-        )
-        if method == "POST":
-            return request.post_res(url, json=json_data, allow_redirects=False)
-        return request.get_res(url, params=params, allow_redirects=False)
+        with self._state_lock:
+            headers = self._headers(authenticated=authenticated)
+        # State is snapshotted above; no shared lock covers the actual request.
+        request = RequestUtils(headers=headers, proxies=Config().get_proxies(), timeout=15,
+                               verify=True, isolated=True, deadline=current_deadline(),
+                               max_bytes=4 * 1024 * 1024)
+        for redirects in range(self.MAX_REDIRECTS + 1):
+            # Follow API moves explicitly: retain POST bodies/authentication,
+            # but never forward credentials to a different HTTPS origin.
+            if method == 'POST':
+                response = request.post_res(url, json=json_data, allow_redirects=False)
+            else:
+                response = request.get_res(url, params=params, allow_redirects=False)
+            if response is None or response.status_code not in self.REDIRECT_STATUSES \
+                    or redirects == self.MAX_REDIRECTS \
+                    or (method == 'POST' and response.status_code == 303):
+                return response
+            source_url = requests.Request(
+                method, url, params=params if method != 'POST' else None
+            ).prepare().url
+            target = self.resolve_redirect(source_url, response.headers.get('Location'), same_origin=True)
+            if not target:
+                return response
+            response.close()
+            url = target
+            # Location already contains the canonical query; do not append the
+            # original parameters a second time after a search-order redirect.
+            params = None
 
     @classmethod
     def _api_base_url(cls, value):
@@ -174,17 +212,50 @@ class OpenSubtitles:
             and parsed.username is None and parsed.password is None
         )
 
+    @classmethod
+    def resolve_redirect(cls, url, location, same_origin=False):
+        """Resolve relative HTTPS redirects without downgrades or embedded credentials."""
+        location = str(location or '').strip()
+        if not location:
+            return None
+        try:
+            # urljoin repairs malformed absolute URLs such as https:///path;
+            # validate them first rather than silently inheriting the API host.
+            if urlsplit(location).scheme and not cls._https_url(location):
+                return None
+            target = urljoin(url, location)
+            if not cls._https_url(target):
+                return None
+            if same_origin:
+                source, destination = urlsplit(url), urlsplit(target)
+                # Only an omitted port defaults to 443; an explicit zero port
+                # must not be mistaken for the authenticated API's origin.
+                source_port = 443 if source.port is None else source.port
+                target_port = 443 if destination.port is None else destination.port
+                if (source.hostname, source_port) != (destination.hostname, target_port):
+                    return None
+            return target
+        except ValueError:
+            return None
+
     def _request(self, method, path, params=None, json_data=None, authenticated=False,
                  retry_server_error=True):
         if authenticated:
             ok, error = self.login()
             if not ok:
                 return None, {}, error
-        url = "%s/%s" % (self._base_url.rstrip("/"), path.lstrip("/"))
+        with self._state_lock:
+            used_token = self._token
+            base_url = self._base_url
+        url = "%s/%s" % (base_url.rstrip("/"), path.lstrip("/"))
         response = self._raw_request(method, url, params=params, json_data=json_data,
                                      authenticated=authenticated)
         if authenticated and response is not None and response.status_code == 401:
-            ok, error = self.login(force=True)
+            with self._state_lock:
+                # Another caller may already have refreshed this rejected JWT;
+                # reuse it rather than issuing a second identical login.
+                needs_refresh = self._token == used_token
+            ok, error = self.login(force=needs_refresh)
             if not ok:
                 return response, self._safe_json(response), error
             url = "%s/%s" % (self._base_url.rstrip("/"), path.lstrip("/"))
@@ -198,7 +269,37 @@ class OpenSubtitles:
             return response, payload, self._response_error(response, payload, "OpenSubtitles请求失败")
         return response, payload, ""
 
+    @network_operation
     def login(self, force=False):
+        """Coalesce token refresh while doing the actual HTTP call outside locks."""
+        with self._state_lock:
+            if self._token and not force:
+                return True, ''
+            prior = self._login_future
+            owner = prior is None or prior.done()
+            if owner:
+                prior = self._login_future = Future()
+        if not owner:
+            try:
+                return prior.result(timeout=current_deadline().remaining())
+            except FutureTimeoutError:
+                return False, 'OpenSubtitles登录等待超过总时限'
+        try:
+            result = self._perform_login(force)
+        except BaseException as error:
+            prior.set_exception(error)
+            raise
+        else:
+            prior.set_result(result)
+            return result
+        finally:
+            # Waiters own their Future reference; release completed results and
+            # exception tracebacks without clearing a newer concurrent refresh.
+            with self._state_lock:
+                if self._login_future is prior:
+                    self._login_future = None
+
+    def _perform_login(self, force=False):
         configured, error = self.is_configured(require_login=True)
         if not configured:
             return False, error
@@ -220,10 +321,12 @@ class OpenSubtitles:
             self._base_url = self.API_ROOT
             self._last_error = "OpenSubtitles登录失败：服务端返回了不安全的API地址"
             return False, self._last_error
-        self._token = payload.get("token")
-        self._base_url = base_url
+        with self._state_lock:
+            self._token = payload.get("token")
+            self._base_url = base_url
         return True, ""
 
+    @network_operation
     def get_user_info(self):
         _, payload, error = self._request("GET", "/infos/user", authenticated=True)
         if error:
@@ -249,7 +352,14 @@ class OpenSubtitles:
             return [], error
         params = {key: value for key, value in params.items() if value not in (None, "")}
         params["languages"] = ",".join(sorted(self._languages))
-        _, payload, error = self._request("GET", "/subtitles", params=params)
+        # OpenSubtitles canonicalizes unsorted GET parameters with HTTP 301.
+        # Requests already encodes spaces as '+', as required by the API.
+        params = dict(sorted(params.items()))
+        with self._state_lock:
+            authenticated = bool(self._token)
+        # The shared client may have switched to the VIP host after a manual
+        # download. That host requires its JWT on subsequent searches too.
+        _, payload, error = self._request("GET", "/subtitles", params=params, authenticated=authenticated)
         if error:
             return [], error
         return self._flatten_results(payload.get("data") or []), ""
@@ -327,8 +437,9 @@ class OpenSubtitles:
             candidate.get("download_count") or 0,
         ), reverse=True)
 
-    def search_subtitles(self, item):
-        """Return ranked candidates without consuming a download quota."""
+    @network_operation
+    def search_subtitles(self, item, query=None):
+        """Return ranked candidates; explicit online queries can work without IMDb."""
         media_path = self._media_path(item)
         moviehash = self.calculate_moviehash(media_path)
         candidates = []
@@ -345,23 +456,36 @@ class OpenSubtitles:
 
         imdb_id = self._imdb_number(item.get("imdbid"))
         if item.get("type") == MediaType.TV:
-            if not imdb_id:
+            if not imdb_id and query is None:
                 return [], "电视剧缺少IMDb ID，无法准确检索字幕"
             params = {
-                "parent_imdb_id": imdb_id,
                 "season_number": item.get("season"),
                 "episode_number": item.get("episode"),
             }
+            # Only manual online searches may fall back to a title; automatic
+            # downloads retain their IMDb requirement and confidence checks.
+            params.update({"parent_imdb_id": imdb_id} if imdb_id else {"query": query})
         elif imdb_id:
             params = {"imdb_id": imdb_id}
         else:
-            params = {"query": item.get("name"), "year": item.get("year")}
+            params = {"query": query if query is not None else item.get("name"), "year": item.get("year")}
         candidates, error = self._search(params)
         if error:
             return [], error
         return self._score_candidates(item, candidates), ""
 
+    @network_operation
     def download(self, file_id):
+        # Serialize only the quota-consuming API stage; content fetching and
+        # unrelated searches do not hold this admission slot.
+        if not self._download_slot.acquire(timeout=current_deadline().remaining()):
+            return None, 'OpenSubtitles下载配额等待超过总时限'
+        try:
+            return self._download_one(file_id)
+        finally:
+            self._download_slot.release()
+
+    def _download_one(self, file_id):
         """Consume at most one quota unit by requesting one temporary URL."""
         _, payload, error = self._request(
             "POST", "/download",

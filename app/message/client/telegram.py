@@ -61,7 +61,9 @@ class Telegram(_IMessageClient):
                     if not self._message_proxy_event:
                         event = Event()
                         self._message_proxy_event = event
-                        ThreadHelper().start_thread(self.__start_telegram_message_proxy, [event])
+                        # Lifetime polling has dedicated capacity, leaving job
+                        # workers available for finite background operations.
+                        ThreadHelper().start_thread(self.__start_telegram_message_proxy, [event], pool='service')
 
     @classmethod
     def match(cls, ctype):
@@ -191,7 +193,10 @@ class Telegram(_IMessageClient):
                     sc_url = "https://api.telegram.org/bot%s/sendPhoto" % self._telegram_token
                     data = {"chat_id": chat_id, "caption": caption, "parse_mode": "Markdown"}
                     files = {"photo": photo_req.content}
-                    res = requests.post(sc_url, proxies=proxies, data=data, files=files)
+                    # 本文件唯一未设超时的请求：Telegram 或代理不响应时线程会
+                    # 永久挂起。图片上传给较宽的读取超时。
+                    res = requests.post(sc_url, proxies=proxies, data=data, files=files,
+                                        timeout=(5, 30))
                     flag, msg = _res_parse(res)
                     if flag:
                         return flag, msg
@@ -296,7 +301,9 @@ class Telegram(_IMessageClient):
             return _offset
 
         offset = 0
-        while True:
+        # Reconfiguration sets the old event. Exit its outer loop as well;
+        # otherwise it spins without polling and blocks the replacement service.
+        while not event.is_set():
             _config = Config()
             web_port = _config.get_config("app").get("web_port")
             sc_url = "https://api.telegram.org/bot%s/getUpdates?" % self._telegram_token

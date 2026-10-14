@@ -1,0 +1,20 @@
+{
+  "profile": "product-admin",
+  "sourceRoots": ["web/static/js/action-tasks", "web/templates/action-tasks", "web/static/css/action-tasks"],
+  "locale": "zh-CN",
+  "canonicalMap": "UX-CONTRACT.md",
+  "requiredCapabilities": ["Scrollbar", "Toast", "CRUD"],
+  "ownership": {"Scrollbar": "native", "Toast": "authored", "CRUD": "authored"},
+  "requiredCommands": ["unit", "e2e", "accessibility", "servicePanel", "premium"],
+  "commands": {
+    "unit": "python3 -m tests.run_stability tests.test_b4_hardening",
+    "e2e": "node tests/test_action_tasks_ui.js",
+    "accessibility": "node tests/test_action_tasks_ui.js",
+    "servicePanel": "node tests/test_action_tasks_service_ui.js",
+    "premium": "python3 scripts/audit_action_ui.py"
+  },
+  "evidence": {
+    "crudFullFlow": "tests/test_action_tasks_ui.js",
+    "failurePaths": "tests/test_b4_hardening.py"
+  }
+}

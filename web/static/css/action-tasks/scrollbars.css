@@ -1,0 +1,24 @@
+/* All application scroll surfaces inherit one visible, token-based baseline. */
+:root {
+    --nt-scrollbar-thumb: var(--tblr-muted, #626976);
+    --nt-scrollbar-track: var(--tblr-bg-surface, transparent);
+    --nt-scrollbar-active: var(--tblr-body-color, #1d273b);
+}
+* {
+    scrollbar-width: auto;
+    scrollbar-color: var(--nt-scrollbar-thumb) var(--nt-scrollbar-track);
+}
+*::-webkit-scrollbar { width: 12px; height: 12px; }
+*::-webkit-scrollbar-track { background: var(--nt-scrollbar-track); }
+*::-webkit-scrollbar-thumb {
+    background: var(--nt-scrollbar-thumb);
+    border: 3px solid var(--nt-scrollbar-track);
+    border-radius: 6px;
+}
+*::-webkit-scrollbar-thumb:hover,
+*::-webkit-scrollbar-thumb:active { background: var(--nt-scrollbar-active); }
+@media (forced-colors: active) {
+    * { scrollbar-color: auto; }
+    *::-webkit-scrollbar-thumb { background: ButtonText; border-color: Canvas; }
+    *::-webkit-scrollbar-track { background: Canvas; }
+}

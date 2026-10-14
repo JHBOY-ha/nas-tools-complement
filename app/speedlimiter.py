@@ -1,4 +1,5 @@
 from app.conf import SystemConfig
+from app.db.session_scope import with_db_session
 from app.downloader import Downloader
 from app.mediaserver import MediaServer
 from app.utils import ExceptionUtils
@@ -6,7 +7,8 @@ from app.utils.commons import singleton
 from app.utils.types import DownloaderType, MediaServerType
 from app.helper.security_helper import SecurityHelper
 from apscheduler.schedulers.background import BackgroundScheduler
-from config import Config
+from app.utils.scheduled_executor import SharedScheduledExecutor
+from config import Config, SCHEDULER_JOB_DEFAULTS
 
 import log
 
@@ -88,8 +90,12 @@ class SpeedLimiter:
             ExceptionUtils.exception_traceback(e)
         # 启动限速任务
         if self.limit_enabled:
-            self._scheduler = BackgroundScheduler(timezone=Config().get_timezone())
-            self._scheduler.add_job(func=self.__check_playing_sessions,
+            self._scheduler = BackgroundScheduler(timezone=Config().get_timezone(),
+                                                job_defaults=SCHEDULER_JOB_DEFAULTS,
+                                                # Playback checks share reserved callback
+                                                # capacity instead of waiting behind scans.
+                                                executors={'default': SharedScheduledExecutor(interactive=True)})
+            self._scheduler.add_job(func=with_db_session(self.__check_playing_sessions),
                                     args=[self.mediaserver.get_type(), True],
                                     trigger='interval',
                                     seconds=300)
@@ -204,9 +210,6 @@ class SpeedLimiter:
                 self.__stop()
             else:
                 pass
-
-
-
 
 
 
