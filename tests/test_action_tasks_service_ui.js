@@ -30,6 +30,7 @@ const pages = JSON.parse(rendered.stdout);
   try {
     const page = await browser.newPage({viewport: {width: 1512, height: 870}, reducedMotion: 'reduce'});
     const errors = [], tasks = new Map();
+    const networkRequests = [];
     let emptyService = false, readFailure = false, slowRead = false, nextSubmitted = 0;
     page.on('pageerror', error => errors.push(error.message));
     await page.route('**/*', async route => {
@@ -41,6 +42,8 @@ const pages = JSON.parse(rendered.stdout);
       if (url.pathname === '/do') {
         const form = new URLSearchParams(route.request().postData()), command = form.get('cmd');
         const data = JSON.parse(form.get('data') || '{}');
+        // Observe all diagnostic commands, including the removed automatic IP query.
+        if (['net_test', 'egress_ip_test'].includes(command)) networkRequests.push({command, data});
         if (command === 'run_directory_sync' || command === 'sch') {
           const task = {task_id: 'submitted-' + (++nextSubmitted), command, title: '目录同步', status: 'queued',
             created_at: Date.now() / 1000, message: '已排队，等待执行', result: null};
@@ -58,10 +61,8 @@ const pages = JSON.parse(rendered.stdout);
           task.status = 'canceled'; task.message = '已取消'; task.result = {code: -1, msg: '已取消'};
           return route.fulfill({json: {code: 0, task}});
         }
-        // 普通和动漫弹窗都从服务器动作读取出口，不请求浏览器所在设备的公网地址。
+        // 普通和动漫弹窗只请求列表内目标，并保留后端返回的耗时。
         if (command === 'net_test') return route.fulfill({json: {res: true, time: '80 毫秒'}});
-        if (command === 'egress_ip_test') return route.fulfill({json: {res: true,
-          ip: data.mode === 'direct' ? '2001:4860:4860:1234:5678:1234:5678:8888' : '1.1.1.1'}});
         return route.fulfill({json: {code: -1, msg: '布局测试未配置此接口'}});
       }
       const file = path.join(root, 'web', url.pathname);
@@ -312,7 +313,7 @@ const pages = JSON.parse(rendered.stdout);
     await page.locator('#system-success-modal').waitFor({state: 'hidden'});
     await page.waitForFunction(() => document.activeElement.matches('#service-action-tasks [data-action-task-open]'));
     assert.equal(await panel.isVisible(), false);
-    // 检查真实 Jinja 宏、两个测试弹窗及手机上的 IPv6 换行，沿用 Bootstrap 焦点行为。
+    // Both real dialogs retain target results and keyboard behavior without egress queries.
     for (const [id, prefix] of [['nettest', 'nettest_item'], ['nettest_anime', 'nettest_anime_item']]) {
       for (const narrow of [false, true]) {
         await page.setViewportSize(narrow ? {width: 390, height: 720} : {width: 1100, height: 900});
@@ -325,29 +326,22 @@ const pages = JSON.parse(rendered.stdout);
         const modal = page.locator('#' + modalId);
         await modal.waitFor({state: 'visible'});
         await page.waitForFunction(id => !bootstrap.Modal.getInstance(document.getElementById(id))._isTransitioning, modalId);
-        assert.equal(await page.locator(`#${prefix}_egress_direct`).textContent(), '尚未测试');
+        assert.equal(await modal.locator('[id*="_egress_"]').count(), 0);
+        const expectedTargets = await modal.locator(`input[name="${prefix}"]`)
+          .evaluateAll(inputs => inputs.map(input => decodeURI(input.value.split('|')[0])).sort());
+        const requestStart = networkRequests.length;
         const button = page.locator(`#${id}_btn`);
         await button.focus();
         await page.keyboard.press('Enter');
         await page.waitForFunction(id => !document.getElementById(id).disabled, `${id}_btn`);
-        assert.equal(await page.locator(`#${prefix}_egress_direct`).textContent(), '2001:4860:4860:1234:5678:1234:5678:8888');
-        assert.equal(await page.locator(`#${prefix}_egress_proxy`).textContent(), '1.1.1.1');
+        const batchRequests = networkRequests.slice(requestStart);
+        assert.equal(batchRequests.length, expectedTargets.length);
+        assert(batchRequests.every(request => request.command === 'net_test'));
+        assert.deepEqual(batchRequests.map(request => request.data).sort(), expectedTargets);
         assert.equal(await page.locator(`#${prefix}_res_0`).textContent(), '是');
+        assert.equal(await page.locator(`#${prefix}_res_time_0`).textContent(), '80 毫秒');
         assert(await modal.evaluate(element => element.scrollWidth <= element.clientWidth));
-        const captionContrast = await modal.evaluate(element => {
-          const rgb = color => color.match(/[\d.]+/g).slice(0, 3).map(Number);
-          const luminance = color => color.map(value => {
-            value /= 255; return value <= 0.04045 ? value / 12.92 : Math.pow((value + 0.055) / 1.055, 2.4);
-          }).reduce((sum, value, i) => sum + value * [0.2126, 0.7152, 0.0722][i], 0);
-          const background = rgb(getComputedStyle(element.querySelector('.modal-content')).backgroundColor);
-          const style = getComputedStyle(element.querySelector('dt'));
-          const opacity = Number(style.opacity);
-          const foreground = rgb(style.color).map((value, i) => value * opacity + background[i] * (1 - opacity));
-          const light = [luminance(foreground), luminance(background)].sort((a, b) => b - a);
-          return (light[0] + 0.05) / (light[1] + 0.05);
-        });
-        assert(captionContrast >= 4.5, 'Egress labels must remain readable in both themes');
-        await modal.screenshot({path: `/tmp/nas-egress-${id}-${narrow ? 'mobile-dark' : 'desktop'}.png`});
+        await modal.screenshot({path: `/tmp/nas-network-${id}-${narrow ? 'mobile-dark' : 'desktop'}.png`});
         await modal.locator('[data-bs-dismiss="modal"]').first().click();
         await modal.waitFor({state: 'hidden'});
       }

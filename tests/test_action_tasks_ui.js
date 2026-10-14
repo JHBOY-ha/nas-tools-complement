@@ -10,9 +10,8 @@ const root = path.resolve(__dirname, '..');
     let next = 0, mutations = 0, progressReads = 0, finish = false, offline = false, fail = false;
     let networkReply = {res: false, reachable: true, http_status: 403,
       msg: 'TMDB 官网拒绝访问（HTTP 403）', time: '120 毫秒'};
-    let egressReplies = {direct: {res: true, ip: '8.8.8.8'},
-      proxy: {res: false, skipped: true, msg: '未配置适用的 HTTPS 代理'}};
-    let slowEgress = false, egressOffline = false;
+    const networkCommands = [];
+    let slowNetwork = false, networkOffline = false;
     page.on('pageerror', error => errors.push(error.message));
     await page.route('http://tasks.test/**', async route => {
       const url = new URL(route.request().url());
@@ -23,6 +22,8 @@ const root = path.resolve(__dirname, '..');
       if (url.pathname === '/do') {
         const form = new URLSearchParams(route.request().postData());
         const command = form.get('cmd'), data = JSON.parse(form.get('data') || '{}');
+        // Capture removed diagnostics too, so an accidental automatic query fails the contract.
+        if (['net_test', 'egress_ip_test'].includes(command)) networkCommands.push(command);
         if (offline && ['get_action_task', 'get_action_tasks'].includes(command)) return route.abort('connectionfailed');
         let response;
         if (['run_directory_sync', 'start_mediasync', 'sch', 'run_userrss', 'run_brushtask', 'auto_remove_torrents'].includes(command)) {
@@ -48,11 +49,10 @@ const root = path.resolve(__dirname, '..');
           const row = rows.get(data.task_id); row.status = 'canceled'; row.message = '已取消';
           row.result = {code: -1, retcode: -1, msg: '已取消', retmsg: '已取消'};
           response = {code: 0, task: row};
-        } else if (command === 'net_test') response = networkReply;
-        else if (command === 'egress_ip_test') {
-          if (egressOffline) return route.abort('connectionfailed');
-          if (slowEgress) await new Promise(resolve => setTimeout(resolve, 350));
-          response = egressReplies[data.mode];
+        } else if (command === 'net_test') {
+          if (networkOffline) return route.abort('connectionfailed');
+          if (slowNetwork) await new Promise(resolve => setTimeout(resolve, 350));
+          response = networkReply;
         }
         else response = {code: -1, msg: '不存在'};
         return route.fulfill({json: response});
@@ -241,11 +241,8 @@ const root = path.resolve(__dirname, '..');
     await page.addScriptTag({content: service.slice(networkStart, networkEnd)});
     const tableStart = service.indexOf('      <div class="table-responsive">', service.indexOf('id="modal-nettest"'));
     const tableEnd = service.indexOf('      <div class="modal-footer">', tableStart);
-    // 使用生产宏的摘要，覆盖实际线路状态和现有域名表格共用的按钮生命周期。
-    const egressStart = service.indexOf('      <div class="modal-body border-bottom py-3">');
-    const egressMarkup = service.slice(egressStart, service.indexOf('{% endmacro %}', egressStart))
-      .replace(/{{\s*prefix\s*}}/g, 'nettest_item');
-    const networkTable = egressMarkup + service.slice(tableStart, tableEnd)
+    // Use the production target table without adding a separate diagnostic surface.
+    const networkTable = service.slice(tableStart, tableEnd)
       .replace(/{%[\s\S]*?%}/g, '').replace(/{{\s*target\s*}}/g, 'www.themoviedb.org')
       .replace(/{{\s*loop.index0\s*}}/g, '0');
     await page.evaluate(markup => {
@@ -267,9 +264,8 @@ const root = path.resolve(__dirname, '..');
     assert.equal(await page.locator('#nettest_item_res_0').getAttribute('aria-live'), 'polite');
     assert.equal(await page.locator('#nettest_item_res_time_0').textContent(), '120 毫秒');
     await page.waitForFunction(() => !document.getElementById('nettest_btn').disabled);
-    assert.equal(await page.locator('#nettest_item_egress_direct').textContent(), '8.8.8.8');
-    assert.equal(await page.locator('#nettest_item_egress_proxy').textContent(), '未配置适用的 HTTPS 代理');
-    assert.equal(await page.locator('#nettest_item_egress_proxy.text-red').count(), 0);
+    assert.deepEqual(networkCommands, ['net_test'], 'One target must produce exactly one target request');
+    assert.equal(await page.locator('[id*="_egress_"]').count(), 0);
     await page.locator('#page_content').screenshot({path: '/tmp/nas-network-test-desktop.png'});
     await page.setViewportSize({width: 390, height: 720});
     assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
@@ -289,34 +285,32 @@ const root = path.resolve(__dirname, '..');
     assert.equal(await page.locator('#nettest_item_res_time_0').textContent(), '80 毫秒');
     assert.equal(await page.locator('#nettest_btn').textContent(), '测试');
 
-    // 慢查询期间保留忙碌状态；IPv6、错误文本、断网和重试都不能影响站点结果。
-    slowEgress = true;
-    egressReplies = {direct: {res: true, ip: '2001:4860:4860:1234:5678:1234:5678:8888'},
-      proxy: {res: false, msg: '<img src=x onerror="window.networkXss=true">查询失败'}};
+    // Busy state follows only target requests; offline failures and retries restore the button.
+    slowNetwork = true;
     await page.locator('#nettest_btn').click();
-    assert.equal(await page.locator('#nettest_item_egress_direct').textContent(), '查询中...');
     assert.equal(await page.locator('#nettest_btn').getAttribute('aria-busy'), 'true');
     await page.waitForFunction(() => !document.getElementById('nettest_btn').disabled);
-    assert.equal(await page.locator('#nettest_item_egress_direct').textContent(), egressReplies.direct.ip);
-    assert.equal(await page.locator('#nettest_item_egress_proxy.text-red').count(), 1);
-    assert.equal(await page.locator('#nettest_item_egress_proxy img').count(), 0);
-    assert.equal(await page.evaluate(() => Boolean(window.networkXss)), false);
-    assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
-    await page.locator('#page_content').screenshot({path: '/tmp/nas-network-egress-mobile.png'});
-    slowEgress = false;
-    egressOffline = true;
+    assert.equal(await page.locator('#nettest_item_res_0').textContent(), '是');
+    assert.equal(await page.locator('#nettest_btn').getAttribute('aria-busy'), 'false');
+    slowNetwork = false;
+    networkOffline = true;
     await page.locator('#nettest_btn').click();
     await page.waitForFunction(() => !document.getElementById('nettest_btn').disabled);
-    assert.equal(await page.locator('#nettest_item_egress_direct').textContent(), '网络错误，请检查登录或连接');
-    assert.equal(await page.locator('#nettest_item_res_0').textContent(), '是');
-    egressOffline = false;
-    egressReplies.proxy = {res: true, ip: '1.1.1.1'};
+    assert.equal(await page.locator('#nettest_item_res_0 .bg-red').textContent(), '否');
+    assert((await page.locator('#nettest_item_res_0').textContent()).includes('网络错误'));
+    networkOffline = false;
     await page.locator('#nettest_btn').focus();
     await page.keyboard.press('Enter');
     await page.waitForFunction(() => !document.getElementById('nettest_btn').disabled);
-    assert.equal(await page.locator('#nettest_item_egress_proxy').textContent(), '1.1.1.1');
-    assert.equal(await page.locator('#nettest_item_egress_proxy.text-red').count(), 0);
-    assert.equal(await page.locator('#nettest_item_egress_proxy').getAttribute('aria-live'), 'polite');
+    assert.equal(await page.locator('#nettest_item_res_0').textContent(), '是');
+    assert(networkCommands.every(command => command === 'net_test'), 'Default tests must never query egress IP');
+    // An empty target list remains usable without issuing any requests.
+    await page.locator('input[name="nettest_item"]').evaluateAll(inputs => inputs.forEach(input => input.remove()));
+    const completedRequests = networkCommands.length;
+    await page.locator('#nettest_btn').click();
+    assert.equal(await page.locator('#nettest_btn').isEnabled(), true);
+    assert.equal(await page.locator('#nettest_btn').textContent(), '测试');
+    assert.equal(networkCommands.length, completedRequests);
 
     // Exercise the actual settings callback: errors remain visible and the
     // original proxy input survives a rejected save or a later successful retry.
