@@ -5,8 +5,11 @@ import io
 import os
 from pathlib import Path
 import tempfile
+import threading
 import types
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from unittest.mock import Mock, patch
 import zipfile
 
@@ -34,7 +37,7 @@ class OnlineSubtitleTest(unittest.TestCase):
         params = {'token': 'SECRET', 'id': '123456'}
         for failure in (self.response(520), module.requests.ConnectTimeout()):
             with self.subTest(failure=type(failure).__name__):
-                with patch.object(module.requests, 'get', side_effect=[failure, self.response(payload={'status': 0})]) as get:
+                with patch.object(module, 'bounded_request', side_effect=[failure, self.response(payload={'status': 0})]) as get:
                     self.assertEqual(OnlineSubtitles()._json('https://api.assrt.net/v1/sub/detail', params), {'status': 0})
                 self.assertEqual(get.call_args.args[0], 'https://api.makedie.me/v1/sub/detail')
                 self.assertEqual(get.call_args.kwargs['params'], params)
@@ -47,18 +50,18 @@ class OnlineSubtitleTest(unittest.TestCase):
                 ('https://api.assrt.net/v1/sub/search', [self.response(520), self.response(520)], 2),
                 ('https://api.assrt.net/v1/sub/search', [self.response(payload=[])], 1)):
             with self.subTest(url=url, expected_calls=expected_calls):
-                with patch.object(module.requests, 'get', side_effect=responses) as get:
+                with patch.object(module, 'bounded_request', side_effect=responses) as get:
                     with self.assertRaises(ValueError):
                         OnlineSubtitles()._json(url, {'token': 'SECRET'})
                 self.assertEqual(get.call_count, expected_calls)
-        with patch.object(module.requests, 'get', return_value=self.response(payload={'status': 30900})) as get:
+        with patch.object(module, 'bounded_request', return_value=self.response(payload={'status': 30900})) as get:
             self.assertEqual(OnlineSubtitles()._json('https://api.assrt.net/v1/sub/search', {})['status'], 30900)
             self.assertEqual(get.call_count, 1)
 
     def test_assrt_http_520_upgrades_preserving_signed_url(self):
         service = OnlineSubtitles()
         url = 'http://file1.assrt.net:80/download/123/a%20b.srt?_=123&-=a%2Fb&api=1'
-        with patch.object(service, '_check_url') as check, patch.object(module.requests, 'get', side_effect=[self.response(520), self.response()]) as get:
+        with patch.object(service, '_check_url') as check, patch.object(module, 'bounded_request', side_effect=[self.response(520), self.response()]) as get:
             self.assertEqual(service._download(url), b'subtitle')
         upgraded = 'https://file1.assrt.net/download/123/a%20b.srt?_=123&-=a%2Fb&api=1'
         self.assertEqual([call.args[0] for call in get.call_args_list], [url, upgraded])
@@ -73,7 +76,7 @@ class OnlineSubtitleTest(unittest.TestCase):
                 ('http://file1.assrt.net.evil.example/sub', 520, 1),
                 ('http://example.com/sub', 520, 1)):
             with self.subTest(url=url, code=code):
-                with patch.object(service, '_check_url'), patch.object(service, '_report_download_failure'), patch.object(module.requests, 'get', side_effect=[self.response(code) for _ in range(count)]) as get:
+                with patch.object(service, '_check_url'), patch.object(service, '_report_download_failure'), patch.object(module, 'bounded_request', side_effect=[self.response(code) for _ in range(count)]) as get:
                     with self.assertRaisesRegex(ValueError, 'HTTP ' + str(code)):
                         service._download(url)
                 self.assertEqual(get.call_count, count)
@@ -99,7 +102,7 @@ class OnlineSubtitleTest(unittest.TestCase):
         # Exercise the real queue append, replacing only the configured logger.
         for response, expected in cases:
             with self.subTest(expected=expected):
-                with patch.object(service, 'cid', return_value=''), patch.object(module.requests, 'get', side_effect=[response]), patch.object(module.log.Logger, 'get_instance', return_value=Mock()), patch.object(module.log, 'LOG_QUEUE', []):
+                with patch.object(service, 'cid', return_value=''), patch.object(module, 'bounded_request', side_effect=[response]), patch.object(module.log.Logger, 'get_instance', return_value=Mock()), patch.object(module.log, 'LOG_QUEUE', []):
                     results, warnings = service.search('影片', '/private/SECRET.mkv', 'thunder')
                     self.assertFalse(results)
                     self.assertEqual(warnings, ['迅雷检索失败，请稍后重试'])
@@ -112,7 +115,7 @@ class OnlineSubtitleTest(unittest.TestCase):
 
     def test_thunder_empty_results_do_not_log_failure(self):
         service = OnlineSubtitles()
-        with patch.object(service, 'cid', return_value=''), patch.object(module.requests, 'get', return_value=self.response(payload={'code': 0, 'data': []})), patch.object(module.log, 'error') as error:
+        with patch.object(service, 'cid', return_value=''), patch.object(module, 'bounded_request', return_value=self.response(payload={'code': 0, 'data': []})), patch.object(module.log, 'error') as error:
             self.assertEqual(service.search('影片', '/media.mkv', 'thunder'), ([], []))
             error.assert_not_called()
 
@@ -147,6 +150,117 @@ class OnlineSubtitleTest(unittest.TestCase):
         items, warnings = OnlineSubtitles().search('影片', '', 'assrt')
         self.assertEqual(items, [])
         self.assertIn('Token', warnings[0])
+
+    def test_opensubtitles_matches_api_movie_metadata_without_auto_confidence_threshold(self):
+        client = Mock()
+        client.is_configured.return_value = (True, '')
+        client.search_subtitles.return_value = ([
+            dict(file_id=42, release='GROUP', language='zh-cn', high_confidence=False,
+                 feature={'feature_type': 'movie', 'title': 'Movie', 'year': 2024}),
+            dict(file_id=42, release='duplicate', language='zh-cn', feature={}),
+            dict(file_id=43, release='Other.2024', language='zh-cn',
+                 feature={'feature_type': 'movie', 'title': 'Other', 'year': 2024}),
+            dict(file_id=44, release='Movie.2000', language='zh-cn',
+                 feature={'feature_type': 'movie', 'title': 'Movie', 'year': 2000}),
+        ], '')
+        service = OnlineSubtitles(opensubtitles=client)
+        items, warnings = service.search('Movie 2024', '/Movie.mkv', 'opensubtitles',
+                                         {'title': 'Movie', 'year': 2024, 'imdbid': 'tt123'})
+        self.assertEqual([item['remote_id'] for item in items], ['42'])
+        self.assertEqual(items[0]['match_label'], '片名与年份匹配')
+        self.assertEqual(items[0]['language'], '简体中文')
+        self.assertIn('2', warnings[0])
+        request = client.search_subtitles.call_args
+        self.assertEqual(request.kwargs['query'], 'Movie 2024')
+        self.assertEqual(request.args[0]['imdbid'], 'tt123')
+        client.download.assert_not_called()
+
+    def test_opensubtitles_episode_query_is_bound_to_path_and_filters_wrong_episode_hash(self):
+        client = Mock()
+        client.is_configured.return_value = (True, '')
+        client.search_subtitles.return_value = ([
+            dict(file_id=1, release='release', language='ze', feature={
+                'feature_type': 'episode', 'parent_title': 'Show', 'season_number': 2, 'episode_number': 3}),
+            dict(file_id=2, release='Show.S02E04', language='ze', moviehash_match=True, feature={
+                'feature_type': 'episode', 'parent_title': 'Show', 'season_number': 2, 'episode_number': 4}),
+            dict(file_id=3, release='Other.S02E03', language='ze', feature={
+                'feature_type': 'episode', 'parent_title': 'Other', 'season_number': 2, 'episode_number': 3}),
+        ], '')
+        service = OnlineSubtitles(opensubtitles=client)
+        items, _ = service.search('Show 1080p', '/Show.S02E03.mkv', 'opensubtitles',
+                                  {'title': 'Show', 'media_type': 'episode', 'season': 2, 'episode': 3,
+                                   'imdbid': 'tt123', 'query_edited': True})
+        self.assertEqual([item['remote_id'] for item in items], ['1'])
+        self.assertEqual(items[0]['target']['episode'], 3)
+        self.assertEqual(items[0]['match_label'], '剧名与季集匹配')
+        request = client.search_subtitles.call_args
+        self.assertEqual(request.kwargs['query'], 'Show 1080p')
+        self.assertIsNone(request.args[0]['imdbid'])
+        self.assertEqual(request.args[0]['season'], 2)
+        self.assertEqual(request.args[0]['episode'], 3)
+
+    def test_opensubtitles_preserves_the_configured_language_order(self):
+        client = Mock()
+        client.is_configured.return_value = (True, '')
+        client.search_subtitles.return_value = ([
+            dict(file_id=1, release='Movie', language='ze', identity_match=True),
+            dict(file_id=2, release='Movie', language='zh-cn', identity_match=True),
+        ], '')
+        items, _ = OnlineSubtitles(opensubtitles=client).search('Movie', '/Movie.mkv', 'opensubtitles')
+        self.assertEqual([item['remote_id'] for item in items], ['1', '2'])
+
+    def test_opensubtitles_failure_keeps_other_source_results(self):
+        client = Mock()
+        client.is_configured.return_value = (True, '')
+        client.search_subtitles.return_value = ([], 'OpenSubtitles请求失败：HTTP 403')
+        service = OnlineSubtitles('token', opensubtitles=client)
+        with patch.object(service, 'cid', return_value=''), patch.object(service, '_json', side_effect=[
+            {'code': 0, 'data': [{'name': 'Movie.2024.srt', 'url': 'https://example.com/sub', 'ext': 'srt'}]},
+            {'status': 0, 'sub': {'subs': []}},
+        ]):
+            items, warnings = service.search('Movie 2024', '/Movie.mkv')
+        self.assertEqual(items[0]['provider'], 'thunder')
+        self.assertIn('HTTP 403', warnings[0])
+
+    def test_opensubtitles_configuration_and_download_errors_do_not_consume_another_link(self):
+        items, warnings = OnlineSubtitles().search('Movie', '/Movie.mkv', 'opensubtitles')
+        self.assertFalse(items)
+        self.assertIn('OpenSubtitles', warnings[0])
+        client = Mock()
+        client.is_configured.return_value = (False, '未配置OpenSubtitles用户名或密码')
+        service = OnlineSubtitles(opensubtitles=client)
+        item = dict(provider='opensubtitles', remote_id='42', name='Movie', language_code='zh-cn')
+        with self.assertRaisesRegex(ValueError, '用户名或密码'):
+            service.files(item)
+        client.download.assert_not_called()
+        client.is_configured.return_value = (True, '')
+        client.download.return_value = (None, 'OpenSubtitles请求失败：HTTP 406，下载次数已用尽')
+        with self.assertRaisesRegex(ValueError, 'HTTP 406'):
+            service.files(item)
+        client.download.assert_called_once_with('42')
+
+    def test_opensubtitles_download_uses_signed_file_id_and_language_with_existing_content_guard(self):
+        client = Mock()
+        client.is_configured.return_value = (True, '')
+        client.download.return_value = ({'link': 'https://www.opensubtitles.com/download/signed'}, '')
+        service = OnlineSubtitles(opensubtitles=client)
+        content = b'1\n00:00:01,000 --> 00:00:02,000\nHello\n'
+        item = dict(provider='opensubtitles', remote_id='42', name='Show.S02E03.ass', language_code='ze',
+                    target={'season': 2, 'episode': 3}, hash_match=False)
+        proxies = {'https': 'http://proxy.example:7890'}
+        with patch.object(service, '_download', return_value=content) as download, \
+                patch.object(module, 'Config', return_value=types.SimpleNamespace(get_proxies=lambda: proxies)):
+            name, result = service.files(item)
+        self.assertEqual(name, 'Show.S02E03.zh-cn.srt')
+        self.assertEqual(result, content)
+        client.download.assert_called_once_with('42')
+        download.assert_called_once_with('https://www.opensubtitles.com/download/signed', proxies=proxies)
+
+    def test_opensubtitles_proxy_fake_ip_is_allowed_only_for_its_real_domain(self):
+        with patch.object(module, 'resolve_addresses', return_value=[(None, None, None, None, ('198.18.0.38', 443))]):
+            OnlineSubtitles._check_url('https://www.opensubtitles.com/download/sub.srt')
+            with self.assertRaises(ValueError):
+                OnlineSubtitles._check_url('https://opensubtitles.com.evil.example/sub.srt')
 
     def test_archive_requires_selection_and_never_extracts_paths(self):
         stream = io.BytesIO()
@@ -185,29 +299,29 @@ class OnlineSubtitleTest(unittest.TestCase):
         self.assertIn('RAR', str(error.exception))
 
     def test_download_rejects_private_destination_and_redirect(self):
-        with patch.object(module.socket, 'getaddrinfo', return_value=[(None, None, None, None, ('127.0.0.1', 80))]):
+        with patch.object(module, 'resolve_addresses', return_value=[(None, None, None, None, ('127.0.0.1', 80))]):
             with self.assertRaises(ValueError):
                 OnlineSubtitles._check_url('http://localhost/sub.srt')
         response = Mock(is_redirect=True, headers={'Location': 'http://localhost/private'})
         response.__enter__ = Mock(return_value=response)
         response.__exit__ = Mock(return_value=False)
         service = OnlineSubtitles()
-        with patch.object(service, '_check_url', side_effect=[None, ValueError('private')]), patch.object(module.requests, 'get', return_value=response) as get:
+        with patch.object(service, '_check_url', side_effect=[None, ValueError('private')]), patch.object(module, 'bounded_request', return_value=response) as get:
             with self.assertRaises(ValueError):
                 service._download('https://example.com/subtitle')
             self.assertEqual(get.call_count, 1)
 
     def test_proxy_fake_ip_is_only_allowed_for_known_providers(self):
-        with patch.object(module.socket, 'getaddrinfo', return_value=[(None, None, None, None, ('198.18.0.38', 80))]):
+        with patch.object(module, 'resolve_addresses', return_value=[(None, None, None, None, ('198.18.0.38', 80))]):
             OnlineSubtitles._check_url('https://subtitle.v.geilijiasu.com/file.srt')
             with self.assertRaises(ValueError):
                 OnlineSubtitles._check_url('https://untrusted.example/file.srt')
-        with patch.object(module.socket, 'getaddrinfo', return_value=[(None, None, None, None, ('192.168.1.1', 80))]):
+        with patch.object(module, 'resolve_addresses', return_value=[(None, None, None, None, ('192.168.1.1', 80))]):
             with self.assertRaises(ValueError):
                 OnlineSubtitles._check_url('https://subtitle.v.geilijiasu.com/file.srt')
 
     def test_request_failure_does_not_expose_token(self):
-        with patch.object(module.requests, 'get', side_effect=module.requests.RequestException('url?token=SECRET')):
+        with patch.object(module, 'bounded_request', side_effect=module.requests.RequestException('url?token=SECRET')):
             with self.assertRaises(ValueError) as context:
                 OnlineSubtitles('SECRET')._json('https://api.assrt.net', {})
             self.assertNotIn('SECRET', str(context.exception))
@@ -406,3 +520,104 @@ class OnlineSubtitleRouteTest(unittest.TestCase):
             self.ns['PathUtils'] = types.SimpleNamespace(is_path_in_path=lambda base, path: os.path.commonpath([base, path]) == base)
             with self.assertRaises(ValueError):
                 self.ns['_online_subtitle_media_path'](str(link))
+
+    def test_opensubtitles_ticket_requires_explicit_quota_confirmation_before_download(self):
+        service = Mock()
+        self.ns['_online_subtitle_service'] = lambda: service
+        self.ns['_online_subtitle_media_path'] = lambda path: path
+        ticket = self.ns['_online_subtitle_signer']().dumps({
+            'user': 'user', 'path': '/library/movie.mkv', 'item': {'provider': 'opensubtitles', 'remote_id': '42'}
+        })
+        with self.app.test_request_context(json={'ticket': ticket}):
+            result = self.ns['library_online_subtitle_download']()
+        self.assertEqual(result['code'], -1)
+        self.assertIn('配额', result['msg'])
+        service.files.assert_not_called()
+
+    def test_opensubtitles_download_defers_quota_until_idempotent_queue_admission(self):
+        service = Mock()
+        service.files.return_value = ('movie.zh-cn.srt', b'content')
+        manager = Mock()
+        manager.submit_download_upload.return_value = ({'task_id': 'existing-task'}, True)
+        self.ns.update(_online_subtitle_service=lambda: service,
+                       _online_subtitle_media_path=lambda path: path,
+                       _subtitle_tasks=lambda: manager,
+                       _get_all_media_library_root_paths=lambda: ['/library'],
+                       _path_authorization_snapshot=lambda path, roots: {'real_path': path},
+                       _subtitle_task_owner=lambda: 'user',
+                       _subtitle_task_response=lambda task, reused, message: {'code': 0, 'task_id': task['task_id'], 'reused': reused},
+                       Config=lambda: types.SimpleNamespace(get_config=lambda key: {'media_server': 'jellyfin'}))
+        ticket = self.ns['_online_subtitle_signer']().dumps({
+            'user': 'user', 'path': '/library/movie.mkv', 'item': {'provider': 'opensubtitles', 'remote_id': '42'}
+        })
+        with self.app.test_request_context(json={'ticket': ticket, 'confirm_quota': True}):
+            result = self.ns['library_online_subtitle_download']()
+        self.assertTrue(result['reused'])
+        service.files.assert_not_called()
+        kwargs = manager.submit_download_upload.call_args.kwargs
+        self.assertEqual(kwargs['owner'], 'user')
+        self.assertEqual(kwargs['payload']['canonical_media_file'], '/library/movie.mkv')
+        with self.app.test_request_context(json={'ticket': ticket, 'confirm_quota': True, 'member': 'ignored.srt'}):
+            self.ns['library_online_subtitle_download']()
+        self.assertEqual(manager.submit_download_upload.call_args.kwargs['request_id'], kwargs['request_id'])
+        files = kwargs['files_factory']()
+        self.assertEqual(files[0].filename, 'movie.zh-cn.srt')
+        service.files.assert_called_once_with({'provider': 'opensubtitles', 'remote_id': '42'})
+
+
+class OnlineDownloadAdmissionTest(unittest.TestCase):
+    def manager(self):
+        # Exercise the production admission method and per-owner reentrant lock
+        # without importing unrelated NAS services or a configured database.
+        tree = ast.parse((ROOT / 'app/helper/subtitle_tasks.py').read_text())
+        klass = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'SubtitleTaskManager')
+        methods = [node for node in klass.body if isinstance(node, ast.FunctionDef)
+                   and node.name in ('submit_download_upload', '_owner_submission')]
+        namespace = {'contextmanager': contextmanager, 'threading': threading,
+                     'SubtitleTaskError': ValueError, '_STANDARD_STAGING_FACTOR': 2}
+        exec(compile(ast.Module(body=methods, type_ignores=[]), '<download-admission>', 'exec'), namespace)
+        manager = types.SimpleNamespace(_lock=threading.RLock(), _owner_submit_locks={})
+        manager._owner_submission = types.MethodType(namespace['_owner_submission'], manager)
+        manager.submit_download_upload = types.MethodType(namespace['submit_download_upload'], manager)
+        stored = {}
+        manager.start = Mock()
+        manager._find_reusable = lambda owner, kind, request, dedupe: stored.get((owner, request))
+        manager._task_dict = lambda task, **kwargs: task
+        manager.acquire_upload_admission = Mock(return_value='lease')
+        manager.release_upload_admission = Mock()
+        def submit_upload(**kwargs):
+            task = {'task_id': 'task-1'}
+            stored[(kwargs['owner'], kwargs['request_id'])] = task
+            return task, False
+        manager.submit_upload = Mock(side_effect=submit_upload)
+        return manager
+
+    def test_concurrent_retries_download_once_and_reuse_the_recorded_task(self):
+        manager = self.manager()
+        fetch = Mock(return_value=['subtitle'])
+        def submit(_):
+            return manager.submit_download_upload('user', fetch, {}, 'signed-request', 'jellyfin')
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(submit, range(2)))
+        self.assertEqual(sorted(reused for _, reused in results), [False, True])
+        fetch.assert_called_once()
+        manager.acquire_upload_admission.assert_called_once()
+        manager.release_upload_admission.assert_called_once_with('lease')
+        self.assertEqual(manager._owner_submit_locks, {})
+
+    def test_full_queue_never_calls_quota_consuming_fetch(self):
+        manager = self.manager()
+        manager.acquire_upload_admission.side_effect = ValueError('queue full')
+        fetch = Mock()
+        with self.assertRaisesRegex(ValueError, 'queue full'):
+            manager.submit_download_upload('user', fetch, {}, 'signed-request')
+        fetch.assert_not_called()
+        manager.release_upload_admission.assert_not_called()
+
+    def test_failed_download_releases_admission_without_creating_a_task(self):
+        manager = self.manager()
+        fetch = Mock(side_effect=ValueError('HTTP 403'))
+        with self.assertRaisesRegex(ValueError, 'HTTP 403'):
+            manager.submit_download_upload('user', fetch, {}, 'signed-request')
+        manager.release_upload_admission.assert_called_once_with('lease')
+        manager.submit_upload.assert_not_called()

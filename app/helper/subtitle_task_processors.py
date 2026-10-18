@@ -696,11 +696,14 @@ def process_repair_task(manager, task_id):
         raise InterruptedError("manager stopping")
     processed = data.get("processed") or []
     warnings = data.setdefault("warnings", [])
-    for item in processed:
-        try:
-            manager.invalidate_probe_cache([item.get("source"), item.get("target")])
-        except Exception as warning:
-            warnings.append(f"探测缓存失效失败：{str(warning)}")
+    # All modified subtitles belong to one repair result; invalidate them in
+    # one transaction, with bounded SQL chunks handled by the manager.
+    try:
+        manager.invalidate_probe_cache([
+            path for item in processed for path in (item.get("source"), item.get("target"))
+        ])
+    except Exception as warning:
+        warnings.append(f"探测缓存失效失败：{str(warning)}")
     try:
         MediaLibrary.invalidate_subtitle_directory_cache(requested_media_file)
     except Exception as warning:
@@ -805,7 +808,7 @@ def process_audit_task(manager, task_id):
         "subcategory": payload.get("subcategory") or "",
         "mode": payload.get("mode") or "linked"
     }, ensure_ascii=False, sort_keys=True)
-    cache_buffer = []
+    cache_buffer = {}
     cache_last_flush = [time.monotonic()]
     cache_warnings = []
     audit_started = time.monotonic()
@@ -830,13 +833,15 @@ def process_audit_task(manager, task_id):
         )
 
     def cache_get(fingerprint):
-        for pending_fingerprint, pending_result in reversed(cache_buffer):
-            if pending_fingerprint == fingerprint:
-                return dict(pending_result)
+        # Canonical JSON preserves the previous full-fingerprint comparison,
+        # while deduplicating writes and providing constant-time batch lookup.
+        pending = cache_buffer.get(json.dumps(fingerprint, sort_keys=True))
+        if pending is not None:
+            return dict(pending[1])
         return manager.probe_cache_get(server_type, fingerprint)
 
     def cache_put(fingerprint, result):
-        cache_buffer.append((dict(fingerprint), dict(result)))
+        cache_buffer[json.dumps(fingerprint, sort_keys=True)] = (dict(fingerprint), dict(result))
         flush_cache()
 
     def flush_cache(force=False):
@@ -845,8 +850,8 @@ def process_audit_task(manager, task_id):
         if not force and len(cache_buffer) < 25 \
                 and time.monotonic() - cache_last_flush[0] < 2:
             return
-        pending = list(cache_buffer)
-        del cache_buffer[:]
+        pending = list(cache_buffer.values())
+        cache_buffer.clear()
         try:
             manager.probe_cache_put_many(server_type, pending)
             cache_last_flush[0] = time.monotonic()

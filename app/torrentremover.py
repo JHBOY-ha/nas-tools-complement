@@ -2,15 +2,17 @@ import json
 from threading import Lock
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from app.utils.scheduled_executor import SharedScheduledExecutor
 
 import log
 from app.conf import ModuleConf
+from app.db.session_scope import with_db_session
 from app.downloader import Downloader
 from app.helper import DbHelper
 from app.message import Message
 from app.utils import ExceptionUtils
 from app.utils.commons import singleton
-from config import Config
+from config import Config, SCHEDULER_JOB_DEFAULTS
 
 lock = Lock()
 
@@ -59,12 +61,16 @@ class TorrentRemover(object):
         if not self._remove_tasks:
             return
         # 启动删种任务
-        self._scheduler = BackgroundScheduler(timezone=Config().get_timezone())
+        self._scheduler = BackgroundScheduler(timezone=Config().get_timezone(),
+                                              job_defaults=SCHEDULER_JOB_DEFAULTS,
+                                              # Keep native non-reentry checks while
+                                              # sharing the finite scheduled queue.
+                                              executors={'default': SharedScheduledExecutor()})
         remove_flag = False
         for task in self._remove_tasks.values():
             if task.get("enabled") and task.get("interval") and task.get("config"):
                 remove_flag = True
-                self._scheduler.add_job(func=self.auto_remove_torrents,
+                self._scheduler.add_job(func=with_db_session(self.auto_remove_torrents),
                                         args=[task.get("id")],
                                         trigger='interval',
                                         seconds=int(task.get("interval")) * 60)

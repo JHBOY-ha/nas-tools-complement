@@ -1,8 +1,10 @@
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from contextlib import nullcontext
 
@@ -63,6 +65,8 @@ class SubtitleHealth:
     _validator_version = "subtitle-health-v2"
     _max_local_text_bytes = 20 * 1024 * 1024
     _ffprobe_version = None
+    _ffprobe_lookup = None
+    _ffprobe_lookup_lock = threading.Lock()
     _chinese_filename_re = re.compile(
         r"(^|[.\-_\[( ])(zh(?:[-_]?(?:cn|hans|chs|sg|sc|tw|hant|cht|hk))?|"
         r"zho|chi|chs|cht|cn|sc|tc|简|简中|简体|繁|繁中|繁体|中文|中文字幕)"
@@ -84,7 +88,7 @@ class SubtitleHealth:
             "encoding": "",
             "removed_blank_lines": 0,
             "ass_repairs": [],
-            "probe_available": bool(shutil.which("ffprobe")),
+            "probe_available": bool(cls.__ffprobe_executable()),
             "valid": False,
             "message": ""
         }
@@ -134,6 +138,9 @@ class SubtitleHealth:
                     cancel_check=cancel_check
                 )
             result.update(validation)
+            # Hash bytes already in memory after normalization, not another
+            # complete NAS read. Binary formats keep the copy-time digest.
+            result["content_hash"] = hashlib.sha256(normalized_bytes).hexdigest()
             return result
         except InterruptedError:
             result["canceled"] = True
@@ -147,7 +154,7 @@ class SubtitleHealth:
     @classmethod
     def validate_subtitle(cls, subtitle_file, timeout_seconds=10, cancel_check=None):
         ext = os.path.splitext(subtitle_file)[-1].lower()
-        probe_available = bool(shutil.which("ffprobe"))
+        probe_available = bool(cls.__ffprobe_executable())
         if not os.path.isfile(subtitle_file):
             return {"valid": False, "probe_available": probe_available, "message": "字幕文件不存在"}
         file_size = os.path.getsize(subtitle_file)
@@ -624,16 +631,15 @@ class SubtitleHealth:
             if not os.path.isdir(root) or os.path.islink(root):
                 cls.__record_inaccessible(accumulator, root)
                 continue
-            for current_dir, dir_names, file_names in os.walk(
-                    root, topdown=True, onerror=_onerror, followlinks=False):
-                # os.walk 在网络文件系统上可能阻塞于一次目录调用；返回后立即合作式取消。
+            for current_dir, dir_names, file_names in cls.__walk_audit_directories(
+                    root, _onerror, lambda: cls.__should_stop_audit(accumulator)):
+                # scandir 可能阻塞于 NAS 调用；枚举期间及返回后均合作式取消。
                 if cls.__should_stop_audit(accumulator):
                     dir_names[:] = []
                     break
                 dir_names[:] = [
                     name for name in dir_names
                     if name.casefold() not in cls._nas_skip_directories
-                    and not os.path.islink(os.path.join(current_dir, name))
                 ]
                 if accumulator["directories"] >= accumulator["directory_limit"]:
                     accumulator["partial"] = True
@@ -645,7 +651,6 @@ class SubtitleHealth:
                 media_files = [
                     name for name in file_names
                     if os.path.splitext(name)[-1].lower() in RMT_MEDIAEXT
-                    and not os.path.islink(os.path.join(current_dir, name))
                 ]
                 media_bases = sorted(
                     [(os.path.splitext(name)[0], os.path.join(current_dir, name)) for name in media_files],
@@ -656,8 +661,6 @@ class SubtitleHealth:
                     if os.path.splitext(sub_name)[-1].lower() not in RMT_SUBEXT:
                         continue
                     subtitle_file = os.path.join(current_dir, sub_name)
-                    if os.path.islink(subtitle_file):
-                        continue
                     media_file = cls.__match_media_file(sub_name, media_bases)
                     if not cls.__audit_pair(
                             accumulator, subtitle_file, media_file):
@@ -674,6 +677,37 @@ class SubtitleHealth:
             if accumulator.get("stop_reason"):
                 break
         return cls.__finish_audit(accumulator)
+
+    @staticmethod
+    def __walk_audit_directories(root, onerror, canceled):
+        """Yield complete, non-symlink directories with mutable top-down pruning."""
+        pending = [root]
+        while pending:
+            if canceled():
+                return
+            directory = pending.pop()
+            # Recheck a queued directory before descent: it may have been
+            # replaced with a link since its parent's scandir completed.
+            if os.path.islink(directory):
+                continue
+            directories, files = [], []
+            try:
+                with os.scandir(directory) as entries:
+                    for index, entry in enumerate(entries):
+                        if index % 128 == 0 and canceled():
+                            return
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            directories.append(entry.name)
+                        else:
+                            files.append(entry.name)
+            except OSError as error:
+                onerror(error)
+                # A partial enumeration must never publish negative coverage.
+                continue
+            yield directory, directories, files
+            pending.extend(os.path.join(directory, name) for name in reversed(directories))
 
     @classmethod
     def subtitle_fingerprint(cls, subtitle_file, cancel_check=None):
@@ -1019,10 +1053,24 @@ class SubtitleHealth:
         }
 
     @classmethod
+    def __ffprobe_executable(cls):
+        # Cache both outcomes briefly; PATH changes take effect immediately and
+        # binaries installed/removed within the same PATH are rechecked later.
+        key = (os.environ.get("PATH", ""), os.environ.get("PATHEXT", ""))
+        with cls._ffprobe_lookup_lock:
+            now = time.monotonic()
+            cached = cls._ffprobe_lookup
+            if cached and cached[0] == key and cached[1] > now:
+                return cached[2]
+            executable = shutil.which("ffprobe")
+            cls._ffprobe_lookup = (key, now + 60, executable)
+            return executable
+
+    @classmethod
     def __get_ffprobe_version(cls, cancel_check=None):
         if cls._ffprobe_version is not None:
             return cls._ffprobe_version
-        executable = shutil.which("ffprobe")
+        executable = cls.__ffprobe_executable()
         if not executable:
             cls._ffprobe_version = "unavailable"
             return cls._ffprobe_version

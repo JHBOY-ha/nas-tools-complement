@@ -17,6 +17,7 @@ from app.conf import SystemConfig
 from app.utils import Torrent, StringUtils, SystemUtils, ExceptionUtils
 from app.utils.commons import singleton
 from app.utils.types import MediaType, DownloaderType, SearchType, RmtMode
+from app.utils.workload import TaskQueueFull
 from config import Config, PT_TAG, RMT_MEDIAEXT
 
 lock = Lock()
@@ -449,10 +450,15 @@ class Downloader:
                             subtitle_dir = os.path.join(visit_dir, dl_files_folder)
                         else:
                             subtitle_dir = visit_dir
-                        ThreadHelper().start_thread(
-                            Subtitle().download_subtitle_from_site,
-                            (media_info, site_info.get("cookie"), site_info.get("ua"), subtitle_dir)
-                        )
+                        try:
+                            ThreadHelper().start_thread(
+                                Subtitle().download_subtitle_from_site,
+                                (media_info, site_info.get("cookie"), site_info.get("ua"), subtitle_dir)
+                            )
+                        except TaskQueueFull:
+                            # The torrent and download history already succeeded;
+                            # subtitle queue pressure must not report a false failure.
+                            log.warn("【Downloader】字幕下载队列繁忙，下载任务已添加，可稍后补下载字幕")
                 return ret, ""
             else:
                 return ret, "请检查下载任务是否已存在"

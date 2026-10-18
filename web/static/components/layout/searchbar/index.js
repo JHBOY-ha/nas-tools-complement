@@ -45,6 +45,8 @@ export class LayoutSearchbar extends CustomElement {
 
   firstUpdated() {
     this._search_source = localStorage.getItem("SearchSource") ?? this.layout_search_source;
+    // 页头可能晚于任务状态加载；由共享客户端补齐计数，不限制为管理员入口。
+    window.ActionTaskClient?.renderSummary();
     // 当前状态：是否模糊
     let blur = false;
     window.addEventListener("scroll", () => {
@@ -150,6 +152,17 @@ export class LayoutSearchbar extends CustomElement {
               </a>
             </span>
           </div>
+          <!-- 任何有权提交任务的用户都能从页头打开同一个任务抽屉。 -->
+          <button type="button" class="btn btn-icon btn-ghost-secondary flex-shrink-0 position-relative me-1"
+                  data-action-task-open aria-controls="action-task-panel" aria-haspopup="dialog"
+                  aria-label="打开后台操作" title="后台操作"
+                  @click=${event => window.ActionTaskClient.open(event.currentTarget)}>
+            <svg xmlns="http://www.w3.org/2000/svg" class="icon" width="24" height="24" viewBox="0 0 24 24"
+                 stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M3 12h4l3 8l4 -16l3 8h4"></path>
+            </svg>
+            <span class="badge bg-primary badge-notification" data-action-task-count hidden></span>
+          </button>
           <!-- 头像 -->
           <div class="nav-item dropdown me-2">
               <a href="#" class="nav-link d-flex lh-1 text-reset ms-1 p-0" data-bs-toggle="dropdown">

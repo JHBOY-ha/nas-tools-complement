@@ -45,10 +45,14 @@
       layout-userpris='{{ UserPris|tojson|safe }}'>
   </layout-searchbar>
   <div class="spinner-border" role="status" id="logo_animation" style="position:absolute;top:30%;left:calc(50% - 40px);width:80px;height:80px;"></div>
-  <div class="page-wrapper" id="page_content" hidden="">
-    {{ OOPS.loading() }}
+  <!-- 页面切换只替换业务内容；全局任务抽屉放在主布局外，避免被裁剪或替换。 -->
+  <div class="page-wrapper">
+    <div class="flex-fill" id="page_content" hidden="">
+      {{ OOPS.loading() }}
+    </div>
   </div>
 </div>
+{% include "action-tasks/panel.html" %}
 <div class="offcanvas offcanvas-end" tabindex="-1" id="offcanvasEnd" aria-labelledby="消息中心">
   <div class="offcanvas-header">
     <h2 class="offcanvas-title" id="offcanvasEndLabel">消息中心</h2>
@@ -691,9 +695,9 @@
             </div>
           </div>
         </div>
-        <form class="dropzone mt-2" id="torrent_files" action="/upload">
+        <form class="dropzone mt-2" id="torrent_files" action="/upload/torrent">
           <div class="fallback">
-            <input name="file" type="file" accept="*.zip" />
+            <input name="file" type="file" accept=".torrent" />
           </div>
           <div class="dz-message">
             <h3 class="dropzone-msg-title">上传种子文件</h3>
@@ -864,6 +868,7 @@
 <script src="../static/js/FileSaver.min.js"></script>
 <script src="../static/js/nprogress.js"></script>
 <script src="../static/js/ace.js"></script>
+<script src="../static/js/action-tasks/client.js"></script>
 <script src="../static/js/util.js"></script>
 {% include "rename/special_confirmation.html" %}
 <script src="../static/js/special-confirmation.js"></script>
@@ -901,7 +906,7 @@
       if (refresh_fail_count < 5) {
         setTimeout("refresh_process('"+type+"')", 200);
       }
-    }, true, false);
+    }, true, false, null, 'global');
   }
 
   // 显示全局进度框
@@ -2235,7 +2240,7 @@
       if (refresh_logging_flag === true) {
         refresh_logging_timer = window.setTimeout("refresh_logging(true)", 2000);
       }
-    }, true, false);
+    }, true, false, null, 'global');
   }
 
   //暂停实时日志
@@ -2305,7 +2310,7 @@
         }
         setTimeout("refresh_message('" + lst_time + "')", 10000);
       }
-    }, true, false);
+    }, true, false, null, 'global');
   }
 
   //检查系统是否在线
@@ -2316,7 +2321,7 @@
         } else {
           setTimeout("check_system_online()", 1000);
         }
-      }, true, false)
+      }, true, false, null, 'global')
   }
 
   //注销
@@ -2463,6 +2468,10 @@
     // 初始化DropZone
     torrent_dropzone = new Dropzone("#torrent_files");
     torrent_dropzone.options.acceptedFiles = ".torrent";
+    // Use the server's exclusive staging name while retaining the display title.
+    torrent_dropzone.on('success', function(file, response) {
+      if (response.code === 0 && response.filename) file.upload.filename = response.filename;
+    });
 
     // 单选框事件
     $('input[type=radio][name=rename_type]').change(function () {

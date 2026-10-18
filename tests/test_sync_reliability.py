@@ -32,6 +32,15 @@ class MediaType(Enum):
 
 def load_class(path, name, methods, namespace, keep_attrs=False):
     tree = ast.parse((ROOT / path).read_text())
+    if path == 'app/filetransfer.py':
+        # Include the real metadata-reservation decorator, not a no-op stub.
+        # It opens only the runner's disposable database when a transfer runs.
+        from functools import wraps
+        namespace['wraps'] = wraps
+        decorator = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                         and node.name == '_reserve_transfer_records')
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[decorator], type_ignores=[])),
+                     path, 'exec'), namespace)
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == name)
     cls.decorator_list = []
     cls.bases = []
@@ -654,6 +663,141 @@ class HardlinkTests(unittest.TestCase):
             self.assertEqual(source.stat().st_ino, target.stat().st_ino)
             t._FileTransfer__transfer_command.assert_not_called()
             t.dbhelper.insert_transfer_blacklist.assert_called_once_with(str(source))
+
+    def test_subtitle_failure_after_publication_retries_without_blacklisting(self):
+        from app.media.meta import extra_transfer
+        from app.utils.types import RmtMode
+        self.ns['Subtitle'] = Mock()
+        self.ns['RmtMode'] = RmtMode
+        self.mode = RmtMode.LINK
+        t = self.transfer
+        t.progress, t.message, t.threadhelper = Mock(), Mock(), Mock()
+        t._filesize_cover = t._refresh_mediaserver = t._scraper_flag = t._movie_category_flag = False
+        t.check_ignore = lambda file_list: (file_list, '')
+        # Keep the production history lookup: the first publication becomes
+        # visible to deduplication before its subtitle stage succeeds.
+        rows = []
+        t.dbhelper.get_media_transfer_history.side_effect = lambda *_: rows
+        t.media = Mock()
+        t.dbhelper.insert_transfer_history.return_value = True
+        t.dbhelper.insert_transfer_blacklist.return_value = True
+        t._FileTransfer__transfer_subtitles.side_effect = [-1, 0]
+        t._FileTransfer__transfer_command = Mock()
+        meta = NS(tmdb_id=1, type=MediaType.MOVIE, category='', title='Film', year='2026',
+                  note={}, skip_reason=None, en_name='Film', cn_name='', begin_season=None,
+                  begin_episode=None, imdb_id=None, set_tmdb_info=Mock(), tmdb_info={'id': 1},
+                  get_title_string=lambda: 'Film (2026)')
+        # Execute the real publication receipt lifecycle, including subtitle failure.
+        self.ns['publish_exclusive'] = extra_transfer.publish_exclusive
+        def transfer(source, target, mode):
+            os.link(source, target)
+            return 0
+        t._FileTransfer__transfer_command.side_effect = transfer
+        def record(**kwargs):
+            target = Path(kwargs['out_path'])
+            rows.append(NS(DEST_PATH=str(target.parent), DEST_FILENAME=target.name, SEASON_EPISODE=''))
+            return True
+        t.dbhelper.insert_transfer_history.side_effect = record
+        with tempfile.TemporaryDirectory() as folder:
+            source, target = Path(folder) / 'source.mkv', Path(folder) / 'target.mkv'
+            source.write_bytes(b'media')
+            t.media.get_media_info_on_files.return_value = {str(source): meta}
+            t._FileTransfer__is_media_exists = lambda *_: (
+                True, folder, target.exists(), str(target if target.exists() else target.with_suffix('')))
+            kwargs = dict(in_from='manual', in_path=str(source), files=[str(source)],
+                          rmt_mode=self.mode, target_dir=folder)
+            self.assertFalse(t.transfer_media(**kwargs)[0])
+            t.dbhelper.insert_transfer_blacklist.assert_not_called()
+            inode = target.stat().st_ino
+            self.assertTrue(t.transfer_media(**kwargs)[0])
+            self.assertEqual(target.stat().st_ino, inode)
+            self.assertEqual(t._FileTransfer__transfer_subtitles.call_count, 2)
+            t.dbhelper.insert_transfer_blacklist.assert_called_once_with(str(source))
+            t._FileTransfer__transfer_command.assert_called_once()
+            self.assertFalse(extra_transfer.has_pending_publication(str(source), str(target)))
+            # Even after a cache clear/re-submission, complete same-inode history
+            # must not repeat subtitles, metadata, scraping or notifications.
+            prior = (t.media.get_tmdb_info.call_count, t.message.send_transfer_movie_message.call_count)
+            self.assertTrue(t.transfer_media(**kwargs)[0])
+            self.assertEqual(t._FileTransfer__transfer_subtitles.call_count, 2)
+            self.assertEqual(prior, (t.media.get_tmdb_info.call_count, t.message.send_transfer_movie_message.call_count))
+
+    def test_copy_move_pending_publication_recovers_before_existing_file_skip(self):
+        import shutil
+        from app.media.meta import extra_transfer
+        from app.utils.types import RmtMode
+
+        # Use the real publisher and real local files through transfer_media,
+        # including both link receipts and the exclusive-rename fallback.
+        self.ns['RmtMode'] = RmtMode
+        # Avoid the production MOVE pacing delay in this offline fixture.
+        self.ns['sleep'], self.ns['random'] = Mock(), NS(uniform=lambda *_: 0)
+        self.ns['Subtitle'] = Mock()
+        self.ns['publish_exclusive'] = extra_transfer.publish_exclusive
+        for mode in (RmtMode.COPY, RmtMode.MOVE):
+            for receipt_kind in ('pending', 'rename', 'invalid'):
+                with self.subTest(mode=mode, receipt=receipt_kind), tempfile.TemporaryDirectory() as folder:
+                    t = self.transfer
+                    t.progress, t.message, t.threadhelper = Mock(), Mock(), Mock()
+                    t._filesize_cover = t._refresh_mediaserver = t._scraper_flag = t._movie_category_flag = False
+                    t.check_ignore = lambda file_list: (file_list, '')
+                    t.media, t.dbhelper = Mock(), Mock()
+                    t.dbhelper.insert_transfer_history.side_effect = [False, False, True]
+                    t.dbhelper.insert_transfer_blacklist.return_value = True
+                    t._FileTransfer__transfer_subtitles = Mock(return_value=0)
+                    source, target = Path(folder) / 'source.mkv', Path(folder) / 'target.mkv'
+                    source.write_bytes(b'published content')
+                    meta = NS(tmdb_id=1, type=MediaType.MOVIE, category='', title='Film', year='2026',
+                              note={}, skip_reason=None, en_name='Film', cn_name='', begin_season=None,
+                              begin_episode=None, imdb_id=None, set_tmdb_info=Mock(), tmdb_info={'id': 1},
+                              get_title_string=lambda: 'Film (2026)')
+                    t.media.get_media_info_on_files.return_value = {str(source): meta}
+                    t._FileTransfer__is_media_exists = lambda *_: (
+                        True, folder, target.exists(), str(target if target.exists() else target.with_suffix('')))
+                    def copy(source, pending, staging_mode):
+                        self.assertEqual(staging_mode, RmtMode.COPY)
+                        shutil.copy2(source, pending)
+                        return 0
+                    t._FileTransfer__transfer_command = Mock(side_effect=copy)
+                    kwargs = dict(in_from='manual', in_path=str(source), files=[str(source)],
+                                  rmt_mode=mode, target_dir=folder)
+                    if receipt_kind == 'rename':
+                        import errno
+                        with patch.object(extra_transfer.os, 'link', side_effect=OSError(errno.EOPNOTSUPP, 'unsupported')):
+                            self.assertFalse(t.transfer_media(**kwargs)[0])
+                    else:
+                        self.assertFalse(t.transfer_media(**kwargs)[0])
+                    self.assertTrue(source.exists())
+                    self.assertTrue(extra_transfer.has_pending_publication(str(source), str(target)))
+                    inode = target.stat().st_ino
+                    if receipt_kind == 'invalid':
+                        # A candidate receipt is not proof: an unrelated inode
+                        # must fail before any history or completion acknowledgement.
+                        target.unlink()
+                        target.write_bytes(b'unrelated bytes')
+                        self.assertFalse(t.transfer_media(**kwargs)[0])
+                        self.assertEqual(t.dbhelper.insert_transfer_history.call_count, 1)
+                        self.assertTrue(source.exists())
+                        t.dbhelper.insert_transfer_blacklist.assert_not_called()
+                        t._FileTransfer__transfer_subtitles.assert_not_called()
+                        continue
+                    self.assertFalse(t.transfer_media(**kwargs)[0])
+                    self.assertTrue(source.exists())
+                    self.assertEqual(t.dbhelper.insert_transfer_history.call_count, 2)
+                    t.dbhelper.insert_transfer_blacklist.assert_not_called()
+                    t._FileTransfer__transfer_subtitles.assert_not_called()
+                    self.assertTrue(t.transfer_media(**kwargs)[0])
+                    self.assertEqual(target.stat().st_ino, inode)
+                    self.assertEqual(target.read_bytes(), b'published content')
+                    self.assertEqual(source.exists(), mode != RmtMode.MOVE)
+                    self.assertEqual(list(Path(folder).glob('*.extra-pending*')), [])
+                    if mode == RmtMode.MOVE and receipt_kind == 'pending':
+                        # Same-volume MOVE preserves the inode without copying bytes.
+                        t._FileTransfer__transfer_command.assert_not_called()
+                    else:
+                        t._FileTransfer__transfer_command.assert_called_once()
+                    t._FileTransfer__transfer_subtitles.assert_called_once()
+                    t.dbhelper.insert_transfer_blacklist.assert_called_once_with(str(source))
 
     def test_failed_replacement_preserves_old_media(self):
         with tempfile.TemporaryDirectory() as folder:

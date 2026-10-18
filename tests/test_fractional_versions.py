@@ -286,7 +286,7 @@ class FractionalWorkflowTest(unittest.TestCase):
                 patch("app.filetransfer.Subtitle"), \
                 patch.object(Media, "get_tmdb_en_title", return_value="Attack on Titan"), \
                 patch.object(transfer, "_existing_media_files", return_value=[]), \
-                patch.object(transfer, "_FileTransfer__transfer_subtitles", return_value=0):
+                patch.object(transfer, "_FileTransfer__transfer_subtitles", return_value=0) as subtitles:
             target = os.path.join(root, "library")
             os.mkdir(target)
             medias = {}
@@ -325,19 +325,29 @@ class FractionalWorkflowTest(unittest.TestCase):
             second_target = os.path.join(root, "second-library")
             os.mkdir(second_target)
             transfer._existing_media_files.return_value = [(existing, "S00E01")]
+            subtitles.reset_mock()
+            transfer.dbhelper.insert_transfer_history.reset_mock()
             success, _ = transfer.transfer_media(
                 in_from=SyncType.MON, in_path=special, files=[special],
                 target_dir=second_target, rmt_mode=RmtMode.LINK)
             self.assertTrue(success)
             self.assertEqual([], os.listdir(second_target))
-            # No history yet: the same inode in the target must still reach history writing.
-            transfer._existing_media_files.return_value = []
-            transfer.dbhelper.insert_transfer_blacklist.reset_mock()
-            success, _ = transfer.transfer_media(
-                in_from=SyncType.MON, in_path=special, files=[special],
-                target_dir=target, rmt_mode=RmtMode.LINK)
-            self.assertTrue(success)
-            transfer.dbhelper.insert_transfer_blacklist.assert_called_once_with(special)
+            # 跨目录去重必须在字幕/历史写入前结束；同一目标的补重试则无论
+            # 是否已写媒体历史，都应保留 inode 并经过字幕处理和成功黑名单。
+            subtitles.assert_not_called()
+            transfer.dbhelper.insert_transfer_history.assert_not_called()
+            for history in ([(existing, "S00E01")], []):
+                with self.subTest(history_saved=bool(history)):
+                    transfer._existing_media_files.return_value = history
+                    subtitles.reset_mock()
+                    transfer.dbhelper.insert_transfer_blacklist.reset_mock()
+                    success, _ = transfer.transfer_media(
+                        in_from=SyncType.MON, in_path=special, files=[special],
+                        target_dir=target, rmt_mode=RmtMode.LINK)
+                    self.assertTrue(success)
+                    self.assertTrue(os.path.samefile(special, existing))
+                    subtitles.assert_called_once_with(org_name=special, new_name=existing, rmt_mode=RmtMode.LINK)
+                    transfer.dbhelper.insert_transfer_blacklist.assert_called_once_with(special)
 
 
 class ReleaseCutTest(unittest.TestCase):

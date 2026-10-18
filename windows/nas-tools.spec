@@ -64,7 +64,10 @@ hiddenimports = ['Crypto.Math',
                 'app.mediaserver.client',
                 'app.message.client',
                 'app.indexer.client',
-                'app.downloader.client']
+                'app.downloader.client',
+                # Analyze worker dependencies even though the early entrypoint
+                # runs its source without importing app.utils at runtime.
+                'app.utils.isolated_worker']
 hiddenimports += collect_local_submodules('app.sites.siteuserinfo')
 hiddenimports += collect_local_submodules('app.mediaserver.client')
 hiddenimports += collect_local_submodules('app.message.client')
@@ -79,7 +82,9 @@ a = Analysis(
              ['./../run.py'],
              pathex=pathex_tp,
              binaries=[],
-             datas=[],
+             # Keep the single-executable distribution: the private worker is
+             # extracted with the app and dispatched before service startup.
+             datas=[('../app/utils/isolated_worker.py', 'app/utils')],
              hiddenimports=hiddenimports,
              hookspath=[],
              hooksconfig={},
