@@ -331,7 +331,7 @@ class LLMMetaParserTest(TestCase):
         verified = self.parser._LLMMetaParser__verify_candidate_binding(
             {"tmdb_id": 45790, "tmdb_type": "tv", "tmdb_season": 6,
              "cn_name": "JoJo的奇妙冒险 飙马野郎"},
-            payload, title)
+            payload, title, subtitle="飙马野郎")
 
         self.assertTrue(verified.get("season_verified"))
         self.assertEqual(6, verified.get("tmdb_season"))
@@ -351,12 +351,155 @@ class LLMMetaParserTest(TestCase):
 
         verified = self.parser._LLMMetaParser__verify_candidate_binding(
             {"tmdb_id": 45790, "tmdb_type": "tv", "tmdb_season": 1,
+             "tmdb_season_name": "幻影之血和战斗潮流篇", "tmdb_episode": 10,
              "cn_name": "JoJo的奇妙冒险 飙马野郎"},
-            payload, title)
+            payload, title, subtitle="飙马野郎")
 
         self.assertTrue(verified.get("season_verified"))
         self.assertEqual(6, verified.get("tmdb_season"))
         self.assertEqual("season_name_override", verified.get("season_evidence"))
+        self.assertEqual("飙马野郎篇", verified.get("tmdb_season_name"))
+        self.assertIsNone(verified.get("tmdb_episode"))
+
+    @staticmethod
+    def _cyberpunk_payload():
+        # Public TMDB season names observed for 105248 on 2026-10-20.
+        return {"tmdb": [{
+            "id": 105248, "name": "赛博朋克：边缘行者", "type": "tv",
+            "aliases": ["Cyberpunk: Edgerunners"],
+            "seasons": [{"n": 1, "name": "赛博朋克：边缘行者", "eps": 10},
+                        {"n": 2, "name": "赛博朋克：边缘行者2", "eps": 10}]
+        }]}
+
+    def test_verify_cyberpunk_preserves_s02_despite_generated_series_name(self):
+        for title in ("Cyberpunk.Edgerunners.S02E01.Last.Chance.for.a.Slow.Dance.1080p.mkv",
+                      "赛博朋克：边缘行者 S02E01.mkv"):
+            with self.subTest(title=title):
+                result = {"tmdb_id": 105248, "tmdb_type": "tv", "tmdb_season": 2,
+                          "tmdb_season_name": "赛博朋克：边缘行者2", "tmdb_episode": 1,
+                          "cn_name": "赛博朋克：边缘行者", "en_name": "Cyberpunk: Edgerunners"}
+                verified = self.parser._LLMMetaParser__verify_candidate_binding(
+                    result, self._cyberpunk_payload(), title)
+
+                self.assertTrue(verified["season_verified"])
+                self.assertEqual(2, verified["tmdb_season"])
+                self.assertEqual("release_marker", verified["season_evidence"])
+                self.assertEqual("赛博朋克：边缘行者2", verified["tmdb_season_name"])
+                self.assertNotIn("tmdb_episode", verified)
+                self.assertEqual(2, result["tmdb_season"])
+
+    def test_verify_release_marker_corrects_llm_season_and_discards_old_episode(self):
+        for proposed in (1, 99, None):
+            with self.subTest(proposed=proposed):
+                verified = self.parser._LLMMetaParser__verify_candidate_binding(
+                    {"tmdb_id": 105248, "tmdb_type": "tv", "tmdb_season": proposed,
+                     "tmdb_season_name": "错误季名", "tmdb_episode": 7},
+                    self._cyberpunk_payload(), "Cyberpunk.Edgerunners.s02e01.mkv")
+
+                self.assertTrue(verified["season_verified"])
+                self.assertEqual(2, verified["tmdb_season"])
+                self.assertEqual("release_marker", verified["season_evidence"])
+                self.assertEqual("赛博朋克：边缘行者2", verified["tmdb_season_name"])
+                self.assertIn("tmdb_episode", verified)
+                self.assertIsNone(verified["tmdb_episode"])
+
+    def test_generated_arc_name_cannot_verify_its_own_season(self):
+        payload = {"tmdb": [{"id": 45790, "name": "JOJO的奇妙冒险", "type": "tv",
+                            "seasons": [{"n": 1, "name": "幻影之血和战斗潮流篇"},
+                                        {"n": 6, "name": "飙马野郎篇"}]}]}
+        verified = self.parser._LLMMetaParser__verify_candidate_binding(
+            {"tmdb_id": 45790, "tmdb_type": "tv", "tmdb_season": 6,
+             "cn_name": "JoJo的奇妙冒险 飙马野郎", "tmdb_season_name": "飙马野郎篇"},
+            payload, "JoJo Steel Ball Run 01.mkv")
+
+        self.assertTrue(verified["candidate_verified"])
+        self.assertFalse(verified["season_verified"])
+
+    def test_generic_and_numbered_series_names_are_not_arc_evidence(self):
+        for name in ("赛博朋克：边缘行者", "赛博朋克：边缘行者2", "Cyberpunk: Edgerunners",
+                     "Cyberpunk: Edgerunners Season 2", "第 2 季", "Season 2"):
+            with self.subTest(name=name):
+                verified = self.parser._LLMMetaParser__verify_candidate_binding(
+                    {"tmdb_id": 105248, "tmdb_type": "tv", "tmdb_season": 2,
+                     "cn_name": "赛博朋克：边缘行者"},
+                    self._cyberpunk_payload(), name + " 01.mkv")
+                if name in ("Cyberpunk: Edgerunners Season 2", "第 2 季", "Season 2"):
+                    self.assertTrue(verified["season_verified"])
+                    self.assertEqual("release_marker", verified["season_evidence"])
+                else:
+                    self.assertFalse(verified["season_verified"])
+
+    def test_raw_arc_can_override_release_marker_with_independent_evidence(self):
+        payload = {"tmdb": [{"id": 45790, "name": "JOJO的奇妙冒险", "type": "tv",
+                            "seasons": [{"n": 1, "name": "幻影之血和战斗潮流篇"},
+                                        {"n": 6, "name": "飙马野郎篇"}]}]}
+        verified = self.parser._LLMMetaParser__verify_candidate_binding(
+            {"tmdb_id": 45790, "tmdb_type": "tv", "tmdb_season": 1},
+            payload, "JOJO 飙马野郎 S01E01.mkv")
+
+        self.assertTrue(verified["season_verified"])
+        self.assertEqual(1, verified["release_season"])
+        self.assertEqual(6, verified["tmdb_season"])
+        self.assertEqual("season_name_override", verified["season_evidence"])
+
+    def test_ambiguous_arc_names_are_not_verified(self):
+        for names, title in ((("Dawn Arc", "Night Arc"), "Dawn.Arc.Night.Arc.S02E01.mkv"),
+                             (("Dawn Arc", "Dawn Arc"), "Dawn.Arc.S02E01.mkv"),
+                             (("战斗", "战斗潮流"), "战斗潮流 S02E01.mkv")):
+            with self.subTest(names=names):
+                payload = {"tmdb": [{"id": 1, "type": "tv", "name": "Show",
+                                    "seasons": [{"n": n, "name": name}
+                                                for n, name in enumerate(names, 1)]}]}
+                verified = self.parser._LLMMetaParser__verify_candidate_binding(
+                    {"tmdb_id": 1, "tmdb_type": "tv", "tmdb_season": 2}, payload, title)
+                self.assertFalse(verified["season_verified"])
+
+    def test_english_arc_name_requires_word_boundaries(self):
+        payload = {"tmdb": [{"id": 1, "type": "tv", "name": "Show",
+                            "seasons": [{"n": 1, "name": "Battle"},
+                                        {"n": 2, "name": "Battleship"}]}]}
+        verified = self.parser._LLMMetaParser__verify_candidate_binding(
+            {"tmdb_id": 1, "tmdb_type": "tv", "tmdb_season": 1},
+            payload, "Show.Battleship.S02E01.mkv")
+
+        self.assertTrue(verified["season_verified"])
+        self.assertEqual(2, verified["tmdb_season"])
+
+    def test_verified_season_name_always_comes_from_candidate(self):
+        for name in (None, "官方季名"):
+            with self.subTest(name=name):
+                payload = {"tmdb": [{"id": 1, "type": "tv", "name": "Show",
+                                    "seasons": [{"n": 2, "name": name}]}]}
+                verified = self.parser._LLMMetaParser__verify_candidate_binding(
+                    {"tmdb_id": 1, "tmdb_type": "tv", "tmdb_season": 2,
+                     "tmdb_season_name": "模型编造的季名"}, payload, "Show S02E01.mkv")
+
+                self.assertTrue(verified["season_verified"])
+                self.assertEqual(name, verified["tmdb_season_name"])
+
+    def test_numbered_work_names_cannot_override_release_season(self):
+        for name in ("Show II", "作品2季", "作品 第二季"):
+            with self.subTest(name=name):
+                payload = {"tmdb": [{"id": 1, "type": "tv", "name": "Show", "aliases": ["作品"],
+                                    "seasons": [{"n": 1, "name": "第 1 季"},
+                                                {"n": 2, "name": name}]}]}
+                verified = self.parser._LLMMetaParser__verify_candidate_binding(
+                    {"tmdb_id": 1, "tmdb_type": "tv", "tmdb_season": 2},
+                    payload, name + " S01E01.mkv")
+
+                self.assertTrue(verified["season_verified"])
+                self.assertEqual(1, verified["tmdb_season"])
+                self.assertEqual("release_marker", verified["season_evidence"])
+
+    def test_movie_candidate_does_not_attempt_season_verification(self):
+        with patch("app.media.meta.llm_parser.log") as logger:
+            verified = self.parser._LLMMetaParser__verify_candidate_binding(
+                {"tmdb_id": 11, "tmdb_type": "movie"},
+                {"tmdb": [{"id": 11, "type": "movie", "name": "Dune"}]}, "Dune 2021.mkv")
+
+        self.assertTrue(verified["candidate_verified"])
+        self.assertFalse(verified["season_verified"])
+        logger.warn.assert_not_called()
 
     def test_verify_season_binding_rejects_season_outside_candidates(self):
         payload = {"tmdb": [{

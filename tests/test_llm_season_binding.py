@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
 
 from app.media import Media
 from app.media.meta import MetaInfo
+from app.media.meta.llm_parser import LLMMetaParser
 from app.utils.types import MediaType
 
 
@@ -238,3 +239,37 @@ class LlmSeasonBindingTest(TestCase):
         self.assertTrue(valid)
         self.assertEqual(2, meta_info.begin_season)
         self.assertEqual(5, meta_info.begin_episode)
+
+    def test_cyberpunk_verification_and_binding_keep_s02e01(self):
+        title = "Cyberpunk.Edgerunners.S02E01.Last.Chance.for.a.Slow.Dance.1080p.mkv"
+        candidate = {"id": 105248, "type": "tv", "name": "赛博朋克：边缘行者",
+                     "aliases": ["Cyberpunk: Edgerunners"],
+                     "seasons": [{"n": 1, "name": "赛博朋克：边缘行者", "eps": 10},
+                                 {"n": 2, "name": "赛博朋克：边缘行者2", "eps": 10}]}
+        info = {"id": 105248, "media_type": MediaType.TV, "genres": [{"id": 16}],
+                "name": "赛博朋克：边缘行者", "first_air_date": "2022-09-13",
+                "seasons": [{"season_number": 1, "episode_count": 10},
+                            {"season_number": 2, "episode_count": 10}]}
+        detail = {"episodes": [{"episode_number": n} for n in range(1, 11)]}
+        parser = LLMMetaParser()
+        for proposed_season, proposed_episode in ((2, 1), (1, 7)):
+            with self.subTest(proposed_season=proposed_season):
+                meta = MetaInfo(title, use_llm=False)
+                result = {"type": MediaType.ANIME, "cn_name": "赛博朋克：边缘行者",
+                          "en_name": "Cyberpunk: Edgerunners", "tmdb_id": 105248,
+                          "tmdb_type": "tv", "tmdb_season": proposed_season,
+                          "tmdb_season_name": "错误季名", "tmdb_episode": proposed_episode}
+                result.update(parser._LLMMetaParser__verify_candidate_binding(
+                    result, {"tmdb": [candidate]}, title))
+                with patch.object(parser, "parse", return_value=result):
+                    parser.merge_into(meta, title)
+                with self._no_episode_mapping_rules(), \
+                        patch.object(self.media, "get_tmdb_tv_season_detail", return_value=detail) as fetch:
+                    valid = self.media._prepare_media_identity(meta, info)
+
+                self.assertTrue(valid)
+                self.assertEqual((2, 1), (meta.begin_season, meta.begin_episode))
+                self.assertEqual("赛博朋克：边缘行者2", meta.note["season_binding"]["tmdb_season_name"])
+                self.assertEqual("release_marker", meta.note["season_binding"]["evidence"])
+                self.assertTrue(fetch.called)
+                self.assertTrue(all(call.args[1] == 2 for call in fetch.call_args_list))

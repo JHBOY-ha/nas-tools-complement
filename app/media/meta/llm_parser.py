@@ -160,7 +160,8 @@ class LLMMetaParser(object):
                 "1) tmdb_season 只能取自候选 seasons 里的 n，不得自造；判断不出就省略。"
                 "2) 发布方写的季号与 TMDB 分季经常不一致：发布版“第4季”可能对应 TMDB 第1季，多季也可能被 TMDB 合并成第1季。要结合 seasons 的 name(季名/篇章名)、year(首播年份)、eps(集数) 判断标题实际对应哪一季，不要照抄标题里的季标记。"
                 "3) 标题或副标题里出现篇章名/arc 名且与某季 name 语义一致时（例如“飙马野郎”对应“飙马野郎篇”、“Steel Ball Run”对应“STEEL BALL RUN”），采用该季并把该季显示的季名回填到 tmdb_season_name。"
-                "4) 标题季标记与候选证据冲突时以候选证据为准；找不到任何证据时保持 begin_season 原值，不要改。"
+                "4) 作品通用名、作品别名和普通季号名称只能用于作品匹配，不能作为篇章证据；你生成的 cn_name/en_name 也不是原文证据。"
+                "4.1) 只有原始标题/副标题中的独立篇章证据才可用于转换发布季号；找不到证据时保持 begin_season 原值，不要改。"
                 "5) tmdb_episode 填该季内部的集号，用于发布方按放送季编号而 TMDB 合并成单季的情况（如发布版“第4季第18集”在 TMDB 是第1季第84集）；能确定才填，不确定就省略。"
                 "候选选择规则（external_candidates.tmdb 有多项时）："
                 "1) 优先选片名或别名与标题完全对应的一项；出现同名作品时，用标题/副标题里的年份与候选 year 对齐后再选。"
@@ -620,8 +621,8 @@ class LLMMetaParser(object):
 
     def __verify_candidate_binding(self, result, candidate_payload, title, subtitle=None):
         """
-        核对 LLM 给出的 TMDB 作品与季号：候选必须真实存在，季号必须在该候选的季列表内，
-        标题季标记与候选季名证据冲突时以季名为准；拿不出证据时保留标题季标记。
+        作品和季号必须存在于候选中。季号由原文季标记或唯一的篇章名证据确认，
+        LLM 生成的片名、季名与集号不能反过来证明其自身的季号判断。
         """
         verified = {"candidate_verified": False, "season_verified": False}
         if not result or not isinstance(candidate_payload, dict):
@@ -648,67 +649,80 @@ class LLMMetaParser(object):
             number = self.__parse_int(item.get("n"), min_val=0, max_val=999)
             if number is not None:
                 seasons[number] = item
+        if not seasons:
+            return verified
         release_season = self.__extract_release_season(title, subtitle)
         if release_season is not None:
             verified["release_season"] = release_season
-        season = self.__parse_int(result.get("tmdb_season"), min_val=0, max_val=999)
-        if season is None:
+        proposed_season = self.__parse_int(result.get("tmdb_season"), min_val=0, max_val=999)
+        evidence_text = " ".join([str(title or ""), str(subtitle or "")])
+        work_names = [candidate.get("name"), candidate.get("original_name")]
+        work_names.extend(candidate.get("aliases") or [])
+        name_matched = self.__match_seasons_by_name(evidence_text, seasons, work_names)
+        if len(name_matched) > 1:
+            log.warn("【Meta】原文篇章名命中多个候选季，无法确认季号：%s" % name_matched)
             return verified
-        if season not in seasons:
-            log.warn("【Meta】LLM季号不在候选季列表中，忽略：%s" % result.get("tmdb_season"))
+        if len(name_matched) == 1:
+            season = name_matched[0]
+            evidence = "season_name" if season == proposed_season else "season_name_override"
+            if season != proposed_season:
+                log.warn("【Meta】LLM季号与TMDB季名证据不符，按季名修正：%s -> %s"
+                         % (proposed_season, season))
+        elif release_season in seasons:
+            season = release_season
+            evidence = "release_marker"
+            if season != proposed_season:
+                log.warn("【Meta】LLM缺少独立篇章证据，采用原文季标记：%s -> %s"
+                         % (proposed_season, season))
+        else:
+            log.warn("【Meta】LLM季号缺少可核验的原文季标记或独立篇章证据，忽略：%s"
+                     % proposed_season)
             return verified
 
-        evidence_text = " ".join([
-            str(title or ""),
-            str(subtitle or ""),
-            str(result.get("cn_name") or ""),
-            str(result.get("en_name") or "")
-        ])
-        name_matched = self.__match_seasons_by_name(evidence_text, seasons)
-        evidence = "llm_only"
-        if name_matched:
-            if season in name_matched:
-                evidence = "season_name"
-            elif len(name_matched) == 1:
-                log.warn("【Meta】LLM季号与TMDB季名证据不符，按季名修正：%s -> %s"
-                         % (result.get("tmdb_season"), name_matched[0]))
-                season = name_matched[0]
-                evidence = "season_name_override"
-        if season not in seasons:
-            return verified
-        if release_season is not None and season != release_season and evidence == "llm_only":
-            log.warn("【Meta】LLM季号%s与标题季标记%s冲突且缺少季名证据，保留标题季标记"
-                     % (season, release_season))
-            return verified
         verified["season_verified"] = True
         verified["tmdb_season"] = season
         verified["season_evidence"] = evidence
-        season_name = self.__clean_text(result.get("tmdb_season_name"), max_len=60)
-        if not season_name:
-            season_name = self.__clean_text(seasons.get(season, {}).get("name"), max_len=60)
-        if season_name:
-            verified["tmdb_season_name"] = season_name
+        # Always replace the suggested name, including when the candidate has no name.
+        verified["tmdb_season_name"] = self.__clean_text(seasons[season].get("name"), max_len=60) or None
+        if season != proposed_season:
+            # The suggested episode belongs to the old season. Downstream must
+            # revalidate release episodes or apply an explicit episode mapping.
+            verified["tmdb_episode"] = None
         return verified
 
     @classmethod
-    def __match_seasons_by_name(cls, text, seasons):
+    def __match_seasons_by_name(cls, text, seasons, work_names=()):
         """
-        用季名（篇章名/arc 名）反向匹配标题文本，返回命中的季号列表。
+        只匹配原文中的独立篇章名；作品通用名及其编号变体不构成季号证据。
         """
-        normalized_text = cls.__normalize_match_text(text)
+        separators = r"[\s._\-\[\]\(\)\{\}【】（）「」:：·・/\\|,，+&]+"
+        normalized_text = re.sub(separators, " ", str(text or "").lower()).strip()
         if not normalized_text:
             return []
+        work_names = {cls.__normalize_match_text(name) for name in work_names if name}
+        work_names.discard("")
+        numerals = r"[0-9一二三四五六七八九十百两零〇]+"
+        roman = r"x{0,3}(?:ix|iv|v?i{0,3})"
+        numbering = r"(?:(?:season|series|part|s)?%s[季部]?|第%s[季部]?|%s)" % (numerals, numerals, roman)
         matched = []
         for number, season in seasons.items():
-            name = cls.__normalize_match_text(season.get("name") or "")
-            if not name:
+            display_name = re.sub(separators, " ", str(season.get("name") or "").lower()).strip()
+            name = cls.__normalize_match_text(display_name)
+            if (not name or re.fullmatch(numbering, name)
+                    or name in ("special", "specials", "特别篇", "特別篇", "特典", "ova", "oad")
+                    or any(name == work or (name.startswith(work) and
+                           re.fullmatch(numbering, name[len(work):])) for work in work_names)):
                 continue
-            for suffix in ("season", "specials", "special", "part", "篇", "編", "编", "章", "季"):
-                if name.endswith(suffix) and len(name) > len(suffix) + 1:
-                    name = name[: -len(suffix)]
-            if len(name) < 2 or name.isdigit():
+            display_name = re.sub(r"(?:\s+(?:season|specials?|part)|[篇編编章季])$", "", display_name).strip()
+            name = cls.__normalize_match_text(display_name)
+            if len(name) < 2 or name in work_names or re.fullmatch(numbering, name):
                 continue
-            if name in normalized_text:
+            pattern = r"\s*".join(re.escape(part) for part in display_name.split())
+            if re.match(r"[a-z0-9]", display_name):
+                pattern = r"(?<![a-z0-9])" + pattern
+            if re.search(r"[a-z0-9]$", display_name):
+                pattern += r"(?![a-z0-9])"
+            if re.search(pattern, normalized_text):
                 matched.append(number)
         return matched
 
@@ -729,7 +743,7 @@ class LLMMetaParser(object):
         if not text.strip():
             return None
         patterns = [
-            r"(?<![A-Za-z0-9])S(\d{1,2})(?!\d)",
+            r"(?i)(?<![A-Za-z0-9])S(\d{1,2})(?!\d)",
             r"(?i)\bSeason[ ._-]*(\d{1,2})\b",
             r"第\s*(\d{1,2})\s*[季部]",
         ]
