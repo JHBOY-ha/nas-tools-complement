@@ -1054,11 +1054,13 @@ class WebAction:
                                                                udf_flag=True)
         else:
             # 按识别的信息转移
+            # 按名称识别作品时，也必须保留用户明确选择的目标季号。
             succ_flag, ret_msg = FileTransfer().transfer_media(in_from=SyncType.MAN,
                                                                in_path=inpath,
                                                                rmt_mode=syncmod,
                                                                target_dir=outpath,
                                                                media_type=media_type,
+                                                               season=season,
                                                                episode=(
                                                                    EpisodeFormat(episode_format,
                                                                                  episode_details,

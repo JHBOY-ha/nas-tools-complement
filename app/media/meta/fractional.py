@@ -113,10 +113,19 @@ def protect_fractional_episode(title):
         }
     # Malformed explicit decimals must not fall through to E01. Known resolution
     # suffixes are not decimals; this also avoids taking a prefix of E01.123.
-    malformed = re.search(r"(?i)(?<![A-Z0-9])(?:S\d{1,2})?EP?\d+\.\d[A-Z0-9.]*", scan_stem)
+    malformed = re.search(r"(?i)(?<![A-Z0-9])(?P<season>S\d{1,2})?EP?\d+\.\d[A-Z0-9.]*", scan_stem)
     if malformed and not _INTEGER_RESOURCE.match(stem[malformed.start():]):
-        return stem[:malformed.start()] + " " + stem[malformed.end():] + ext, {
-            "raw": malformed[0], "key": None, "source": "malformed",
+        # A malformed episode/title must not swallow dotted release metadata.
+        # Keep the season and resource suffix while leaving the episode unresolved.
+        resource = re.search(
+            r"(?i)(?<![A-Z0-9])(?:\d{3,4}[pi]|[248]k|(?:8|10|12|16)bit|"
+            r"WEB[ ._-]?DL|WEBRip|BluRay|HEVC|[HX][ ._-]?26[45]|NF|AMZN|DSNP)(?![A-Z0-9])",
+            stem[malformed.start():])
+        end = min(malformed.end(), malformed.start() + resource.start()) if resource else malformed.end()
+        season = malformed["season"] or ""
+        return stem[:malformed.start()] + season + " " + stem[end:] + ext, {
+            "raw": stem[malformed.start():end].rstrip("."), "key": None, "source": "malformed",
+            "source_season": int(season[1:]) if season else None,
             "status": "unconfirmed", "reason": "小数集格式不完整或有歧义",
         }
     # Keep malformed bracket/Chinese/separator labels out of generic integer parsing.

@@ -53,6 +53,10 @@ class EpisodeFormat(object):
         return self.__offset
 
     def match(self, file: str):
+        # Fixed manual targets do not depend on the filename pattern. Directory
+        # scanning must use the same precedence as split_episode().
+        if self._start_ep is not None and self._start_ep == self._end_ep:
+            return True
         if not self._format:
             return True
         s, e = self.__handle_single(file)

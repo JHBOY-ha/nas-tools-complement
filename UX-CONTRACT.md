@@ -19,9 +19,15 @@
 | Scrollbar | Tabler 与应用样式的原生滚动 | `web/static/css/tabler.min.css`、`web/static/css/style.css`、`DESIGN.md` | 自然文档滚动、结果模态框内部滚动、文件管理目录树与文件内容独立滚动 | 窄屏与键盘浏览器检查 |
 | Toast | 共享任务反馈与已有反馈模态框 | `web/static/js/action-tasks/client.js`、`web/templates/navigation.html` | 中性排队、成功、失败、结果未确认 | live region 与浏览器检查 |
 | CRUD | 共享请求及任务状态协议 | `web/static/js/util.js`、`web/static/js/action-tasks/client.js`、`web/action.py` | 接受、查询、取消排队、恢复读取 | Python 与浏览器全流程回归 |
+| Form | 共享手动识别表单及集数解析 | `web/templates/navigation.html`、`app/utils/episode_format.py` | 固定 EP、定位规则、筛选区间及偏移 | `test_manual_episode_ui.js`、`test_manual_episode_precedence.py` |
 
 本次不新增表格选择、下拉或日期输入。特殊集确认沿用既有原生选择与 Bootstrap
 模态框，不改变勾选复核与明确确认的业务门槛。
+
+手动 EP 按当前修复要求优先于文件名推断。固定单集或合并集范围可不填定位规则，
+包括对固定目标加偏移；逗号筛选区间和单独偏移仍需定位规则。TMDB ID 留空仅表示
+自动查找作品，不应丢弃已填的季集。共享确认窗口仍须核对源文件及正式目标单集，
+失败保留输入供修正；数字标题歧义不能阻挡同一文件已经明确核验的目标。
 
 ## 后台操作入口与抽屉
 

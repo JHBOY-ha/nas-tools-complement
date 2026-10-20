@@ -34,8 +34,14 @@ python3 -m tests.run_recognition tests.test_media_identity_matrix
 | 特殊集二次确认 | 只读查询、正式链接、明确确认、文件变化、目标消失、单文件作用域与配置冲突；模拟接口浏览器交互 | `test_special_confirmation`、`test_special_confirmation_ui.js` |
 | 审查边界 | 自定义词先行、单次提取、真实搜索分页、标题归一化、无硬链接发布回退、竞争目标及失败记录 | `test_review_regressions` |
 | 下游处理 | RSS/搜索、下载选集、手动季集覆盖、任务冲突、保留源文件、目标碰撞、失败重试 | `test_media_cache_numbering`、`test_meta_parser_boundaries`、`test_sync_reliability`、`test_special_episodes` |
+| 手动 EP 优先级 | 数字标题与小数集、固定集数及定位偏移、作品搜索/缓存/ID 入口一致性、特殊内容目标核验与覆盖保护、确认窗口及资源字段保留 | `test_manual_episode_precedence` |
+| 手动 EP 表单 | 固定 EP 无定位规则提交、区间筛选/偏移限制、失败恢复、键盘重试、桌面与窄屏；WebKit 无头运行 | `test_manual_episode_ui.js` |
 
 文件名解析阶段的动漫常先得到电视剧类型；TMDB 电视剧详情中的动画分类才决定最终 `ANIME` 类型。动画电影仍属于 `MOVIE`。测试分别检查解析阶段和最终分类，不能用“文件名解析为 TV”直接判定动漫识别失败。
+
+手动转移明确指定 EP（固定集数或成功匹配的集数定位规则）时，目标集数优先于文件名的小数集判断；固定集数也不会被旧定位规则在目录扫描时过滤。小数集保护路径中的目标季及范围内每一集仍须通过 TMDB 核验，并保留下载任务约束和目标文件冲突检查。空规则、未匹配规则及仅填写偏移量均不视为明确 EP；没有手动 EP 时，原有小数集确认规则保持生效。
+
+普通文件在作品搜索、缓存命中和显式 TMDB ID 三个入口应用相同手动季集覆盖。特殊集确认可处理单个数字标题歧义，但仍拒绝多集范围只确认一端、文件作用域错误及失效目标；解析不会因该歧义吞掉分辨率和来源字段。共享表单允许固定 EP 或合并集范围不填定位规则，逗号筛选区间及单独偏移仍需要定位规则。浏览器回归使用 `node tests/test_manual_episode_ui.js`，需可用的 Playwright WebKit；截图、跟踪与报告保存到 `docs/validation/manual-episode-precedence/`。
 
 原始 `tests/cases/meta_cases.py` 有 61 条非空命名样例，期望类型为电影 17 条、电视剧 44 条。新增矩阵的同义格式变体用于检验规则一致性；它们和 unittest 方法数都不是独立真实作品数量。第三方 anitopy 的已知失败样例不计入本项目通过率。
 

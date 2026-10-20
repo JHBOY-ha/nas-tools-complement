@@ -1211,13 +1211,10 @@ class Media:
         meta_info.total_episodes = len(mapped)
         log.info("【Meta】已验证作品季集映射：%s" % note["episode_mapping"])
 
-    def _confirm_fractional_episode(self, meta_info, info, batch_cache=None):
-        """Confirm one release label against complete, batch-cached TMDB evidence."""
+    def _confirm_fractional_episode(self, meta_info, info, batch_cache=None, manual=None):
+        """Validate explicit EP targets first, otherwise confirm the release label."""
         fraction = (meta_info.note or {}).get("fractional_episode")
         if not fraction or not info or info.get("media_type") != MediaType.TV or not info.get("id"):
-            return False
-        key = episode_key(fraction["raw"])
-        if not key:
             return False
         cache = batch_cache if batch_cache is not None else {}
         language = getattr(self.tmdb, "language", None)
@@ -1240,14 +1237,69 @@ class Media:
                     and str(ep.get("show_id", info["id"])) == str(info["id"]))
 
         source_season = fraction.get("source_season", meta_info.begin_season)
+        # The dedicated review dialog carries file-scoped evidence; retain its
+        # original path/configuration checks even though it also sends EP controls.
+        if manual is not None and not info.get("_file_episode_confirmation"):
+            # Explicit EP controls outrank filename decimals, including malformed
+            # numeric titles. Keep the fractional note for collision protection.
+            target_season, begin, end = manual
+            if target_season is None:
+                target_season = source_season
+                if target_season is None:
+                    # Malformed protection may have removed the whole S/E token.
+                    marker = re.match(r"(?i)^S(\d{1,2})EP?", fraction["raw"])
+                    target_season = int(marker[1]) if marker else None
+            last = begin if end is None else end
+            if (type(target_season) is not int or target_season < 0
+                    or type(begin) is not int or type(last) is not int
+                    or begin < 0 or last < begin):
+                fraction["reason"] = "手动季集无效：请指定非负整数季号和有效集数范围"
+                return False
+            detail = cached("season", target_season, lambda: self.get_tmdb_tv_season_detail(
+                tmdbid=info["id"], season=target_season))
+            episodes = detail.get("episodes") if hasattr(detail, "get") else None
+            if not isinstance(episodes, list):
+                fraction["reason"] = "无法核验手动目标集数：TMDB 季集列表不可用"
+                return False
+            targets = {}
+            for ep in episodes:
+                if (hasattr(ep, "get") and type(ep.get("episode_number")) is int
+                        and begin <= ep["episode_number"] <= last):
+                    if (not valid_episode(ep, target_season) or not (ep.get("name") or ep.get("air_date"))
+                            or ep["episode_number"] in targets):
+                        fraction["reason"] = "手动目标单集信息无效或重复，保留源文件"
+                        return False
+                    targets[ep["episode_number"]] = ep
+            if len(targets) != last - begin + 1:
+                fraction["reason"] = "手动目标集数在 TMDB 中不存在或范围不完整，保留源文件"
+                return False
+            meta_info.begin_season, meta_info.end_season = target_season, None
+            meta_info.begin_episode, meta_info.end_episode = begin, end
+            meta_info.total_seasons, meta_info.total_episodes = 1, len(targets)
+            fraction.update(status="confirmed", manual=True)
+            fraction.pop("reason", None)
+            if meta_info.note.get("special_episode"):
+                meta_info.note["special_episode"].update(status="confirmed", provider="tmdb",
+                    target_type="TV", target_id=info["id"])
+            meta_info.note["episode_mapping"] = {
+                "source_episode": fraction["raw"], "source_season": source_season,
+                "target_season": target_season, "target_episode": begin,
+                "target_end_episode": end, "evidence": "manual"}
+            return True
+        # Automatic recognition still requires an unambiguous release label.
+        # A file-scoped review may resolve one malformed label (e.g. a numeric
+        # title), but must not silently select one endpoint of a merged release.
+        confirmed = info.get("_file_episode_confirmation")
+        key = episode_key(fraction["raw"])
+        if not key and not (confirmed and fraction.get("source") == "malformed"):
+            return False
         rules = (Config().get_config("media") or {}).get("fractional_episode_mappings") or []
         matching = [rule for rule in rules
-                    if str(rule.get("tmdb_id")) == str(info["id"])
+                    if key is not None and str(rule.get("tmdb_id")) == str(info["id"])
                     and episode_key(rule.get("source_episode")) == key
                     and (rule.get("source_season") is None or rule.get("source_season") == source_season)]
         # A web confirmation is scoped to the original file and revalidated against TMDB.
         # Never place this transient selection in global configuration or identity caches.
-        confirmed = info.get("_file_episode_confirmation")
         if confirmed:
             if confirmed.get("path") != fraction.get("file_path"):
                 fraction["reason"] = "人工确认与源文件或已有映射冲突"
@@ -1375,6 +1427,10 @@ class Media:
                     return False
         # 小数集的发布季不能参与普通整数映射；具体单集稍后独立核验。
         if (meta_info.note or {}).get("fractional_episode"):
+            return self._valid_media_identity(meta_info, info)
+        if (meta_info.note or {}).get("_manual_numbering"):
+            # The file lookup already carries explicit target numbers. Validate
+            # work/type/season identity without applying release mappings again.
             return self._valid_media_identity(meta_info, info)
         # Reject a wrong adaptation before using its episode metadata.
         if Media.__expect_anime_genre(meta_info) and info:
@@ -1887,6 +1943,24 @@ class Media:
         else:
             self.meta.update_meta_data({media_key: {'id': 0}})
 
+    @staticmethod
+    def _apply_manual_numbering(meta_info, season, episode_format, file_name):
+        """Apply the same ordinary-file overrides after either identity lookup path."""
+        # Switching the form to movies may leave hidden EP fields populated.
+        if meta_info.type == MediaType.MOVIE:
+            return
+        if season is not None:
+            # A manual single season replaces any parsed season range.
+            meta_info.begin_season = season
+            meta_info.end_season = None
+            meta_info.total_seasons = 1
+        if episode_format:
+            begin, end = episode_format.split_episode(file_name)
+            if begin is not None:
+                # Replace the whole range; a single EP must clear the old endpoint.
+                meta_info.begin_episode, meta_info.end_episode = begin, end
+                meta_info.total_episodes = len(meta_info.get_episode_list())
+
     def get_media_info_on_files(self,
                                 file_list,
                                 tmdb_info=None,
@@ -1954,6 +2028,9 @@ class Media:
                 # 解析媒体名称
                 # 先用自己的名称
                 file_name = os.path.basename(file_path)
+                # An empty formatter or a nonmatching rule is not an EP override.
+                begin, end = episode_format.split_episode(file_name) if episode_format else (None, None)
+                manual_episode = (season, begin, end) if begin is not None else None
                 if specials[file_path] and not fractions[file_path]:
                     meta_info = MetaInfo(file_name, use_llm=not bool(download_context), _prepared=prepared[file_path])
                     manual = None
@@ -2015,6 +2092,15 @@ class Media:
                             meta_info.skip_reason = "小数集未识别出作品，保留原文件"
                             return_media_infos[file_path] = meta_info
                         continue
+                    # Validate ordinary candidates against the explicit target,
+                    # not an incorrect source season that manual input corrects.
+                    manual_lookup = (meta_info.type != MediaType.MOVIE
+                        and (season is not None or manual_episode is not None)
+                        and not any(meta_info.note.get(key) for key in
+                            ("fractional_episode", "ordinal_candidates", "ordinal_default")))
+                    if manual_lookup:
+                        self._apply_manual_numbering(meta_info, season, episode_format, file_name)
+                        meta_info.note["_manual_numbering"] = True
                     # 区配缓存及TMDB
                     media_key = self.__make_cache_key(meta_info)
                     file_media_info = None
@@ -2034,13 +2120,20 @@ class Media:
                         if file_media_info and not (meta_info.note or {}).get("ordinal_resolution"):
                             self.__insert_media_cache(media_key=media_key,
                                                       file_media_info=file_media_info)
+                    # This flag is local to candidate validation, never reusable evidence.
+                    meta_info.note.pop("_manual_numbering", None)
                     # 赋值TMDB信息
                     meta_info.set_tmdb_info(file_media_info)
                     if (meta_info.note or {}).get("fractional_episode"):
                         meta_info.note["fractional_episode"]["file_path"] = file_path
-                        if not self._confirm_fractional_episode(meta_info, file_media_info, fractional_cache):
+                        if not self._confirm_fractional_episode(
+                                meta_info, file_media_info, fractional_cache, manual=manual_episode):
                             meta_info.skip_reason = (meta_info.note["fractional_episode"].get("reason")
                                                      or "小数集缺少唯一且可核验的 TMDB 单集映射")
+                    elif file_media_info:
+                        # Leaving TMDB ID blank only changes how the work is found;
+                        # it must not discard the user's explicit season/EP controls.
+                        self._apply_manual_numbering(meta_info, season, episode_format, file_name)
                 # 自带TMDB信息
                 else:
                     # 已绑定作品身份时不再让LLM根据缩写文件名改写类型和季集。
@@ -2072,7 +2165,8 @@ class Media:
                     fractional = (meta_info.note or {}).get("fractional_episode")
                     if fractional:
                         fractional["file_path"] = file_path
-                    if fractional and not self._confirm_fractional_episode(meta_info, tmdb_info, fractional_cache):
+                    if fractional and not self._confirm_fractional_episode(
+                            meta_info, tmdb_info, fractional_cache, manual=manual_episode):
                         meta_info.skip_reason = (meta_info.note["fractional_episode"].get("reason")
                                                  or "小数集缺少唯一且可核验的 TMDB 单集映射")
                         return_media_infos[file_path] = meta_info
@@ -2103,6 +2197,10 @@ class Media:
                         # 上下文无编号语义标记时保持保守；只有明确发布编号才按来源校验。
                         if fractional:
                             numbering = download_context.get("numbering", "unknown")
+                            # Manual targets use formal TMDB numbers; task constraints
+                            # still apply to every selected episode, not filename decimals.
+                            if fractional.get("manual"):
+                                numbering = "tmdb"
                             check_season = (fractional.get("source_season") if numbering == "release"
                                             else meta_info.begin_season)
                             conflict = bool(seasons and check_season not in seasons)
@@ -2111,12 +2209,14 @@ class Media:
                                 conflict = conflict or bool(episodes and fractional["key"] not in
                                     {episode_key(ep) for ep in episodes})
                             else:
-                                conflict = conflict or bool(episodes and meta_info.begin_episode not in episodes)
+                                conflict = conflict or bool(episodes and not
+                                    set(meta_info.get_episode_list()).issubset(set(episodes)))
                             # Only new, explicitly scoped season packs permit confirmed
                             # S00 extras from the same release season. Legacy and selected
                             # episode tasks retain their strict formal-number constraints.
                             pack_special = (
-                                numbering == "tmdb" and download_context.get("scope") == "season_pack"
+                                not fractional.get("manual") and numbering == "tmdb"
+                                and download_context.get("scope") == "season_pack"
                                 and not episodes and meta_info.begin_season == 0
                                 and fractional.get("source_season") is not None
                                 and fractional["source_season"] in (download_context.get("release_seasons") or []))
@@ -2166,18 +2266,8 @@ class Media:
                     meta_info.set_tmdb_info(tmdb_info)
                     before_override = (meta_info.begin_season, meta_info.end_season,
                                        meta_info.begin_episode, meta_info.end_episode)
-                    if has_season_override and not fractional and meta_info.type != MediaType.MOVIE:
-                        # 手动指定的是单季，同时清除名称中原有的季范围。
-                        meta_info.begin_season = int(season)
-                        meta_info.end_season = None
-                        meta_info.total_seasons = 1
-                    if episode_format and not fractional:
-                        begin_ep, end_ep = episode_format.split_episode(file_name)
-                        if begin_ep is not None:
-                            # 手动规则替换整个集号范围；单集必须清除解析器留下的旧终点。
-                            meta_info.begin_episode = begin_ep
-                            meta_info.end_episode = end_ep
-                            meta_info.total_episodes = len(meta_info.get_episode_list())
+                    if not fractional:
+                        self._apply_manual_numbering(meta_info, season, episode_format, file_name)
                     after_override = (meta_info.begin_season, meta_info.end_season,
                                       meta_info.begin_episode, meta_info.end_episode)
                     if (download_context and not fractional and bound_type != MediaType.MOVIE
@@ -2191,7 +2281,8 @@ class Media:
                         if not final_episodes or (episodes and not set(final_episodes).issubset(set(episodes))):
                             raise ValueError("手动集号与下载任务冲突：%s" % file_name)
                     # 加入缓存
-                    if not download_context and not tmdb_info.get("_file_episode_confirmation"):
+                    if (not download_context and not tmdb_info.get("_file_episode_confirmation")
+                            and not (fractional and fractional.get("manual"))):
                         # File-scoped human evidence must not become a reusable identity-cache override.
                         self.save_rename_cache(file_name, tmdb_info)
                 # 按文件路程存储

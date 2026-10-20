@@ -96,6 +96,8 @@ class RecognitionTests(unittest.TestCase):
             '__expect_anime_genre', '__get_genre_ids',
             '__search_media_info', '__confirm_search_result', '__search_media_by_alias_candidates',
             '_prepare_media_identity', '_apply_episode_mapping', '_apply_llm_season',
+            # File recognition now shares manual overrides across both identity paths.
+            '_apply_manual_numbering',
             '__verify_remapped_episodes', '__convert_absolute_episodes', '__suggest_episode_mapping',
             '__episode_list_of', '__lacks_anime_genre', '__normalize_identity_name',
             '__candidate_all_names', '__is_other_work_by_prefix', '__is_other_work',

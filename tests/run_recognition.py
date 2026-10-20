@@ -20,6 +20,8 @@ RECOGNITION_MODULES = (
     "tests.test_metadata_binding_guards",
     "tests.test_meta_recognition_plan",
     "tests.test_fractional_versions",
+    # Include manual EP priority and its target/publication safeguards.
+    "tests.test_manual_episode_precedence",
     "tests.test_special_episodes",
     "tests.test_special_confirmation",
     "tests.test_review_regressions",
