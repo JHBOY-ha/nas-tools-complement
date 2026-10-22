@@ -4496,10 +4496,11 @@ class WebAction:
                           "episode": media.begin_episode,
                           "bluray": False,
                           "imdbid": media.imdb_id}]
-        success, retmsg = Subtitle().download_subtitle(
-            items=subtitle_item,
-            selected_file_id=data.get("file_id")
-        )
+        # File-manager downloads retain the source subtitle, then resolve the
+        # trusted transfer history for library naming, publication and refresh.
+        from app.helper.mediafile_subtitles import MediaFileSubtitles
+        success, retmsg = MediaFileSubtitles().download(
+            subtitle_item[0], selected_file_id=data.get("file_id"))
         if success:
             return {"code": 0, "msg": retmsg}
         elif isinstance(retmsg, dict):

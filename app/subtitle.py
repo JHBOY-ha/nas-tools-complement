@@ -107,6 +107,81 @@ class Subtitle:
             return self.__download_chinesesubfinder(items)
         return False, "未配置字幕下载器"
 
+    def is_chinesesubfinder(self):
+        """The file-manager action must wait for this provider's queued download."""
+        return self._server == "chinesesubfinder"
+
+    def find_downloaded_subtitle(self, item):
+        """Locate a matching configured-language subtitle without spending quota."""
+        # ChineseSubFinder's Chinese output is independent of language choices
+        # configured for the other provider (which may, for example, be English).
+        languages = OpenSubtitles.DEFAULT_LANGUAGES.split(",") if self.is_chinesesubfinder() else None
+        return self.__existing_opensubtitles_target(item, languages=languages)
+
+    def sync_downloaded_subtitle(self, source_subtitle, media_file, target_media_file,
+                                 rmt_mode=None, server_type=None, path_guard_check=None):
+        """Publish a downloaded subtitle using the recorded library video's name.
+
+        Reuse identical outputs on retry, retain different existing subtitles,
+        and use atomic no-replace publication when a hardlink is unavailable.
+        """
+        result = {"source_subtitle": source_subtitle, "target_subtitle": "", "synced": False}
+        try:
+            if path_guard_check:
+                path_guard_check()
+            if os.path.islink(source_subtitle) or not os.path.isfile(source_subtitle):
+                raise ValueError("源字幕不是有效的普通文件，未同步")
+            if os.path.getsize(source_subtitle) > self._opensubtitles_download_limit:
+                raise ValueError("源字幕超过 20 MiB，未同步")
+            validation = SubtitleHealth.validate_subtitle(source_subtitle)
+            if not validation.get("valid"):
+                raise ValueError("源字幕无法解析，未同步：%s" % (validation.get("message") or "格式无效"))
+            source_hash = self.__file_sha256(source_subtitle)
+            if os.path.abspath(media_file) == os.path.abspath(target_media_file):
+                result.update(target_subtitle=source_subtitle, synced=True)
+                return True, "字幕已保存在媒体库：%s" % source_subtitle, result
+
+            # Only suffix tags describe the subtitle language; the original
+            # video title can itself contain words such as English or Chinese.
+            media_base = os.path.splitext(os.path.basename(media_file))[0]
+            suffix = os.path.basename(source_subtitle)[len(media_base):]
+            # A generic ISO 639-2 prefix must not override an explicit zh-tw tag.
+            suffix = re.sub(r"(?i)^\.(?:chi|zho)\.(?=zh-)", ".", suffix)
+            language = self.__infer_subtitle_language(source_subtitle) or "zh-CN"
+            profile = self.__guess_subtitle_profile(suffix, default_language=language)
+            extension = os.path.splitext(source_subtitle)[1].lower()
+            for attempt in range(3):
+                if path_guard_check:
+                    path_guard_check()
+                target = self.__build_subtitle_path(
+                    target_media_file, profile, extension, server_type, reuse_hash=source_hash)
+                # Naming may inspect existing files on a slow NAS. Revalidate
+                # the media placement again immediately before publication.
+                if path_guard_check:
+                    path_guard_check()
+                try:
+                    if rmt_mode == RmtMode.LINK:
+                        try:
+                            os.link(source_subtitle, target)
+                        except FileExistsError:
+                            # Another request may have just linked identical
+                            # bytes. Reuse them rather than adding another track.
+                            self.__publish_file_no_replace(source_subtitle, target, expected_hash=source_hash)
+                        except OSError:
+                            self.__publish_file_no_replace(source_subtitle, target, expected_hash=source_hash)
+                    else:
+                        # Keep a real subtitle beside softlinked videos too;
+                        # later source changes must not invalidate the library copy.
+                        self.__publish_file_no_replace(source_subtitle, target, expected_hash=source_hash)
+                    result.update(target_subtitle=target, synced=True)
+                    return True, "字幕已同步到媒体库：%s" % target, result
+                except FileExistsError:
+                    if attempt == 2:
+                        raise
+            raise OSError("字幕同步重试次数耗尽")
+        except (OSError, ValueError) as error:
+            return False, "字幕已保存在原目录，同步失败：%s" % error, result
+
     def upload_subtitle(self, upload_file, media_file, target_media_file=None, rmt_mode=None, server_type=None,
                         align_mode=None):
         """
@@ -1584,7 +1659,8 @@ class Subtitle:
         return ""
 
     @classmethod
-    def __build_subtitle_path(cls, media_file, subtitle_profile, sub_ext, server_type=None, companion_exts=None):
+    def __build_subtitle_path(cls, media_file, subtitle_profile, sub_ext, server_type=None,
+                              companion_exts=None, reuse_hash=None):
         """
         生成不覆盖已有文件的外挂字幕路径。
         命名格式：
@@ -1593,6 +1669,7 @@ class Subtitle:
           - Plex:          Movie.zh-CN.srt → Movie(1).zh-CN.srt → ...
                            (forced/sdh/cc 标记拼接在语言标签后: Movie.en.forced.sdh.srt)
         重名时最多尝试 100 个编号，超过则抛出 FileExistsError。
+        下载同步可传入 reuse_hash，复用相同语言/标记且内容相同的文件名。
         """
         media_base = os.path.splitext(media_file)[0]
         suffix_parts = [cls.__subtitle_language_tag(subtitle_profile.get("language"), server_type)]
@@ -1608,8 +1685,9 @@ class Subtitle:
         companion_exts = [str(ext).lower() for ext in (companion_exts or []) if ext]
 
         def available(path):
-            if os.path.exists(path):
-                return False
+            if os.path.lexists(path):
+                return bool(reuse_hash and not os.path.islink(path) and os.path.isfile(path)
+                            and cls.__file_sha256(path) == reuse_hash)
             base = os.path.splitext(path)[0]
             return not any(os.path.exists(base + ext) for ext in companion_exts)
 
@@ -2227,11 +2305,11 @@ class Subtitle:
     def __subtitle_target(self, item, language):
         return "%s.%s.srt" % (item.get("file"), self.__subtitle_language_suffix(language))
 
-    def __existing_opensubtitles_target(self, item, language_evidence=None):
+    def __existing_opensubtitles_target(self, item, language_evidence=None, languages=None):
         media_base = str(item.get("file") or "")
         media_dir = os.path.dirname(media_base) or "."
         media_name = os.path.basename(media_base)
-        wanted = set(self.opensubtitles.languages)
+        wanted = set(self.opensubtitles.languages if languages is None else languages)
         if "ze" in wanted:
             wanted.add("zh-cn")
         try:

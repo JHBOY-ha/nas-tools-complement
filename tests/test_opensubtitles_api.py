@@ -69,9 +69,14 @@ class OpenSubtitlesApiTest(TestCase):
             def get_proxies(self):
                 return None
 
+        # Keep the real isolated I/O/network submodules importable without
+        # executing app.utils' unrelated media-parser and browser imports.
+        utils = types.ModuleType("app.utils")
+        utils.__path__ = [str(Path(root_path) / "app" / "utils")]
         stubs = {
             "log": types.SimpleNamespace(info=lambda *args, **kwargs: None),
             "app.utils.http_utils": types.SimpleNamespace(RequestUtils=object),
+            "app.utils": utils,
             "app.utils.types": types.SimpleNamespace(MediaType=TestMediaType),
             "config": types.SimpleNamespace(Config=TestConfig),
             "version": types.SimpleNamespace(APP_VERSION="v2.10.3"),
@@ -96,14 +101,17 @@ class OpenSubtitlesApiTest(TestCase):
     @classmethod
     def _load_subtitle_module(cls):
         """Exercise real subtitle orchestration without unrelated browser/UI imports."""
+        utils = types.ModuleType("app.utils")
+        utils.__path__ = [str(Path(__file__).resolve().parents[1] / "app" / "utils")]
+        for name in ("RequestUtils", "PathUtils", "SystemUtils", "StringUtils", "ExceptionUtils"):
+            setattr(utils, name, object)
         stubs = {
             "lxml": types.SimpleNamespace(etree=object),
             "log": types.SimpleNamespace(info=lambda *args, **kwargs: None),
             "app.conf": types.SimpleNamespace(SiteConf=object),
             "app.helper": types.SimpleNamespace(OpenSubtitles=cls.module.OpenSubtitles),
             "app.helper.subtitle_align": types.SimpleNamespace(SubtitleAligner=object),
-            "app.utils": types.SimpleNamespace(**{name: object for name in (
-                "RequestUtils", "PathUtils", "SystemUtils", "StringUtils", "ExceptionUtils")}),
+            "app.utils": utils,
             "app.utils.commons": types.SimpleNamespace(singleton=lambda klass: klass),
             "app.utils.types": types.SimpleNamespace(MediaType=cls.module.MediaType, RmtMode=object),
             "config": types.SimpleNamespace(Config=cls.module.Config, RMT_MEDIAEXT=[".mkv"],
