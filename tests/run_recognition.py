@@ -22,6 +22,8 @@ RECOGNITION_MODULES = (
     "tests.test_fractional_versions",
     # Include manual EP priority and its target/publication safeguards.
     "tests.test_manual_episode_precedence",
+    # Numeric guards, scan rejection reasons and the current receipt lifecycle.
+    "tests.test_episode_transfer_guards",
     "tests.test_special_episodes",
     "tests.test_special_confirmation",
     "tests.test_review_regressions",

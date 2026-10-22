@@ -12,6 +12,7 @@ from app.filetransfer import FileTransfer
 from app.downloader.downloader import Downloader
 from app.utils.types import MediaType, RmtMode, SyncType, DownloaderType
 from app.media.tmdbv3api.as_obj import AsObj
+from app.media.meta.extra_transfer import has_pending_publication
 
 
 class FractionalWorkflowTest(unittest.TestCase):
@@ -332,21 +333,28 @@ class FractionalWorkflowTest(unittest.TestCase):
                 target_dir=second_target, rmt_mode=RmtMode.LINK)
             self.assertTrue(success)
             self.assertEqual([], os.listdir(second_target))
-            # 跨目录去重必须在字幕/历史写入前结束；同一目标的补重试则无论
-            # 是否已写媒体历史，都应保留 inode 并经过字幕处理和成功黑名单。
+            # 完整历史且无待恢复凭据时应去重；缺失历史才进入补齐流程。
+            # 字幕失败后的真实凭据恢复由独立的恢复回归覆盖，不能把已完成当作失败。
             subtitles.assert_not_called()
             transfer.dbhelper.insert_transfer_history.assert_not_called()
+            self.assertFalse(has_pending_publication(special, existing))
             for history in ([(existing, "S00E01")], []):
                 with self.subTest(history_saved=bool(history)):
                     transfer._existing_media_files.return_value = history
                     subtitles.reset_mock()
+                    transfer.dbhelper.insert_transfer_history.reset_mock()
                     transfer.dbhelper.insert_transfer_blacklist.reset_mock()
                     success, _ = transfer.transfer_media(
                         in_from=SyncType.MON, in_path=special, files=[special],
                         target_dir=target, rmt_mode=RmtMode.LINK)
                     self.assertTrue(success)
                     self.assertTrue(os.path.samefile(special, existing))
-                    subtitles.assert_called_once_with(org_name=special, new_name=existing, rmt_mode=RmtMode.LINK)
+                    if history:
+                        subtitles.assert_not_called()
+                        transfer.dbhelper.insert_transfer_history.assert_not_called()
+                    else:
+                        subtitles.assert_called_once_with(org_name=special, new_name=existing, rmt_mode=RmtMode.LINK)
+                        transfer.dbhelper.insert_transfer_history.assert_called_once()
                     transfer.dbhelper.insert_transfer_blacklist.assert_called_once_with(special)
 
 

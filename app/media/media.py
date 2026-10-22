@@ -2029,14 +2029,23 @@ class Media:
                 # 先用自己的名称
                 file_name = os.path.basename(file_path)
                 # An empty formatter or a nonmatching rule is not an EP override.
-                begin, end = episode_format.split_episode(file_name) if episode_format else (None, None)
+                try:
+                    begin, end = (episode_format.split_episode(file_name)
+                                  if episode_format and media_type != MediaType.MOVIE
+                                  and (tmdb_info or {}).get("media_type") != MediaType.MOVIE else (None, None))
+                except ValueError as error:
+                    # Direct recognition callers also get an explicit per-file failure,
+                    # instead of losing the file or silently accepting a negative EP.
+                    invalid = MetaBase(file_name, fileflag=True)
+                    invalid.skip_reason = str(error)
+                    return_media_infos[file_path] = invalid
+                    continue
                 manual_episode = (season, begin, end) if begin is not None else None
                 if specials[file_path] and not fractions[file_path]:
                     meta_info = MetaInfo(file_name, use_llm=not bool(download_context), _prepared=prepared[file_path])
                     manual = None
                     # Existing manual controls are explicit target evidence, not a guess.
                     if tmdb_info and not download_context:
-                        begin, end = episode_format.split_episode(file_name) if episode_format else (None, None)
                         if tmdb_info.get("media_type") == MediaType.MOVIE:
                             manual = {"media_type": "movie", "tmdb_id": tmdb_info["id"]}
                         elif season is not None and begin is not None and (end is None or begin == end):
@@ -2150,7 +2159,6 @@ class Media:
                             meta_info.skip_reason = "人工作品与下载任务身份冲突"
                             return_media_infos[file_path] = meta_info
                             continue
-                        begin, end = episode_format.split_episode(file_name) if episode_format else (None, None)
                         manual = None
                         if season is not None and begin is not None:
                             manual = dict(begin_season=season, end_season=None, total_seasons=1,
@@ -3159,7 +3167,8 @@ class Media:
         if media_info.type == MediaType.MOVIE:
             return None
         if media_info.tmdb_id:
-            if not media_info.begin_episode:
+            # Zero is a valid explicit episode; only absence prevents a lookup.
+            if media_info.begin_episode is None:
                 return None
             episodes = self.get_tmdb_season_episodes(tmdbid=media_info.tmdb_id,
                                                      season=int(media_info.get_season_seq()))
