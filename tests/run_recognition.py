@@ -28,6 +28,8 @@ RECOGNITION_MODULES = (
     "tests.test_recognition_performance",
     "tests.test_llm_season_binding",
     "tests.test_media_cn_fallback",
+    # Chinese interactive searches must include English-only torrent sites.
+    "tests.test_indexer_language",
     "tests.test_meta_llm_parser",
     "tests.test_sync_reliability",
     "tests.test_download_dedupe",

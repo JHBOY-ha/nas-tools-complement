@@ -6,6 +6,7 @@ from app.conf import ModuleConf
 from app.db.session_scope import with_db_session
 from app.helper import ProgressHelper, SubmoduleHelper
 from app.indexer.client import BuiltinIndexer
+from app.media import Media
 from app.utils import ExceptionUtils, StringUtils
 from app.utils.commons import singleton
 from app.utils.types import SearchType, IndexerType
@@ -148,6 +149,30 @@ class Indexer(object):
         if not indexers:
             log.error(f"【{self._client_type.value}】没有有效的索引器配置！")
             return []
+        # 按站点语言选择片名，不能等所有中文站都无结果才补搜英文站。
+        # 分发前只解析一次，避免多个站点并发查询同一影片的英文详情。
+        # 自定义关键字和未识别的快速搜索保留用户输入，不擅自替换。
+        english_word = None
+        if (self._client_type == IndexerType.BUILTIN
+                and match_media and not match_media.keyword
+                and StringUtils.is_chinese(key_word)
+                and any(index.language == "en" and
+                        (not filter_args or not filter_args.get("site")
+                         or index.name in filter_args["site"]) for index in indexers)):
+            candidates = [match_media.en_name]
+            if match_media.original_language == "en":
+                candidates.append(match_media.original_title)
+            english_word = next((name for name in candidates
+                                 if name and name.strip() and not StringUtils.is_chinese(name)), None)
+            if not english_word and match_media.tmdb_id:
+                try:
+                    # 独立媒体客户端，避免修改结果识别所用客户端的 TMDB 语言。
+                    title = Media().get_tmdb_en_title(match_media)
+                    if title and title.strip() and not StringUtils.is_chinese(title):
+                        english_word = title
+                except Exception as err:
+                    # 英文详情不可用时，继续中文站搜索并沿用英文站的跳过提示。
+                    ExceptionUtils.exception_traceback(err)
         # 计算耗时
         start_time = datetime.datetime.now()
         if filter_args and filter_args.get("site"):
@@ -168,12 +193,16 @@ class Indexer(object):
         try:
             for index in indexers:
                 order_seq = 100 - int(index.pri)
+                site_word = key_word
+                if english_word and index.language == "en":
+                    site_word = english_word
+                    log.info(f"【{self._client_type.value}】{index.name} 使用英文名 {site_word} 检索")
                 # 池内线程由 executor 复用，工作单元结束时归还数据库连接。
                 try:
                     task = executor.submit(with_db_session(self._client.search),
                                            order_seq,
                                            index,
-                                           key_word,
+                                           site_word,
                                            filter_args,
                                            match_media,
                                            in_from)
