@@ -6,7 +6,6 @@ from app.conf import ModuleConf
 from app.db.session_scope import with_db_session
 from app.helper import ProgressHelper, SubmoduleHelper
 from app.indexer.client import BuiltinIndexer
-from app.media import Media
 from app.utils import ExceptionUtils, StringUtils
 from app.utils.commons import singleton
 from app.utils.types import SearchType, IndexerType
@@ -131,7 +130,8 @@ class Indexer(object):
                           key_word: [str, list],
                           filter_args: dict,
                           match_media=None,
-                          in_from: SearchType = None):
+                          in_from: SearchType = None,
+                          search_context: dict = None):
         """
         根据关键字调用 Index API 检索
         :param key_word: 检索的关键字，不能为空
@@ -140,6 +140,7 @@ class Indexer(object):
                             sp_state: 为UL DL，* 代表不关心，
         :param match_media: 需要匹配的媒体信息
         :param in_from: 搜索渠道
+        :param search_context: 同一次检索两轮共用的片名和已提交站点查询，不能跨请求复用
         :return: 命中的资源媒体信息列表
         """
         if not key_word:
@@ -152,6 +153,9 @@ class Indexer(object):
         # 按站点语言选择片名，不能等所有中文站都无结果才补搜英文站。
         # 分发前只解析一次，避免多个站点并发查询同一影片的英文详情。
         # 自定义关键字和未识别的快速搜索保留用户输入，不擅自替换。
+        if search_context is None:
+            search_context = {}
+        submitted = search_context.setdefault("submitted", set())
         english_word = None
         if (self._client_type == IndexerType.BUILTIN
                 and match_media and not match_media.keyword
@@ -159,20 +163,22 @@ class Indexer(object):
                 and any(index.language == "en" and
                         (not filter_args or not filter_args.get("site")
                          or index.name in filter_args["site"]) for index in indexers)):
-            candidates = [match_media.en_name]
+            candidates = [search_context.get("english_word"), match_media.en_name]
             if match_media.original_language == "en":
                 candidates.append(match_media.original_title)
-            english_word = next((name for name in candidates
-                                 if name and name.strip() and not StringUtils.is_chinese(name)), None)
-            if not english_word and match_media.tmdb_id:
+            title = next((name for name in candidates
+                          if name and name.strip() and not StringUtils.is_chinese(name)), None)
+            if not title and "english_word" not in search_context and match_media.tmdb_id:
                 try:
-                    # 独立媒体客户端，避免修改结果识别所用客户端的 TMDB 语言。
-                    title = Media().get_tmdb_en_title(match_media)
-                    if title and title.strip() and not StringUtils.is_chinese(title):
-                        english_word = title
+                    # 英文查询使用请求级语言，可安全复用现有媒体客户端。
+                    title = self._client.media.get_tmdb_en_title(match_media)
                 except Exception as err:
-                    # 英文详情不可用时，继续中文站搜索并沿用英文站的跳过提示。
                     ExceptionUtils.exception_traceback(err)
+            search_context["english_word"] = title
+            if title and title.strip() and not StringUtils.is_chinese(title):
+                english_word = title
+            else:
+                english_word = None
         # 计算耗时
         start_time = datetime.datetime.now()
         if filter_args and filter_args.get("site"):
@@ -188,6 +194,7 @@ class Indexer(object):
         # background task cannot consume its own executor's remaining workers.
         executor = self._search_executor
         all_task = []
+        task_queries = {}
         ret_array = []
         unfinished = 0
         try:
@@ -197,6 +204,13 @@ class Indexer(object):
                 if english_word and index.language == "en":
                     site_word = english_word
                     log.info(f"【{self._client_type.value}】{index.name} 使用英文名 {site_word} 检索")
+                # 两轮搜索按实际发送的关键词去重；记录仅属于本次用户请求。
+                normalized_word = StringUtils.handler_special_chars(
+                    text=site_word, replace_word=" ", allow_space=True)
+                query_key = (self._client_type.value, index.id,
+                             tuple(normalized_word) if isinstance(normalized_word, list) else normalized_word)
+                if query_key in submitted:
+                    continue
                 # 池内线程由 executor 复用，工作单元结束时归还数据库连接。
                 try:
                     task = executor.submit(with_db_session(self._client.search),
@@ -209,7 +223,10 @@ class Indexer(object):
                 except TaskQueueFull:
                     unfinished += 1
                     continue
+                # 未准入的任务不能记为已搜索，下一轮仍允许尝试提交。
+                submitted.add(query_key)
                 all_task.append(task)
+                task_queries[task] = query_key
             if unfinished:
                 log.warn("【%s】检索队列繁忙，%s 个站点未准入，请稍后重试"
                          % (self._client_type.value, unfinished))
@@ -238,7 +255,9 @@ class Indexer(object):
             # executor or cancel another user's search. Running requests keep
             # their slots until their real work and session cleanup finish.
             for task in all_task:
-                task.cancel()
+                if task.cancel():
+                    # 尚未执行便取消的查询不应阻止第二轮重试。
+                    submitted.discard(task_queries[task])
         # 计算耗时
         end_time = datetime.datetime.now()
         log.info(f"【{self._client_type.value}】检索结束，有效资源数：%s，未完成站点：%s，总耗时 %s 秒"
