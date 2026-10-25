@@ -88,8 +88,12 @@ class RecognitionTests(unittest.TestCase):
         # New special classification is pure and safe in the AST harness.
         from app.media.meta.special import extract_special
         from app.media.meta.special_resolver import identity
+        from app.media.meta.release_groups import ReleaseGroupsMatcher
+        from app.media.meta.ordinal import Evidence
         self.ns["extract_special"] = extract_special
         self.ns["identity"] = identity
+        self.ns["ReleaseGroupsMatcher"] = ReleaseGroupsMatcher
+        self.ns["Evidence"] = Evidence
         cls = load_class('app/media/media.py', 'Media', [
             '__search_media_with_name', '__extract_llm_tmdb_target', '__resolve_tmdb_mtype',
             'get_media_info_on_files', 'get_cache_info', '__make_cache_key', '_valid_media_identity',
@@ -102,6 +106,8 @@ class RecognitionTests(unittest.TestCase):
             '__episode_list_of', '__lacks_anime_genre', '__normalize_identity_name',
             '__candidate_all_names', '__is_other_work_by_prefix', '__is_other_work',
             '__load_cached_identity',
+            # Match the production search and cache guards in the AST harness.
+            '__filter_tv_candidates', '__is_release_group_name',
             '__search_tv_by_name'], self.ns, keep_attrs=True)
         self.media = cls()
 

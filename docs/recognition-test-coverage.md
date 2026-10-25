@@ -37,6 +37,7 @@ python3 -m tests.run_recognition tests.test_media_identity_matrix
 | 手动 EP 优先级 | 数字标题与小数集、固定集数及定位偏移、作品搜索/缓存/ID 入口一致性、特殊内容目标核验与覆盖保护、确认窗口及资源字段保留 | `test_manual_episode_precedence` |
 | 手动 EP 表单 | 固定 EP 无定位规则提交、区间筛选/偏移限制、失败恢复、键盘重试、桌面与窄屏；WebKit 无头运行 | `test_manual_episode_ui.js` |
 | 集数与筛选保护 | 偏移后非负性、范围顺序、第 0 集定位及标题、目录过滤原因、待恢复凭据与完成去重；保留强制覆盖和普通未收录集数策略 | `test_episode_transfer_guards` |
+| 剧名完整性 | 数字标题与明确集号、中文括号和短英文标题、发布组缓存隔离、同名候选重试、缺分类动漫详情核验及失败回滚 | `test_series_name_integrity` |
 
 文件名解析阶段的动漫常先得到电视剧类型；TMDB 电视剧详情中的动画分类才决定最终 `ANIME` 类型。动画电影仍属于 `MOVIE`。测试分别检查解析阶段和最终分类，不能用“文件名解析为 TV”直接判定动漫识别失败。
 

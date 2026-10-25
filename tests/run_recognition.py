@@ -24,6 +24,8 @@ RECOGNITION_MODULES = (
     "tests.test_manual_episode_precedence",
     # Numeric guards, scan rejection reasons and the current receipt lifecycle.
     "tests.test_episode_transfer_guards",
+    # Preserve title roles through provider lookup and cache reuse.
+    "tests.test_series_name_integrity",
     "tests.test_special_episodes",
     "tests.test_special_confirmation",
     "tests.test_review_regressions",

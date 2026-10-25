@@ -88,6 +88,21 @@ class ReleaseGroupsMatcher(object):
         else:
             self.__release_groups = '|'.join(release_groups)
 
+    def is_group_label(self, label):
+        """Require publisher evidence, not merely anitopy's first-block guess."""
+        if not label:
+            return False
+        text = str(label).strip()
+        if re.search(r"字幕组|字幕組|(?:^|[ &_-])(?:group|subs?|raws|studio|team)(?:$|[ &_-])", text, re.I):
+            return True
+        try:
+            return bool(self.match(title="[%s]" % text))
+        except (re.error, TypeError):
+            # A malformed/capturing custom pattern cannot erase built-in group
+            # evidence or abort name parsing. Do not change the global matcher.
+            builtin = '|'.join(group for groups in self.RELEASE_GROUPS.values() for group in groups)
+            return bool(self.match(title="[%s]" % text, groups=builtin))
+
     def match(self, title=None, groups=None):
         """
         :param title: 资源标题或文件名
