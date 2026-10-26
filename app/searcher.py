@@ -61,7 +61,7 @@ class Searcher:
                          no_exists: dict,
                          sites: list = None,
                          filters: dict = None,
-                         user_name=None):
+                         user_name=None, search_context=None, search_only=False):
         """
         只检索和下载一个资源，用于精确检索下载，由微信、Telegram或豆瓣调用
         :param media_info: 已识别的媒体信息
@@ -69,6 +69,7 @@ class Searcher:
         :param no_exists: 缺失的剧集清单
         :param sites: 检索哪些站点
         :param filters: 过滤条件，为空则不过滤
+        :param search_only: 仅收集资源到 search_context，不改写共享结果或触发下载
         :param user_name: 用户名
         :return: 请求的资源是否全部下载完整，如完整则返回媒体信息
                  请求的资源如果是剧集则返回下载后仍然缺失的季集信息
@@ -78,7 +79,8 @@ class Searcher:
         if not media_info:
             return None, {}, 0, 0
         # 进度计数重置
-        self.progress.start('search')
+        if not search_only:
+            self.progress.start('search')
         # 查找的季
         if media_info.begin_season is None:
             search_season = None
@@ -98,7 +100,8 @@ class Searcher:
         if filters:
             filter_args.update(filters)
         # 两轮共用局部上下文，复用片名并跳过已搜索的站点/关键词组合。
-        search_context = {}
+        if search_context is None:
+            search_context = {}
         if media_info.keyword:
             # 直接使用搜索词搜索
             first_search_name = media_info.keyword
@@ -142,7 +145,8 @@ class Searcher:
                                         in_from=in_from,
                                         search_context=search_context)
         # 使用名称重新搜索
-        if len(media_list) == 0 \
+        if not (search_context.get("cancel_event") and search_context["cancel_event"].is_set()) \
+                and len(media_list) == 0 \
                 and second_search_name \
                 and second_search_name != first_search_name:
             log.info("【Searcher】%s 未检索到资源,尝试通过 %s 重新检索 ..." % (first_search_name, second_search_name))
@@ -151,6 +155,12 @@ class Searcher:
                                             match_media=media_info,
                                             in_from=in_from,
                                             search_context=search_context)
+
+        if search_only:
+            # Interactive sessions own their snapshots and decide downloads only
+            # after the complete search, including cancellation, has finished.
+            search_context['results'] = media_list
+            return None, no_exists, len(media_list), None
 
         if len(media_list) == 0:
             log.info("【Searcher】%s 未搜索到任何资源" % second_search_name)

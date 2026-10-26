@@ -30,6 +30,8 @@ RECOGNITION_MODULES = (
     "tests.test_media_cn_fallback",
     # Chinese interactive searches must include English-only torrent sites.
     "tests.test_indexer_language",
+    # Session ownership and Telegram callbacks share the real search pipeline.
+    "tests.test_search_sessions",
     "tests.test_meta_llm_parser",
     "tests.test_sync_reliability",
     "tests.test_download_dedupe",

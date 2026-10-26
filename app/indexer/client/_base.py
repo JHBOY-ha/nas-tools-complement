@@ -75,7 +75,9 @@ class _IIndexClient(metaclass=ABCMeta):
         result_array = self.__parse_torznabxml(api_url)
         if len(result_array) == 0:
             log.warn(f"【{self.index_type}】{indexer.name} 未检索到数据")
-            self.progress.update(ptype='search', text=f"{indexer.name} 未检索到数据")
+            # Session-owned status must not overwrite another web search bar.
+            if not filter_args.get("_session_search"):
+                self.progress.update(ptype='search', text=f"{indexer.name} 未检索到数据")
             return []
         else:
             log.warn(f"【{self.index_type}】{indexer.name} 返回数据：{len(result_array)}")
@@ -393,6 +395,7 @@ class _IIndexClient(metaclass=ABCMeta):
         end_time = datetime.datetime.now()
         log.info(
             f"【{self.index_type}】{indexer.name} 共检索到 {len(result_array)} 条数据，过滤 {index_rule_fail}，不匹配 {index_match_fail}，错误 {index_error}，有效 {index_sucess}，耗时 {(end_time - start_time).seconds} 秒")
-        self.progress.update(ptype='search',
-                             text=f"{indexer.name} 共检索到 {len(result_array)} 条数据，过滤 {index_rule_fail}，不匹配 {index_match_fail}，错误 {index_error}，有效 {index_sucess}，耗时 {(end_time - start_time).seconds} 秒")
+        if not filter_args.get("_session_search"):
+            self.progress.update(ptype='search',
+                                 text=f"{indexer.name} 共检索到 {len(result_array)} 条数据，过滤 {index_rule_fail}，不匹配 {index_match_fail}，错误 {index_error}，有效 {index_sucess}，耗时 {(end_time - start_time).seconds} 秒")
         return ret_array

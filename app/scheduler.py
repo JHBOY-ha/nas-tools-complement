@@ -180,6 +180,10 @@ class Scheduler:
 
         # 元数据定时保存
         self._add_job(MetaHelper().save_meta_data, 'interval', seconds=METAINFO_SAVE_INTERVAL)
+        # Search receipts reuse the bounded scheduler and persist across restart;
+        # the poller stays quiet unless a download changes lifecycle state.
+        from web.backend.telegram_search import TelegramSearch
+        self._add_job(TelegramSearch().refresh_pending, 'interval', seconds=60)
 
         # 定时把队列中的监控文件转移走
         self._add_job(Sync().transfer_mon_files, 'interval', seconds=SYNC_TRANSFER_INTERVAL)

@@ -20,7 +20,7 @@ SEARCH_MEDIA_CACHE = {}
 SEARCH_MEDIA_TYPE = {}
 
 
-def search_medias_for_web(content, ident_flag=True, filters=None, tmdbid=None, media_type=None):
+def search_medias_for_web(content, ident_flag=True, filters=None, tmdbid=None, media_type=None, search_id=None):
     """
     WEB资源搜索
     :param content: 关键字文本，可以包括 类型、标题、季、集、年份等信息，使用 空格分隔，也支持种子的命名格式
@@ -153,9 +153,17 @@ def search_medias_for_web(content, ident_flag=True, filters=None, tmdbid=None, m
                                               match_media=media_info,
                                               in_from=SearchType.WEB,
                                               search_context=search_context)
-    # 清空缓存结果
+    # Authenticated web searches own immutable resource IDs just like Telegram;
+    # legacy callers keep their existing database contract.
     dbhepler = DbHelper()
-    dbhepler.delete_all_search_torrents()
+    if search_id:
+        from app.helper.search_sessions import SearchSessions, pack_media
+        with SearchSessions().edit(search_id) as record:
+            record.update(state='results', view='results', ident_flag=ident_flag,
+                          selected=pack_media(media_info) if media_info else None)
+            record['results'] = {str(index): pack_media(item) for index, item in enumerate(media_list[:500])}
+    else:
+        dbhepler.delete_all_search_torrents()
     # 结束进度
     search_process.end('search')
     if len(media_list) == 0:
@@ -167,9 +175,10 @@ def search_medias_for_web(content, ident_flag=True, filters=None, tmdbid=None, m
         media_list = sorted(media_list, key=lambda x: "%s%s%s" % (str(x.res_order).rjust(3, '0'),
                                                                   str(x.site_order).rjust(3, '0'),
                                                                   str(x.seeders).rjust(10, '0')), reverse=True)
-        dbhepler.insert_search_results(media_items=media_list,
-                                       ident_flag=ident_flag,
-                                       title=content)
+        if not search_id:
+            dbhepler.insert_search_results(media_items=media_list,
+                                           ident_flag=ident_flag,
+                                           title=content)
         return 0, ""
 
 
@@ -449,7 +458,7 @@ def __search_media(in_from, media_info, user_id, user_name=None):
             Message().send_channel_msg(channel=in_from,
                                        title="%s 共搜索到%s个资源，点击选择下载" % (media_info.title, search_count),
                                        image=media_info.get_message_image(),
-                                       url="search",
+                                       url="search?legacy=1",
                                        user_id=user_id)
             return
         else:

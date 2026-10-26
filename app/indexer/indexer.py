@@ -1,5 +1,6 @@
 import datetime
-from concurrent.futures import as_completed, TimeoutError as FutureTimeoutError
+import time
+from concurrent.futures import wait, FIRST_COMPLETED
 
 import log
 from app.conf import ModuleConf
@@ -156,6 +157,11 @@ class Indexer(object):
         if search_context is None:
             search_context = {}
         submitted = search_context.setdefault("submitted", set())
+        report = search_context.setdefault("report", {})
+        observer = search_context.get("on_progress")
+        cancel = search_context.get("cancel_event")
+        if observer:
+            filter_args = dict(filter_args or {}, _session_search=True)
         english_word = None
         if (self._client_type == IndexerType.BUILTIN
                 and match_media and not match_media.keyword
@@ -183,22 +189,29 @@ class Indexer(object):
         start_time = datetime.datetime.now()
         if filter_args and filter_args.get("site"):
             log.info(f"【{self._client_type.value}】开始检索 %s，站点：%s ..." % (key_word, filter_args.get("site")))
-            self.progress.update(ptype='search', text="开始检索 %s，站点：%s ..." % (key_word, filter_args.get("site")))
+            if not observer:
+                self.progress.update(ptype='search', text="开始检索 %s，站点：%s ..." % (key_word, filter_args.get("site")))
         else:
             concurrency = self._search_executor.snapshot()['max_workers']
             log.info(f"【{self._client_type.value}】开始并行检索 %s，站点数：%s，共享并发上限：%s ..."
                      % (key_word, len(indexers), concurrency))
-            self.progress.update(ptype='search', text="开始检索 %s，站点数：%s，并发上限：%s ..."
-                                 % (key_word, len(indexers), concurrency))
+            if not observer:
+                self.progress.update(ptype='search', text="开始检索 %s，站点数：%s，并发上限：%s ..."
+                                     % (key_word, len(indexers), concurrency))
         # Network searches use a separate, process-wide FIFO queue so a waiting
         # background task cannot consume its own executor's remaining workers.
         executor = self._search_executor
         all_task = []
         task_queries = {}
+        task_sites = {}
         ret_array = []
         unfinished = 0
         try:
             for index in indexers:
+                if cancel and cancel.is_set():
+                    break
+                if filter_args and filter_args.get("site") and index.name not in filter_args["site"]:
+                    continue
                 order_seq = 100 - int(index.pri)
                 site_word = key_word
                 if english_word and index.language == "en":
@@ -212,6 +225,8 @@ class Indexer(object):
                 if query_key in submitted:
                     continue
                 # 池内线程由 executor 复用，工作单元结束时归还数据库连接。
+                stats = {"name": getattr(index, 'name', str(index.id)), "state": "searching"}
+                report[str(index.id)] = stats
                 try:
                     task = executor.submit(with_db_session(self._client.search),
                                            order_seq,
@@ -219,37 +234,61 @@ class Indexer(object):
                                            site_word,
                                            filter_args,
                                            match_media,
-                                           in_from)
+                                           in_from,
+                                           **({'stats': stats} if self._client_type == IndexerType.BUILTIN else {}))
                 except TaskQueueFull:
+                    stats["state"] = "busy"
                     unfinished += 1
                     continue
                 # 未准入的任务不能记为已搜索，下一轮仍允许尝试提交。
                 submitted.add(query_key)
                 all_task.append(task)
                 task_queries[task] = query_key
+                task_sites[task] = stats
             if unfinished:
                 log.warn("【%s】检索队列繁忙，%s 个站点未准入，请稍后重试"
                          % (self._client_type.value, unfinished))
-            finish_count = 0
-            try:
-                for future in as_completed(all_task, timeout=SEARCH_TOTAL_TIMEOUT_SECONDS):
+            pending = set(all_task)
+            deadline = time.monotonic() + SEARCH_TOTAL_TIMEOUT_SECONDS
+            if observer:
+                observer([], report)
+            # Short waits allow cancellation without interrupting an in-flight
+            # HTTP call; its worker slot remains held until the real call ends.
+            while pending and not (cancel and cancel.is_set()):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                done, pending = wait(pending, timeout=min(0.25, remaining), return_when=FIRST_COMPLETED)
+                for future in done:
+                    stats = task_sites[future]
                     try:
-                        result = future.result()
+                        result = future.result() or []
+                        stats.update(valid=len(result))
+                        if stats['state'] == 'searching':
+                            stats['state'] = 'done' if result else 'empty'
                     except Exception as err:
-                        # 单个站点异常只丢弃该站点结果，不再中断整次检索。
                         ExceptionUtils.exception_traceback(err)
-                        finish_count += 1
+                        stats['state'] = 'failed'
                         unfinished += 1
-                        continue
-                    finish_count += 1
-                    self.progress.update(ptype='search', value=round(100 * (finish_count / len(all_task))))
-                    if result:
-                        ret_array = ret_array + result
-            except FutureTimeoutError:
-                pending = len([task for task in all_task if not task.done()])
-                unfinished += len(all_task) - finish_count
-                log.warn("【%s】检索 %s 有 %s 个站点超过 %s 秒未返回，已跳过等待"
-                         % (self._client_type.value, key_word, pending, SEARCH_TOTAL_TIMEOUT_SECONDS))
+                        result = []
+                    if cancel and cancel.is_set():
+                        break
+                    ret_array.extend(result)
+                    if not observer:
+                        self.progress.update(ptype='search', value=round(100 * (len(all_task) - len(pending)) / len(all_task)))
+                    if observer:
+                        observer(result, report)
+            for future in pending:
+                task_sites[future]['state'] = 'canceled' if cancel and cancel.is_set() else 'timeout'
+            unfinished += len(pending)
+            if pending and not (cancel and cancel.is_set()):
+                log.warn(f"【{self._client_type.value}】{len(pending)} 个站点超时，已停止等待")
+            # Running workers may finish after the deadline. Freeze the report
+            # so their late statistics cannot rewrite this search's outcome.
+            report = {key: dict(value) for key, value in report.items()}
+            search_context['report'] = report
+            if observer:
+                observer([], report)
         finally:
             # Cancel only this call's queued work, never shut down the shared
             # executor or cancel another user's search. Running requests keep
@@ -262,7 +301,8 @@ class Indexer(object):
         end_time = datetime.datetime.now()
         log.info(f"【{self._client_type.value}】检索结束，有效资源数：%s，未完成站点：%s，总耗时 %s 秒"
                  % (len(ret_array), unfinished, (end_time - start_time).seconds))
-        self.progress.update(ptype='search', text="检索完成，有效资源数：%s，未完成站点：%s，总耗时 %s 秒"
-                                                  % (len(ret_array), unfinished, (end_time - start_time).seconds),
-                             value=100)
+        if not observer:
+            self.progress.update(ptype='search', text="检索完成，有效资源数：%s，未完成站点：%s，总耗时 %s 秒"
+                                                      % (len(ret_array), unfinished, (end_time - start_time).seconds),
+                                 value=100)
         return ret_array
