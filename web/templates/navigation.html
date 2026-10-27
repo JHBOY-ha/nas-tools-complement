@@ -989,7 +989,8 @@
     ajax_post("search", param, function (ret) {
       hide_refresh_process();
       if (ret.code === 0) {
-        navmenu('search?s=' + title)
+        // Bind this tab to its search; later searches must not replace its resources.
+        navmenu('search?s=' + encodeURIComponent(title) + '&search_id=' + encodeURIComponent(ret.search_id || ''))
       } else {
         show_fail_modal(ret.msg);
       }
@@ -1197,7 +1198,8 @@
     ajax_post("search", param, function (ret) {
       hide_refresh_process();
       if (ret.code === 0) {
-        navmenu('search?s=' + title);
+        // Bind this tab to its search; later searches must not replace its resources.
+        navmenu('search?s=' + encodeURIComponent(title) + '&search_id=' + encodeURIComponent(ret.search_id || ''));
       } else {
         show_fail_modal(ret.msg);
       }
@@ -1749,7 +1751,8 @@
     ajax_post("search", param, function (ret) {
       hide_refresh_process();
       if (ret.code === 0) {
-        navmenu(`search?s=${keyword}`);
+        // Keep the result page bound to the returned search session.
+        navmenu(`search?s=${encodeURIComponent(keyword)}&search_id=${encodeURIComponent(ret.search_id || '')}`);
       } else {
         show_fail_modal(ret.msg,function () {
           $("#modal-search-advanced").modal("show");

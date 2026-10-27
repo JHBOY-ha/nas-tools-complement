@@ -3143,13 +3143,19 @@ class Media:
 
     def get_tmdb_en_title(self, media_info):
         """
-        获取TMDB的英文名称
+        按已确认的媒体 ID 获取英文名，不修改共享语言或执行中文标题转换。
         """
-        en_info = self.get_tmdb_info(mtype=media_info.type,
-                                     tmdbid=media_info.tmdb_id,
-                                     language="en-US")
-        if en_info:
-            return en_info.get("title") if media_info.type == MediaType.MOVIE else en_info.get("name")
+        client = self.movie if media_info.type == MediaType.MOVIE else self.tv
+        if not client or not media_info.tmdb_id:
+            return None
+        try:
+            # Pass language all the way into the request URL/cache key. Using
+            # get_tmdb_info here would change the environment for every worker.
+            en_info = client.details(media_info.tmdb_id, language="en-US")
+            if en_info:
+                return en_info.get("title") if media_info.type == MediaType.MOVIE else en_info.get("name")
+        except Exception as err:
+            log.warn(f"【Meta】获取TMDB英文名称失败：{err}")
         return None
 
     def get_episode_title(self, media_info):

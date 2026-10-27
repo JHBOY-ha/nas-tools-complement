@@ -115,9 +115,9 @@ class BuiltinIndexer(_IIndexClient):
                key_word,
                filter_args: dict,
                match_media,
-               in_from: SearchType):
+               in_from: SearchType, stats=None):
         """
-        根据关键字多线程检索
+        根据关键字多线程检索；stats 仅记录本站原始数量和失败原因。
         """
         if not indexer or not key_word:
             return None
@@ -145,6 +145,8 @@ class BuiltinIndexer(_IIndexClient):
                                                         allow_space=True)
         # 避免对英文站搜索中文
         if indexer.language == "en" and StringUtils.is_chinese(search_word):
+            if stats is not None:
+                stats["state"] = "unsupported"
             log.warn(f"【{self.index_type}】{indexer.name} 无法使用中文名搜索")
             return []
         result_array = []
@@ -163,19 +165,27 @@ class BuiltinIndexer(_IIndexClient):
                                                     indexer=indexer,
                                                     mtype=match_media.type if match_media else None)
         except Exception as err:
+            if stats is not None:
+                stats["state"] = "failed"
             print(str(err))
+        if stats is not None:
+            stats["raw"] = len(result_array)
         if len(result_array) == 0:
             log.warn(f"【{self.index_type}】{indexer.name} 未检索到数据")
-            self.progress.update(ptype='search', text=f"{indexer.name} 未检索到数据")
+            if not _filter_args.get("_session_search"):
+                self.progress.update(ptype='search', text=f"{indexer.name} 未检索到数据")
             return []
         else:
             log.warn(f"【{self.index_type}】{indexer.name} 返回数据：{len(result_array)}")
-            return self.filter_search_results(result_array=result_array,
+            results = self.filter_search_results(result_array=result_array,
                                               order_seq=order_seq,
                                               indexer=indexer,
                                               filter_args=_filter_args,
                                               match_media=match_media,
                                               start_time=start_time)
+            if stats is not None:
+                stats["state"] = "done" if results else "filtered"
+            return results
 
     def list(self, index_id, page=0, keyword=None):
         """

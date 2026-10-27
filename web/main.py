@@ -2141,30 +2141,49 @@ def telegram():
         log.error("收到来自 %s 的非法Telegram消息：%s" % (request.remote_addr, msg_json))
         return '不允许的IP地址请求'
     if msg_json:
-        message = msg_json.get("message", {})
-        text = message.get("text")
-        user_id = message.get("from", {}).get("id")
-        log.info("收到Telegram消息：from=%s, text=%s" % (user_id, text))
-        # 获取用户名
-        user_name = message.get("from", {}).get("username")
-        if text:
-            # 检查权限
-            if text.startswith("/"):
-                if str(user_id) not in interactive_client.get("client").get_admin():
-                    Message().send_channel_msg(channel=SearchType.TG,
-                                               title="只有管理员才有权限执行此命令",
-                                               user_id=user_id)
-                    return '只有管理员才有权限执行此命令'
-            else:
-                if not str(user_id) in interactive_client.get("client").get_users():
-                    message.send_channel_msg(channel=SearchType.TG,
-                                             title="你不在用户白名单中，无法使用此机器人",
-                                             user_id=user_id)
-                    return '你不在用户白名单中，无法使用此机器人'
-            WebAction().handle_message_job(msg=text,
-                                           in_from=SearchType.TG,
-                                           user_id=user_id,
-                                           user_name=user_name)
+        client = interactive_client['client']
+        callback = msg_json.get('callback_query')
+        message = msg_json.get('message', {})
+        actor = callback.get('from', {}) if callback else message.get('from', {})
+        user_id = actor.get('id')
+        text = message.get('text') or ''
+        allowed = client.get_admin() if text.startswith('/') else client.get_users()
+        if str(user_id) not in allowed:
+            if callback:
+                client.answer_search_callback(callback['id'], '你没有使用此机器人的权限')
+            return '不允许的用户'
+        from web.backend.telegram_search import TelegramSearch
+        try:
+            if callback:
+                TelegramSearch().callback(callback)
+            elif text:
+                # Preserve existing service commands, subscriptions and direct
+                # links. Movie searches use isolated message-bound sessions.
+                from web.backend.search_torrents import SEARCH_MEDIA_TYPE
+                numeric_choice = text.isdigit() and int(text) < 10
+                legacy = (text.startswith(('/', '订阅', 'http', 'magnet:')) or
+                          (numeric_choice and not message.get('reply_to_message') and
+                           SEARCH_MEDIA_TYPE.get(user_id) == 'SUBSCRIBE'))
+                if legacy:
+                    WebAction().handle_message_job(msg=text, in_from=SearchType.TG,
+                                                   user_id=user_id, user_name=actor.get('username'))
+                else:
+                    if not numeric_choice:
+                        # Numeric film titles also start a new search rather
+                        # than continuing a previous subscription selection.
+                        # A new session search supersedes legacy numeric-reply
+                        # mode, but never replaces another session's candidates.
+                        SEARCH_MEDIA_TYPE[user_id] = 'SESSION_SEARCH'
+                    TelegramSearch().receive(text, user_id, message.get('chat', {}).get('id', user_id),
+                                             actor.get('username'), msg_json.get('update_id'),
+                                             message.get('reply_to_message', {}).get('message_id'))
+        except TaskQueueFull:
+            if callback:
+                client.answer_search_callback(callback['id'], '任务队列繁忙，请稍后重试')
+            return 'Busy', 503
+        except RuntimeError:
+            # A transport failure must not consume a webhook update as success.
+            return 'Telegram unavailable', 503
     return 'Ok'
 
 

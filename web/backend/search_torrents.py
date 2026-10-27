@@ -20,7 +20,7 @@ SEARCH_MEDIA_CACHE = {}
 SEARCH_MEDIA_TYPE = {}
 
 
-def search_medias_for_web(content, ident_flag=True, filters=None, tmdbid=None, media_type=None):
+def search_medias_for_web(content, ident_flag=True, filters=None, tmdbid=None, media_type=None, search_id=None):
     """
     WEB资源搜索
     :param content: 关键字文本，可以包括 类型、标题、季、集、年份等信息，使用 空格分隔，也支持种子的命名格式
@@ -42,6 +42,9 @@ def search_medias_for_web(content, ident_flag=True, filters=None, tmdbid=None, m
     search_process.start('search')
     # 识别媒体
     media_info = None
+    # WEB 的名称回退也必须复用同一搜索上下文，避免英文站重复请求。
+    search_context = {}
+    searcher = Searcher()
     if ident_flag:
 
         # 有TMDBID或豆瓣ID
@@ -49,7 +52,7 @@ def search_medias_for_web(content, ident_flag=True, filters=None, tmdbid=None, m
             media_info = WebUtils.get_mediainfo_from_id(mtype=mtype, mediaid=tmdbid)
         else:
             # 按输入名称查
-            media_info = Media().get_media_info(mtype=media_type or mtype,
+            media_info = searcher.media.get_media_info(mtype=media_type or mtype,
                                                 title=content)
 
         # 整合集
@@ -84,9 +87,10 @@ def search_medias_for_web(content, ident_flag=True, filters=None, tmdbid=None, m
                 if media_info.original_language == "en":
                     search_en_name = media_info.original_title
                 else:
-                    en_title = Media().get_tmdb_en_title(media_info)
+                    en_title = searcher.media.get_tmdb_en_title(media_info)
                     if en_title:
                         search_en_name = en_title
+            search_context["english_word"] = search_en_name
             # 两次搜索名称
             second_search_name = None
             if Config().get_config("laboratory").get("search_en_title"):
@@ -130,10 +134,11 @@ def search_medias_for_web(content, ident_flag=True, filters=None, tmdbid=None, m
         filter_args.update(filters)
     # 开始检索
     log.info("【Web】开始检索 %s ..." % content)
-    media_list = Searcher().search_medias(key_word=first_search_name,
+    media_list = searcher.search_medias(key_word=first_search_name,
                                           filter_args=filter_args,
                                           match_media=media_info,
-                                          in_from=SearchType.WEB)
+                                          in_from=SearchType.WEB,
+                                          search_context=search_context)
     # 使用第二名称重新搜索
     if ident_flag \
             and len(media_list) == 0 \
@@ -143,13 +148,22 @@ def search_medias_for_web(content, ident_flag=True, filters=None, tmdbid=None, m
         search_process.update(ptype='search',
                               text="%s 未检索到资源,尝试通过 %s 重新检索 ..." % (first_search_name, second_search_name))
         log.info("【Searcher】%s 未检索到资源,尝试通过 %s 重新检索 ..." % (first_search_name, second_search_name))
-        media_list = Searcher().search_medias(key_word=second_search_name,
+        media_list = searcher.search_medias(key_word=second_search_name,
                                               filter_args=filter_args,
                                               match_media=media_info,
-                                              in_from=SearchType.WEB)
-    # 清空缓存结果
+                                              in_from=SearchType.WEB,
+                                              search_context=search_context)
+    # Authenticated web searches own immutable resource IDs just like Telegram;
+    # legacy callers keep their existing database contract.
     dbhepler = DbHelper()
-    dbhepler.delete_all_search_torrents()
+    if search_id:
+        from app.helper.search_sessions import SearchSessions, pack_media
+        with SearchSessions().edit(search_id) as record:
+            record.update(state='results', view='results', ident_flag=ident_flag,
+                          selected=pack_media(media_info) if media_info else None)
+            record['results'] = {str(index): pack_media(item) for index, item in enumerate(media_list[:500])}
+    else:
+        dbhepler.delete_all_search_torrents()
     # 结束进度
     search_process.end('search')
     if len(media_list) == 0:
@@ -161,9 +175,10 @@ def search_medias_for_web(content, ident_flag=True, filters=None, tmdbid=None, m
         media_list = sorted(media_list, key=lambda x: "%s%s%s" % (str(x.res_order).rjust(3, '0'),
                                                                   str(x.site_order).rjust(3, '0'),
                                                                   str(x.seeders).rjust(10, '0')), reverse=True)
-        dbhepler.insert_search_results(media_items=media_list,
-                                       ident_flag=ident_flag,
-                                       title=content)
+        if not search_id:
+            dbhepler.insert_search_results(media_items=media_list,
+                                           ident_flag=ident_flag,
+                                           title=content)
         return 0, ""
 
 
@@ -443,7 +458,7 @@ def __search_media(in_from, media_info, user_id, user_name=None):
             Message().send_channel_msg(channel=in_from,
                                        title="%s 共搜索到%s个资源，点击选择下载" % (media_info.title, search_count),
                                        image=media_info.get_message_image(),
-                                       url="search",
+                                       url="search?legacy=1",
                                        user_id=user_id)
             return
         else:
