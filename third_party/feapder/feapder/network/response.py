@@ -211,10 +211,10 @@ class Response(res):
 
     def _absolute_links(self, text):
         regexs = [
-            r'(<(?i)a.*?href\s*?=\s*?["\'])(.+?)(["\'])',  # a
-            r'(<(?i)img.*?src\s*?=\s*?["\'])(.+?)(["\'])',  # img
-            r'(<(?i)link.*?href\s*?=\s*?["\'])(.+?)(["\'])',  # css
-            r'(<(?i)script.*?src\s*?=\s*?["\'])(.+?)(["\'])',  # js
+            r'(<a.*?href\s*?=\s*?["\'])(.+?)(["\'])',  # a
+            r'(<img.*?src\s*?=\s*?["\'])(.+?)(["\'])',  # img
+            r'(<link.*?href\s*?=\s*?["\'])(.+?)(["\'])',  # css
+            r'(<script.*?src\s*?=\s*?["\'])(.+?)(["\'])',  # js
         ]
 
         for regex in regexs:
@@ -226,7 +226,8 @@ class Response(res):
                 # return re.sub(regex, r'\1{}\3'.format(absolute_link), html) # 使用正则替换，个别字符不支持。如该网址源代码http://permit.mep.gov.cn/permitExt/syssb/xxgk/xxgk!showImage.action?dataid=0b092f8115ff45c5a50947cdea537726
                 return text.group(1) + absolute_link + text.group(3)
 
-            text = re.sub(regex, replace_href, text, flags=re.S)
+            # Python 3.11+ rejects global inline flags inside a capture group.
+            text = re.sub(regex, replace_href, text, flags=re.S | re.I)
 
         return text
 
