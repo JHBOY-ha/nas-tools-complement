@@ -15,6 +15,16 @@ from web.backend.telegram_search import TelegramSearch, resource_key
 from web.backend.telegram_search_view import render_search_message
 
 
+TMDB_MOVIE_RESPONSE = {
+    'id': 68726, 'media_type': 'movie', 'title': '环太平洋',
+    'original_title': 'Pacific Rim', 'original_language': 'en',
+    'release_date': '2013-07-11', 'genre_ids': [28, 878],
+    'genres': [{'id': 878, 'name': 'Science Fiction'}],
+    'external_ids': {'imdb_id': 'tt1663662'},
+    'alternative_titles': {'titles': [{'iso_3166_1': 'US', 'title': 'Pacific Rim'}]},
+}
+
+
 def movie(title='沙丘', year='2021', tmdbid=438631):
     media = MetaInfo(title, use_llm=False)
     media.set_tmdb_info({'id': tmdbid, 'media_type': MediaType.MOVIE, 'title': title,
@@ -57,6 +67,31 @@ class SearchSessionsTest(SearchSessionFixture):
         self.assertEqual(restored.tmdb_info['media_type'], MediaType.MOVIE)
         self.assertEqual(restored.get_title_string(), media.get_title_string())
         self.assertEqual(os.stat(os.path.join(self.directory.name, record['id'] + '.json')).st_mode & 0o777, 0o600)
+
+    def test_sdk_metadata_round_trip_keeps_nested_values_and_snapshot_identity(self):
+        from app.media.tmdbv3api.as_obj import AsObj
+        info = AsObj(**TMDB_MOVIE_RESPONSE)
+        info['media_type'] = MediaType.MOVIE
+        media = MetaInfo('环太平洋', use_llm=False)
+        media.set_tmdb_info(info)
+        record, _ = self.store.create(1, 1, '环太平洋')
+        snapshot = pack_media(media)
+        with self.store.edit(record['id']) as current:
+            current.update(state='candidates', candidates=[snapshot])
+        self.assertIsInstance(snapshot['tmdb_info'], dict)
+        self.assertEqual(snapshot['tmdb_info']['genres'], [{'id': 878, 'name': 'Science Fiction'}])
+        self.assertEqual(snapshot['tmdb_info']['alternative_titles']['titles'][0]['title'], 'Pacific Rim')
+        info.genres[0].name = 'later mutation'
+        self.assertEqual(snapshot['tmdb_info']['genres'][0]['name'], 'Science Fiction')
+        reloaded = self.store_type(self.directory.name).get(record['id'])
+        self.assertEqual(reloaded['candidates'][0], snapshot)
+        restored = unpack_media(reloaded['candidates'][0])
+        self.assertEqual((restored.tmdb_id, restored.type, restored.imdb_id),
+                         (68726, MediaType.MOVIE, 'tt1663662'))
+        before = self.store.get(record['id'])['updated_at']
+        with self.store.edit(record['id']):
+            pass
+        self.assertEqual(self.store.get(record['id'])['updated_at'], before)
 
     def test_concurrent_searches_and_redelivery_remain_isolated(self):
         first, created = self.store.create(1, -10, '沙丘', request_id=15)
@@ -156,6 +191,35 @@ class TelegramSearchTest(SearchSessionFixture):
         self.assertNotEqual(record['id'], self.sid)
         self.assertEqual(record['state'], 'identifying')
         self.helper.start_thread.assert_called_once()
+
+    def test_identify_persists_real_sdk_candidates_with_and_without_year(self):
+        from app.media import Media
+        from app.media.tmdbv3api import Search
+        # SDK construction initializes process-wide defaults; restore them when
+        # this isolated provider test ends.
+        environment = patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
+        provider = Media.__new__(Media)
+        provider.tmdb = True
+        provider.search = Search()
+        # Only the SDK request boundary is replaced. Media lookup, candidate
+        # parsing, SDK AsObj construction and session persistence remain real.
+        def response(action, *args, **kwargs):
+            return {'results': [] if action == '/search/tv' else [TMDB_MOVIE_RESPONSE]}
+        with patch('web.backend.web_utils.Media', return_value=provider), \
+                patch.object(provider.search, '_call', side_effect=response):
+            for query in ('环太平洋', '环太平洋 2013'):
+                with self.subTest(query=query):
+                    record, _ = self.store.create(1, 1, query)
+                    self.service.identify(record['id'], 0)
+                    saved = self.store.get(record['id'])
+                    self.assertEqual(saved['state'], 'queued')
+                    self.assertEqual(saved['selected']['tmdb_id'], 68726)
+                    self.assertEqual(saved['selected']['tmdb_info']['media_type'], MediaType.MOVIE)
+                    self.assertIsInstance(saved['selected']['tmdb_info']['genres'][0], dict)
+                    reloaded = self.store_type(self.directory.name).get(record['id'])
+                    self.assertEqual(reloaded['selected'], saved['selected'])
 
     def test_old_candidate_button_cannot_select_from_new_search(self):
         with self.store.edit(self.sid) as record:

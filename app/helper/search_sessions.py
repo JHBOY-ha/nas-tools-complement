@@ -15,6 +15,7 @@ from contextlib import contextmanager
 from enum import Enum
 
 from app.media.meta._base import MetaBase
+from app.media.tmdbv3api.as_obj import AsObj
 from app.utils.commons import singleton
 from app.utils.types import MediaType
 from app.utils.workload import TaskQueueFull
@@ -30,8 +31,19 @@ PENDING_DOWNLOAD_STATES = frozenset({'accepted', 'unknown', 'downloading', 'comp
 def pack_media(media):
     # Recognition may reuse nested TMDB dictionaries and notes. A snapshot
     # must own those values before another worker continues modifying media.
-    return copy.deepcopy({key: value for key, value in vars(media).items()
-                          if key not in _RUNTIME_FIELDS and not key.startswith('_')})
+    return _snapshot_value({key: value for key, value in vars(media).items()
+                            if key not in _RUNTIME_FIELDS and not key.startswith('_')})
+
+
+def _snapshot_value(value):
+    # TMDB AsObj is dictionary-like but not JSON serializable, including inside
+    # lists. Normalize at the snapshot boundary so memory and restored data have
+    # the same containers; enums retain the existing typed persistence format.
+    if isinstance(value, (dict, AsObj)):
+        return {key: _snapshot_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_snapshot_value(item) for item in value]
+    return copy.deepcopy(value)
 
 
 def unpack_media(data):
