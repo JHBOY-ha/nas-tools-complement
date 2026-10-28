@@ -6,7 +6,7 @@ from anitopy.parser_number import is_valid_episode_number
 import log
 from app.helper import WordsHelper
 from app.media.meta.llm_parser import LLMMetaParser
-from app.media.meta._base import MetaBase
+from app.media.meta._base import MetaBase, is_fansub_release_name
 from app.media.meta.metaanime import MetaAnime
 from app.media.meta.metavideo import MetaVideo
 from app.utils.types import MediaType
@@ -14,6 +14,7 @@ from config import Config, RMT_MEDIAEXT
 from app.media.meta.fractional import protect_fractional_episode
 from app.media.meta.release_version import extract_cut
 from app.media.meta.special import extract_special
+from app.media.meta.title_utils import strip_anime_part_markers
 
 
 def prepare_title(title):
@@ -169,6 +170,15 @@ def is_anime(name):
     """
     if not name:
         return False
+    # Fansub releases can carry both S4 and an explicit [25-37] episode block.
+    # Keep their part ordinals out of the generic video's bare-number parser,
+    # even when the later explicit-season shortcut would normally choose it.
+    if strip_anime_part_markers(name) != name and is_fansub_release_name(name):
+        if re.search(r'(?i)(?<![A-Z])COUR(?![A-Z])|クール|(?<![A-Z0-9])(?:S\d{1,2})?EP?\d{1,4}(?!\d)', name):
+            return True
+        for block in re.finditer(r'[\[【]\s*(\d{1,4})(?:v\d+)?(?:\s*-\s*(\d{1,4})(?:v\d+)?)?\s*[\]】]', name, re.I):
+            if all(is_valid_episode_number(n) for n in block.groups() if n):
+                return True
     # A complete completion block is stronger evidence than a following resource
     # bracket. Share anitopy's number validation so years cannot become episodes.
     for block in re.finditer(r'\[([^\[\]]+)]|【([^【】]+)】|\(([^()]+)\)', name):

@@ -694,11 +694,13 @@ class FileTransfer:
         refresh_library_items = []
         # 需要下载字段的清单
         download_subtitle_items = []
-        # 先检测小数集目标冲突，避免批次内较大文件覆盖先写入的版本。
+        # Detect batch collisions before any publication, including ordinary
+        # episodes that a parser may have collapsed onto the same number.
         checked_roots = self._check_fractional_destinations(Medias, target_dir, rmt_mode)
         # 处理识别后的每一个文件或单个文件夹
         for file_item, media in Medias.items():
             try:
+                total_count += 1
                 # 跳过结果不得落入未识别目录，也不能执行重命名或转移。
                 if getattr(media, "skip_reason", None):
                     log.info("【Rmt】%s 跳过：%s" % (file_item, media.skip_reason))
@@ -710,9 +712,6 @@ class FileTransfer:
                     if self.dbhelper.is_need_insert_transfer_unknown(file_item):
                         self.dbhelper.insert_transfer_unknown(file_item, target_dir, rmt_mode)
                     continue
-                # 总数量
-                total_count = total_count + 1
-
                 if not udf_flag:
                     if re.search(r'[./\s\[]+Sample[/.\s\]]+', file_item, re.IGNORECASE):
                         log.warn("【Rmt】%s 可能是预告片，跳过..." % file_item)
@@ -1531,12 +1530,16 @@ class FileTransfer:
             raise ValueError("Extras 目标目录已变化，保留源文件等待重新预检")
 
     def _check_fractional_destinations(self, medias, target_dir, rmt_mode):
-        """Preflight decimal destinations before publishing any file in the batch."""
+        """Preflight batch destinations, retaining stricter special-content rules."""
         # All evidence-bound content receives the same preflight collision protection.
         fractional = {path for path, meta in medias.items() if meta and not meta.skip_reason
                       and any((meta.note or {}).get(key, {}).get("status") == "confirmed"
                               for key in ("fractional_episode", "special_episode", "extra"))}
-        if not fractional:
+        ordinary = {path for path, meta in medias.items()
+                    if path not in fractional and meta and not meta.skip_reason and meta.tmdb_info
+                    and meta.type in (MediaType.TV, MediaType.ANIME)
+                    and not (meta.note or {}).get("extra") and meta.get_episode_list()}
+        if not fractional and len(ordinary) < 2:
             return {}
         roots, destinations = {}, {}
         extra_directories = {}  # Shared only by this preflight, never across batches.
@@ -1547,7 +1550,7 @@ class FileTransfer:
                 if (meta.note or {}).get("extra"):
                     root, destination = self._extra_destination(path, meta, target_dir, extra_directories)
                     meta.note["extra"].update(library_root=root, destination=destination)
-                    destinations.setdefault(os.path.normcase(os.path.abspath(os.path.splitext(destination)[0])), []).append(path)
+                    destinations.setdefault(os.path.normcase(os.path.realpath(os.path.splitext(destination)[0])), []).append(path)
                     continue
                 root = target_dir or self.__get_best_target_path(
                     mtype=meta.type, in_path=path, size=os.path.getsize(path), rmt_mode=rmt_mode)
@@ -1558,15 +1561,19 @@ class FileTransfer:
                 if not destination:
                     raise ValueError("无法生成目标文件名")
                 stem = os.path.splitext(destination)[0] if exists else destination
-                destinations.setdefault(os.path.normcase(os.path.abspath(stem)), []).append(path)
+                destinations.setdefault(os.path.normcase(os.path.realpath(stem)), []).append(path)
                 # 已存在的不同内容不能被小数集按体积覆盖；同一硬链接重试可通过。
                 if path in fractional and exists and not os.path.samefile(path, destination):
                     meta.skip_reason = "小数集目标已存在不同文件，保留源文件"
             except Exception as err:
                 if path in fractional:
                     meta.skip_reason = "小数集目标校验失败：%s" % err
+                elif path in ordinary:
+                    meta.skip_reason = "剧集目标校验失败，保留源文件：%s" % err
         for paths in destinations.values():
-            if len(paths) < 2 or not fractional.intersection(paths):
+            regular_conflicts = ordinary.intersection(paths)
+            protected_conflicts = fractional.intersection(paths)
+            if len(paths) < 2 or (not protected_conflicts and len(regular_conflicts) < 2):
                 continue
             try:
                 if all(os.path.samefile(paths[0], other) for other in paths[1:]):
@@ -1576,9 +1583,13 @@ class FileTransfer:
                 for path in paths:
                     medias[path].skip_reason = "目标冲突校验失败，保留源文件：%s" % err
                 continue
-            # 整数文件仍可整理；同名小数文件全部跳过，避免先写入者获胜。
-            for path in fractional.intersection(paths):
+            # A protected clip cannot displace an ordinary episode. Conflicting
+            # ordinary sources are all retained rather than choosing a winner.
+            for path in protected_conflicts:
                 medias[path].skip_reason = "小数集与本批其他文件目标冲突，保留源文件"
+            if len(regular_conflicts) > 1:
+                for path in regular_conflicts:
+                    medias[path].skip_reason = "本批多个剧集文件目标冲突，保留源文件等待确认"
         return roots
 
     def get_format_dict(self, media):

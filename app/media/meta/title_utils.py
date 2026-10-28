@@ -1,6 +1,19 @@
 import re
 
 
+_ANIME_PART_MARKER_RE = re.compile(
+    r"(?<![A-Z0-9])(?:COUR|PART)[ ._-]*"
+    r"(?:[1-9][0-9]?|VIII|VII|VI|IV|IX|III|II|V|X|I)(?![A-Z0-9]|[.．][0-9])"
+    r"|(?<![A-Z0-9])[1-9][0-9]?(?:ST|ND|RD|TH)\s+COUR(?![A-Z0-9])"
+    r"|第\s*[0-9一二三四五六七八九十百]{1,4}\s*(?:部分|クール)"
+    r"|(?<![A-Z0-9])[1-9][0-9]?\s*クール", re.I)
+
+
+def strip_anime_part_markers(title):
+    """Keep release-part ordinals out of episode parsing; callers retain raw evidence."""
+    return _ANIME_PART_MARKER_RE.sub(" ", str(title or ""))
+
+
 def promote_bracket_title(title):
     """Keep a release group's following title block visible to name parsers."""
     title = str(title or "").replace("【", "[").replace("】", "]")

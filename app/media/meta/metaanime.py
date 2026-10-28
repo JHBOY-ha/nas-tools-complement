@@ -5,7 +5,7 @@ import zhconv
 import anitopy
 from app.media.meta._base import MetaBase
 from app.media.meta.release_groups import ReleaseGroupsMatcher
-from app.media.meta.title_utils import promote_bracket_title
+from app.media.meta.title_utils import promote_bracket_title, strip_anime_part_markers
 from app.utils import StringUtils, ExceptionUtils
 from app.utils.types import MediaType
 
@@ -40,6 +40,9 @@ class MetaAnime(MetaBase):
             anitopy_info_origin = anitopy.parse(title)
             # Series totals are metadata, not candidates for anitopy's bare episode rule.
             title = re.sub(self._subtitle_episode_all_re, " ", title, flags=re.IGNORECASE)
+            # Cour 3 [37] describes part 3, episode 37. Without masking the
+            # part marker, anitopy picks 3 and relegates 37 to an alternate.
+            title = strip_anime_part_markers(title)
             title = self.__prepare_title(title)
             anitopy_info = anitopy.parse(title)
             if anitopy_info:
@@ -222,9 +225,9 @@ class MetaAnime(MetaBase):
                 if isinstance(self.audio_encode, list):
                     self.audio_encode = self.audio_encode[0]
                 # 解析副标题，只要季和集
-                self.init_subtitle(self.org_string)
+                self.init_subtitle(strip_anime_part_markers(self.org_string))
                 if not self._subtitle_flag and self.subtitle:
-                    self.init_subtitle(self.subtitle)
+                    self.init_subtitle(strip_anime_part_markers(self.subtitle))
             if not self.type:
                 self.type = MediaType.TV
         except Exception as e:

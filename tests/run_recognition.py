@@ -33,6 +33,7 @@ RECOGNITION_MODULES = (
     "tests.test_media_cache_numbering",
     "tests.test_media_recognition_integrity",
     "tests.test_meta_parser_boundaries",
+    "tests.test_cour_episode_recognition",
     "tests.test_meta_multi_episode_guards",
     "tests.test_meta_recognition_matrix",
     "tests.test_media_identity_matrix",
