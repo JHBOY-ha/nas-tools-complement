@@ -44,6 +44,10 @@ RECOGNITION_MODULES = (
     "tests.test_media_identity_matrix",
     # Constraint matrix for the series recognition invariants (C1-C6).
     "tests.test_recognition_invariants",
+    # Cross-branch regressions: release evidence, identity sources and query reuse.
+    "tests.test_recognition_special_crossings",
+    "tests.test_recognition_llm_crossings",
+    "tests.test_recognition_query_crossings",
 )
 
 

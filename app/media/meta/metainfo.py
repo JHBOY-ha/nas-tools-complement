@@ -99,11 +99,21 @@ def MetaInfo(title, subtitle=None, mtype=None, use_llm=True, _prepared=None):
     if special:
         # anitopy's short-title fallback can mistake a resolution bracket for a title.
         name_info = MetaVideo(title, subtitle, fileflag)
+        written_ordinal = (re.search(r"(?i)\b\d{1,2}(?:st|nd|rd|th)[ ._-]+Season\b", title)
+                           and re.search(r"(?i)\bSeason[ ._-]+\d{1,2}[ ._-]+(?:Episode\b|EP?\d)", title))
         if (re.fullmatch(r"\d{3,4}[pi]", meta_info.get_name() or "", re.I)
-                or (not meta_info.year and name_info.year and name_info.get_name())):
+                or (not meta_info.year and name_info.year and name_info.get_name())
+                # A complete written season/episode structure disambiguates
+                # ordinal words in the title, even when an OVA label is present.
+                or written_ordinal):
             meta_info.cn_name, meta_info.en_name = name_info.cn_name, name_info.en_name
             meta_info._name = name_info.get_name()
             meta_info.year = name_info.year
+        if written_ordinal:
+            # The ordinal belongs to the title; the written Season N owns the
+            # release season. Do not retain anitopy's interpretation of "2nd".
+            for field in ("begin_season", "end_season", "total_seasons"):
+                setattr(meta_info, field, getattr(name_info, field))
         special["source_season"] = meta_info.begin_season
         if meta_info.end_season is not None and meta_info.end_season != meta_info.begin_season:
             special["reason"] = "特殊内容发布季范围不明确"

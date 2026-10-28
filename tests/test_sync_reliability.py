@@ -91,7 +91,8 @@ class RecognitionTests(unittest.TestCase):
         from app.media.meta.special_resolver import SpecialResolver, identity
         from app.media.meta.release_groups import ReleaseGroupsMatcher
         from app.media.meta.ordinal import Evidence
-        from app.media.meta.recognition import NumberingResult, NumberingState, RecognitionPending
+        from app.media.meta.recognition import NumberingResult, NumberingState, RecognitionPending, query_tmdb
+        from app.utils import StringUtils
         from app.media.meta.special import download_block_reason
         self.ns["extract_special"] = extract_special
         self.ns["identity"] = identity
@@ -99,7 +100,8 @@ class RecognitionTests(unittest.TestCase):
         self.ns["ReleaseGroupsMatcher"] = ReleaseGroupsMatcher
         self.ns["Evidence"] = Evidence
         self.ns.update(NumberingResult=NumberingResult, NumberingState=NumberingState,
-                       RecognitionPending=RecognitionPending, download_block_reason=download_block_reason)
+                       RecognitionPending=RecognitionPending, download_block_reason=download_block_reason,
+                       query_tmdb=query_tmdb, StringUtils=StringUtils)
         # Per-recognition candidate detail reuse uses the production decorator.
         from contextlib import contextmanager
         from app.media.media import _shares_candidate_details
@@ -123,7 +125,7 @@ class RecognitionTests(unittest.TestCase):
             '__candidate_all_names', '__is_other_work_by_prefix', '__is_other_work',
             '__load_cached_identity',
             # Match the production search and cache guards in the AST harness.
-            '__is_release_group_name',
+            '__is_release_group_name', '__cacheable_release', '__tv_year_matches', '__llm_year_matches',
             '__search_tv_by_name', '__identity_conflict',
             '_recognition_details', '__detail_key', '__detail_reused', '__candidate_detail'], self.ns, keep_attrs=True)
         self.media = cls()
@@ -158,7 +160,8 @@ class RecognitionTests(unittest.TestCase):
         self.media._rmt_match_mode = 'strict'
         self.media._Media__search_tmdb = Mock(side_effect=[{}, {'id': 309974}])
         meta = NS(type=MediaType.ANIME, year='2025', begin_season=1,
-                  note={'llm': {'inferred_year': True}})
+                  note={'llm': {'inferred_year': True}},
+                  get_season_list=lambda: [1], get_episode_list=lambda: [])
         result = self.media._Media__search_media_with_name(meta, '透明之夜', strict=True)
         self.assertEqual(309974, result['id'])
         self.assertNotIn('first_media_year', self.media._Media__search_tmdb.call_args.kwargs)
@@ -167,7 +170,8 @@ class RecognitionTests(unittest.TestCase):
         for year in ['2024', None]:
             self.media._Media__search_tmdb = Mock(return_value={'id': 123})
             self.media._Media__search_media_with_name(
-                NS(type=MediaType.ANIME, year=year, begin_season=2), 'Example')
+                NS(type=MediaType.ANIME, year=year, begin_season=2,
+                   get_season_list=lambda: [2], get_episode_list=lambda: []), 'Example')
             self.assertEqual(MediaType.TV, self.media._Media__search_tmdb.call_args.kwargs['search_type'])
 
     def test_llm_id_requires_candidate_and_matching_type(self):
@@ -310,7 +314,7 @@ class RecognitionTests(unittest.TestCase):
         self.media.save_rename_cache = Mock()
         metas = [NS(type=MediaType.MOVIE, note={}, skip_reason=None, tmdb_info=None, begin_season=None,
                     end_season=None, begin_episode=None, end_episode=None,
-                    get_episode_list=lambda: [], set_tmdb_info=Mock()) for _ in range(3)]
+                    get_episode_list=lambda: [], get_name=lambda: 'Film', set_tmdb_info=Mock()) for _ in range(3)]
         for meta in metas:
             meta.set_tmdb_info.side_effect = lambda info, current=meta: setattr(current, 'tmdb_info', info)
         self.ns['MetaInfo'] = Mock(side_effect=metas)

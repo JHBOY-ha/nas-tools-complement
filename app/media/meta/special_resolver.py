@@ -243,6 +243,33 @@ class SpecialResolver:
                 and not episodes and season == 0 and note.get("source_season") is not None
                 and note["source_season"] in (context.get("release_seasons") or []))
 
+    def validate_fractional_target(self, note, parent, season, episodes, manual=False):
+        """A decimal match cannot authorize contradictory special-release evidence."""
+        if not note:
+            return
+        if note.get("reason"):
+            raise ValueError(note["reason"])
+        target = self.configured_target(note, parent)
+        numbers = [ep["episode_number"] for ep in episodes]
+        if target and (tmdb_type(target.get("media_type")) != identity(parent)[0]
+                       or str(target.get("tmdb_id")) != str(parent["id"])
+                       or target.get("season") != season or numbers != [target.get("episode")]):
+            raise ValueError("小数集目标与特殊集配置映射冲突")
+        # Explicit per-file EP controls may override source labels, but not an
+        # incompatible configured target or an ambiguous special release range.
+        if manual:
+            return
+        if note.get("formal") and (season, numbers[0]) != tuple(note["formal"]):
+            raise ValueError("小数集目标与文件正式季集编号冲突")
+        if not note.get("number"):
+            return
+        for ep in episodes:
+            refs = special_references("%s\n%s" % (ep.get("name") or "", ep.get("overview") or ""))
+            matching = [ref for ref in refs if ref[:2] == (note["kind"], note["number"])]
+            if refs and (not matching or any(ref[2] is not None and note.get("source_season") is not None
+                                            and ref[2] != note["source_season"] for ref in matching)):
+                raise ValueError("小数集目标与特殊集发布编号证据冲突")
+
     @staticmethod
     def validate_type_hint(info, mtype_hint):
         """Constrain the final target, allowing an independently typed parent."""
