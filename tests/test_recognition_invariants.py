@@ -336,6 +336,17 @@ class C3OnlyDisprovedIdentitySwitchesWork(InvariantCase):
         cold = self.name("Ghosts.S05E01.1080p.WEB-DL.mkv")
         self.assertRetained(cold, [5], [1], forbidden=(2,))
 
+    def test_c3_e1_same_name_works_without_distinction_stay_pending(self):
+        self.ghosts()
+        meta = self.name("Ghosts.S01E01.1080p.WEB-DL.mkv", cache=False)
+        self.assertRetained(meta, [1], [1], forbidden=(1, 2))
+
+    def test_c3_e1_equally_close_fuzzy_works_stay_pending(self):
+        self.fx.tv(1, "Harbor Lights", year="2015")
+        self.fx.tv(2, "Harbor Lights", year="2021")
+        meta = self.name("Harbor.Light.S01E01.1080p.mkv", cache=False)
+        self.assertRetained(meta, [1], [1], forbidden=(1, 2))
+
     def test_c3_e1_year_conflict_may_switch_work(self):
         self.ghosts()
         meta = self.name("Ghosts.2019.S01E01.1080p.mkv", cache=False)
@@ -410,6 +421,19 @@ class C3UserSampleCyberpunk(InvariantCase):
         self.fx.tv(999, "Edgerunners Live", aliases=["Cyberpunk: Edgerunners"], year="2026", seasons={1: 8, 2: 8})
         for meta, episode in zip(self.recognize(), (1, 3, 10)):
             self.assertRetained(meta, [2], [episode], forbidden=(999,))
+
+    def test_c3_e4_other_formal_name_ties_real_alias_and_stays_pending(self):
+        # F6: formal names and aliases are one tier; "both have S02" decides nothing.
+        self.catalogue(with_s02=True)
+        self.fx.tv(999, "Cyberpunk Edgerunners", year="2026", seasons={1: 8, 2: 8})
+        for meta, episode in zip(self.recognize(), (1, 3, 10)):
+            self.assertRetained(meta, [2], [episode], forbidden=(999, 105248))
+
+    def test_c3_e1_explicit_year_selects_the_unique_exact_work(self):
+        self.catalogue(with_s02=True)
+        self.fx.tv(999, "Cyberpunk Edgerunners", year="2026", seasons={1: 8, 2: 8})
+        meta = self.name("Cyberpunk.Edgerunners.2022.S02E01.1080p.NF.WEB-DL.mkv", cache=False)
+        self.assertEqual(dict(id=105248, skip=False, seasons=[2], episodes=[1]), outcome(meta))
 
 
 class C4CacheStoresOnlyAdmittedIdentities(InvariantCase):

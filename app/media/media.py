@@ -465,9 +465,10 @@ class Media:
     def __select_tv_candidate(self, candidates, name, year=None, season_number=None,
                               anime_only=False, candidate_check=None):
         """
-        Select by name tier: formal/original, then aliases/translations, then ranked fuzzy.
-        A name-matched candidate with UNKNOWN evidence blocks its tier; a failed
-        detail without any name evidence is an unrelated result and is ignored.
+        Select by name tier: exact (formal, original, alias, translation), then fuzzy.
+        A tier accepts only a unique VALID work: several distinct exact matches need
+        year/type/binding evidence, never "only one has the season" (C3). A
+        name-matched UNKNOWN blocks; a failed detail without name evidence is ignored.
         """
         if anime_only:
             candidates = [candidate for candidate in candidates
@@ -531,26 +532,23 @@ class Media:
                 log.info("【Meta】候选 %s 证据不足：%s" % (candidate.get("id"), error))
                 return Evidence.UNKNOWN, None
 
-        def decide(group, blocked=False):
-            """First VALID in order; any UNKNOWN (or an unchecked named candidate) blocks."""
+        def valid_of(group, blocked=False):
+            """(score, info) of every VALID member; any UNKNOWN or unchecked named candidate blocks."""
             if blocked:
                 raise RecognitionPending("存在详情不可用或未检查的近似名称候选，保留待确认")
             valid = []
-            for candidate, info in group:
+            for candidate, info, score in group:
                 state, accepted = evaluate(candidate, info)
                 if state == Evidence.UNKNOWN:
                     # The result is pending whatever the rest show; stop reading.
                     raise RecognitionPending("存在证据不足的同名候选，不能排除，保留待确认")
                 if state == Evidence.VALID:
-                    valid.append(accepted)
-            return valid[0] if valid else None
+                    valid.append((score, accepted))
+            return valid
 
-        formal = [(candidate, None) for candidate in candidates if summary_match(candidate, False)]
-        accepted = decide(formal)
-        if accepted:
-            return accepted
-        aliases, fuzzy, unknown_named = [], [], False
-        formal_ids = {str(candidate["id"]) for candidate, _ in formal}
+        exact = [(candidate, None, 0) for candidate in candidates if summary_match(candidate, False)]
+        fuzzy, unknown_named = [], False
+        formal_ids = {str(candidate["id"]) for candidate, _, _ in exact}
         for candidate in candidates:
             if str(candidate["id"]) in formal_ids:
                 continue
@@ -563,16 +561,23 @@ class Media:
                 continue
             names = self.__candidate_all_names(info)
             if self.__compare_tmdb_names(name, names, fuzzy=False):
-                aliases.append((candidate, info))
+                exact.append((candidate, info, 0))
             elif self.__compare_tmdb_names(name, names):
                 fuzzy.append((candidate, info, self.__match_tmdb_name_score(name, names)))
-        accepted = decide(aliases, blocked=unknown_named)
-        if accepted:
-            return accepted
+        valid = valid_of(exact, blocked=unknown_named)
+        if len(valid) > 1:
+            raise RecognitionPending("多部作品名称精确匹配，缺少年份、类型等区分证据，保留待确认")
+        if valid:
+            return valid[0][1]
         # Eligibility and ranking are different: an earlier fuzzy response must
-        # not hide a later, closer title. Stable ties retain provider ordering.
-        ranked = sorted(fuzzy, key=lambda item: item[2], reverse=True)
-        return decide([(candidate, info) for candidate, info, _ in ranked]) or {}
+        # not hide a later, closer title; equally close works stay unconfirmed.
+        valid = valid_of(sorted(fuzzy, key=lambda item: item[2], reverse=True))
+        if not valid:
+            return {}
+        best = [accepted for score, accepted in valid if score == valid[0][0]]
+        if len(best) > 1:
+            raise RecognitionPending("多部作品名称同样接近，缺少区分证据，保留待确认")
+        return best[0]
 
     def __search_multi_tmdb(self, file_media_name):
         """

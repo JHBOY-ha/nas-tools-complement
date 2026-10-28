@@ -259,6 +259,13 @@ class SeriesNameIntegrityTest(unittest.TestCase):
                     self.assertNotIn('episode_mapping', unresolved.note)
                     self.assertNotIn(1002, [int(call.args[0]) for call in provider.tv.details.call_args_list])
                     provider.tv.season_details.side_effect = provider._season
+                    # Both namesakes are now valid exact matches: nothing distinguishes
+                    # them, so the source stays unconfirmed (C3 multiple exact works).
+                    ambiguous = media.get_media_info('Echo S03E01.mkv', mtype=MediaType.TV)
+                    self.assertFalse(ambiguous.tmdb_id)
+                    self.assertTrue(ambiguous.skip_reason)
+                    # The earlier failure left no negative evidence: a retry recovers.
+                    provider.records.pop(1002)
                     recovered = media.get_media_info('Echo S03E01.mkv', mtype=MediaType.TV)
                     self.assertEqual((1001, 1, [3]),
                         (recovered.tmdb_id, recovered.begin_season, recovered.get_episode_list()))
