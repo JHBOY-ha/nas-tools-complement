@@ -3,6 +3,7 @@ from config import Config
 from app.utils.types import MediaType
 from app.media.meta.special import normalized, requires_confirmation, special_references
 from app.media.meta.llm_parser import LLMMetaParser
+from app.media.meta.recognition import NumberingResult
 
 
 def tmdb_type(value):
@@ -138,14 +139,14 @@ class SpecialResolver:
         return self.cache[key]
 
     @staticmethod
-    def validate_episode(info, season, ep):
-        if (type(ep.get("episode_number")) is not int or ep["episode_number"] < 1
+    def validate_episode(info, season, ep, allow_zero=False):
+        if (type(ep.get("episode_number")) is not int or ep["episode_number"] < (0 if allow_zero else 1)
                 or ep.get("season_number", season) != season
                 or str(ep.get("show_id", info["id"])) != str(info["id"])):
             raise ValueError("TMDB 单集身份无效")
 
-    def target_episode(self, info, season, number):
-        if type(season) is not int or season < 0 or type(number) is not int or number < 1:
+    def target_episode(self, info, season, number, allow_zero=False):
+        if type(season) is not int or season < 0 or type(number) is not int or number < (0 if allow_zero else 1):
             raise ValueError("正式季集编号无效")
         detail = self.season(info, season)
         if not detail or not isinstance(detail.get("episodes"), list):
@@ -153,7 +154,7 @@ class SpecialResolver:
         items = [ep for ep in detail["episodes"] if ep.get("episode_number") == number]
         if len(items) != 1:
             raise ValueError("目标单集不存在或重复")
-        self.validate_episode(info, season, items[0])
+        self.validate_episode(info, season, items[0], allow_zero=allow_zero)
         return season, items[0]
 
     def configured_target(self, note, parent):
@@ -237,9 +238,17 @@ class SpecialResolver:
                 if not self.context_allows(note, parent, parent, None, None, context):
                     raise ValueError("附加内容与选集任务约束冲突")
                 note["status"] = "confirmed"
+                meta._numbering_result = NumberingResult.verified(meta, parent)
                 return meta
             target = self.configured_target(note, parent)
             if manual:
+                # Leaving ID blank changes only how the parent is found. Resolve
+                # the work before comparing or validating the explicit EP target.
+                manual = dict(manual)
+                if not manual.get("tmdb_id"):
+                    if tmdb_type(manual.get("media_type")) != identity(parent)[0]:
+                        raise ValueError("手动目标类型与已识别作品冲突，请明确指定作品")
+                    manual["tmdb_id"] = parent["id"]
                 def target_key(value):
                     return (tmdb_type(value.get("media_type")), str(value.get("tmdb_id")),
                             value.get("season"), value.get("episode"))
@@ -336,6 +345,7 @@ class SpecialResolver:
                 "source_episode": note.get("number"), "target_season": season,
                 "target_episode": number, "evidence": evidence, "provider": "tmdb"}
             meta.skip_reason = None
+            meta._numbering_result = NumberingResult.verified(meta, target_info)
         except Exception as err:
             note.update(status="unconfirmed", reason=str(err))
             meta.skip_reason = "特殊内容待确认：%s" % err

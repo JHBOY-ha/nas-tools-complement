@@ -24,6 +24,7 @@ from app.media.meta import MetaInfo
 from app.media.meta.special import extract_special, special_references
 from app.media.meta.special_resolver import SpecialResolver
 from app.media.meta.extra_transfer import publish_extra
+from app.utils import EpisodeFormat
 from app.utils.types import MediaType, RmtMode, SyncType, SearchType
 
 SAMPLE = '[Kamigami&VCB-Studio] Yahari Ore no Seishun Lovecome wa Machigatte Iru. [OVA][Ma10p_1080p][x265_flac].mkv'
@@ -215,6 +216,12 @@ class SpecialRecognitionTest(unittest.TestCase):
             movie = dict(self.info, media_type=MediaType.MOVIE)
             self.assertTrue(self.media.get_media_info_on_files(
                 [path], tmdb_info=movie, download_context=context)[path].skip_reason)
+            with patch.dict(self.info, name='Show', original_name='Show'):
+                for bound in (self.info, None):
+                    manual = self.media.get_media_info_on_files([path], tmdb_info=bound,
+                        season=1, episode_format=EpisodeFormat(None, '1'))[path]
+                    self.assertIsNone(manual.skip_reason)
+                    self.assertEqual((1, [1]), (manual.begin_season, manual.get_episode_list()))
         with patch('app.media.meta.metainfo.LLMMetaParser') as llm:
             llm.return_value.parse.return_value = {}
             self.assertEqual(65676, self.media.get_media_info(SAMPLE).tmdb_id)

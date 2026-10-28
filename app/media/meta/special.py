@@ -158,15 +158,24 @@ def requires_confirmation(meta):
     return note.get("special_episode") or note.get("extra")
 
 
-def download_block_reason(meta):
+def download_block_reason(meta, allow_extra=False):
     """Keep unresolved content and local extras out of regular download coverage."""
     reason = getattr(meta, "skip_reason", None)
     if reason:
         return reason
+    numbering = getattr(meta, "_numbering_result", None)
+    if numbering is not None:
+        if not numbering.ready:
+            return numbering.reason
+        info = getattr(meta, "tmdb_info", None)
+        if info and not numbering.matches(meta, info):
+            return "最终作品或季集已偏离核验结果，保留待确认"
     note = getattr(meta, "note", None) or {}
-    if note.get("extra"):
+    if note.get("ordinal_candidates"):
+        return "序数词可能属于片名，季集解释尚未唯一确认"
+    if note.get("extra") and not allow_extra:
         return "附加内容不参与正片下载和缺集统计"
-    for key in ("special_episode", "fractional_episode"):
+    for key in ("special_episode", "fractional_episode", "extra"):
         evidence = note.get(key)
         if evidence and evidence.get("status") != "confirmed":
             return evidence.get("reason") or "特殊内容季集尚未确认，保留待确认"

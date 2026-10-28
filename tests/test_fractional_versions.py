@@ -10,6 +10,7 @@ from app.media.meta.llm_parser import LLMMetaParser
 from app.media.media import Media
 from app.filetransfer import FileTransfer
 from app.downloader.downloader import Downloader
+from app.utils import EpisodeFormat
 from app.utils.types import MediaType, RmtMode, SyncType, DownloaderType
 from app.media.tmdbv3api.as_obj import AsObj
 from app.media.meta.extra_transfer import has_pending_publication
@@ -63,13 +64,25 @@ class FractionalWorkflowTest(unittest.TestCase):
             meta = MetaInfo("Show.S01E01.%s.mkv" % token, use_llm=False)
             self.assertNotIn("fractional_episode", meta.note)
             self.assertEqual((1, 1), (meta.begin_season, meta.begin_episode))
-        with tempfile.TemporaryDirectory() as root:
+        with tempfile.TemporaryDirectory() as root, patch.object(self.media, 'get_tmdb_tv_season_detail',
+                return_value={'episodes': [{'episode_number': 8, 'season_number': 1, 'show_id': 1429}]}) as detail:
             path = os.path.join(root, "Show - 2022.08.01.mkv")
             open(path, "wb").close()
             meta = self.media.get_media_info_on_files([path], download_context={
                 "tmdb_info": self.info, "seasons": [1], "episodes": [8]})[path]
             self.assertIsNone(meta.skip_reason)
             self.assertEqual((1, 8), (meta.begin_season, meta.begin_episode))
+            # A live target response is stronger than an older series manifest;
+            # reapplying the same manual EP must preserve that season evidence.
+            with patch.dict(self.info, seasons=[{'season_number': 0}]):
+                explicit = self.media.get_media_info_on_files([path], episode_format=EpisodeFormat(None, '8'),
+                    download_context={'tmdb_info': self.info, 'seasons': [1], 'episodes': [8]})[path]
+                self.assertIsNone(explicit.skip_reason)
+            detail.return_value = {}
+            unverified = self.media.get_media_info_on_files([path], download_context={
+                'tmdb_info': self.info, 'seasons': [1], 'episodes': [8]})[path]
+            self.assertTrue(unverified.skip_reason)
+            self.assertIsNone(unverified.begin_episode)
 
     def test_ambiguous_resolution_range(self):
         for ending in ("480", "720", "1080", "2160", "1080p"):

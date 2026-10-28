@@ -21,6 +21,7 @@ class EpisodeFormat(object):
         self._format = eformat
         self._start_ep = None
         self._end_ep = None
+        self._fixed_target = False
         if details is not None and details != "":
             # Validate the whole input; never collapse a reversed selection into
             # a fixed EP or accept a valid-looking prefix of malformed text.
@@ -30,16 +31,16 @@ class EpisodeFormat(object):
                 raise ValueError("集数参数无效：请输入非负整数、筛选区间（如 2,4）或合并范围（如 2-4）")
             start, end = int(match[1]), int(match[3]) if match[3] else int(match[1])
             self._validate_result(start, end)
-            if match[2] == "-":
-                self._start_ep = self._end_ep = "%s-%s" % (start, end)
-            else:
-                self._start_ep, self._end_ep = start, end
+            self._start_ep, self._end_ep = start, end
+            # Equal comma bounds still select source files; only a single EP
+            # or a hyphenated merged range supplies a fixed output number.
+            self._fixed_target = match[2] != ","
         value = "0" if offset is None or offset == "" else str(offset).strip()
         if not re.fullmatch(r"[+-]?\d+", value):
             raise ValueError("集数偏移无效：请输入整数")
         self.__offset = int(value)
         self._key = key
-        if self._start_ep is not None and self._start_ep == self._end_ep:
+        if self._fixed_target:
             # Fixed targets can be checked before any directory scan or provider request.
             self.split_episode("")
 
@@ -69,7 +70,7 @@ class EpisodeFormat(object):
     def match(self, file: str):
         # Fixed manual targets do not depend on the filename pattern. Directory
         # scanning must use the same precedence as split_episode().
-        if self._start_ep is not None and self._start_ep == self._end_ep:
+        if self._fixed_target:
             return True
         if not self._format:
             return True
@@ -84,13 +85,9 @@ class EpisodeFormat(object):
 
     def split_episode(self, file_name):
         # 指定的具体集数，直接返回
-        if self._start_ep is not None and self._start_ep == self._end_ep:
-            if isinstance(self._start_ep, str):
-                s, e = self._start_ep.split("-")
-                if int(s) == int(e):
-                    return self._validate_result(int(s) + self.__offset, None)
-                return self._validate_result(int(s) + self.__offset, int(e) + self.__offset)
-            return self._validate_result(self._start_ep + self.__offset, None)
+        if self._fixed_target:
+            end = self._end_ep + self.__offset if self._end_ep != self._start_ep else None
+            return self._validate_result(self._start_ep + self.__offset, end)
         if not self._format:
             return None, None
         s, e = self.__handle_single(file_name)

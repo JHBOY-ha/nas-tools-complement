@@ -697,7 +697,8 @@ class FileTransfer:
                 download_context.get("source_title"), media_type.value, tmdb_info.get("id")))
         Medias = self.media.get_media_info_on_files(
             file_list, tmdb_info, media_type, season, episode[0],
-            download_context=download_context, download_contexts=contexts)
+            download_context=download_context, download_contexts=contexts,
+            bluray=bool(bluray_disk_dir))
         if len(Medias or {}) != len(file_list):
             return __finish_transfer(False, "部分文件未能识别或与下载任务季集冲突，请核对")
         if not Medias:

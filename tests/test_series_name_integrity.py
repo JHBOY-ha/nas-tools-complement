@@ -9,6 +9,7 @@ from app.media.meta import MetaInfo
 from app.media.meta.llm_parser import LLMMetaParser
 from app.media.meta.ordinal import Evidence
 from app.media.meta.release_groups import ReleaseGroupsMatcher
+from app.utils import EpisodeFormat
 from app.utils.types import MediaType
 from tests import test_media_identity_matrix as fixtures
 
@@ -186,8 +187,42 @@ class SeriesNameIntegrityTest(unittest.TestCase):
                             value.pop('seasons')
                     return value
                 provider.tv.details.side_effect = detail
-                found = media.get_media_info('Echo S03E01.mkv', mtype=MediaType.TV, cache=False)
-                self.assertFalse(found.tmdb_id)
+                provider.records[1003] = fixtures.series_fixture(1003, 'Other Show', 'Other Show', 2020, [18], 3)
+                for title in ('Echo S03E01.mkv', 'Echo 2022 S03E01.mkv'):
+                    with patch.object(LLMMetaParser(), 'get_alias_candidates', return_value=['Other Show']) as aliases:
+                        found = media.get_media_info(title, mtype=MediaType.TV, cache=False)
+                    aliases.assert_not_called()
+                    self.assertFalse(found.tmdb_id)
+                    self.assertTrue(found.skip_reason)
+
+    def test_file_numbering_preserves_source_and_checks_task_scope(self):
+        media, provider, _ = fixtures.MediaIdentityMatrixTest.make_media()
+        for name in ('The Expanse S03 (2015)/S01E01.mkv', 'The Expanse S03 (2015)/Season 1/01.mkv',
+                     'Bocchi the Rock (2022)/The Expanse/01.mkv', 'TV/The Expanse/01.mkv'):
+            found = self.file(media, name)
+            self.assertEqual((920001, [1], [1]), (found.tmdb_id, found.get_season_list(), found.get_episode_list()))
+        info = dict(provider.records[920001], media_type=MediaType.TV)
+        with patch('app.media.media.Config') as config:
+            config.return_value.get_config.return_value = {'episode_mappings': [dict(
+                tmdb_id=920001, source_season=1, source_begin=1, source_end=12, target_season=1, offset=1)]}
+            found = self.file(media, 'The Expanse S01E01.mkv', tmdb_info=info,
+                              episode_format=EpisodeFormat('Other.E{ep}.mkv'))
+        self.assertEqual([2], found.get_episode_list())
+        for formatter in (None, EpisodeFormat(None, '999')):
+            missing = self.file(media, 'The Expanse S09E01.mkv', tmdb_info=info, episode_format=formatter)
+            self.assertTrue(missing.skip_reason)
+        manual = self.file(media, 'The Expanse S09E01.mkv', tmdb_info=info,
+                           season=1, episode_format=EpisodeFormat(None, '999'))
+        self.assertFalse(manual.skip_reason)
+        self.assertEqual((1, [999]), (manual.begin_season, manual.get_episode_list()))
+        for name in ('The Expanse 第1-3季 第01集.mkv', 'The Expanse S01-S03E01.mkv',
+                     '[Group] The Expanse S01-S03 - 01 [1080p].mkv'):
+            # Every parser must preserve the range before the transfer guard sees it.
+            self.assertEqual([1, 2, 3], MetaInfo(name, use_llm=False).get_season_list())
+            for target_season in (1, 2):
+                found = self.file(media, name, download_context=dict(tmdb_info=info,
+                    numbering='tmdb', seasons=[target_season], episodes=[1], source_title='The Expanse 第1季'))
+                self.assertTrue(found is None or found.skip_reason)
 
     def test_unavailable_mapping_episodes_do_not_switch_work_and_can_retry(self):
         # A valid configured mapping identifies the first work; an unavailable
@@ -305,11 +340,24 @@ class SeriesNameIntegrityTest(unittest.TestCase):
         candidates = [dict(id=record['id'], name=record['name'], original_name=record['original_name'],
                            first_air_date=record['first_air_date'], genre_ids=[18]) for record in records]
         provider.search.tv_shows.side_effect = lambda params: deepcopy(candidates)
-        for title in ('Echo.Nights.S03E01.mkv', 'Echo.Nights.2022.S03E01.mkv'):
+        for title in ('Echo.Nights.S03E01.mkv', 'Echo.Nights.2020.S03E01.mkv', 'Echo.Nights.2022.S03E01.mkv'):
             with self.subTest(title=title):
                 found = media.get_media_info(title, mtype=MediaType.TV, cache=False)
                 self.assertEqual(1003, found.tmdb_id)
                 self.assertEqual((3, [1]), (found.begin_season, found.get_episode_list()))
+        # Exact aliases occupy the same tier as exact primary titles, even when
+        # the earlier response contains a plausible fuzzy primary name.
+        provider.records[1003].update(name='Official Title', original_name='Official Title',
+                                     alternative_titles={'results': [{'title': 'Echo Nights'}]})
+        candidates[2].update(name='Official Title', original_name='Official Title')
+        found = media.get_media_info('Echo.Nights.2022.S03E01.mkv', mtype=MediaType.TV, cache=False)
+        self.assertEqual(1003, found.tmdb_id)
+        rows = [fixtures.series_fixture(1011, 'Echo Lights', 'Echo Lights', 2020, [18], 1),
+                fixtures.series_fixture(1012, 'Echo Nights', 'Echo Nights', 2020, [18], 1)]
+        provider.records = {row['id']: row for row in rows}
+        provider.search.multi.side_effect = lambda params: [dict(row, media_type='tv') for row in deepcopy(rows)]
+        found = media.get_media_info('Echo Night.mkv', cache=False)
+        self.assertEqual(1012, found.tmdb_id)
 
     def test_missing_search_genres_do_not_bypass_known_live_action_details(self):
         media, provider, _ = fixtures.MediaIdentityMatrixTest.make_media()

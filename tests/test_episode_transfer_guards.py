@@ -44,6 +44,9 @@ class EpisodeFormatValidationTest(unittest.TestCase):
         # Keep previously accepted whitespace and numeric strings while validating ranges.
         self.assertTrue(EpisodeFormat('Show.E{ep}.mkv', '2, 4').match('Show.E03.mkv'))
         self.assertEqual((3, None), EpisodeFormat(None, '３').split_episode('ignored'))
+        selection = EpisodeFormat('Show.E{ep}.mkv', '2,2', offset=1)
+        self.assertEqual([False, True, False], [selection.match('Show.E%02d.mkv' % ep) for ep in (1, 2, 3)])
+        self.assertEqual((3, None), selection.split_episode('Show.E02.mkv'))
 
 
 class EpisodeTransferGuardsTest(unittest.TestCase):

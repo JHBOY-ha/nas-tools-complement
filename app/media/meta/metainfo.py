@@ -68,6 +68,14 @@ def MetaInfo(title, subtitle=None, mtype=None, use_llm=True, _prepared=None):
     else:
         meta_info = MetaVideo(title, subtitle, fileflag)
 
+    if (isinstance(meta_info, MetaAnime)
+            and re.search(r"(?i)(?<![A-Z0-9])S\d{1,2}\s*-\s*S\d{1,2}(?=EP?\d|\W|$)", title or "")):
+        # anitopy can keep only the first Sxx marker. Share the explicit range
+        # parser so selecting the anime route cannot bypass file season guards.
+        season_range = MetaVideo(title, subtitle, fileflag)
+        for field in ("begin_season", "end_season", "total_seasons"):
+            setattr(meta_info, field, getattr(season_range, field))
+
     if (isinstance(meta_info, MetaAnime) and not special and not fractional_episode
             and re.search(r"(?i)(?<![A-Z0-9])\d{1,2}(?:st|nd|rd|th)[ ._-]+Season\b", title or "")):
         # Share ordinal title/season evidence without replacing the anime parser.

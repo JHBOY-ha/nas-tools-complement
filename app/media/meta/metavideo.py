@@ -500,9 +500,9 @@ class MetaVideo(MetaBase):
                     if se > self.begin_season:
                         self.end_season = se
                         self.total_seasons = (self.end_season - self.begin_season) + 1
-                        if self.fileflag and self.total_seasons > 1:
-                            self.end_season = None
-                            self.total_seasons = 1
+                        # Retain the source range in file mode too. Recognition
+                        # and transfer must reject ambiguity, not silently name
+                        # a multi-season file as its first season.
         elif token.isdigit():
             try:
                 int(token)

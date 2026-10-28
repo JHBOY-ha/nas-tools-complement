@@ -4,11 +4,13 @@ Evidence is owned by a single recognition/file batch. No global negative cache o
 ordinary work-cache entry may be derived from a selected ordinal interpretation.
 """
 import copy
+from collections.abc import Mapping
 from enum import Enum
 
 from config import Config
 from app.media.meta.llm_parser import LLMMetaParser
 from app.media.meta.recognition_rules import DEFAULT_NAME_ALIASES
+from app.media.meta.recognition import NumberingResult
 from app.media.meta.special import normalized
 from app.media.meta.special_resolver import SpecialResolver, identity, tmdb_type
 from app.utils.types import MediaType
@@ -76,7 +78,7 @@ class OrdinalResolver:
         seasons = info.get("seasons")
         if not isinstance(seasons, list) or not seasons:
             return Evidence.UNKNOWN
-        numbers = [s.get("season_number") for s in seasons if isinstance(s, dict)]
+        numbers = [s.get("season_number") for s in seasons if isinstance(s, Mapping)]
         if (len(numbers) != len(seasons) or any(type(n) is not int or n < 0 for n in numbers)
                 or len(set(numbers)) != len(numbers)):
             return Evidence.UNKNOWN
@@ -111,7 +113,7 @@ class OrdinalResolver:
                 return Evidence.UNKNOWN
             found = []
             for episode in episodes:
-                if not isinstance(episode, dict):
+                if not isinstance(episode, Mapping):
                     return Evidence.UNKNOWN
                 try:
                     self.evidence.validate_episode(info, season, episode)
@@ -136,7 +138,7 @@ class OrdinalResolver:
         return Evidence.VALID if valid else Evidence.UNKNOWN
 
     @staticmethod
-    def apply(target, chosen, source):
+    def apply(target, chosen, source, info):
         chosen.note.pop("ordinal_candidates", None)
         chosen.note.pop("ordinal_default", None)
         # Retain provenance after clearing the block, so callers cannot cache a
@@ -146,12 +148,13 @@ class OrdinalResolver:
             chosen.note["ordinal_evidence"] = target.note["ordinal_evidence"]
         chosen.skip_reason = None
         target.__dict__.update(chosen.__dict__)
+        target._numbering_result = NumberingResult.verified(target, info)
 
     def resolve(self, meta, bound=None, mtype_hint=None, manual=None):
         fields_list = meta.note.get("ordinal_candidates") or meta.note.get("ordinal_default")
         if not fields_list:
             return {}
-        if manual is not None:
+        if bound and manual is not None and "begin_season" in manual and "begin_episode" in manual:
             chosen = copy.deepcopy(meta)
             for key, value in manual.items():
                 setattr(chosen, key, value)
@@ -160,7 +163,7 @@ class OrdinalResolver:
                 valid_range = (type(begin) is int and begin > 0
                     and (end is None or (type(end) is int and end >= begin)))
                 if valid_range and self.validate(chosen, bound, mtype_hint, manual=True) == Evidence.VALID:
-                    self.apply(meta, chosen, "manual")
+                    self.apply(meta, chosen, "manual", bound)
                     return bound
             except Exception:
                 pass
@@ -187,7 +190,14 @@ class OrdinalResolver:
                 results = []
                 for info in infos:
                     candidate = copy.deepcopy(parsed)
-                    result = self.validate(candidate, info, mtype_hint)
+                    # With a partial override, first identify the interpretation
+                    # matching the bound work, then retain its unspecified fields.
+                    # Checking the old season before applying a correction would
+                    # reject precisely the files that need manual recovery.
+                    if manual:
+                        for key, value in manual.items():
+                            setattr(candidate, key, value)
+                    result = self.validate(candidate, info, mtype_hint, manual=manual is not None)
                     results.append(result)
                     if result == Evidence.VALID:
                         accepted.append((candidate, info))
@@ -198,7 +208,10 @@ class OrdinalResolver:
         meta.note["ordinal_evidence"] = [state.value for state in states]
         if len(accepted) == 1 and Evidence.UNKNOWN not in states:
             chosen, info = accepted[0]
-            self.apply(meta, chosen, "bound" if bound else "automatic")
+            source = "bound" if bound else "automatic"
+            if manual is not None:
+                source = "manual"
+            self.apply(meta, chosen, source, info)
             return info
         meta.skip_reason = "序数词可能属于片名，季集解释尚未唯一确认"
         return {}
