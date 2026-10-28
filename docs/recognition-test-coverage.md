@@ -38,6 +38,7 @@ python3 -m tests.run_recognition tests.test_media_identity_matrix
 | 手动 EP 表单 | 固定 EP 无定位规则提交、区间筛选/偏移限制、失败恢复、键盘重试、桌面与窄屏；WebKit 无头运行 | `test_manual_episode_ui.js` |
 | 集数与筛选保护 | 偏移后非负性、范围顺序、第 0 集定位及标题、目录过滤原因、待恢复凭据与完成去重；保留强制覆盖和普通未收录集数策略 | `test_episode_transfer_guards` |
 | 剧名完整性 | 数字标题与明确集号、中文括号和短英文标题、发布组缓存隔离、同名候选重试、缺分类动漫详情核验及失败回滚 | `test_series_name_integrity` |
+| 识别链路约束矩阵 | 人工编号不被改写、未知证据不扩大不降级、缺季不改选同名作品、缓存准入、编号快照、范围不压缩；覆盖名称、缓存、LLM 直出 ID、文件、绑定、下载任务、特殊集/序数季、IMDb 入口 | `test_recognition_invariants` |
 
 文件名解析阶段的动漫常先得到电视剧类型；TMDB 电视剧详情中的动画分类才决定最终 `ANIME` 类型。动画电影仍属于 `MOVIE`。测试分别检查解析阶段和最终分类，不能用“文件名解析为 TV”直接判定动漫识别失败。
 
@@ -46,6 +47,8 @@ python3 -m tests.run_recognition tests.test_media_identity_matrix
 普通文件在作品搜索、缓存命中和显式 TMDB ID 三个入口应用相同手动季集覆盖。特殊集确认可处理单个数字标题歧义，但仍拒绝多集范围只确认一端、文件作用域错误及失效目标；解析不会因该歧义吞掉分辨率和来源字段。共享表单允许固定 EP 或合并集范围不填定位规则，逗号筛选区间及单独偏移仍需要定位规则。浏览器回归使用 `node tests/test_manual_episode_ui.js`，需可用的 Playwright WebKit；截图、跟踪与报告保存到 `docs/validation/manual-episode-precedence/`。
 
 手动集数的格式、范围顺序和偏移后非负性在识别/转移前检查；合法负偏移和第 0 集继续可用，不因普通人工集号未被 TMDB 收录而强制拒绝。目录空筛选结果按实际首个排除原因汇总路径、后缀、定位或区间、大小；监控空目录继续正常跳过，下载整理及扫描故障继续失败。字幕回归区分有待恢复凭据的失败任务与完整历史且无凭据的已完成任务，后者不重复字幕或历史写入。
+
+已知片名解析缺口（未知发布组作片名、纯数字括号片名、中文季范围、中英文连写目录名）保留在 `tests/test_recognition_naming_gaps.py`，不在默认入口中，需单独运行：`python3 -m tests.run_recognition tests.test_recognition_naming_gaps`。
 
 原始 `tests/cases/meta_cases.py` 有 61 条非空命名样例，期望类型为电影 17 条、电视剧 44 条。新增矩阵的同义格式变体用于检验规则一致性；它们和 unittest 方法数都不是独立真实作品数量。第三方 anitopy 的已知失败样例不计入本项目通过率。
 

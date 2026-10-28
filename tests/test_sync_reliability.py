@@ -100,6 +100,11 @@ class RecognitionTests(unittest.TestCase):
         self.ns["Evidence"] = Evidence
         self.ns.update(NumberingResult=NumberingResult, NumberingState=NumberingState,
                        RecognitionPending=RecognitionPending, download_block_reason=download_block_reason)
+        # Per-recognition candidate detail reuse uses the production decorator.
+        from contextlib import contextmanager
+        from app.media.media import _shares_candidate_details
+        self.ns.update(threading=threading, contextmanager=contextmanager,
+                       _shares_candidate_details=_shares_candidate_details)
         cls = load_class('app/media/media.py', 'Media', [
             '__search_media_with_name', '__extract_llm_tmdb_target', '__resolve_tmdb_mtype',
             'get_media_info_on_files', 'get_cache_info', '__make_cache_key', '_valid_media_identity',
@@ -107,7 +112,7 @@ class RecognitionTests(unittest.TestCase):
             '__search_media_info', '__confirm_search_result', '__search_media_by_alias_candidates',
             '_prepare_media_identity', '_apply_episode_mapping',
             '_resolve_numbering', '_resolve_llm_numbering', '_finalize_recognition',
-            '__lookup_media_identity', '__select_tv_candidate', '__query_tv_candidates', '__season_manifest_complete',
+            '__lookup_media_identity', '__select_tv_candidate', '__query_tv_candidates',
             '__known_seasons_match',
             # File recognition now shares manual overrides across both identity paths.
             '_apply_manual_numbering', '_inherit_directory_identity',
@@ -117,7 +122,8 @@ class RecognitionTests(unittest.TestCase):
             '__load_cached_identity',
             # Match the production search and cache guards in the AST harness.
             '__is_release_group_name',
-            '__search_tv_by_name'], self.ns, keep_attrs=True)
+            '__search_tv_by_name', '__identity_conflict',
+            '_recognition_details', '__detail_key', '__detail_reused', '__candidate_detail'], self.ns, keep_attrs=True)
         self.media = cls()
 
     def test_explicit_work_mapping_is_verified_and_not_applied_twice(self):

@@ -1,4 +1,6 @@
 """Confirm special content against typed TMDB identities before any publication."""
+import difflib
+
 from config import Config
 from app.utils.types import MediaType
 from app.media.meta.special import normalized, requires_confirmation, special_references
@@ -71,7 +73,11 @@ class SpecialResolver:
                     continue
                 info = self.detail(kind, item["id"])
                 if not info:
-                    raise ValueError("作品详情查询失败")
+                    # Only a result with name evidence may still be the work;
+                    # an unrelated result's failure cannot block uniqueness.
+                    if self.has_name_evidence(name, item):
+                        raise ValueError("作品详情查询失败")
+                    continue
                 genres = info.get("genre_ids") or [g.get("id") for g in info.get("genres") or []]
                 if anime and "16" not in {str(g) for g in genres}:
                     continue
@@ -85,6 +91,18 @@ class SpecialResolver:
                     continue
                 candidates[identity(info)] = info
         return list(candidates.values())
+
+    @staticmethod
+    def has_name_evidence(name, item):
+        """Search-summary names equal to, or closely resembling, the queried name."""
+        wanted = normalized(name)
+        for title in (item.get(k) for k in ("title", "name", "original_title", "original_name")):
+            actual = normalized(title)
+            if wanted and actual and (wanted == actual or (
+                    min(len(wanted), len(actual)) > 4
+                    and difflib.SequenceMatcher(None, wanted, actual).ratio() >= 0.8)):
+                return True
+        return False
 
     def parent(self, meta, bound):
         if bound:

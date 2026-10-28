@@ -143,28 +143,42 @@ class SeriesNameIntegrityTest(unittest.TestCase):
             self.assertNotEqual('1080p', meta.get_name().casefold())
 
     def test_later_same_name_candidate_is_checked_after_rejection(self):
-        rows = [fixtures.series_fixture(1001, 'Echo', 'Echo', 2000, [18], 1),
-                fixtures.series_fixture(1002, 'Echo', 'Echo', 2020, [18], 3)]
+        # A definite identity conflict (live action for an explicit anime request)
+        # lets the next same-name candidate be checked, in either response order.
+        rows = [fixtures.series_fixture(1001, 'Echo', 'Echo', 2000, [18], 3),
+                fixtures.series_fixture(1002, 'Echo', 'Echo', 2020, [16], 3)]
         for ordered in (rows, list(reversed(rows))):
             with self.subTest(order=[row['id'] for row in ordered]):
                 media, provider, _ = fixtures.MediaIdentityMatrixTest.make_media()
                 provider.records = {row['id']: deepcopy(row) for row in ordered}
-                found = media.get_media_info('Echo S03E01.mkv', mtype=MediaType.TV, cache=False)
+                found = media.get_media_info('Echo S03E01.mkv', mtype=MediaType.ANIME, cache=False)
                 self.assertEqual(1002, found.tmdb_id)
                 self.assertEqual((3, [1]), (found.begin_season, found.get_episode_list()))
                 self.assertIsNone(found.skip_reason)
+        # A missing season is UNKNOWN, not a conflict: the namesake with S03 is
+        # never selected instead, and the release numbering is untouched (C3).
+        rows = [fixtures.series_fixture(1001, 'Echo', 'Echo', 2000, [18], 1),
+                fixtures.series_fixture(1002, 'Echo', 'Echo', 2020, [18], 3)]
+        for ordered in (rows, list(reversed(rows))):
+            with self.subTest(order=[row['id'] for row in ordered], missing_season=True):
+                media, provider, _ = fixtures.MediaIdentityMatrixTest.make_media()
+                provider.records = {row['id']: deepcopy(row) for row in ordered}
+                found = media.get_media_info('Echo S03E01.mkv', mtype=MediaType.TV, cache=False)
+                self.assertFalse(found.tmdb_id)
+                self.assertTrue(found.skip_reason)
+                self.assertEqual((3, [1]), (found.begin_season, found.get_episode_list()))
 
     def test_definite_rejection_preserves_selected_work_numbering(self):
         media, provider, _ = fixtures.MediaIdentityMatrixTest.make_media()
         rows = [fixtures.series_fixture(1001, 'Echo', 'Echo', 2000, [18], 1),
-                fixtures.series_fixture(1002, 'Echo', 'Echo', 2020, [18], 1)]
+                fixtures.series_fixture(1002, 'Echo', 'Echo', 2020, [16], 1)]
         provider.records = {row['id']: row for row in rows}
         with patch('app.media.media.Config') as config:
-            # The first work is disproved by its season manifest, not a failed
-            # mapping. The next work's explicit mapping must still apply once.
+            # The first work is disproved by its genre, not by a missing season or
+            # a failed mapping. The next work's explicit mapping must apply once.
             config.return_value.get_config.return_value = {'episode_mappings': [
                 dict(tmdb_id=1002, source_season=3, source_begin=1, source_end=12, target_season=1, offset=2)]}
-            found = media.get_media_info('Echo S03E01.mkv', mtype=MediaType.TV, cache=False)
+            found = media.get_media_info('Echo S03E01.mkv', mtype=MediaType.ANIME, cache=False)
         self.assertEqual(1002, found.tmdb_id)
         self.assertEqual((1, [3]), (found.begin_season, found.get_episode_list()))
         self.assertEqual([1], found.note['episode_mapping']['source_episodes'])
@@ -264,11 +278,16 @@ class SeriesNameIntegrityTest(unittest.TestCase):
         info = dict(fixtures.series_fixture(1001, 'Echo', 'Echo', 2000, [18], 1),
                     media_type=MediaType.TV)
         provider.records[1001] = info
-        for rules, expected in (([], Evidence.INVALID), ([dict(tmdb_id=1001, source_season=3,
-                source_begin=1, source_end=12, target_season=1, offset=100)], Evidence.UNKNOWN)):
-            with self.subTest(expected=expected), patch('app.media.media.Config') as config:
+        # A missing season and a failed mapping are UNKNOWN (C3); only a definite
+        # identity conflict, here live action for an explicit anime request, is INVALID.
+        for rules, mtype, expected in (
+                ([], None, Evidence.UNKNOWN),
+                ([dict(tmdb_id=1001, source_season=3, source_begin=1, source_end=12,
+                       target_season=1, offset=100)], None, Evidence.UNKNOWN),
+                ([], MediaType.ANIME, Evidence.INVALID)):
+            with self.subTest(expected=expected, mtype=mtype), patch('app.media.media.Config') as config:
                 config.return_value.get_config.return_value = {'episode_mappings': rules}
-                meta = MetaInfo('Echo S03E01.mkv', use_llm=False)
+                meta = MetaInfo('Echo S03E01.mkv', mtype=mtype, use_llm=False)
                 evidence = {}
                 self.assertFalse(media._prepare_media_identity(meta, info, evidence=evidence))
                 self.assertEqual(expected, evidence['state'])
@@ -334,23 +353,30 @@ class SeriesNameIntegrityTest(unittest.TestCase):
     def test_exact_and_year_priority_survive_candidate_retries(self):
         media, provider, _ = fixtures.MediaIdentityMatrixTest.make_media()
         records = [fixtures.series_fixture(1001, 'Echo Night', 'Echo Night', 2020, [18], 3),
-                   fixtures.series_fixture(1002, 'Echo Nights', 'Echo Nights', 2020, [18], 1),
+                   fixtures.series_fixture(1002, 'Echo Nights', 'Echo Nights', 2019, [18], 1),
                    fixtures.series_fixture(1003, 'Echo Nights', 'Echo Nights', 2020, [18], 3)]
         provider.records = {record['id']: record for record in records}
         candidates = [dict(id=record['id'], name=record['name'], original_name=record['original_name'],
                            first_air_date=record['first_air_date'], genre_ids=[18]) for record in records]
         provider.search.tv_shows.side_effect = lambda params: deepcopy(candidates)
-        for title in ('Echo.Nights.S03E01.mkv', 'Echo.Nights.2020.S03E01.mkv', 'Echo.Nights.2022.S03E01.mkv'):
+        # An explicit year disambiguates same-name works; the fuzzy title never wins.
+        for title, expected in (('Echo.Nights.2020.S01E01.mkv', 1003), ('Echo.Nights.2019.S01E01.mkv', 1002)):
             with self.subTest(title=title):
                 found = media.get_media_info(title, mtype=MediaType.TV, cache=False)
-                self.assertEqual(1003, found.tmdb_id)
+                self.assertEqual(expected, found.tmdb_id)
+                self.assertEqual((1, [1]), (found.begin_season, found.get_episode_list()))
+        # The 2019 work lacks S03: that is UNKNOWN, so the S03 namesake is not chosen (C3).
+        for title in ('Echo.Nights.S03E01.mkv', 'Echo.Nights.2022.S03E01.mkv'):
+            with self.subTest(title=title):
+                found = media.get_media_info(title, mtype=MediaType.TV, cache=False)
+                self.assertFalse(found.tmdb_id)
+                self.assertTrue(found.skip_reason)
                 self.assertEqual((3, [1]), (found.begin_season, found.get_episode_list()))
-        # Exact aliases occupy the same tier as exact primary titles, even when
-        # the earlier response contains a plausible fuzzy primary name.
+        # An exact alias still beats a plausible fuzzy primary name.
         provider.records[1003].update(name='Official Title', original_name='Official Title',
                                      alternative_titles={'results': [{'title': 'Echo Nights'}]})
         candidates[2].update(name='Official Title', original_name='Official Title')
-        found = media.get_media_info('Echo.Nights.2022.S03E01.mkv', mtype=MediaType.TV, cache=False)
+        found = media.get_media_info('Echo.Nights.2020.S01E01.mkv', mtype=MediaType.TV, cache=False)
         self.assertEqual(1003, found.tmdb_id)
         rows = [fixtures.series_fixture(1011, 'Echo Lights', 'Echo Lights', 2020, [18], 1),
                 fixtures.series_fixture(1012, 'Echo Nights', 'Echo Nights', 2020, [18], 1)]

@@ -42,6 +42,8 @@ RECOGNITION_MODULES = (
     "tests.test_meta_multi_episode_guards",
     "tests.test_meta_recognition_matrix",
     "tests.test_media_identity_matrix",
+    # Constraint matrix for the series recognition invariants (C1-C6).
+    "tests.test_recognition_invariants",
 )
 
 
