@@ -472,7 +472,7 @@ class Media:
         year/type/binding evidence, never "only one has the season" (C3). A
         name-matched UNKNOWN blocks; a failed detail without name evidence is ignored.
         Every candidate read shares one per-round limit; while any candidate stays
-        unread, its aliases are unknown, so no match can be declared unique.
+        unread, its aliases are unknown, so neither a match nor a miss is declared.
         """
         if anime_only:
             candidates = [candidate for candidate in candidates
@@ -583,17 +583,17 @@ class Media:
         valid = valid_of(exact, blocked=unknown_named)
         if len(valid) > 1:
             raise RecognitionPending("多部作品名称精确匹配，缺少年份、类型等区分证据，保留待确认")
+        if unchecked:
+            # An unread candidate may match by alias: neither a unique match nor
+            # a miss is proven, and a miss would authorize name fallbacks.
+            raise RecognitionPending(limit_reason)
         if valid:
-            if unchecked:
-                raise RecognitionPending(limit_reason)
             return valid[0][1]
         # Eligibility and ranking are different: an earlier fuzzy response must
         # not hide a later, closer title; equally close works stay unconfirmed.
         valid = valid_of(sorted(fuzzy, key=lambda item: item[2], reverse=True))
         if not valid:
             return {}
-        if unchecked:
-            raise RecognitionPending(limit_reason)
         best = [accepted for score, accepted in valid if score == valid[0][0]]
         if len(best) > 1:
             raise RecognitionPending("多部作品名称同样接近，缺少区分证据，保留待确认")

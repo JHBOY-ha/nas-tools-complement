@@ -227,15 +227,60 @@ class C2UnknownIsNeitherWidenedNorDowngraded(InvariantCase):
         rounds = len([call for call in self.fx.calls if call[:2] == ("search", MediaType.TV)])
         self.assertLessEqual(len(self.fx.detail_calls()), 6 * rounds)
 
-    def test_c2_e1_limit_without_any_match_is_an_ordinary_miss(self):
-        # Nothing to disambiguate: unread results are not evidence for any work,
-        # so later search names still run (they follow the same rules).
+    def test_c2_e1_limit_without_any_match_stays_pending(self):
+        # "None of the first six match" only covers what was read.
         for number in range(1, 9):
             self.fx.tv(100 + number, "Noise %s" % number)
             self.fx.noise.append((MediaType.TV, 100 + number))
         meta = self.name("Quiet.Harbor.S01E01.1080p.mkv", cache=False)
-        self.assertFalse(meta.tmdb_info)
-        self.assertFalse(meta.skip_reason)
+        self.assertRetained(meta, [1], [1])
+        self.assertIn("上限", meta.skip_reason)
+        self.fx.external_aliases.assert_not_called()
+
+    def unread_alias_with_fallback_work(self, true_work_first):
+        """The true work matches only by alias; an external name finds another work."""
+        for number in range(1, 9):
+            self.fx.tv(100 + number, "Unrelated Candidate %s" % number)
+            self.fx.noise.append((MediaType.TV, 100 + number))
+        self.fx.tv(42, "Localized Official Name", aliases=["Quiet Harbor"], seasons={1: 12})
+        self.fx.tv(43, "Other Show", seasons={1: 12})
+        self.fx.external_aliases.return_value = ["Other Show"]
+        provider = self.fx._search
+
+        def search(params):
+            results = provider(MediaType.TV, params)
+            if params["query"] == "Other Show":
+                return [candidate for candidate in results if candidate["id"] == 43]
+            return sorted(results, key=lambda candidate: candidate["id"] != 42) if true_work_first else results
+        self.fx.media.search.tv_shows.side_effect = search
+
+    def test_c2_e1_unread_alias_never_authorizes_a_fallback_work(self):
+        for true_work_first in (True, False):
+            with self.subTest(true_work_first=true_work_first):
+                self.setUp()
+                self.unread_alias_with_fallback_work(true_work_first)
+                meta = self.name("Quiet.Harbor.S01E01.1080p.mkv", cache=False)
+                self.assertRetained(meta, [1], [1], forbidden=(42, 43))
+                self.fx.external_aliases.assert_not_called()
+
+    def test_c2_e4_unread_alias_never_authorizes_a_fallback_work(self):
+        for true_work_first in (True, False):
+            with self.subTest(true_work_first=true_work_first):
+                self.setUp()
+                self.unread_alias_with_fallback_work(true_work_first)
+                meta = self.file("Quiet.Harbor.S01E01.1080p.mkv")
+                self.assertRetained(meta, [1], [1], forbidden=(42, 43))
+
+    def test_c2_e1_complete_miss_still_uses_name_fallback(self):
+        # Every candidate was read and none matched: the fallback stays available.
+        for number in range(1, 4):
+            self.fx.tv(100 + number, "Unrelated Candidate %s" % number)
+            self.fx.noise.append((MediaType.TV, 100 + number))
+        self.fx.tv(50, "Harbor Formal", seasons={1: 12})
+        self.fx.external_aliases.return_value = ["Harbor Formal"]
+        meta = self.name("Quiet.Harbor.S01E01.1080p.mkv", cache=False)
+        self.assertEqual(dict(id=50, skip=False, seasons=[1], episodes=[1]), outcome(meta))
+        self.fx.external_aliases.assert_called()
 
     def test_c2_e1_named_candidate_beyond_limit_stays_pending(self):
         for number in range(1, 8):

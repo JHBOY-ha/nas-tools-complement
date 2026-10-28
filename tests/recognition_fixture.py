@@ -32,7 +32,11 @@ class FakeTmdb:
         # The LLM is disabled by the runner configuration; external alias
         # candidates (Bangumi) are always unavailable in this fixture.
         for module in ("app.media.media", "app.media.meta.special_resolver", "app.media.meta.ordinal"):
-            patch(module + ".LLMMetaParser").start().return_value.get_alias_candidates.return_value = []
+            parser = patch(module + ".LLMMetaParser").start()
+            parser.return_value.get_alias_candidates.return_value = []
+            if module == "app.media.media":
+                # External (Bangumi) names for the title fallback; set per test.
+                self.external_aliases = parser.return_value.get_alias_candidates
         for module in ("app.media.media", "app.media.meta.special_resolver", "app.media.meta.ordinal"):
             config = patch(module + ".Config").start()
             config.return_value.get_config.side_effect = (
