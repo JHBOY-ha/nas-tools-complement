@@ -6,9 +6,12 @@ tests/test_recognition_naming_gaps.py. All provider and LLM boundaries are offli
 Run: python3 -m tests.run_recognition tests.test_recognition_invariants
 """
 import csv
+import datetime
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 from app.media.meta import MetaInfo
 from app.media.meta.special import download_block_reason
@@ -216,6 +219,24 @@ class C2UnknownIsNeitherWidenedNorDowngraded(InvariantCase):
         self.assertFalse(meta.tmdb_info)
         self.assertLessEqual(len(self.fx.detail_calls()), 6 * rounds)
 
+    def test_c2_e1_exact_candidates_share_the_detail_limit(self):
+        for identifier in range(1, 10):
+            self.fx.tv(identifier, "Echo Nights", seasons={1: 12})
+        meta = self.name("Echo.Nights.S01E01.1080p.mkv", cache=False)
+        self.assertRetained(meta, [1], [1])
+        rounds = len([call for call in self.fx.calls if call[:2] == ("search", MediaType.TV)])
+        self.assertLessEqual(len(self.fx.detail_calls()), 6 * rounds)
+
+    def test_c2_e1_limit_without_any_match_is_an_ordinary_miss(self):
+        # Nothing to disambiguate: unread results are not evidence for any work,
+        # so later search names still run (they follow the same rules).
+        for number in range(1, 9):
+            self.fx.tv(100 + number, "Noise %s" % number)
+            self.fx.noise.append((MediaType.TV, 100 + number))
+        meta = self.name("Quiet.Harbor.S01E01.1080p.mkv", cache=False)
+        self.assertFalse(meta.tmdb_info)
+        self.assertFalse(meta.skip_reason)
+
     def test_c2_e1_named_candidate_beyond_limit_stays_pending(self):
         for number in range(1, 8):
             self.fx.tv(100 + number, "Noise %s" % number)
@@ -296,6 +317,17 @@ class C2UnknownIsNeitherWidenedNorDowngraded(InvariantCase):
         self.assertRetained(meta, [4], [5])
         self.assertNotIn("season_binding", meta.note)
 
+    def test_c2_e7_special_search_shares_the_detail_limit(self):
+        for identifier in range(1, 10):
+            self.fx.tv(identifier, "Unrelated Candidate %s" % identifier, genres=(16,), language="ja")
+            self.fx.noise.append((MediaType.TV, identifier))
+        self.show(seasons={0: 1, 1: 1}, genres=(16,), language="ja")
+        self.fx.episodes[(42, 0)][0]["name"] = "OVA 1"
+        meta = self.file("Show [OVA01].mkv")
+        self.assertLessEqual(len(self.fx.detail_calls()), 6)
+        # Unread results may match by alias, so uniqueness is unproven.
+        self.assertTrue(rejected(meta), outcome(meta))
+
     def special_show(self):
         self.show(seasons={0: 2, 1: 12}, genres=(16,), language="ja")
         self.fx.episodes[(42, 0)][0]["name"] = "OVA 1"
@@ -335,6 +367,22 @@ class C3OnlyDisprovedIdentitySwitchesWork(InvariantCase):
         self.fx.cache.clear()
         cold = self.name("Ghosts.S05E01.1080p.WEB-DL.mkv")
         self.assertRetained(cold, [5], [1], forbidden=(2,))
+
+    def test_c3_e1_unread_exact_alias_cannot_make_a_formal_match_unique(self):
+        for identifier in range(1, 7):
+            self.fx.tv(identifier, "Unrelated Candidate %s" % identifier)
+            self.fx.noise.append((MediaType.TV, identifier))
+        self.fx.tv(42, "Echo Nights", seasons={1: 12})
+        self.fx.tv(43, "Localized Official Name", aliases=["Echo Nights"], seasons={1: 12})
+        search = self.fx.media.search.tv_shows
+        provider_order = search.side_effect
+        for alias_first in (True, False):
+            with self.subTest(alias_first=alias_first):
+                self.fx.cache.clear()
+                search.side_effect = (lambda params: sorted(provider_order(params), key=lambda c: c["id"] != 43)
+                                      ) if alias_first else provider_order
+                meta = self.name("Echo.Nights.S01E01.1080p.mkv", cache=False)
+                self.assertRetained(meta, [1], [1], forbidden=(42, 43))
 
     def test_c3_e1_same_name_works_without_distinction_stay_pending(self):
         self.ghosts()
@@ -378,6 +426,53 @@ class C3OnlyDisprovedIdentitySwitchesWork(InvariantCase):
         self.assertTrue(self.fx.media.prepare_bound_release(meta, self.bound(1)))
         self.assertEqual(dict(id=1, skip=False, seasons=[4], episodes=[2]), outcome(meta))
         self.assertIsNone(download_block_reason(meta))
+
+    def test_c3_e7_missing_ordinal_season_cannot_prove_another_title(self):
+        # "Show" lacks S4 on TMDB, which does not make "Show 4th" S5 correct.
+        self.fx.tv(42, "Show", seasons={1: 12, 2: 12, 3: 12})
+        self.fx.tv(43, "Show 4th", seasons={5: 12})
+        meta = self.name("Show 4th Season 5", cache=False)
+        self.assertTrue(meta.skip_reason)
+        self.assertFalse(meta.tmdb_info)
+        self.assertFalse(self.fx.cache)
+
+    def test_c3_e7_bound_ordinal_missing_season_stays_pending(self):
+        # The binding excludes "Show 4th" by name; the missing S4 proves nothing.
+        self.show(seasons={1: 12, 2: 12, 3: 12})
+        meta = self.file("Show 4th Season 5.mkv", tmdb_info=self.bound())
+        self.assertTrue(rejected(meta), outcome(meta))
+
+    def test_c3_e7_ordinal_title_disproved_by_type_resolves(self):
+        self.fx.movie(43, "Show 4th", year="2015")
+        self.fx.tv(42, "Show", seasons={1: 12, 2: 12, 3: 12, 4: 12})
+        meta = self.name("Show 4th Season 5", cache=False)
+        self.assertEqual(dict(id=42, skip=False, seasons=[4], episodes=[5]), outcome(meta))
+
+    def test_c3_e9_imdb_explicit_anime_rejects_live_action(self):
+        self.show(seasons={1: 12}, genres=(18,))
+        meta = MetaInfo("Show S01E05 1080p", use_llm=False)
+        self.assertFalse(self.fx.media.prepare_bound_release(meta, self.bound(), mtype_hint=MediaType.ANIME))
+
+    def test_c3_e9_indexer_imdb_path_keeps_explicit_anime_constraint(self):
+        from app.filter import Filter
+        from app.indexer.client._base import _IIndexClient
+        self.show(seasons={1: 12}, genres=(18,))
+        wanted = MetaInfo("Show S01", use_llm=False)
+        wanted.set_tmdb_info(self.bound())
+        wanted.imdb_id = "tt0042000"
+        wanted.get_poster_image = wanted.get_backdrop_image = Mock(return_value="")
+        # Real resource/season filters; only rule storage is a fixture.
+        filter_type = type(Filter())
+        rules = SimpleNamespace(check_rules=lambda *_args: (True, 0, "offline"))
+        rules.check_torrent_filter = filter_type.check_torrent_filter.__get__(rules)
+        rules.is_torrent_match_sey = filter_type.is_torrent_match_sey
+        client = SimpleNamespace(media=self.fx.media, filter=rules, progress=Mock(),
+                                 _reverse_title_sites=[], index_type="Offline")
+        results = _IIndexClient.filter_search_results(client,
+            [dict(title="Show S01E05 1080p", size=1024, enclosure="offline", imdbid="tt0042000")], 0,
+            SimpleNamespace(id="offline", name="Offline", public=False),
+            dict(type=MediaType.ANIME, season=1, episode=5), wanted, datetime.datetime.now())
+        self.assertFalse(results)
 
     def test_c3_e7_ordinal_same_name_works_missing_season_do_not_choose(self):
         # The title interpretation is disproved by type, leaving only the

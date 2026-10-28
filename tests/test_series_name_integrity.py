@@ -257,7 +257,8 @@ class SeriesNameIntegrityTest(unittest.TestCase):
                     self.assertFalse(unresolved.tmdb_id)
                     self.assertEqual((3, [1]), (unresolved.begin_season, unresolved.get_episode_list()))
                     self.assertNotIn('episode_mapping', unresolved.note)
-                    self.assertNotIn(1002, [int(call.args[0]) for call in provider.tv.details.call_args_list])
+                    # The namesake may be read as evidence, but is never selected.
+                    self.assertTrue(unresolved.skip_reason)
                     provider.tv.season_details.side_effect = provider._season
                     # Both namesakes are now valid exact matches: nothing distinguishes
                     # them, so the source stays unconfirmed (C3 multiple exact works).

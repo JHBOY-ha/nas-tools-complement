@@ -103,8 +103,10 @@ class RecognitionTests(unittest.TestCase):
         # Per-recognition candidate detail reuse uses the production decorator.
         from contextlib import contextmanager
         from app.media.media import _shares_candidate_details
+        from app.media.meta.recognition import CANDIDATE_DETAIL_LIMIT
         self.ns.update(threading=threading, contextmanager=contextmanager,
-                       _shares_candidate_details=_shares_candidate_details)
+                       _shares_candidate_details=_shares_candidate_details,
+                       CANDIDATE_DETAIL_LIMIT=CANDIDATE_DETAIL_LIMIT)
         cls = load_class('app/media/media.py', 'Media', [
             '__search_media_with_name', '__extract_llm_tmdb_target', '__resolve_tmdb_mtype',
             'get_media_info_on_files', 'get_cache_info', '__make_cache_key', '_valid_media_identity',

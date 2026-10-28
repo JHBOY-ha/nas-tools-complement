@@ -22,7 +22,7 @@ from app.media.meta.release_groups import ReleaseGroupsMatcher
 from app.media.meta.special import normalized, requires_confirmation, download_block_reason
 from app.media.meta.special_resolver import SpecialResolver, identity
 from app.media.meta.ordinal import OrdinalResolver, Evidence
-from app.media.meta.recognition import NumberingResult, NumberingState, RecognitionPending
+from app.media.meta.recognition import CANDIDATE_DETAIL_LIMIT, NumberingResult, NumberingState, RecognitionPending
 from app.media.meta.recognition_rules import DEFAULT_EPISODE_MAPPINGS, DEFAULT_NAME_ALIASES
 from app.media.tmdbv3api import TMDb, Search, Movie, TV, Person, Find, TMDbException, Discover, Trending, Episode, Genre
 from app.utils import PathUtils, EpisodeFormat, RequestUtils, StringUtils, cacheman
@@ -58,8 +58,8 @@ class Media:
     _rmt_match_mode = None
     _search_keyword = None
     _search_tmdbweb = None
-    # Alias discovery reads at most this many candidate details per selection round.
-    CANDIDATE_DETAIL_LIMIT = 6
+    # Candidate details read per selection round, including exact-name checks.
+    CANDIDATE_DETAIL_LIMIT = CANDIDATE_DETAIL_LIMIT
     # Detail reads shared by one title/file recognition; never shared across threads.
     _recognition_scope = threading.local()
 
@@ -179,8 +179,10 @@ class Media:
         return kind.name, str(tmdbid), bool(chinese), append_to_response
 
     def __detail_reused(self, mtype, tmdbid):
+        """This work's details were already read in the current recognition (any options)."""
         memo = getattr(Media._recognition_scope, "details", None)
-        return memo is not None and self.__detail_key(mtype, tmdbid) in memo
+        work = self.__detail_key(mtype, tmdbid)[:2]
+        return memo is not None and any(key[:2] == work for key in memo)
 
     def __candidate_detail(self, mtype, tmdbid, chinese=True, append_to_response=None):
         """get_tmdb_info, memoized (including failures) for the current recognition."""
@@ -469,25 +471,29 @@ class Media:
         A tier accepts only a unique VALID work: several distinct exact matches need
         year/type/binding evidence, never "only one has the season" (C3). A
         name-matched UNKNOWN blocks; a failed detail without name evidence is ignored.
+        Every candidate read shares one per-round limit; while any candidate stays
+        unread, its aliases are unknown, so no match can be declared unique.
         """
         if anime_only:
             candidates = [candidate for candidate in candidates
                           if not self.__get_genre_ids(candidate)
                           or set(self.__get_genre_ids(candidate)).intersection(ANIME_GENREIDS)]
         budget = [self.CANDIDATE_DETAIL_LIMIT]
-        exhausted = object()
+        # Read with the identity check's own options so its detail is reused.
+        options = getattr(candidate_check, "detail_options", None) or {}
 
         def summary_match(candidate, fuzzy):
             return any(self.__compare_tmdb_names(name, candidate.get(key), fuzzy=fuzzy)
                        for key in ("name", "original_name"))
 
-        def read(candidate):
-            # Reused details are free; the limit bounds alias discovery only.
-            if not self.__detail_reused(MediaType.TV, candidate["id"]):
-                if budget[0] <= 0:
-                    return exhausted
-                budget[0] -= 1
-            return self.__candidate_detail(MediaType.TV, candidate["id"])
+        def claim(candidate):
+            """Spend one read on a work not yet read in this recognition."""
+            if self.__detail_reused(MediaType.TV, candidate["id"]):
+                return True
+            if budget[0] <= 0:
+                return False
+            budget[0] -= 1
+            return True
 
         def year_matches(candidate, info):
             if not year:
@@ -546,17 +552,26 @@ class Media:
                     valid.append((score, accepted))
             return valid
 
-        exact = [(candidate, None, 0) for candidate in candidates if summary_match(candidate, False)]
-        fuzzy, unknown_named = [], False
-        formal_ids = {str(candidate["id"]) for candidate, _, _ in exact}
-        for candidate in candidates:
-            if str(candidate["id"]) in formal_ids:
+        exact, fuzzy = [], []
+        unknown_named = unchecked = False
+        # Name evidence is read first (stable, provider order within each group).
+        ordered = sorted(candidates, key=lambda c: (not summary_match(c, False), not summary_match(c, True)))
+        for candidate in ordered:
+            formal = summary_match(candidate, False)
+            named = formal or summary_match(candidate, True)
+            if not claim(candidate):
+                # An unread candidate is never INVALID: its aliases are unknown.
+                unchecked = True
+                unknown_named = unknown_named or named
                 continue
-            named = summary_match(candidate, True)
-            info = read(candidate)
-            if info is exhausted or not info:
-                # Unchecked or unavailable candidates are never INVALID; only
-                # those with name evidence may still be the requested work.
+            if formal:
+                # Its name is already exact; the reserved read happens only if
+                # the identity check needs the details.
+                exact.append((candidate, None, 0))
+                continue
+            info = self.__candidate_detail(MediaType.TV, candidate["id"], **options)
+            if not info:
+                # Only an unavailable candidate with name evidence may be the work.
                 unknown_named = unknown_named or named
                 continue
             names = self.__candidate_all_names(info)
@@ -564,16 +579,21 @@ class Media:
                 exact.append((candidate, info, 0))
             elif self.__compare_tmdb_names(name, names):
                 fuzzy.append((candidate, info, self.__match_tmdb_name_score(name, names)))
+        limit_reason = "候选详情读取已达上限，仍有未检查的候选，无法确认唯一作品，保留待确认"
         valid = valid_of(exact, blocked=unknown_named)
         if len(valid) > 1:
             raise RecognitionPending("多部作品名称精确匹配，缺少年份、类型等区分证据，保留待确认")
         if valid:
+            if unchecked:
+                raise RecognitionPending(limit_reason)
             return valid[0][1]
         # Eligibility and ranking are different: an earlier fuzzy response must
         # not hide a later, closer title; equally close works stay unconfirmed.
         valid = valid_of(sorted(fuzzy, key=lambda item: item[2], reverse=True))
         if not valid:
             return {}
+        if unchecked:
+            raise RecognitionPending(limit_reason)
         best = [accepted for score, accepted in valid if score == valid[0][0]]
         if len(best) > 1:
             raise RecognitionPending("多部作品名称同样接近，缺少区分证据，保留待确认")
@@ -1850,6 +1870,8 @@ class Media:
                     raise RecognitionPending(probe.skip_reason or "候选作品的季集证据不足，保留待确认")
             return checked_candidates[key]
 
+        check_tv_candidate.detail_options = dict(chinese=chinese, append_to_response=append_to_response)
+
         if meta_info.type not in [MediaType.TV, MediaType.ANIME] and not meta_info.year:
             file_media_info = self.__search_multi_tmdb(file_media_name=query_name)
         else:
@@ -1984,18 +2006,20 @@ class Media:
         if not bound_info:
             return False
         note = meta_info.note or {}
+        # An explicit type (including ANIME's animation genre) constrains the
+        # identity check and the final admission alike.
         if any(note.get(key) for key in ("ordinal_candidates", "ordinal_default")):
             prepared = self.resolve_ordinal_identity(meta_info, bound=bound_info, mtype_hint=mtype_hint)
             if prepared and not meta_info.note.get("ordinal_resolution"):
                 # The compatibility default still needs the original identity
                 # and number-mapping checks; it is not a bypass.
-                prepared = self._prepare_media_identity(meta_info, bound_info)
+                prepared = self._prepare_media_identity(meta_info, bound_info, mtype_hint=mtype_hint)
         else:
-            prepared = self._prepare_media_identity(meta_info, bound_info)
+            prepared = self._prepare_media_identity(meta_info, bound_info, mtype_hint=mtype_hint)
         if not prepared:
             return False
         meta_info.set_tmdb_info(bound_info)
-        self._finalize_recognition(meta_info)
+        self._finalize_recognition(meta_info, mtype_hint=mtype_hint)
         return not meta_info.skip_reason
 
     def resolve_ordinal_identity(self, meta_info, bound=None, mtype_hint=None,

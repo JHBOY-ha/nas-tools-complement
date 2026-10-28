@@ -67,11 +67,12 @@ class OrdinalResolver:
         return (self.matches(self.names(alternate), info)
                 and not self.matches(self.names(meta), info))
 
-    def validate(self, meta, info, mtype_hint=None, manual=False, absent=Evidence.INVALID):
+    def validate(self, meta, info, mtype_hint=None, manual=False):
         """
         INVALID requires complete contrary facts; failed validation is UNKNOWN.
-        ``absent`` grades a season/episode missing from TMDB: within a bound work it
-        rejects one title interpretation, but it never proves another work (C3).
+        A season or episode missing from TMDB is UNKNOWN even with a complete
+        manifest: TMDB may lag a new season, so absence never proves another
+        title interpretation or another work (C3).
         """
         if not info or not info.get("id") or not tmdb_type(info.get("media_type")):
             return Evidence.UNKNOWN
@@ -101,10 +102,8 @@ class OrdinalResolver:
         if not wanted:
             return Evidence.UNKNOWN
         if not set(wanted).issubset(numbers):
-            # Presence proves a season exists; absence needs a complete manifest.
-            if (meta.note.get("llm") or {}).get("season_verified") and not prepared:
-                return Evidence.UNKNOWN
-            return absent if type(count) is int and count >= 0 else Evidence.UNKNOWN
+            # Presence proves a season exists; absence proves nothing.
+            return Evidence.UNKNOWN
         if not prepared:
             return Evidence.UNKNOWN
         for season in wanted:
@@ -127,7 +126,7 @@ class OrdinalResolver:
             if len(set(found)) != len(found):
                 return Evidence.UNKNOWN
             if not set(meta.get_episode_list()).issubset(found):
-                return absent
+                return Evidence.UNKNOWN
         if manual:
             # The selected work overrides the filename, but not type/genre constraints.
             checked = copy.copy(meta)
@@ -192,9 +191,6 @@ class OrdinalResolver:
                     infos = self.search(parsed)
                     state = Evidence.UNKNOWN if not infos else None
                 results = []
-                # A missing season may reject this title interpretation of its only
-                # work, but never chooses among same-name works (C3).
-                absent = Evidence.INVALID if len(infos) == 1 else Evidence.UNKNOWN
                 for info in infos:
                     candidate = copy.deepcopy(parsed)
                     # With a partial override, first identify the interpretation
@@ -204,8 +200,7 @@ class OrdinalResolver:
                     if manual:
                         for key, value in manual.items():
                             setattr(candidate, key, value)
-                    result = self.validate(candidate, info, mtype_hint, manual=manual is not None,
-                                           absent=absent)
+                    result = self.validate(candidate, info, mtype_hint, manual=manual is not None)
                     results.append(result)
                     if result == Evidence.VALID:
                         accepted.append((candidate, info))

@@ -5,7 +5,7 @@ from config import Config
 from app.utils.types import MediaType
 from app.media.meta.special import normalized, requires_confirmation, special_references
 from app.media.meta.llm_parser import LLMMetaParser
-from app.media.meta.recognition import NumberingResult
+from app.media.meta.recognition import CANDIDATE_DETAIL_LIMIT, NumberingResult
 
 
 def tmdb_type(value):
@@ -37,6 +37,9 @@ class SpecialResolver:
                 self.cache[key] = None
         return self.cache[key]
 
+    def detail_cached(self, kind, tmdbid):
+        return ("special", self.language, "detail", kind, str(tmdbid)) in self.cache
+
     def detail(self, kind, tmdbid):
         return self.cached(("detail", kind, str(tmdbid)), lambda: self.media.get_tmdb_info(
             mtype=kind, tmdbid=tmdbid, append_to_response="alternative_titles"))
@@ -49,6 +52,8 @@ class SpecialResolver:
         # Ordinal callers need unmatched details too: absent aliases are unknown,
         # not proof that the alternative interpretation does not exist.
         candidates = {}
+        # One detail-read limit per search; batch-cached details are free.
+        budget = [CANDIDATE_DETAIL_LIMIT]
         for name in dict.fromkeys(name for name in names if name):
             items = []
             seen_pages = set()
@@ -67,10 +72,17 @@ class SpecialResolver:
                     break
             else:
                 raise ValueError("作品候选过多，请使用更具体的片名或人工确认")
+            # Results with name evidence are read first (stable provider order).
+            items.sort(key=lambda item: not self.has_name_evidence(name, item))
             for item in items:
                 kind = tmdb_type(item.get("media_type"))
                 if not kind or not item.get("id"):
                     continue
+                if not self.detail_cached(kind, item["id"]):
+                    if budget[0] <= 0:
+                        # Unread results may match by alias: uniqueness is unproven.
+                        raise ValueError("作品候选超过详情读取上限，无法确认唯一性，保留待确认")
+                    budget[0] -= 1
                 info = self.detail(kind, item["id"])
                 if not info:
                     # Only a result with name evidence may still be the work;

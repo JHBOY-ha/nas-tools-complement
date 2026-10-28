@@ -3,6 +3,11 @@ from dataclasses import dataclass
 from enum import Enum
 
 
+# Candidate detail reads allowed per selection round (TV search, special and
+# ordinal work search). Reads already made in the same recognition are free.
+CANDIDATE_DETAIL_LIMIT = 6
+
+
 class RecognitionPending(ValueError):
     """Required evidence is unavailable; trying another work is not authorized."""
 
