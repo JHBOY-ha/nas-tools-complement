@@ -2,6 +2,8 @@ import json
 import re
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
+import httpx
+
 import log
 from app.utils import ExceptionUtils, StringUtils
 from config import Config
@@ -156,12 +158,21 @@ class LLMClient:
 
     def __get_client(self):
         if not self._client:
-            self._client = OpenAI(
-                api_key=self._api_key,
-                base_url=self._api_base_url,
-                timeout=self._timeout,
-                max_retries=self._max_retries
-            )
+            # Older SDKs pass the removed `proxies` argument to HTTPX 0.28.
+            # Supply a native client through the supported SDK interface;
+            # HTTPX still honors the existing proxy environment and TLS checks.
+            transport = httpx.Client(timeout=self._timeout, follow_redirects=True)
+            try:
+                self._client = OpenAI(
+                    api_key=self._api_key,
+                    base_url=self._api_base_url,
+                    timeout=self._timeout,
+                    max_retries=self._max_retries,
+                    http_client=transport
+                )
+            except Exception:
+                transport.close()
+                raise
         return self._client
 
     @classmethod

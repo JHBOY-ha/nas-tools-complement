@@ -5,7 +5,7 @@ import sys
 import types
 from types import SimpleNamespace
 from unittest import TestCase
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 import httpx
 from openai import APIStatusError
@@ -91,12 +91,46 @@ class LLMClientTest(TestCase):
             api_key="key",
             base_url="https://api.example/v1/",
             timeout=9,
-            max_retries=1
+            max_retries=1,
+            http_client=ANY
         )
         kwargs = sdk.chat.completions.create.call_args.kwargs
         self.assertEqual("gpt-test", kwargs["model"])
         self.assertEqual(128, kwargs["max_tokens"])
         self.assertEqual("system", kwargs["messages"][0]["content"])
+
+    def test_real_sdk_serializes_request_with_native_httpx_client(self):
+        # Exercise the actual SDK constructor/serialization. Only HTTP I/O is
+        # replaced, so SDK/HTTPX version incompatibility remains visible.
+        response = httpx.Response(200, json={
+            "id": "test", "object": "chat.completion", "created": 0,
+            "model": "test-model",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": '{"ok": true}'}}]
+        })
+        client = LLMClient({"base_url": "https://api.example/v1",
+                            "api_key": "test-key", "model": "test-model",
+                            "timeout": 7, "max_retries": 0})
+        try:
+            with patch.object(httpx.HTTPTransport, "handle_request",
+                              return_value=response) as send:
+                self.assertEqual({"ok": True}, client.complete_json("system", "user"))
+            self.assertEqual(1, send.call_count)
+            request = send.call_args.args[0]
+            self.assertEqual("https://api.example/v1/chat/completions", str(request.url))
+            self.assertEqual("Bearer test-key", request.headers["authorization"])
+            self.assertEqual(7, request.extensions["timeout"]["read"])
+        finally:
+            if client._client:
+                client._client.close()
+
+    def test_native_transport_closes_when_sdk_initialization_fails(self):
+        with patch("app.utils.llm_client.httpx.Client") as transport, \
+                patch("app.utils.llm_client.OpenAI", side_effect=ValueError("invalid setup")):
+            client = LLMClient({"base_url": "https://api.example/v1",
+                                "api_key": "test-key", "model": "test-model"})
+            self.assertEqual("", client.complete_text("system", "user"))
+            transport.return_value.close.assert_called_once_with()
 
     def test_per_request_timeout_and_retry_override_use_sdk_options(self):
         sdk = self.make_sdk()

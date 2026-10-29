@@ -68,6 +68,30 @@ class PrimaryRecognizer:
                       season_verified=False, reason=reason)
         return result
 
+    @staticmethod
+    def evidence_catalog(source, candidates):
+        """Assign references to supplied facts; the model need not copy text."""
+        catalog = []
+
+        def add(ref, text, owner=None):
+            if isinstance(text, str) and text.strip():
+                catalog.append({"id": ref, "text": text, "owner": owner})
+
+        for key in ("title", "subtitle"):
+            add("source." + key, source.get(key))
+        context = source.get("context") or {}
+        for key in ("source_title", "original_title"):
+            add("source.context." + key, context.get(key))
+        for index, parent in enumerate(context.get("parents") or []):
+            add("source.parent.%s" % index, parent)
+        for candidate in candidates:
+            owner = "tmdb.%s.%s" % (candidate.get("type"), candidate.get("id"))
+            for key in ("name", "original_name"):
+                add(owner + "." + key, candidate.get(key), owner)
+            for season in candidate.get("seasons") or []:
+                add(owner + ".season.%s" % season.get("n"), season.get("name"), owner)
+        return catalog
+
     def recognize(self, title, subtitle=None, mtype_hint=None, context=None):
         context = safe_context(context)
         source = {"title": str(title or "")[:4000], "subtitle": str(subtitle or "")[:2000],
@@ -113,7 +137,8 @@ class PrimaryRecognizer:
         if not candidates:
             return self.unresolved("未取得可供 LLM 判断的 TMDB 候选", release)
         # Keep complete names and season data; never validate against invisible candidates.
-        payload = {"source": source, "release": raw, "candidates": candidates}
+        payload = {"source": source, "release": raw, "candidates": candidates,
+                   "evidence_catalog": self.evidence_catalog(source, candidates)}
         encoded = json.dumps(payload, ensure_ascii=False)
         if len(encoded) > 32000:
             return self.unresolved("TMDB 候选过大，需要缩小识别范围", release)
@@ -128,7 +153,9 @@ class PrimaryRecognizer:
                 "只有scope=season_pack且episodes为空时，release_seasons内的已确认特别篇可对应S00。"
                 "只返回JSON：status(matched/unresolved), tmdb_id,tmdb_type(movie/tv),"
                 "targets([{season:整数,begin_episode:整数或null,end_episode:整数或null}]),"
-                "evidence(原始title/subtitle或上下文中的逐字短引文数组), reason(判断依据)。"
+                "evidence_ids(只从evidence_catalog选取id的数组), reason(判断依据)。"
+                "evidence_ids至少一条引用source原始输入，至少一条引用所选TMDB候选；"
+                "不要返回引文、译名或自己编造的id，程序会用这些id还原原始证据。"
                 "targets描述这条资源的全部正式TMDB季集：单集一个目标；多集保留完整范围；多季整包每季一个目标，"
                 "整季未知集数时两集号均为null；电影targets为空数组。不要把S01-S02缩成S01。"
                 "发布多季合并/重分季时，每个target必须附source_seasons数组，完整分配所有发布季，不能遗漏或重复。"
@@ -136,7 +163,7 @@ class PrimaryRecognizer:
                 "小数集/OVA不能取整或默认S00E01；只有明确对应时才提议正式整数季集，之后仍需单集元数据核验。"
                 "同名作品结合类型、年份、原名、别名和外链判断，不能因为季结构合意就选错作品。"
                 "不要用生成的译名作为原文引文。缺少季信息、候选冲突、无法确定季或映射关系时必须unresolved，"
-                "禁止猜第一季。reason解释语义关系，evidence引用实际判断依据。"),
+                "禁止猜第一季。reason解释语义关系，evidence_ids引用实际判断依据。"),
             user_prompt=encoded))
         return self.validate(decision, release, candidates, source, mtype_hint)
 
@@ -144,20 +171,55 @@ class PrimaryRecognizer:
         fail = lambda reason: self.unresolved(reason, release)
         if not isinstance(decision, dict) or decision.get("status") != "matched":
             return fail("LLM 未确认唯一的作品及完整季集")
-        evidence = decision.get("evidence")
-        source_texts = [source["title"], source["subtitle"]]
-        context = source.get("context") or {}
-        source_texts += [context.get("source_title") or "", context.get("original_title") or ""] + context.get("parents", [])
-        if (not isinstance(evidence, list) or not evidence or len(evidence) > 12
-                or any(not isinstance(e, str) or not e.strip() or len(e) > 500
-                       or not any(e in text for text in source_texts) for e in evidence)
-                or not isinstance(decision.get("reason"), str) or not decision["reason"].strip()):
-            return fail("LLM 判断缺少可追溯的原文依据")
         selected = [c for c in candidates if type(decision.get("tmdb_id")) is int
                     and c.get("id") == decision["tmdb_id"] and c.get("type") == decision.get("tmdb_type")]
         if len(selected) != 1:
             return fail("LLM 选择的作品不在提供的候选中")
         candidate = selected[0]
+        evidence_ids = decision.get("evidence_ids")
+        if evidence_ids is not None:
+            catalog = {item["id"]: item for item in self.evidence_catalog(source, candidates)}
+            owner = "tmdb.%s.%s" % (candidate["type"], candidate["id"])
+            if (not isinstance(evidence_ids, list) or not evidence_ids or len(evidence_ids) > 12
+                    or any(not isinstance(ref, str) or ref not in catalog for ref in evidence_ids)
+                    or len(set(evidence_ids)) != len(evidence_ids)):
+                return fail("LLM 返回无效证据引用")
+            references = [catalog[ref] for ref in evidence_ids]
+            if (not any(ref["owner"] is None for ref in references)
+                    or not any(ref["owner"] == owner for ref in references)
+                    or any(ref["owner"] not in (None, owner) for ref in references)):
+                return fail("LLM 证据必须关联原始输入及所选候选")
+            evidence = [ref["text"] for ref in references]
+        else:
+            # Accept the prior quote format for compatible clients/cached data.
+            evidence = decision.get("evidence")
+        source_texts = [source["title"], source["subtitle"]]
+        context = source.get("context") or {}
+        source_texts += [context.get("source_title") or "", context.get("original_title") or ""] + context.get("parents", [])
+        # A semantic decision may cite both a release and the selected provider's
+        # season name/alias. Validate both provenances, never model-generated
+        # extraction fields or records belonging to a different candidate.
+        def text_values(value):
+            if isinstance(value, str):
+                yield value
+            elif isinstance(value, dict):
+                for item in value.values():
+                    yield from text_values(item)
+            elif isinstance(value, list):
+                for item in value:
+                    yield from text_values(item)
+
+        # Ignore formatting whitespace only; this does not choose an identity
+        # or a season and does not permit translations absent from the inputs.
+        normalized_source = ["".join(text.split()) for text in source_texts]
+        known_texts = normalized_source + ["".join(text.split()) for text in text_values(candidate)]
+        if evidence_ids is None and (not isinstance(evidence, list) or not evidence or len(evidence) > 12
+                or any(not isinstance(e, str) or not e.strip() or len(e) > 500
+                       or not any("".join(e.split()) in text for text in known_texts) for e in evidence)
+                or not any("".join(e.split()) in text for e in evidence for text in normalized_source)):
+            return fail("LLM 判断缺少可追溯的原文依据")
+        if not isinstance(decision.get("reason"), str) or not decision["reason"].strip():
+            return fail("LLM 判断缺少语义依据")
         kind = candidate["type"]
         expected = mtype_hint or release.get("type")
         if (expected == MediaType.MOVIE) != (kind == "movie"):
@@ -209,6 +271,8 @@ class PrimaryRecognizer:
                       evidence=evidence, reason=decision["reason"][:1000],
                       release_fields={key: release.get(key) for key in IDENTITY_FIELDS},
                       season_verified=kind == "tv", season_evidence="llm_semantic")
+        if evidence_ids is not None:
+            result["evidence_ids"] = list(evidence_ids)
         if not result.get("cn_name") and not result.get("en_name"):
             result["en_name"] = candidate.get("name") or candidate.get("original_name")
         if targets:

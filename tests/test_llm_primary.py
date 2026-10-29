@@ -82,6 +82,58 @@ class LLMPrimaryTest(unittest.TestCase):
                 self.assertEqual((86031, [4], [episode]), (meta.tmdb_id, meta.get_season_list(), meta.get_episode_list()))
         self.rule_mapping.assert_not_called()
 
+    def test_live_stone_evidence_can_cite_release_and_selected_tmdb_season(self):
+        title = self.filename(37)
+        # Public response reproduced from the real provider: the model cites
+        # input text, a spacing variant, and the actual TMDB season name.
+        self.responses(title, release={'begin_season': 3, 'end_season': 3},
+                       decision={'evidence': ['Dr.STONE SCIENCE FUTURE Cour 3 [37]',
+                                              'Dr. STONE SCIENCE FUTURE', '科学与未来']})
+        meta = self.file(title)
+        self.assertFalse(meta.skip_reason)
+        self.assertEqual((86031, [4], [37]),
+                         (meta.tmdb_id, meta.get_season_list(), meta.get_episode_list()))
+
+    def test_provider_only_or_other_candidate_evidence_is_rejected(self):
+        title = self.filename(37)
+        other = {'id': 123, 'type': 'tv', 'name': 'Different Work',
+                 'seasons': [{'n': 4, 'name': 'Other Arc', 'eps': 37}]}
+        self.search.return_value = [self.candidate, other]
+        for evidence in (['科学与未来'], [title, 'Other Arc'], [title, 'Generated Translation']):
+            with self.subTest(evidence=evidence):
+                self.parser._parse_cache = {}
+                self.responses(title, decision={'evidence': evidence})
+                meta = self.file(title)
+                self.assertTrue(meta.skip_reason)
+                self.assertFalse(meta.tmdb_id)
+
+    def test_evidence_references_restore_input_and_provider_text(self):
+        title = self.filename(37)
+        refs = ['source.title', 'tmdb.tv.86031.season.4']
+        self.responses(title, decision={'evidence_ids': refs, 'evidence': None})
+        meta = self.file(title)
+        self.assertFalse(meta.skip_reason)
+        self.assertEqual([title, '科学与未来'], meta.note['llm']['evidence'])
+        payload = json.loads(self.client.complete_text.call_args.kwargs['user_prompt'])
+        catalog = {item['id']: item['text'] for item in payload['evidence_catalog']}
+        self.assertEqual(title, catalog['source.title'])
+        self.assertEqual('科学与未来', catalog['tmdb.tv.86031.season.4'])
+
+    def test_evidence_references_require_input_and_selected_candidate(self):
+        title = self.filename(37)
+        self.search.return_value = [self.candidate, {'id': 123, 'type': 'tv', 'name': 'Other Work'}]
+        cases = [[], ['source.title'], ['tmdb.tv.86031.name'],
+                 ['source.title', 'tmdb.tv.123.name'], ['source.title', 'invented.ref'],
+                 ['source.title', True], ['source.title', {}],
+                 ['source.title', 'source.title', 'tmdb.tv.86031.name']]
+        for refs in cases:
+            with self.subTest(refs=refs):
+                self.parser._parse_cache = {}
+                self.responses(title, decision={'evidence_ids': refs})
+                meta = self.file(title)
+                self.assertTrue(meta.skip_reason)
+                self.assertFalse(meta.tmdb_id)
+
     def test_cross_language_arc_reaches_correct_season_without_literal_match(self):
         title = "[UHA-WINGS][JoJo's Bizarre Adventure Steel Ball Run][01][1080p HEVC].mkv"
         self.candidate.update(id=45790, name='JOJO的奇妙冒险', seasons=[{'n': 1, 'name': '幻影之血篇', 'eps': 26},
