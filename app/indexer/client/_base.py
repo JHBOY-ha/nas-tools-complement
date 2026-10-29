@@ -7,6 +7,7 @@ from app.filter import Filter
 from app.helper import ProgressHelper
 from app.media import Media
 from app.media.meta import MetaInfo
+from app.media.meta.llm_parser import LLMMetaParser
 from app.media.meta.special_resolver import identity, tmdb_type
 from app.utils import DomUtils, RequestUtils, StringUtils, ExceptionUtils
 from app.utils.types import MediaType, SearchType
@@ -230,8 +231,12 @@ class _IIndexClient(metaclass=ABCMeta):
                 index_rule_fail += 1
                 continue
             # 识别种子名称
-            meta_info = MetaInfo(title=torrent_name, subtitle=description)
-            if not meta_info.get_name():
+            if LLMMetaParser().is_primary():
+                meta_info = self.media.get_media_info(title=torrent_name, subtitle=description)
+            else:
+                meta_info = MetaInfo(title=torrent_name, subtitle=description)
+            if (not meta_info or not meta_info.get_name()
+                    or ((meta_info.note or {}).get("llm", {}).get("primary") and meta_info.skip_reason)):
                 log.info(f"【{self.index_type}】{torrent_name} 无法识别到名称")
                 index_match_fail += 1
                 continue

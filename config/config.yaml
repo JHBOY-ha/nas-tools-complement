@@ -382,12 +382,13 @@ laboratory:
   # 【使用TMDB代理】
   tmdb_proxy: false
 
-# 【LLM识别增强】
+# 【LLM媒体识别】
 llm:
   # 【启用LLM识别】
   enable: false
-  # 【识别模式】：rule_first（规则优先）、llm_first（LLM优先）、hybrid（混合）
-  mode: rule_first
+  # 【识别模式】：balanced（LLM主导）、conservative（规则补全兼容模式）
+  # LLM主导失败时保留待处理，不自动回退规则或默认第一季。旧llm_first/primary/hybrid等同balanced。
+  mode: balanced
   # 【API地址】：OpenAI兼容接口地址
   base_url: ''
   # 【API密钥】
@@ -396,9 +397,7 @@ llm:
   model: ''
   # 【请求超时（秒）】
   timeout: 20
-  # 【混合模式置信度阈值】
-  confidence_threshold: 0.75
-  # 【启用检索增强】：先检索TMDB/Bangumi候选，再作为上下文交给LLM（可辅助回填年份）
+  # 【附加检索增强】：保守模式启用TMDB/Bangumi候选；LLM主导始终查询TMDB，此项开启Bangumi补充
   search_context_enable: false
   # 【检索候选数量】
   search_max_results: 3

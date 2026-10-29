@@ -25,6 +25,7 @@ RECOGNITION_MODULES = (
     "tests.test_review_regressions",
     "tests.test_recognition_performance",
     "tests.test_llm_season_binding",
+    "tests.test_llm_primary",
     "tests.test_media_cn_fallback",
     "tests.test_meta_llm_parser",
     "tests.test_sync_reliability",

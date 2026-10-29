@@ -152,7 +152,8 @@ class OrdinalSeasonTest(TestCase):
     def test_ambiguous_parse_cannot_be_overwritten_by_llm_or_work_cache(self):
         with patch('app.media.meta.metainfo.LLMMetaParser') as llm:
             meta = MetaInfo('Show 4th Season 5')
-            llm.assert_not_called()
+            llm.return_value.parse.assert_not_called()
+            llm.return_value.merge_into.assert_not_called()
         self.media.meta.get_meta_data_by_key.return_value = {'id': 1, 'type': MediaType.TV}
         self.assertEqual({}, self.media.get_cache_info(meta))
 

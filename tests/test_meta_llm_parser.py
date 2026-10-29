@@ -92,7 +92,7 @@ class LLMMetaParserTest(TestCase):
                 self.parser.merge_into(meta, meta.org_string, mtype_hint=hint)
             self.assertEqual(expected, meta.type)
 
-    def test_merge_balanced_overrides_name_only(self):
+    def test_merge_balanced_replaces_identity_and_resource_fields(self):
         self.parser._mode = "balanced"
         meta_info = MetaInfo("Dune 2023 1080p", use_llm=False)
         meta_info.year = "2023"
@@ -111,15 +111,16 @@ class LLMMetaParserTest(TestCase):
             self.parser.merge_into(meta_info=meta_info, title=meta_info.org_string)
 
         self.assertEqual("Dune", meta_info.en_name)
-        self.assertEqual("2023", meta_info.year)
-        self.assertEqual("1080p", meta_info.resource_pix)
-        self.assertEqual(["Wrong Name"], meta_info.note["llm"]["rule_names"])
-        self.assertEqual(["Dune"], meta_info.note["llm"]["llm_names"])
+        self.assertEqual("2024", meta_info.year)
+        self.assertEqual("2160p", meta_info.resource_pix)
+        self.assertTrue(meta_info.note["llm"]["primary"])
+        # A partial mocked parse is not a confirmed provider decision.
+        self.assertTrue(meta_info.skip_reason)
 
     def test_legacy_mode_names_are_migrated(self):
         cases = [("rule_first", "conservative"), ("fallback", "conservative"),
                  ("llm_first", "balanced"), ("primary", "balanced"),
-                 ("hybrid", "balanced"), ("bogus", "conservative"), (None, "conservative")]
+                 ("hybrid", "balanced"), ("bogus", "balanced"), (None, "balanced")]
 
         for value, expected in cases:
             with patch("app.media.meta.llm_parser.Config") as config_cls:

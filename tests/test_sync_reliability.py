@@ -59,7 +59,7 @@ def env():
                 Config=lambda: NS(get_config=lambda key: {}),
                 DEFAULT_EPISODE_MAPPINGS=[], DEFAULT_NAME_ALIASES={},
                 ANIME_GENREIDS=['16'], is_fansub_release_name=is_fansub_release_name,
-                LLMMetaParser=lambda: NS(get_alias_candidates=lambda **kwargs: []),
+                LLMMetaParser=lambda: NS(get_alias_candidates=lambda **kwargs: [], is_primary=lambda: False),
                 RmtMode=NS(LINK='link', MOVE='move', RCLONE='rclone', MINIO='minio'),
                 SyncType=NS(MON='monitor'), RMT_MEDIAEXT=['.mkv'], RMT_FAVTYPE='Favorites')
 
@@ -99,7 +99,7 @@ class RecognitionTests(unittest.TestCase):
             '__verify_remapped_episodes', '__convert_absolute_episodes', '__suggest_episode_mapping',
             '__episode_list_of', '__lacks_anime_genre', '__normalize_identity_name',
             '__candidate_all_names', '__is_other_work_by_prefix', '__is_other_work',
-            '__load_cached_identity',
+            '__load_cached_identity', '_is_llm_primary',
             '__search_tv_by_name'], self.ns, keep_attrs=True)
         self.media = cls()
 

@@ -100,7 +100,8 @@ class CourEpisodeRecognitionTest(unittest.TestCase):
                     'numbering': 'tmdb'})[str(path)]
             self.assertIsNone(meta.skip_reason)
             self.assertEqual((4, 37), (meta.begin_season, meta.begin_episode))
-            llm.assert_not_called()
+            llm.return_value.merge_into.assert_not_called()
+            llm.return_value.parse.assert_not_called()
 
 
 class OrdinaryEpisodeCollisionTest(unittest.TestCase):

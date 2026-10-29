@@ -10,6 +10,7 @@ from app.filter import Filter
 from app.helper import DbHelper
 from app.media import Media
 from app.media.meta import MetaInfo
+from app.media.meta.llm_parser import LLMMetaParser
 from app.sites import Sites
 from app.subscribe import Subscribe
 from app.utils import DomUtils, RequestUtils, StringUtils, ExceptionUtils, RssTitleUtils, Torrent
@@ -405,6 +406,8 @@ class Rss:
         :param site_proxy: 是否使用代理
         :return: 匹配到的订阅ID、是否洗版、总集数、匹配规则的资源顺序、上传因子、下载因子，匹配的季（电视剧）
         """
+        if getattr(media_info, "skip_reason", None):
+            return False, [media_info.skip_reason], {}
         # 默认值
         # 匹配状态 0不在订阅范围内 -1不符合过滤条件 1匹配
         match_flag = False
@@ -700,7 +703,8 @@ class Rss:
         RSS feed 会返回同站点大量文章。若文章标题已能按订阅名匹配到剧集订阅，
         且规则解析出的集数明确不在该订阅缺失集里，则在完整识别/LLM前跳过。
         """
-        if not title or not rss_tvs:
+        # Primary recognition must see the release before any episode-number veto.
+        if LLMMetaParser().is_primary() or not title or not rss_tvs:
             return False
 
         matched_rss_infos = [

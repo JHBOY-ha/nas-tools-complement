@@ -23,14 +23,15 @@ def prepare_title(title):
     title, messages, used = WordsHelper().process(title)
     for message in messages or []:
         log.warn("【Meta】%s" % message)
+    llm_title = title
     title, fractional = protect_fractional_episode(title)
     extras = ((Config().get_config("media") or {}).get("extras") or {}).get("enabled") is True
     title, special = extract_special(title, include_extras=extras)
     title, cut = extract_cut(title)
-    return dict(original=original, title=title, used=used, fractional=fractional, special=special, cut=cut)
+    return dict(original=original, title=title, llm_title=llm_title, used=used, fractional=fractional, special=special, cut=cut)
 
 
-def MetaInfo(title, subtitle=None, mtype=None, use_llm=True, _prepared=None):
+def MetaInfo(title, subtitle=None, mtype=None, use_llm=True, _prepared=None, recognition_context=None):
     """
     媒体整理入口，根据名称和副标题，判断是哪种类型的识别，返回对应对象
     :param title: 标题、种子名、文件名
@@ -58,6 +59,26 @@ def MetaInfo(title, subtitle=None, mtype=None, use_llm=True, _prepared=None):
         fileflag = True
     else:
         fileflag = False
+
+    if use_llm and LLMMetaParser().is_primary() is True:
+        # Primary mode never starts from MetaVideo/anitopy's identity guesses.
+        meta_info = MetaBase(original_title, subtitle, fileflag)
+        meta_info.ignored_words = used_info.get("ignored")
+        meta_info.replaced_words = used_info.get("replaced")
+        meta_info.offset_words = used_info.get("offset")
+        meta_info.cut = cut
+        evidence = dict(recognition_context or {})
+        evidence["original_title"] = original_title
+        meta_info = LLMMetaParser().merge_into(
+            meta_info, prepared.get("llm_title", original_title), subtitle, mtype, recognition_context=evidence)
+        if fractional_episode:
+            fractional_episode["source_season"] = meta_info.begin_season
+            meta_info.note["fractional_episode"] = fractional_episode
+        if special:
+            special["source_season"] = meta_info.begin_season
+            special["source_filename"] = os.path.basename(original_title)
+            meta_info.note["extra" if special["is_extra"] else "special_episode"] = special
+        return meta_info
 
     if numeric_movie:
         # Numeric movie titles still pass through user rules and common provenance assignment.
