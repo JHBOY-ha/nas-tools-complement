@@ -1065,6 +1065,13 @@ class WebAction:
             outpath = os.path.normpath(outpath)
         if not os.path.exists(inpath):
             return False, "输入路径不存在"
+        try:
+            # Reject malformed controls before TMDB lookup; movie inputs do not
+            # consume hidden episode fields left over from the TV form.
+            episode = (EpisodeFormat(None) if media_type == MediaType.MOVIE else
+                       EpisodeFormat(episode_format, episode_details, episode_offset))
+        except ValueError as error:
+            return False, str(error)
         if tmdbid:
             # 有输入TMDBID
             tmdb_info = Media().get_tmdb_info(mtype=media_type, tmdbid=tmdbid)
@@ -1078,11 +1085,7 @@ class WebAction:
                                                                tmdb_info=tmdb_info,
                                                                media_type=media_type,
                                                                season=season,
-                                                               episode=(
-                                                                   EpisodeFormat(episode_format,
-                                                                                 episode_details,
-                                                                                 episode_offset),
-                                                                   need_fix_all),
+                                                               episode=(episode, need_fix_all),
                                                                min_filesize=min_filesize,
                                                                udf_flag=True)
         else:
@@ -1094,11 +1097,7 @@ class WebAction:
                                                                target_dir=outpath,
                                                                media_type=media_type,
                                                                season=season,
-                                                               episode=(
-                                                                   EpisodeFormat(episode_format,
-                                                                                 episode_details,
-                                                                                 episode_offset),
-                                                                   need_fix_all),
+                                                               episode=(episode, need_fix_all),
                                                                min_filesize=min_filesize,
                                                                udf_flag=True)
         return succ_flag, ret_msg

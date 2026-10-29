@@ -22,6 +22,10 @@ RECOGNITION_MODULES = (
     "tests.test_fractional_versions",
     # Include manual EP priority and its target/publication safeguards.
     "tests.test_manual_episode_precedence",
+    # Numeric guards, scan rejection reasons and the current receipt lifecycle.
+    "tests.test_episode_transfer_guards",
+    # Preserve title roles through provider lookup and cache reuse.
+    "tests.test_series_name_integrity",
     "tests.test_special_episodes",
     "tests.test_special_confirmation",
     "tests.test_review_regressions",
@@ -44,6 +48,12 @@ RECOGNITION_MODULES = (
     "tests.test_meta_multi_episode_guards",
     "tests.test_meta_recognition_matrix",
     "tests.test_media_identity_matrix",
+    # Constraint matrix for the series recognition invariants (C1-C6).
+    "tests.test_recognition_invariants",
+    # Cross-branch regressions: release evidence, identity sources and query reuse.
+    "tests.test_recognition_special_crossings",
+    "tests.test_recognition_llm_crossings",
+    "tests.test_recognition_query_crossings",
 )
 
 

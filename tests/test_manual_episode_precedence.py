@@ -96,7 +96,11 @@ class ManualEpisodePrecedenceTest(unittest.TestCase):
         self.assertEqual((2, [3]), (meta.begin_season, meta.get_episode_list()))
 
     def test_missing_invalid_or_incomplete_targets_fail_closed(self):
-        for value in ("9", "-1", "4-3", "3-5"):
+        # Structurally invalid controls now fail before recognition/provider lookup.
+        for value in ("-1", "4-3"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "集数"):
+                EpisodeFormat(None, value)
+        for value in ("9", "3-5"):
             with self.subTest(value=value):
                 self.assertTrue(self.recognize(EpisodeFormat(None, value)).skip_reason)
         for episodes in ([], [dict(self.episodes[1], show_id=99)],

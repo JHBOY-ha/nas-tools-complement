@@ -331,7 +331,8 @@ class LLMMetaParserTest(TestCase):
         verified = self.parser._LLMMetaParser__verify_candidate_binding(
             {"tmdb_id": 45790, "tmdb_type": "tv", "tmdb_season": 6,
              "cn_name": "JoJo的奇妙冒险 飙马野郎"},
-            payload, title)
+            # Publisher-provided subtitle is independent of the model translation.
+            payload, title, subtitle="JoJo的奇妙冒险 飙马野郎")
 
         self.assertTrue(verified.get("season_verified"))
         self.assertEqual(6, verified.get("tmdb_season"))
@@ -352,7 +353,7 @@ class LLMMetaParserTest(TestCase):
         verified = self.parser._LLMMetaParser__verify_candidate_binding(
             {"tmdb_id": 45790, "tmdb_type": "tv", "tmdb_season": 1,
              "cn_name": "JoJo的奇妙冒险 飙马野郎"},
-            payload, title)
+            payload, title, subtitle="JoJo的奇妙冒险 飙马野郎")
 
         self.assertTrue(verified.get("season_verified"))
         self.assertEqual(6, verified.get("tmdb_season"))

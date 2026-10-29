@@ -1,7 +1,7 @@
 import os
 import re
 
-from config import RMT_MEDIAEXT
+from config import RMT_MEDIAEXT, SPLIT_CHARS
 from app.media.meta._base import MetaBase, is_fansub_release_name
 from app.utils import StringUtils
 from app.utils.tokens import Tokens
@@ -88,6 +88,18 @@ class MetaVideo(MetaBase):
         # 拆分tokens
         # Tokens 会拆掉 +；以可识别 token 保护 HDR10+，解析后恢复标记。
         title = re.sub(r"(?i)(?<![A-Z0-9])HDR10\+(?![A-Z0-9])", "HDR10PLUS", title)
+        # Explicit E/EP evidence outranks an earlier bare number in the title.
+        # Season-only releases retain the existing bare-number interpretation.
+        self._has_explicit_episode = any(re.search(r"EP?\d", marker, re.I) for marker in
+            re.findall(self._season_episode_marker_re, title, re.I))
+        # Use the same token boundaries and year exclusion as the parser itself;
+        # Episode(03) is valid, while the words Episode 2020 are not an EP marker.
+        parts = [part for part in re.split(SPLIT_CHARS, title) if part]
+        self._has_explicit_episode = (self._has_explicit_episode
+            or any(re.fullmatch(r"\d{1,2}x\d{1,3}", part, re.I) for part in parts)
+            or any(marker.upper() == "EPISODE" and self.__valid_written_number(marker, number)
+                   for marker, number in zip(parts, parts[1:]))
+            or bool(re.search(r"第\s*[0-9一二三四五六七八九十]+\s*[集话話期]", title)))
         tokens = Tokens(title)
         self.tokens = tokens
         # 解析名称、年份、季、集、资源类型、分辨率等
@@ -190,16 +202,20 @@ class MetaVideo(MetaBase):
                 name = None
         return self.normalize_release_version_suffix(name)
 
-    def __is_written_marker(self, token):
-        # 仅在下一 token 是有效编号时消费英文标记，保留真实片名中的单词。
+    @staticmethod
+    def __valid_written_number(token, following):
+        """Share written-marker recognition with the earlier title-number look-ahead."""
         limit = {"SEASON": 2, "EPISODE": 4}.get(token.upper())
-        following = self.tokens.cur()
-        if token.upper() == "SEASON" and self.__ordinal_season():
-            # 4th Season 已经给出季号，后面的数字是集号（[4th Season][18 - 总第84]）
-            return False
         return bool(limit and following and following.isdigit()
                     and len(following) <= limit
                     and not (len(following) == 4 and following.startswith(("19", "20"))))
+
+    def __is_written_marker(self, token):
+        # 仅在下一 token 是有效编号时消费英文标记，保留真实片名中的单词。
+        if token.upper() == "SEASON" and self.__ordinal_season():
+            # 4th Season 已经给出季号，后面的数字是集号（[4th Season][18 - 总第84]）
+            return False
+        return self.__valid_written_number(token, self.tokens.cur())
 
     def __ordinal_season(self):
         match = re.fullmatch(r"(\d{1,2})(?:ST|ND|RD|TH)", self._prev_raw_token or "", re.IGNORECASE)
@@ -266,6 +282,14 @@ class MetaVideo(MetaBase):
                 if self._last_token_type == 'name_se_words':
                     return
                 if self.get_name():
+                    if (token.isdigit() and self._has_explicit_episode and self.begin_episode is None
+                            and (len(token) < 4 or token.startswith('0'))):
+                        # Keep Class of 09 (and Chinese numeric suffixes) as a
+                        # title when the filename supplies a separate explicit EP.
+                        field = "cn_name" if self._last_token_type == "cnname" else "en_name"
+                        setattr(self, field, "%s %s" % (getattr(self, field) or "", token))
+                        self._continue_flag = False
+                        return
                     # 名字后面以 0 开头的不要，极有可能是集
                     if token.startswith('0'):
                         return
@@ -323,7 +347,7 @@ class MetaVideo(MetaBase):
         拼进片名，得到 “Hundred 10” 这样的脏片名并且丢掉集号。这里只处理发布名同时
         具备“开头组名块 + 数字后面紧跟元数据块”的情况，普通电影名（Toy Story 4）不受影响。
         """
-        if not token.isdigit() or not 1 <= len(token) <= 3:
+        if self._has_explicit_episode or not token.isdigit() or not 1 <= len(token) <= 3:
             return False
         if token.startswith("0"):
             # 0 开头的数字交给后面的 __init_episode 处理
@@ -476,9 +500,9 @@ class MetaVideo(MetaBase):
                     if se > self.begin_season:
                         self.end_season = se
                         self.total_seasons = (self.end_season - self.begin_season) + 1
-                        if self.fileflag and self.total_seasons > 1:
-                            self.end_season = None
-                            self.total_seasons = 1
+                        # Retain the source range in file mode too. Recognition
+                        # and transfer must reject ambiguity, not silently name
+                        # a multi-season file as its first season.
         elif token.isdigit():
             try:
                 int(token)
@@ -587,6 +611,10 @@ class MetaVideo(MetaBase):
                             self.end_episode = None
                             self.total_episodes = 1
         elif token.isdigit():
+            if (self._has_explicit_episode and self.begin_episode is None
+                    and self._last_token_type != "EPISODE"):
+                # Do not let a release number before the marker claim the EP slot.
+                return
             try:
                 int(token)
             except ValueError:
