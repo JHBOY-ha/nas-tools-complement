@@ -9,6 +9,7 @@ from app.media import Media
 from app.media.meta import MetaInfo
 from app.media.meta.special_resolver import identity, tmdb_type
 from app.utils import DomUtils, RequestUtils, StringUtils, ExceptionUtils
+from app.utils.search_cancellation import search_is_canceled
 from app.utils.types import MediaType, SearchType
 
 
@@ -57,7 +58,7 @@ class _IIndexClient(metaclass=ABCMeta):
         """
         根据关键字多线程检索
         """
-        if not indexer or not key_word:
+        if search_is_canceled() or not indexer or not key_word:
             return None
         if filter_args is None:
             filter_args = {}
@@ -73,6 +74,8 @@ class _IIndexClient(metaclass=ABCMeta):
                                                         allow_space=True)
         api_url = f"{indexer.domain}?apikey={self.api_key}&t=search&q={search_word}"
         result_array = self.__parse_torznabxml(api_url)
+        if search_is_canceled():
+            return []
         if len(result_array) == 0:
             log.warn(f"【{self.index_type}】{indexer.name} 未检索到数据")
             # Session-owned status must not overwrite another web search bar.
@@ -206,6 +209,10 @@ class _IIndexClient(metaclass=ABCMeta):
         index_match_fail = 0
         index_error = 0
         for item in result_array:
+            # A site can return hundreds of releases. Stop between releases and
+            # after parsing so cancellation cannot start a second recognition.
+            if search_is_canceled():
+                return []
             # 这此站标题和副标题相反
             if indexer.id in self._reverse_title_sites:
                 torrent_name = item.get('description')
@@ -233,6 +240,8 @@ class _IIndexClient(metaclass=ABCMeta):
                 continue
             # 识别种子名称
             meta_info = MetaInfo(title=torrent_name, subtitle=description)
+            if search_is_canceled():
+                return []
             if not meta_info.get_name():
                 log.info(f"【{self.index_type}】{torrent_name} 无法识别到名称")
                 index_match_fail += 1
@@ -351,6 +360,8 @@ class _IIndexClient(metaclass=ABCMeta):
                             f"跳过低优先级或同优先级资源：{torrent_name}"
                         )
                         continue
+            if search_is_canceled():
+                return []
             # 检查标题是否匹配季、集、年
             if not self.filter.is_torrent_match_sey(media_info,
                                                     filter_args.get("season"),

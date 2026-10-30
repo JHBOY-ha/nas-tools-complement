@@ -5,6 +5,7 @@ import re
 import threading
 import time
 import traceback
+from contextlib import contextmanager
 from typing import Union
 from urllib.parse import parse_qs, urlparse
 
@@ -18,6 +19,7 @@ from app.message import Message
 from app.searcher import Searcher
 from app.subscribe import Subscribe
 from app.utils.commons import singleton
+from app.utils.search_cancellation import SearchCancelled, search_cancellation
 from app.utils.types import MediaType, SearchType
 from app.utils.workload import TaskQueueFull
 from config import Config
@@ -114,7 +116,10 @@ class TelegramSearch:
         try:
             self.helper.start_thread(self.run_job, (sid, function, args, kwargs), pool='background')
         except TaskQueueFull:
+            self.stop_search(sid, self.store.get(sid)['epoch'])
             with self.store.edit(sid) as record:
+                if record['state'] == 'canceled':
+                    return
                 record['message'] = '任务队列繁忙，请稍后重试'
                 if record['state'] in ACTIVE_SEARCH_STATES:
                     record['state'] = 'interrupted'
@@ -128,18 +133,64 @@ class TelegramSearch:
             frames = traceback.extract_tb(error.__traceback__)
             location = ' → '.join(f'{frame.name}:{frame.lineno}' for frame in frames)
             log.error(f'【Telegram Search】{function.__name__}: {type(error).__name__} ({location})')
+            self.stop_search(sid, self.store.get(sid)['epoch'])
             with self.store.edit(sid) as record:
+                if record['state'] == 'canceled':
+                    return
                 record['message'] = '操作失败，请查看日志或稍后重试'
                 if record['state'] in ACTIVE_SEARCH_STATES:
                     record['state'] = 'failed'
             self.publish(sid)
 
+    def stop_search(self, sid, epoch):
+        with self.lock:
+            event = self.cancel_events.get((sid, epoch))
+            if event:
+                event.set()
+
+    def check_submission(self, sid, epoch):
+        # Manual actions can run after the search worker has gone, so consult
+        # the durable session as well as any in-memory cancellation handle.
+        with self.lock:
+            cancel = self.cancel_events.get((sid, epoch))
+        record = self.store.get(sid)
+        if ((cancel and cancel.is_set()) or record['epoch'] != epoch
+                or record['state'] in ('canceled', 'failed', 'interrupted')):
+            raise SearchCancelled('搜索已停止')
+
+    @contextmanager
+    def search_scope(self, sid, epoch):
+        # Register before any provider work, including candidate identification
+        # and library checks. An early stop must not be lost at worker startup.
+        cancel = threading.Event()
+        with self.lock:
+            self.cancel_events[(sid, epoch)] = cancel
+        try:
+            record = self.store.get(sid)
+            if record['epoch'] != epoch or record['state'] not in ACTIVE_SEARCH_STATES:
+                cancel.set()
+            with search_cancellation(cancel, disable_llm_retries=True):
+                yield cancel
+        finally:
+            # Always signal before dropping the handle: site workers may still
+            # be returning from I/O after a timeout or a publication exception.
+            cancel.set()
+            with self.lock:
+                self.cancel_events.pop((sid, epoch), None)
+
     def identify(self, sid, epoch, page=1):
+        with self.search_scope(sid, epoch) as cancel:
+            if not cancel.is_set():
+                self._identify(sid, epoch, page, cancel)
+
+    def _identify(self, sid, epoch, page, cancel):
         record = self.store.get(sid)
         self.publish(sid)
+        if cancel.is_set():
+            return
         candidates = WebUtils.search_media_infos(record['query'], page=page)
         with self.store.edit(sid) as current:
-            if current['epoch'] != epoch or current['state'] == 'canceled':
+            if cancel.is_set() or current['epoch'] != epoch or current['state'] != 'identifying':
                 return
             known = {(value.get('type'), value.get('tmdb_id'), value.get('douban_id'), value.get('title'), value.get('year'))
                      for value in current['candidates']}
@@ -195,16 +246,15 @@ class TelegramSearch:
             # Recheck ownership/version after queueing: the session can advance
             # while a callback waits, even though its wire data is already valid.
             record = self.store.owned(sid, owner, chat, epoch, channel='telegram')
-            if time.time() > record['expires_at'] and action not in ('restart', 'status'):
+            if time.time() > record['expires_at'] and action not in ('cancel', 'restart', 'status'):
                 self.publish(sid)
                 return
             if action == 'cancel':
+                # Signal first even if saving or publishing the confirmation
+                # fails; stopping token-consuming work must not depend on UI I/O.
+                self.stop_search(sid, epoch)
                 with self.store.edit(sid) as current:
-                    current.update(state='canceled', message='搜索已取消；已提交的下载不受影响')
-                with self.lock:
-                    event = self.cancel_events.get((sid, epoch))
-                    if event:
-                        event.set()
+                    current.update(state='canceled', message='搜索已停止；已发出的请求返回后退出，已提交的下载不受影响')
             elif action == 'pick':
                 index = argument
                 if record['state'] != 'candidates' or not 0 <= index < len(record['candidates']):
@@ -304,6 +354,11 @@ class TelegramSearch:
             self.client().search_message(chat, '所选项目已变化，请刷新后重试', [])
 
     def search(self, sid, epoch):
+        with self.search_scope(sid, epoch) as cancel:
+            if not cancel.is_set():
+                self._search(sid, epoch, cancel)
+
+    def _search(self, sid, epoch, cancel):
         record = self.store.get(sid)
         media = unpack_media(record['selected'])
         if not media.tmdb_id:
@@ -312,26 +367,25 @@ class TelegramSearch:
             media = Media().get_media_info(title=media.get_title_string(), mtype=media.type, strict=True)
             if not media or not media.tmdb_id:
                 raise ValueError('无法匹配 TMDB 电影')
+        if cancel.is_set():
+            return
         downloader = Downloader()
         exists, no_exists, messages = downloader.check_exists_medias(meta_info=media)
         with self.store.edit(sid) as current:
-            if current['epoch'] != epoch or current['state'] == 'canceled':
+            if cancel.is_set() or current['epoch'] != epoch or current['state'] != 'queued':
                 return
             current['selected'] = pack_media(media)
             current.update(state='exists' if exists else 'searching',
                            message='媒体库中已有这部作品' if exists else '正在搜索资源…')
         self.publish(sid)
-        if exists:
+        if exists or cancel.is_set():
             return
-        cancel = threading.Event()
-        with self.lock:
-            self.cancel_events[(sid, epoch)] = cancel
         last_update = 0.0
         collected = {}
         def progress(results, report, flush=False):
             nonlocal last_update
             current = self.store.get(sid)
-            if current['epoch'] != epoch or current['state'] != 'searching':
+            if cancel.is_set() or current['epoch'] != epoch or current['state'] != 'searching':
                 cancel.set()
                 return
             for item in results:
@@ -350,7 +404,7 @@ class TelegramSearch:
             if not flush and time.monotonic() - last_update < 2:
                 return
             with self.store.edit(sid) as current:
-                if current['state'] != 'searching':
+                if cancel.is_set() or current['epoch'] != epoch or current['state'] != 'searching':
                     cancel.set()
                     return
                 current.update(report={key: dict(value) for key, value in report.items()}, results=copy.deepcopy(collected),
@@ -359,53 +413,53 @@ class TelegramSearch:
             self.publish(sid)
         context = {'cancel_event': cancel, 'on_progress': progress}
         searcher = Searcher()
-        try:
-            searcher.search_one_media(media, SearchType.TG, no_exists,
-                                       sites=record['preferences']['sites'] or media.search_sites,
-                                       search_context=context, search_only=True)
-            # Use only provider-backed alternative names, only after no valid
-            # result, and retain the same dispatch context to avoid repeat calls.
-            if not context.get('results') and not cancel.is_set():
-                aliases = (media.tmdb_info or {}).get('alternative_titles') or {}
-                provider = searcher.media.movie if media.type == MediaType.MOVIE else searcher.media.tv
-                if not aliases and provider:
-                    try:
-                        details = provider.details(media.tmdb_id, append_to_response='alternative_titles', language='en-US')
-                        aliases = details.get('alternative_titles') or {}
-                    except Exception as error:
-                        log.warn(f'【Telegram Search】别名查询失败：{type(error).__name__}')
-                titles = aliases.get('titles') or aliases.get('results') or []
-                known = {name.casefold() for name in (media.title, media.cn_name, media.original_title,
-                                                     context.get('english_word')) if name}
-                names = []
-                for value in titles:
-                    alias = value.get('title')
-                    if alias and value.get('iso_3166_1') in ('US', 'GB', 'CN') and alias.casefold() not in known:
-                        known.add(alias.casefold())
-                        names.append(alias)
-                for alias in names[:2]:
-                    found = searcher.search_medias(alias, {'year': media.year, 'type': media.type,
-                        'site': record['preferences']['sites'], 'seeders': True}, media, SearchType.TG,
-                        search_context=context)
-                    if found or cancel.is_set():
-                        break
-            progress([], context.get('report', {}), flush=True)
-            with self.store.edit(sid) as current:
-                if cancel.is_set() or current['state'] != 'searching':
-                    return
-                current.update(state='results', message='搜索完成' if current['results'] else '没有找到有效资源')
-            self.publish(sid)
-            settings = Config().get_config('pt')
-            if settings.get('search_no_result_rss') and not self.store.get(sid)['results']:
-                self.subscribe(sid)
-            if settings.get('search_auto', True):
-                items = [unpack_media(value) for _, value in visible_results(self.store.get(sid))]
-                # Reuse the existing ranking and select only after all rounds.
-                for item in downloader.get_download_list(items):
-                    self.download(sid, epoch, resource_key(item), automatic=True, no_exists=no_exists)
-        finally:
-            with self.lock:
-                self.cancel_events.pop((sid, epoch), None)
+        searcher.search_one_media(media, SearchType.TG, no_exists,
+                                   sites=record['preferences']['sites'] or media.search_sites,
+                                   search_context=context, search_only=True)
+        # Use only provider-backed alternative names, only after no valid
+        # result, and retain the same dispatch context to avoid repeat calls.
+        if not context.get('results') and not cancel.is_set():
+            aliases = (media.tmdb_info or {}).get('alternative_titles') or {}
+            provider = searcher.media.movie if media.type == MediaType.MOVIE else searcher.media.tv
+            if not aliases and provider:
+                try:
+                    details = provider.details(media.tmdb_id, append_to_response='alternative_titles', language='en-US')
+                    aliases = details.get('alternative_titles') or {}
+                except Exception as error:
+                    log.warn(f'【Telegram Search】别名查询失败：{type(error).__name__}')
+            titles = aliases.get('titles') or aliases.get('results') or []
+            known = {name.casefold() for name in (media.title, media.cn_name, media.original_title,
+                                                 context.get('english_word')) if name}
+            names = []
+            for value in titles:
+                alias = value.get('title')
+                if alias and value.get('iso_3166_1') in ('US', 'GB', 'CN') and alias.casefold() not in known:
+                    known.add(alias.casefold())
+                    names.append(alias)
+            for alias in names[:2]:
+                if cancel.is_set():
+                    break
+                found = searcher.search_medias(alias, {'year': media.year, 'type': media.type,
+                    'site': record['preferences']['sites'], 'seeders': True}, media, SearchType.TG,
+                    search_context=context)
+                if found or cancel.is_set():
+                    break
+        progress([], context.get('report', {}), flush=True)
+        with self.store.edit(sid) as current:
+            if cancel.is_set() or current['state'] != 'searching':
+                return
+            current.update(state='results', message='搜索完成' if current['results'] else '没有找到有效资源')
+        self.publish(sid)
+        if cancel.is_set():
+            return
+        settings = Config().get_config('pt')
+        if settings.get('search_no_result_rss') and not self.store.get(sid)['results']:
+            self.subscribe(sid)
+        if settings.get('search_auto', True):
+            items = [unpack_media(value) for _, value in visible_results(self.store.get(sid))]
+            # Reuse the existing ranking and select only after all rounds.
+            for item in downloader.get_download_list(items):
+                self.download(sid, epoch, resource_key(item), automatic=True, no_exists=no_exists)
 
 
     def download(self, sid, epoch, rid, automatic=False, no_exists=None, source_index=None):
@@ -437,6 +491,10 @@ class TelegramSearch:
         downloader = Downloader()
         operation = self.store.get(sid)['downloads'][rid]
         attempted = False
+        def before_submit():
+            nonlocal attempted
+            self.check_submission(sid, epoch)
+            attempted = True
         try:
             status = downloader.get_search_task_status(operation['tag'], setting, media.site)
             if status.get('lookup_failed'):
@@ -447,20 +505,31 @@ class TelegramSearch:
                 exists, _, _ = downloader.check_exists_medias(meta_info=media)
                 if exists:
                     operation.update(state='exists', message='媒体库中已存在，未重复下载')
+                elif self.store.get(sid)['state'] in ('canceled', 'failed', 'interrupted'):
+                    # A stop during downloader/library checks still precedes
+                    # submission; preserve the receipt without starting a task.
+                    operation.update(state='not_submitted', message='搜索已停止，尚未提交下载')
                 else:
-                    attempted = True
                     if automatic:
                         media.download_setting = setting
                         downloaded, _ = downloader.batch_download(SearchType.TG, [media],
-                            need_tvs=no_exists, user_name=record['user_name'], task_tag=tag)
+                            need_tvs=no_exists, user_name=record['user_name'], task_tag=tag,
+                            before_submit=before_submit)
                         result = bool(downloaded)
                     else:
-                        result, _ = downloader.download(media, download_setting=setting, task_tag=tag)
+                        result, _ = downloader.download(media, download_setting=setting, task_tag=tag,
+                                                         before_submit=before_submit)
                     operation.update(state='accepted' if result else 'unknown',
                         message='已提交到下载器' if result else '提交状态待确认，请查询下载器后处理')
                     # Confirmation is durable independently of later status
                     # lookups. The existing poller (or status button) resolves
                     # the task ID; a query failure must not undo acceptance.
+        except SearchCancelled:
+            # A batch may already have submitted an earlier item. Keep that
+            # receipt uncertain rather than allowing a duplicate submission.
+            operation.update(state='unknown' if attempted else 'not_submitted',
+                             message='搜索已停止；已尝试提交的下载请查询下载器' if attempted
+                             else '搜索已停止，尚未提交下载')
         except Exception as error:
             log.error(f'【Telegram Search】下载{"提交" if attempted else "检查"}失败：{type(error).__name__}')
             operation.update(state='unknown' if attempted else 'not_submitted',
@@ -495,17 +564,25 @@ class TelegramSearch:
 
     def subscribe(self, sid):
         with self.store.edit(sid) as record:
-            if record.get('subscription'):
+            if record.get('subscription') or record['state'] in ('canceled', 'failed', 'interrupted'):
                 return
             record['subscription'] = 'submitting'
         media = unpack_media(record['selected'])
-        code, message, _ = Subscribe().add_rss_subscribe(
-            mtype=media.type, name=media.title, year=media.year, season=media.begin_season,
-            mediaid=media.tmdb_id, state='R', rss_sites=media.rss_sites,
-            search_sites=record['preferences']['sites'] or media.search_sites)
+        try:
+            code, message, _ = Subscribe().add_rss_subscribe(
+                mtype=media.type, name=media.title, year=media.year, season=media.begin_season,
+                mediaid=media.tmdb_id, state='R', rss_sites=media.rss_sites,
+                search_sites=record['preferences']['sites'] or media.search_sites,
+                before_submit=lambda: self.check_submission(sid, record['epoch']))
+        except SearchCancelled:
+            with self.store.edit(sid) as current:
+                current['subscription'] = None
+            self.publish(sid)
+            return
         with self.store.edit(sid) as current:
             current['subscription'] = 'accepted' if code == 0 else None
-            current['message'] = '已添加订阅' if code == 0 else '订阅失败：' + str(message)
+            if current['state'] not in ('canceled', 'failed', 'interrupted'):
+                current['message'] = '已添加订阅' if code == 0 else '订阅失败：' + str(message)
         self.publish(sid)
 
     def publish(self, sid):

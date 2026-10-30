@@ -11,6 +11,7 @@ from app.indexer.client._spider import TorrentSpider
 from app.indexer.client._tnode import TNodeSpider
 from app.sites import Sites
 from app.utils import StringUtils
+from app.utils.search_cancellation import search_is_canceled
 from app.utils.types import SearchType, IndexerType
 from config import Config
 
@@ -121,6 +122,8 @@ class BuiltinIndexer(_IIndexClient):
         """
         if not indexer or not key_word:
             return None
+        if search_is_canceled():
+            return []
         # 不是配置的索引站点过滤掉
         indexer_sites = Config().get_config("pt").get("indexer_sites") or []
         if indexer_sites and indexer.id not in indexer_sites:
@@ -168,6 +171,8 @@ class BuiltinIndexer(_IIndexClient):
             if stats is not None:
                 stats["state"] = "failed"
             print(str(err))
+        if search_is_canceled():
+            return []
         if stats is not None:
             stats["raw"] = len(result_array)
         if len(result_array) == 0:

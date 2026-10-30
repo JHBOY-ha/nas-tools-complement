@@ -1,4 +1,5 @@
 import datetime
+import threading
 import time
 from concurrent.futures import wait, FIRST_COMPLETED
 
@@ -9,6 +10,7 @@ from app.helper import ProgressHelper, SubmoduleHelper
 from app.indexer.client import BuiltinIndexer
 from app.utils import ExceptionUtils, StringUtils
 from app.utils.commons import singleton
+from app.utils.search_cancellation import search_cancellation, search_is_canceled
 from app.utils.types import SearchType, IndexerType
 from app.utils.workload import BoundedExecutor, TaskQueueFull
 from config import Config
@@ -147,6 +149,12 @@ class Indexer(object):
         if not key_word:
             return []
 
+        if search_context is None:
+            search_context = {}
+        cancel = search_context.get("cancel_event")
+        if cancel and cancel.is_set():
+            return []
+
         indexers = self.get_indexers()
         if not indexers:
             log.error(f"【{self._client_type.value}】没有有效的索引器配置！")
@@ -154,12 +162,9 @@ class Indexer(object):
         # 按站点语言选择片名，不能等所有中文站都无结果才补搜英文站。
         # 分发前只解析一次，避免多个站点并发查询同一影片的英文详情。
         # 自定义关键字和未识别的快速搜索保留用户输入，不擅自替换。
-        if search_context is None:
-            search_context = {}
         submitted = search_context.setdefault("submitted", set())
         report = search_context.setdefault("report", {})
         observer = search_context.get("on_progress")
-        cancel = search_context.get("cancel_event")
         if observer:
             filter_args = dict(filter_args or {}, _session_search=True)
         english_word = None
@@ -202,10 +207,15 @@ class Indexer(object):
         # background task cannot consume its own executor's remaining workers.
         executor = self._search_executor
         all_task = []
-        task_queries = {}
+        scheduled = set()
         task_sites = {}
         ret_array = []
         unfinished = 0
+        # A round's timeout/exception must also stop already-running recognition.
+        # Keep this separate from the session event so ordinary fallback rounds
+        # can still retry queries that never started before the deadline.
+        stop = threading.Event()
+        dispatch_lock = threading.Lock()
         try:
             for index in indexers:
                 if cancel and cancel.is_set():
@@ -222,13 +232,14 @@ class Indexer(object):
                     text=site_word, replace_word=" ", allow_space=True)
                 query_key = (self._client_type.value, index.id,
                              tuple(normalized_word) if isinstance(normalized_word, list) else normalized_word)
-                if query_key in submitted:
+                if query_key in submitted or query_key in scheduled:
                     continue
                 # 池内线程由 executor 复用，工作单元结束时归还数据库连接。
                 stats = {"name": getattr(index, 'name', str(index.id)), "state": "searching"}
                 report[str(index.id)] = stats
                 try:
-                    task = executor.submit(with_db_session(self._client.search),
+                    task = executor.submit(with_db_session(self._search_index),
+                                           cancel, stop, dispatch_lock, submitted, query_key,
                                            order_seq,
                                            index,
                                            site_word,
@@ -240,10 +251,10 @@ class Indexer(object):
                     stats["state"] = "busy"
                     unfinished += 1
                     continue
-                # 未准入的任务不能记为已搜索，下一轮仍允许尝试提交。
-                submitted.add(query_key)
+                # Reserve this round's queue entries separately. Only a worker
+                # that starts the site search may suppress a later round.
+                scheduled.add(query_key)
                 all_task.append(task)
-                task_queries[task] = query_key
                 task_sites[task] = stats
             if unfinished:
                 log.warn("【%s】检索队列繁忙，%s 个站点未准入，请稍后重试"
@@ -278,7 +289,12 @@ class Indexer(object):
                         self.progress.update(ptype='search', value=round(100 * (len(all_task) - len(pending)) / len(all_task)))
                     if observer:
                         observer(result, report)
+            # Signal before publishing the final report: Telegram transport may
+            # itself block while timed-out site workers return from their calls.
+            with dispatch_lock:
+                stop.set()
             for future in pending:
+                future.cancel()
                 task_sites[future]['state'] = 'canceled' if cancel and cancel.is_set() else 'timeout'
             unfinished += len(pending)
             if pending and not (cancel and cancel.is_set()):
@@ -290,13 +306,13 @@ class Indexer(object):
             if observer:
                 observer([], report)
         finally:
+            with dispatch_lock:
+                stop.set()
             # Cancel only this call's queued work, never shut down the shared
-            # executor or cancel another user's search. Running requests keep
-            # their slots until their real work and session cleanup finish.
+            # executor or cancel another user's search. In-flight requests keep
+            # their slots until they return; subsequent recognition is stopped.
             for task in all_task:
-                if task.cancel():
-                    # 尚未执行便取消的查询不应阻止第二轮重试。
-                    submitted.discard(task_queries[task])
+                task.cancel()
         # 计算耗时
         end_time = datetime.datetime.now()
         log.info(f"【{self._client_type.value}】检索结束，有效资源数：%s，未完成站点：%s，总耗时 %s 秒"
@@ -306,3 +322,13 @@ class Indexer(object):
                                                       % (len(ret_array), unfinished, (end_time - start_time).seconds),
                                  value=100)
         return ret_array
+
+    def _search_index(self, cancel, stop, dispatch_lock, submitted, query_key, *args, **kwargs):
+        with search_cancellation(cancel, stop, disable_llm_retries=cancel is not None):
+            # Serialize admission with round shutdown, not the network request.
+            # Queued work that exits here has never entered the shared dedupe set.
+            with dispatch_lock:
+                if search_is_canceled():
+                    return []
+                submitted.add(query_key)
+            return self._client.search(*args, **kwargs)

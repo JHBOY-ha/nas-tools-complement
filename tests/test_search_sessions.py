@@ -8,8 +8,12 @@ from unittest import TestCase
 from unittest.mock import Mock, patch
 
 from app.helper.search_sessions import SearchSessions, pack_media, unpack_media
+from app.downloader import Downloader
 from app.media.meta import MetaInfo
-from app.utils.types import MediaType, SearchType
+from app.subscribe import Subscribe
+from app.utils.types import DownloaderType, MediaType, SearchType
+from app.utils.llm_client import LLMClient
+from app.utils.search_cancellation import search_cancellation, search_is_canceled
 from app.utils.workload import TaskQueueFull
 from web.backend.telegram_search import TelegramSearch, resource_key
 from web.backend.telegram_search_view import render_search_message
@@ -43,6 +47,49 @@ def torrent(name='Dune.2021.1080p.WEB-DL', url='magnet:?xt=urn:btih:abc', site='
     media.resource_pix = '1080p'
     media.size, media.seeders = 1024 ** 3, 10
     return media
+
+
+class SearchLLMCancellationTest(TestCase):
+    def setUp(self):
+        self.config = {'base_url': 'https://llm.invalid/v1', 'api_key': 'offline-key',
+                       'model': 'offline', 'timeout': 20, 'max_retries': 2}
+
+    def test_stopped_search_does_not_construct_or_call_llm_client(self):
+        cancel = threading.Event()
+        cancel.set()
+        with patch('app.utils.llm_client.OpenAI') as sdk, search_cancellation(cancel, disable_llm_retries=True):
+            self.assertIsNone(LLMClient(self.config).complete_json('system', 'user'))
+        sdk.assert_not_called()
+
+    def test_cancellable_request_disables_sdk_retries_without_changing_shared_client(self):
+        sdk, request = Mock(), Mock()
+        sdk.with_options.return_value = request
+        reply = {'choices': [{'message': {'content': '{"ok": true}'}}]}
+        request.chat.completions.create.return_value = reply
+        sdk.chat.completions.create.return_value = reply
+        cancel = threading.Event()
+        with patch('app.utils.llm_client.OpenAI', return_value=sdk):
+            client = LLMClient(self.config)
+            with search_cancellation(cancel, disable_llm_retries=True):
+                self.assertEqual(client.complete_json('system', 'user'), {'ok': True})
+                cancel.set()
+                self.assertEqual(client.complete_text('system', 'user'), '')
+            self.assertEqual(client.complete_json('system', 'next user'), {'ok': True})
+        sdk.with_options.assert_called_once_with(timeout=20, max_retries=0)
+        request.chat.completions.create.assert_called_once()
+        sdk.chat.completions.create.assert_called_once()
+
+    def test_stop_while_preparing_request_prevents_sdk_send(self):
+        cancel = threading.Event()
+        sdk = Mock()
+        def options(**kwargs):
+            cancel.set()
+            return sdk
+        sdk.with_options.side_effect = options
+        with patch('app.utils.llm_client.OpenAI', return_value=sdk), \
+                search_cancellation(cancel, disable_llm_retries=True):
+            self.assertEqual(LLMClient(self.config).complete_text('system', 'user'), '')
+        sdk.chat.completions.create.assert_not_called()
 
 
 class SearchSessionFixture(TestCase):
@@ -272,6 +319,225 @@ class TelegramSearchTest(SearchSessionFixture):
         self.assertEqual(self.store.get(self.sid)['results'], {})
         downloader.download.assert_not_called()
         downloader.get_download_list.assert_not_called()
+
+    def test_failed_and_expired_searches_offer_stop_without_queue_capacity(self):
+        for state, expired in (('searching', False), ('failed', False), ('interrupted', False),
+                               ('searching', True), ('failed', True)):
+            with self.subTest(state=state, expired=expired):
+                with self.store.edit(self.sid) as record:
+                    record.update(state=state, expires_at=time.time() + (-1 if expired else 60))
+                event, other_event = threading.Event(), threading.Event()
+                self.service.cancel_events[(self.sid, 0)] = event
+                self.service.cancel_events[('another-session', 0)] = other_event
+                _, rows = render_search_message(self.store.get(self.sid))
+                button = next(button for row in rows for button in row if button['text'] == '停止搜索')
+                self.helper.start_thread.side_effect = TaskQueueFull('busy')
+                self.service.callback({'id': f'{state}-{expired}', 'from': {'id': 1},
+                    'message': {'chat': {'id': 1}}, 'data': button['callback_data']})
+                self.assertTrue(event.is_set())
+                self.assertFalse(other_event.is_set())
+                self.assertEqual(self.store.get(self.sid)['state'], 'canceled')
+                self.helper.start_thread.assert_not_called()
+
+    def test_stop_before_worker_start_skips_all_provider_work(self):
+        self.ready()
+        self.service.action(self.sid, 0, 'cancel', None, 1, 1)
+        with patch('web.backend.telegram_search.Downloader') as downloader, \
+                patch('web.backend.telegram_search.Media') as media, \
+                patch('web.backend.telegram_search.WebUtils.search_media_infos') as identify:
+            self.service.search(self.sid, 0)
+            self.service.identify(self.sid, 0)
+        downloader.assert_not_called()
+        media.assert_not_called()
+        identify.assert_not_called()
+        self.assertFalse(self.service.cancel_events)
+
+    def test_stop_during_library_check_skips_search_and_preserves_canceled_state(self):
+        self.ready()
+        with self.store.edit(self.sid) as record:
+            record['state'] = 'queued'
+        def check(**kwargs):
+            self.service.action(self.sid, 0, 'cancel', None, 1, 1)
+            self.assertTrue(search_is_canceled())
+            return False, {}, []
+        with patch('web.backend.telegram_search.Downloader') as downloader, \
+                patch('web.backend.telegram_search.Searcher') as searcher:
+            downloader.return_value.check_exists_medias.side_effect = check
+            self.service.search(self.sid, 0)
+        searcher.assert_not_called()
+        self.assertEqual(self.store.get(self.sid)['state'], 'canceled')
+        self.assertFalse(search_is_canceled())
+
+    def test_search_exception_signals_workers_before_failure_is_published(self):
+        self.ready()
+        with self.store.edit(self.sid) as record:
+            record.update(state='queued', results={})
+        events = []
+        def fail(*args, **kwargs):
+            events.append(kwargs['search_context']['cancel_event'])
+            raise RuntimeError('offline search failure')
+        with patch('web.backend.telegram_search.Downloader') as downloader, \
+                patch('web.backend.telegram_search.Searcher') as searcher, \
+                patch.object(self.service, 'subscribe') as subscribe:
+            downloader.return_value.check_exists_medias.return_value = (False, {}, [])
+            searcher.return_value.search_one_media.side_effect = fail
+            self.service.run_job(self.sid, self.service.search, (self.sid, 0), {})
+        self.assertTrue(events[0].is_set())
+        self.assertFalse(self.service.cancel_events)
+        self.assertEqual(self.store.get(self.sid)['state'], 'failed')
+        searcher.return_value.search_medias.assert_not_called()
+        downloader.return_value.get_download_list.assert_not_called()
+        subscribe.assert_not_called()
+        self.assertIn('操作失败', self.client.search_message.call_args.args[1])
+        self.assertTrue(any(button['text'] == '停止搜索'
+                            for row in self.client.search_message.call_args.args[2] for button in row))
+
+    def test_stopped_job_failure_does_not_replace_stop_confirmation(self):
+        def fail():
+            self.service.action(self.sid, 0, 'cancel', None, 1, 1)
+            raise RuntimeError('late provider failure')
+        self.service.run_job(self.sid, fail, (), {})
+        record = self.store.get(self.sid)
+        self.assertEqual(record['state'], 'canceled')
+        self.assertIn('搜索已停止', record['message'])
+
+    def test_stop_during_alias_lookup_skips_fallback_and_automatic_actions(self):
+        self.ready()
+        with self.store.edit(self.sid) as record:
+            record.update(state='queued', results={})
+        def aliases(*args, **kwargs):
+            self.service.action(self.sid, 0, 'cancel', None, 1, 1)
+            return {'alternative_titles': {'titles': [{'iso_3166_1': 'US', 'title': 'Dune: Part One'}]}}
+        with patch('web.backend.telegram_search.Downloader') as downloader, \
+                patch('web.backend.telegram_search.Searcher') as searcher, \
+                patch('web.backend.telegram_search.Subscribe') as subscribe:
+            downloader.return_value.check_exists_medias.return_value = (False, {}, [])
+            searcher.return_value.media.movie.details.side_effect = aliases
+            self.service.search(self.sid, 0)
+            self.service.subscribe(self.sid)
+        searcher.return_value.search_medias.assert_not_called()
+        downloader.return_value.get_download_list.assert_not_called()
+        subscribe.assert_not_called()
+
+    def test_failure_in_another_job_stops_the_same_sessions_active_search(self):
+        event = threading.Event()
+        self.service.cancel_events[(self.sid, 0)] = event
+        def fail():
+            raise RuntimeError('offline status failure')
+        self.service.run_job(self.sid, fail, (), {})
+        self.assertTrue(event.is_set())
+        self.assertEqual(self.store.get(self.sid)['state'], 'failed')
+
+    def test_stop_during_download_checks_prevents_unsubmitted_automatic_download(self):
+        rid = self.ready()
+        def check(**kwargs):
+            self.service.action(self.sid, 0, 'cancel', None, 1, 1)
+            return False, {}, []
+        with patch('web.backend.telegram_search.Downloader') as downloader:
+            downloader.return_value.get_search_task_status.return_value = {}
+            downloader.return_value.check_exists_medias.side_effect = check
+            self.service.download(self.sid, 0, rid, automatic=True)
+        downloader.return_value.batch_download.assert_not_called()
+        downloader.return_value.download.assert_not_called()
+        self.assertEqual(self.store.get(self.sid)['downloads'][rid]['state'], 'not_submitted')
+
+    def test_stop_during_subscription_lookup_prevents_database_write(self):
+        for media_type in (MediaType.MOVIE, MediaType.TV):
+            with self.subTest(media_type=media_type):
+                self.ready()
+                selected = movie()
+                selected.type = media_type
+                selected.begin_season = 1 if media_type == MediaType.TV else None
+                with self.store.edit(self.sid) as record:
+                    record['selected'] = pack_media(selected)
+                provider = Subscribe.__new__(Subscribe)
+                provider.dbhelper, provider.media = Mock(), Mock()
+                def stop():
+                    self.service.action(self.sid, 0, 'cancel', None, 1, 1)
+                def lookup(**kwargs):
+                    if media_type == MediaType.MOVIE:
+                        stop()
+                    return selected
+                def episodes(**kwargs):
+                    stop()
+                    return 10
+                provider.media.get_tmdb_season_episodes_num.side_effect = episodes
+                with patch('web.backend.telegram_search.Subscribe', return_value=provider), \
+                        patch('app.subscribe.WebUtils.get_mediainfo_from_id', side_effect=lookup):
+                    self.service.subscribe(self.sid)
+                provider.dbhelper.insert_rss_movie.assert_not_called()
+                provider.dbhelper.insert_rss_tv.assert_not_called()
+                record = self.store.get(self.sid)
+                self.assertEqual(record['state'], 'canceled')
+                self.assertIsNone(record['subscription'])
+                self.assertIn('搜索已停止', record['message'])
+
+    def make_submission_downloader(self):
+        # Keep the real single/batch download implementations. Substitute only
+        # configuration, external queries, persistence and downloader transport.
+        downloader_type = Downloader.__closure__[0].cell_contents
+        downloader = downloader_type.__new__(downloader_type)
+        downloader.sites, downloader.dbhelper, downloader.message = Mock(), Mock(), Mock()
+        downloader.get_search_task_status = Mock(return_value={})
+        downloader.check_exists_medias = Mock(return_value=(False, {}, []))
+        downloader.get_download_setting = Mock(return_value={})
+        downloader.get_default_download_setting = Mock(return_value=1)
+        downloader._Downloader__get_client_type = Mock(return_value=DownloaderType.Aria2)
+        client = Mock()
+        client.add_torrent.return_value = True
+        downloader._Downloader__get_client = Mock(return_value=client)
+        downloader._Downloader__get_download_dir_info = Mock(return_value={'path': '/tmp/offline'})
+        return downloader, client
+
+    def test_stop_during_torrent_fetch_prevents_manual_and_automatic_submission(self):
+        for automatic in (False, True):
+            with self.subTest(automatic=automatic):
+                rid = self.ready([torrent(url='https://example.invalid/offline.torrent')])
+                downloader, client = self.make_submission_downloader()
+                def fetch(**kwargs):
+                    self.service.action(self.sid, 0, 'cancel', None, 1, 1)
+                    client.add_torrent.assert_not_called()
+                    return '', b'offline-torrent', '', [], ''
+                with patch('web.backend.telegram_search.Downloader', return_value=downloader), \
+                        patch('app.downloader.downloader.Torrent') as transport:
+                    transport.return_value.get_torrent_info.side_effect = fetch
+                    self.service.download(self.sid, 0, rid, automatic=automatic)
+                client.add_torrent.assert_not_called()
+                downloader.dbhelper.insert_download_history.assert_not_called()
+                downloader.message.send_download_fail_message.assert_not_called()
+                record = self.store.get(self.sid)
+                self.assertEqual(record['state'], 'canceled')
+                self.assertEqual(record['downloads'][rid]['state'], 'not_submitted')
+
+    def test_stop_after_downloader_submission_preserves_confirmed_receipt(self):
+        rid = self.ready()
+        downloader, client = self.make_submission_downloader()
+        def submitted(*args, **kwargs):
+            self.service.action(self.sid, 0, 'cancel', None, 1, 1)
+            return True
+        client.add_torrent.side_effect = submitted
+        with patch('web.backend.telegram_search.Downloader', return_value=downloader):
+            self.service.download(self.sid, 0, rid, automatic=True)
+        client.add_torrent.assert_called_once()
+        record = self.store.get(self.sid)
+        self.assertEqual(record['state'], 'canceled')
+        self.assertEqual(record['downloads'][rid]['state'], 'accepted')
+
+    def test_completed_subscription_does_not_overwrite_later_stop_confirmation(self):
+        self.ready()
+        provider = Subscribe.__new__(Subscribe)
+        provider.dbhelper = Mock()
+        def written(**kwargs):
+            self.service.action(self.sid, 0, 'cancel', None, 1, 1)
+            return 0
+        provider.dbhelper.insert_rss_movie.side_effect = written
+        with patch('web.backend.telegram_search.Subscribe', return_value=provider), \
+                patch('app.subscribe.WebUtils.get_mediainfo_from_id', return_value=movie()):
+            self.service.subscribe(self.sid)
+        record = self.store.get(self.sid)
+        self.assertEqual(record['subscription'], 'accepted')
+        self.assertEqual(record['state'], 'canceled')
+        self.assertIn('搜索已停止', record['message'])
 
     def test_double_click_and_another_session_submit_only_once(self):
         rid = self.ready()

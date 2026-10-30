@@ -37,11 +37,15 @@ def render_search_message(record: dict) -> tuple[str, list[list[dict[str, str]]]
         name = record['results'].get(rid, {}).get('org_string') or rid
         lines.append(f"下载任务 {str(name)[:70]}：{operation['message']}")
     if time.time() > record['expires_at']:
-        return '\n'.join(lines + ['搜索已过期，请重新搜索。已提交的下载仍保留。']), [
-            [button('重新搜索', 'restart'), button('下载状态', 'status')]]
+        rows = [[button('重新搜索', 'restart'), button('下载状态', 'status')]]
+        if record['state'] in ACTIVE_SEARCH_STATES | {'failed', 'interrupted'}:
+            rows.insert(0, [button('停止搜索', 'cancel')])
+        return '\n'.join(lines + ['搜索已过期，请重新搜索。已提交的下载仍保留。']), rows
     if record['state'] in ('canceled', 'interrupted', 'failed'):
-        return '\n'.join(lines), [[button('重新搜索', 'restart'), button('换一部', 'change')],
-                                   [button('下载状态', 'status')]]
+        rows = [[button('重新搜索', 'restart'), button('换一部', 'change')], [button('下载状态', 'status')]]
+        if record['state'] != 'canceled':
+            rows.insert(0, [button('停止搜索', 'cancel')])
+        return '\n'.join(lines), rows
     view = record['view']
     if view == 'preferences':
         prefs = record['preferences']
@@ -116,7 +120,7 @@ def render_search_message(record: dict) -> tuple[str, list[list[dict[str, str]]]
         if not items and record['selected'] and record['state'] not in ACTIVE_SEARCH_STATES | {'exists'}:
             rows.append([button('订阅这部作品', 'subscribe')])
     if record['state'] in ACTIVE_SEARCH_STATES:
-        rows.append([button('取消搜索', 'cancel')])
+        rows.append([button('停止搜索', 'cancel')])
     else:
         rows.append([button('重新搜索', 'restart'), button('换一部', 'change')])
     if record['selected'] and (record['selected'].get('poster_path') or '').startswith('https://'):

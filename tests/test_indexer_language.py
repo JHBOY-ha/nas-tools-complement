@@ -1,5 +1,6 @@
 """Offline regressions for Chinese Telegram searches across mixed-language sites."""
 import os
+import datetime
 import threading
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -9,12 +10,14 @@ from unittest import TestCase
 from unittest.mock import Mock, patch
 
 from app.indexer.client.builtin import BuiltinIndexer
+from app.indexer.client._base import _IIndexClient
 from app.indexer.indexer import Indexer
 from app.media import Media
 from app.media.tmdbv3api import TMDb, Movie, TV
 from app.searcher import Searcher
 from app.utils.types import IndexerType, MediaType, SearchType
 from app.utils.workload import BoundedExecutor, TaskQueueFull
+from app.utils.search_cancellation import search_cancellation, search_is_canceled
 
 
 class IndexerLanguageTest(TestCase):
@@ -305,6 +308,104 @@ class IndexerLanguageTest(TestCase):
         self.assertEqual(self.indexer.search_by_keyword('Dune', {}, self.media,
                                                         search_context=context), ['Dune'])
         self.spider.assert_called_once()
+
+    def test_stop_abandons_running_site_recognition_and_queued_sites(self):
+        self.assert_stopped_site_work('cancel')
+
+    def test_progress_failure_abandons_running_site_recognition_and_queued_sites(self):
+        self.assert_stopped_site_work('failure')
+
+    def test_timeout_abandons_running_site_recognition_and_queued_sites(self):
+        self.assert_stopped_site_work('timeout')
+
+    def test_timeout_during_publication_keeps_unstarted_sites_retryable(self):
+        executor = BoundedExecutor(1, 8, 'search-publication-timeout')
+        self.addCleanup(executor.shutdown)
+        self.indexer._search_executor = executor
+        started, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        def spider(**kwargs):
+            started.set()
+            if not release.wait(3):
+                raise AssertionError('test did not release provider')
+            return [kwargs['keyword']]
+        def progress(results, report):
+            self.assertTrue(started.wait(2))
+            if any(item['state'] == 'timeout' for item in report.values()):
+                release.set()
+                # Final message publication can wait for network I/O while
+                # workers drain. The skipped sites must not enter deduplication.
+                executor.submit(lambda: None).result(2)
+        self.spider.side_effect = spider
+        context = {'on_progress': progress}
+        with patch('app.indexer.indexer.SEARCH_TOTAL_TIMEOUT_SECONDS', 0.02):
+            self.assertEqual(self.indexer.search_by_keyword('Dune', {}, self.media, search_context=context), [])
+        self.spider.assert_called_once()
+        self.assertEqual(len(context['submitted']), 1)
+        context.pop('on_progress')
+        self.assertEqual(self.indexer.search_by_keyword('Dune', {}, self.media, search_context=context),
+                         ['Dune', 'Dune'])
+        self.assertEqual(self.spider.call_count, 3)
+
+    def assert_stopped_site_work(self, outcome):
+        # Real dispatch/worker threads; block only the provider request. The
+        # release occurs after orchestration returns, reproducing orphaned work.
+        executor = BoundedExecutor(1, 8, 'search-stop-test')
+        self.addCleanup(executor.shutdown)
+        self.indexer._search_executor = executor
+        started, release, cancel = threading.Event(), threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        def spider(**kwargs):
+            started.set()
+            if not release.wait(3):
+                raise AssertionError('test did not release provider')
+            return [kwargs['keyword']]
+        def progress(*args):
+            self.assertTrue(started.wait(2))
+            if outcome == 'cancel':
+                cancel.set()
+            elif outcome == 'failure':
+                raise RuntimeError('cannot publish progress')
+        self.spider.side_effect = spider
+        context = {'cancel_event': cancel, 'on_progress': progress}
+        with patch('app.indexer.indexer.SEARCH_TOTAL_TIMEOUT_SECONDS', 0.02):
+            if outcome == 'failure':
+                with self.assertRaisesRegex(RuntimeError, 'cannot publish progress'):
+                    self.indexer.search_by_keyword('Dune', {}, self.media, search_context=context)
+            else:
+                self.assertEqual(self.indexer.search_by_keyword('Dune', {}, self.media,
+                                                                search_context=context), [])
+        release.set()
+        # FIFO barrier proves the original worker has exited and its context is
+        # reset before asserting no recognition or queued site started.
+        self.assertFalse(executor.submit(search_is_canceled).result(2))
+        self.spider.assert_called_once()
+        self.client.filter_search_results.assert_not_called()
+        self.assertCountEqual(self.search(keyword='Dune'), ['Dune'] * 3)
+
+    def test_stop_mid_release_skips_remaining_recognition(self):
+        cancel = threading.Event()
+        self.client.filter = Mock()
+        def parse(**kwargs):
+            cancel.set()
+            return Mock()
+        with search_cancellation(cancel), patch('app.indexer.client._base.MetaInfo', side_effect=parse) as meta:
+            result = _IIndexClient.filter_search_results(self.client,
+                [{'title': 'Dune.2021.1080p'}, {'title': 'Dune.2021.2160p'}],
+                1, self.sites[0], {}, self.media, datetime.datetime.now())
+        self.assertEqual(result, [])
+        meta.assert_called_once()
+        self.client.filter.check_torrent_filter.assert_not_called()
+        self.title_provider.get_media_info.assert_not_called()
+
+    def test_stopped_context_skips_indexer_and_english_title_lookup(self):
+        cancel = threading.Event()
+        cancel.set()
+        with patch.object(self.indexer, 'get_indexers') as indexers:
+            self.assertEqual(self.indexer.search_by_keyword('沙丘', {}, self.media,
+                search_context={'cancel_event': cancel}), [])
+        indexers.assert_not_called()
+        self.title_provider.get_tmdb_en_title.assert_not_called()
 
 
 class EnglishTitleRequestTest(TestCase):

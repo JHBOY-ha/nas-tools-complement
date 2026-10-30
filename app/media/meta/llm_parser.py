@@ -12,6 +12,7 @@ from app.media.meta.title_utils import promote_bracket_title
 from app.media.meta.recognition import cached_recognition_query, query_tmdb, RecognitionPending
 from app.utils import ExceptionUtils, RequestUtils, StringUtils
 from app.utils.llm_client import LLMClient
+from app.utils.search_cancellation import search_is_canceled
 from app.utils.commons import singleton
 from app.utils.types import MediaType
 from config import Config, DEFAULT_TMDB_PROXY
@@ -121,7 +122,7 @@ class LLMMetaParser(object):
         """
         调用 LLM 解析媒体名称并返回标准化字段
         """
-        if not title or not self.__is_client_ready(require_enable=True):
+        if search_is_canceled() or not title or not self.__is_client_ready(require_enable=True):
             return {}
         cache_key = self.__make_parse_cache_key(title=title, subtitle=subtitle, mtype_hint=mtype_hint)
         cached_result = self.__get_cached_parse_result(cache_key)
@@ -144,6 +145,8 @@ class LLMMetaParser(object):
                 subtitle=subtitle,
                 mtype_hint=mtype_hint
             )
+            if search_is_canceled():
+                return {}
             system_prompt = (
                 "你是媒体文件名解析助手。"
                 "请严格返回 JSON 对象，不要输出任何额外文本。"
@@ -200,6 +203,10 @@ class LLMMetaParser(object):
                 user_prompt=user_prompt,
                 max_tokens=512
             )
+            # A stopped request is not a negative recognition result. Do not
+            # poison the shared cache for another search of the same release.
+            if search_is_canceled():
+                return {}
             if content:
                 log.info("【Meta】LLM原始返回：%s" % self.__shorten_text(content, 2000))
             else:
@@ -217,6 +224,8 @@ class LLMMetaParser(object):
             self.__set_cached_parse_result(cache_key, result)
             return result
         except Exception as err:
+            if search_is_canceled():
+                return {}
             ExceptionUtils.exception_traceback(err)
             log.error("【Meta】LLM 识别失败：%s" % str(err))
             self.__set_cached_parse_result(cache_key, {})
@@ -589,7 +598,7 @@ class LLMMetaParser(object):
         """
         取单个电视剧候选的季列表、别名与外部链接（一次 TMDB 请求，结果走请求缓存）。
         """
-        if not tmdb_id:
+        if search_is_canceled() or not tmdb_id:
             return {}
         try:
             detail = TV().details(tmdb_id, append_to_response="alternative_titles,external_ids")
@@ -996,6 +1005,8 @@ class LLMMetaParser(object):
         candidates = []
         seen = set()
         for query in query_list:
+            if search_is_canceled():
+                return []
             if len(candidates) >= self._search_max_results:
                 break
             query_candidates = search_func(query) or []
@@ -1113,6 +1124,8 @@ class LLMMetaParser(object):
             return []
 
     def __build_tmdb_candidate(self, item, mtype_hint=None):
+        if search_is_canceled():
+            return {}
         genres = getattr(item, "genre_ids", None) or []
         if mtype_hint == MediaType.ANIME and 16 not in genres:
             return {}
