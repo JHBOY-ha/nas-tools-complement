@@ -1,8 +1,10 @@
 /* Real Bootstrap/Tabler page: status tabs, card menu, detail drawer, drop zone and continuous fill. */
-const {chromium} = require('playwright');
+const {firefox} = require('playwright');
 const {spawnSync} = require('child_process');
 const fs = require('fs'), path = require('path'), assert = require('node:assert/strict');
 const root = path.resolve(__dirname, '..');
+const evidenceDir = process.env.TEST_ARTIFACT_DIR || '/tmp/nas-tools-library-ui';
+fs.mkdirSync(evidenceDir, {recursive: true});
 const rendered = spawnSync('python3', ['-c', `
 import json, re
 from pathlib import Path
@@ -33,9 +35,10 @@ const episodes = [
   {id: 'e2', server_item_id: 'e2', title: '二', season: 1, episode: 2, season_episode: 'S01E02', path: '/media/s/S01E02.mkv', can_upload: true, subtitle_label: '缺中文字幕', subtitle_badge: 'bg-orange'}];
 
 (async () => {
-  const browser = await chromium.launch({headless: true, ...(process.env.CHROME_PATH ? {executablePath: process.env.CHROME_PATH} : {})});
+  const browser = await firefox.launch({headless: true, ...(process.env.FIREFOX_PATH ? {executablePath: process.env.FIREFOX_PATH} : {})});
+  let page;
   try {
-    const page = await browser.newPage({viewport: {width: 1280, height: 900}, reducedMotion: 'reduce'});
+    page = await browser.newPage({viewport: {width: 1280, height: 900}, reducedMotion: 'reduce'});
     const errors = [], requests = [];
     let refreshReply = {code: 0, updated: 1, unchanged: 4, failed: 0, requested: 5};
     page.on('pageerror', error => errors.push(error.message));
@@ -216,8 +219,79 @@ const episodes = [
     await page.getByRole('button', {name: '查看 电影1 的字幕详情'}).click();
     await drawer.waitFor({state: 'visible'});
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true);
+    await page.screenshot({path: path.join(evidenceDir, 'mobile-drawer.png'), fullPage: true});
+
+    // List reloads after a subtitle save must update the already-open drawer too.
+    items[0].subtitle_status = 'has_chinese_external';
+    items[0].subtitle_label = '已有外挂中文字幕';
+    items[0].subtitle_badge = 'bg-green';
+    await page.evaluate(() => load_library_items(library_page));
+    await page.waitForFunction(() => document.querySelector('.lit-library-card').textContent.includes('已有外挂中文字幕'));
+    assert.match(await page.locator('#library_drawer_overview').innerText(), /已有外挂中文字幕/);
+    await page.screenshot({path: path.join(evidenceDir, 'updated-drawer.png'), fullPage: true});
+
+    // Emulate SPA script/DOM replacement without aborting the old document's AJAX.
+    await page.goto('http://library.test/');
+    await page.locator('.lit-library-card').first().waitFor();
+    let previewArrived;
+    await page.route('**/library/subtitle/preview', route => previewArrived(route));
+    const nextPreview = () => new Promise(resolve => { previewArrived = resolve; });
+    await page.getByRole('button', {name: '查看 电影1 的字幕详情'}).click();
+    const [oldPreview] = await Promise.all([nextPreview(), drop('zone', ['old.chs.srt'])]);
+    const oldGeneration = await page.evaluate(() => library_upload_preview_generation);
+    await page.locator('#library-drawer .btn-close').click();
+    await drawer.waitFor({state: 'hidden'});
+    await page.evaluate(body => { document.querySelector('.page-wrapper').innerHTML = body; }, fixtures.body);
+    await page.addScriptTag({path: path.join(root, 'web/static/js/media-library.js')});
+    await page.evaluate(() => {
+      init_media_library_page({page_size: 18, default_server: 'emby'});
+      window.previewCompletions = 0;
+      $(document).on('ajaxComplete.reviewPreview', function (_event, _xhr, options) {
+        if (options.url === '/library/subtitle/preview') window.previewCompletions += 1;
+      });
+    });
+    await page.locator('.lit-library-card').first().waitFor();
+    await page.getByRole('button', {name: '查看 电影2 的字幕详情'}).click();
+    const [newPreview] = await Promise.all([nextPreview(), drop('zone', ['new.eng.srt'])]);
+    assert.equal(await page.evaluate(() => library_upload_preview_generation), oldGeneration);
+    await newPreview.fulfill({json: {code: 0, items: [{language: 'eng', target: 'Movie2.eng.srt'}]}});
+    await page.waitForFunction(() => window.previewCompletions === 1);
+    await oldPreview.fulfill({json: {code: 0, items: [{language: 'zh-CN', target: 'Movie1.zh-CN.srt'}]}});
+    await page.waitForFunction(() => window.previewCompletions === 2);
+    assert.match(await page.locator('#library_upload_pending').innerText(), /Movie2.eng.srt/);
+    assert.doesNotMatch(await page.locator('#library_upload_pending').innerText(), /Movie1.zh-CN.srt/);
+    await page.screenshot({path: path.join(evidenceDir, 'preview-after-navigation.png'), fullPage: true});
+
+    // A late fill response must not open a shared confirmation on another page.
+    await page.goto('http://library.test/');
+    await page.locator('.lit-library-card').first().waitFor();
+    let fillArrived;
+    const pendingFill = new Promise(resolve => { fillArrived = resolve; });
+    await page.route('**/library/items?*', route => {
+      if (route.request().postDataJSON().page_size === 100) { fillArrived(route); return; }
+      return route.fallback();
+    });
+    await page.getByRole('button', {name: '开始补齐', exact: true}).click();
+    const oldFill = await pendingFill;
+    await page.evaluate(() => {
+      document.querySelector('.page-wrapper').innerHTML = '<p>另一个页面</p>';
+      window.fillCompleted = false;
+      $(document).on('ajaxComplete.reviewFill', function (_event, _xhr, options) {
+        if (options.url.startsWith('/library/items?') && JSON.parse(options.data).page_size === 100) {
+          window.fillCompleted = true;
+        }
+      });
+    });
+    await oldFill.fulfill({json: {code: 0, total: 1, items: [movie(1)]}});
+    await page.waitForFunction(() => window.fillCompleted);
+    assert.equal(await page.locator('#system-confirm-modal').isVisible(), false);
+    assert.equal(await page.evaluate(() => library_fill), null);
+    await page.screenshot({path: path.join(evidenceDir, 'fill-after-navigation.png'), fullPage: true});
     assert.deepEqual(errors, []);
-    console.log('Media library UI checks passed: refresh, tabs, card menu, drawer, drop zone, blocked upload, series target, continuous fill and 390px layout.');
+    console.log('Media library UI checks passed: refresh, tabs, menu, drawer, drops, series, fill, 390px layout, drawer reload and stale preview/fill responses.');
+  } catch (error) {
+    if (page) await page.screenshot({path: path.join(evidenceDir, 'failure.png'), fullPage: true});
+    throw error;
   } finally {
     await browser.close();
   }

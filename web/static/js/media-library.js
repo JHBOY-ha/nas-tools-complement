@@ -287,7 +287,6 @@ function load_library_items(page) {
       if (!(page !== previous_page && JSON.stringify(library_summary_data()) === library_summary_key)) {
         load_library_summary();
       }
-      library_refresh_drawer_item();
       $("#library_page_text").text(`${library_page} / ${total_pages}`);
       update_library_pager(total_pages);
       if (!items.length) {
@@ -299,6 +298,8 @@ function load_library_items(page) {
         library_items_cache[item.id] = item;
         html += library_item_card(item, index);
       });
+      // The drawer reads this cache, so publish all new records before updating it.
+      library_refresh_drawer_item();
       $("#library_items_grid").html(html);
       init_library_posters();
     },
@@ -1499,8 +1500,10 @@ function library_language_label(code) {
 }
 
 function request_library_upload_preview(files) {
+  const view = library_view_instance;
+  const pending = document.getElementById("library_upload_pending");
   const media_path = $("#index_upload_subtitle_target_path").val();
-  if (!media_path || !files.length) { return; }
+  if (!view || !pending || !media_path || !files.length) { return; }
   const generation = library_upload_preview_generation;
   $.ajax({
     type: "POST", url: "/library/subtitle/preview", contentType: "application/json", dataType: "json", timeout: 15000,
@@ -1510,7 +1513,11 @@ function request_library_upload_preview(files) {
       server: $("#index_upload_subtitle_server").val() || library_default_media_server
     }),
     success: function (ret) {
-      if (generation !== library_upload_preview_generation || !ret || ret.code !== 0) { return; }
+      // Script reloads reset the counter; it only identifies a request within
+      // one page instance, never a preview belonging to a restored page.
+      if (view !== library_view_instance || document.getElementById("library_upload_pending") !== pending
+          || generation !== library_upload_preview_generation
+          || $("#index_upload_subtitle_target_path").val() !== media_path || !ret || ret.code !== 0) { return; }
       (ret.items || []).forEach(function (row, index) {
         const text = row.target
             ? ` · 预计${library_language_label(row.language) ? ` ${library_language_label(row.language)}` : ""} → ${row.target}${row.note ? `（${row.note}）` : ""}`
@@ -2051,7 +2058,11 @@ function download_library_online_subtitle(index, button, quota_confirmed) {
 
 function start_library_fill() {
   const view = library_view_instance;
-  if (!view || library_fill || library_fill_loading || library_items_loading) {
+  const grid = document.getElementById("library_items_grid");
+  // Ordinary menu navigation replaces the DOM without clearing the view token.
+  const is_current_view = () => grid && view && view === library_view_instance &&
+      document.getElementById("library_items_grid") === grid;
+  if (!is_current_view() || library_fill || library_fill_loading || library_items_loading) {
     return;
   }
   const data = Object.assign(library_filter_data(1), {
@@ -2073,7 +2084,7 @@ function start_library_fill() {
     data: JSON.stringify(data),
     timeout: 0,
     success: function (ret) {
-      if (view !== library_view_instance) { return; }
+      if (!is_current_view()) { return; }
       if (!ret || ret.code !== 0) {
         show_fail_modal((ret && ret.msg) || "无法生成补齐队列");
         return;
@@ -2092,19 +2103,22 @@ function start_library_fill() {
           `将按当前筛选（电影、${status_label}）逐部检索字幕：共 ${queue.length} 部${truncated}` +
           `${skipped ? `，另有 ${skipped} 部无法上传已排除` : ""}。不会自动下载，每部都由你确认。是否开始？`,
           function () {
+            if (!is_current_view()) { return; }
             library_fill = {queue: queue, index: 0, saved: 0, skipped: 0, current_saved: false};
-            $("#system-confirm-modal").one("hidden.bs.modal", function () { library_fill_open(0); });
+            $("#system-confirm-modal").one("hidden.bs.modal", function () {
+              if (is_current_view()) { library_fill_open(0); }
+            });
             hide_confirm_modal();
           });
     },
     error: function () {
-      if (view !== library_view_instance) { return; }
+      if (!is_current_view()) { return; }
       show_fail_modal("网络错误");
     },
     complete: function () {
+      if (!is_current_view()) { return; }
       library_fill_loading = false;
       NProgress.done();
-      if (view !== library_view_instance) { return; }
       $("#library_fill_btn").prop("disabled", false);
     }
   });

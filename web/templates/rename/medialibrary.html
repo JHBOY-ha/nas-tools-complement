@@ -211,6 +211,9 @@
               <span class="text-muted">尚无媒体级快照，且媒体服务器未明确提供中文字幕信息；不等同于缺中文字幕。</span>
             </div>
           </div>
+          <div class="text-muted small mt-2">
+            剧集覆盖率只统计已关联整理历史的集；这些已知集全部有中文字幕时显示“已有”，不代表媒体服务器中的整部剧已全部补齐。
+          </div>
         </section>
 
         <section class="lit-library-help-section">
@@ -259,7 +262,7 @@
         <section class="lit-library-help-section">
           <h6 class="lit-library-help-title">性能与排查</h6>
           <div class="text-muted mb-2">
-            打开页面、刷新、翻页、筛选和排序只读取同步数据与 SQLite 状态快照，不访问 NAS 文件系统。
+            列表加载、翻页、筛选、排序和状态计数只读取同步数据与 SQLite 状态快照，不访问 NAS 文件系统。
             “刷新”只向媒体服务器读取当前页项目的最新信息（含海报版本）并更新本地记录，不访问 NAS 文件、不重新刮削，也不做全库同步；
             新入库的媒体需等待定时同步，或在首页手动执行“媒体库同步”。默认检测只读取已链接媒体的目标目录，同一目录只枚举一次，并复用未变化字幕的探测缓存。
             深度目录扫描仅在高级选项中提供，受目录、字幕数量和时间上限保护；建议只在排查遗漏时使用。

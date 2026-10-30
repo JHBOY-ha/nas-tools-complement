@@ -305,6 +305,9 @@ class MediaLibrary:
         )
         if str(server_type or "").strip().lower() not in ["emby", "jellyfin", "plex"]:
             return {"code": -1, "msg": "影视服务器配置无效"}
+        # Capture before checking the lock, so a sync starting in either gap
+        # (before the database snapshot or during network reads) is detected.
+        sync_generation = self.media_server.get_sync_generation()
         if self.media_server.is_syncing():
             return {"code": -1, "msg": "媒体库正在同步，请同步完成后再刷新"}
 
@@ -333,8 +336,8 @@ class MediaLibrary:
                 changes.append((row.SERVER, fresh))
 
         if changes:
-            if not self.media_server.begin_incremental_write():
-                return {"code": -1, "msg": "媒体库同步已开始，本次刷新结果未写入"}
+            if not self.media_server.begin_incremental_write(sync_generation):
+                return {"code": -1, "msg": "刷新期间媒体库发生同步，本次刷新结果未写入，请重试"}
             try:
                 staged = sum(len(str(fresh.get("json") or "")) for _, fresh in changes)
                 with self.mediadb.write_transaction(required_bytes=staged * 4):
@@ -1028,6 +1031,8 @@ class MediaLibrary:
             item["missing_count"] = 1 if status.get("status") == "missing_chinese" else 0
         else:
             episode_statuses = []
+            # Coverage is limited to transfer-linked episodes. Listing never
+            # enumerates the server or NAS to discover additional episodes.
             for episode in item.get("linked_episodes") or []:
                 media_path = episode.get("path") or ""
                 snapshot = snapshots.get(SubtitleMediaStatusStore.normalize_path(media_path))

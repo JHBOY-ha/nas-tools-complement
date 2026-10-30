@@ -55,9 +55,11 @@ class LibraryRefreshTest(unittest.TestCase):
         library = MediaLibrary.__new__(MediaLibrary)
         library.media_server = Mock()
         library.media_server.get_type.return_value = types.SimpleNamespace(value="Emby")
+        library.media_server.get_sync_generation.return_value = 0
         library.media_server.is_syncing.return_value = syncing
 
-        def begin():
+        def begin(expected_generation):
+            self.assertEqual(expected_generation, 0)
             events.append("lock")
             return lock_ok
 

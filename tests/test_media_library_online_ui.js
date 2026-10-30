@@ -1,5 +1,5 @@
 /* Real Bootstrap dialogs and source selection with offline subtitle API fixtures. */
-const {chromium} = require('playwright');
+const {firefox} = require('playwright');
 const {spawnSync} = require('child_process');
 const fs = require('fs'), path = require('path'), assert = require('node:assert/strict');
 const root = path.resolve(__dirname, '..');
@@ -19,7 +19,7 @@ assert.equal(rendered.status, 0, rendered.stderr);
 const fixtures = JSON.parse(rendered.stdout);
 
 (async () => {
-  const browser = await chromium.launch({headless: true, ...(process.env.CHROME_PATH ? {executablePath: process.env.CHROME_PATH} : {})});
+  const browser = await firefox.launch({headless: true, ...(process.env.FIREFOX_PATH ? {executablePath: process.env.FIREFOX_PATH} : {})});
   try {
     const page = await browser.newPage({viewport: {width: 1100, height: 800}, reducedMotion: 'reduce'});
     const errors = [], downloads = [];

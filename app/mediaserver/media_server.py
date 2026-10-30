@@ -11,6 +11,9 @@ from config import Config
 
 lock = threading.Lock()
 server_lock = threading.Lock()
+# Guarded by the sync lock when changed or checked before an incremental write.
+# An idle lock alone cannot tell whether a full sync completed during remote reads.
+sync_generation = 0
 
 
 @singleton
@@ -210,11 +213,20 @@ class MediaServer:
         return lock.locked()
 
     @staticmethod
-    def begin_incremental_write():
+    def get_sync_generation():
+        return sync_generation
+
+    @staticmethod
+    def begin_incremental_write(expected_generation):
         """
-        单项刷新写库前抢占同步锁，仅在短事务内持有；同步进行中返回 False
+        非阻塞抢占同步锁并核验读取前的代次；期间启动过全量同步也拒绝写入。
         """
-        return lock.acquire(blocking=False)
+        if not lock.acquire(blocking=False):
+            return False
+        if sync_generation != expected_generation:
+            lock.release()
+            return False
+        return True
 
     @staticmethod
     def end_incremental_write():
@@ -303,9 +315,13 @@ class MediaServer:
         from app.db.settings import DatabaseSettings
         from app.db.transactions import DatabaseBusy, DatabaseWriteError
 
+        global sync_generation
         if not self.server:
             return
         with lock:
+            # Even a sync that finishes before a refresh's final write makes
+            # that refresh stale. Reads remain outside this lock in refresh_items.
+            sync_generation += 1
             log.info("【MediaServer】开始同步媒体库数据...")
             self.progress.start("mediasync")
             try:

@@ -484,13 +484,23 @@ Chrome 入口通过；旧 SQLite 3.37.2 的 DELETE 回退 41 项通过。完整 
 
 用户确认的约束：“更新服务器信息”只是把媒体服务器的最新数据拉回 NAStool，不让服务器重新刮削；刷新只由用户手动触发且只处理当前页，不做全量同步；拖拽上传不放在卡片上，只在点击海报后的详情抽屉里。
 
-- **当前页刷新**：`POST /library/refresh` → `MediaLibrary.refresh_items`。最多 18 个 ID，逐项串行向服务器读取，全部读取完成后才在短事务内写库；读取失败、服务器未返回或返回 ID 不一致的项目保留原记录。全量同步进行中拒绝刷新，写库前以 `MediaServer.begin_incremental_write()` 非阻塞抢占同步锁，网络读取期间不持锁。全量同步与单项刷新共用各客户端的 `sync_item_from_info` / Plex `__sync_item`，保证字段一致。不调用任何服务器刷新或刮削接口。
+- **当前页刷新**：`POST /library/refresh` → `MediaLibrary.refresh_items`。最多 18 个 ID，逐项串行向服务器读取，全部读取完成后才在短事务内写库；读取失败、服务器未返回或返回 ID 不一致的项目保留原记录。全量同步进行中拒绝刷新，读取前记录全量同步代次，写库前以 `MediaServer.begin_incremental_write(expected_generation)` 非阻塞抢占同步锁并核验代次；读取期间只要启动过全量同步，即使已完成也丢弃本次刷新结果，提示重试。网络读取期间不持锁。全量同步与单项刷新共用各客户端的 `sync_item_from_info` / Plex `__sync_item`，保证字段一致。不调用任何服务器刷新或刮削接口。
 - **海报版本**：`poster_url` 带 `?tag=`，值来自 `ImageTags.Primary`（Emby/Jellyfin）或 Plex 海报路径末段。服务器成功返回且带有效版本时使用 `max-age=31536000, immutable`；无版本为 1 小时；本地海报回退为 `private, no-cache`；404 为 5 分钟。图片类型和 ID 经白名单校验后才请求服务器，缩略图固定 `maxWidth=320&quality=85`。路由改为 `<path:itemid>` 以容纳 Plex 的 `/library/metadata/N`，非 Plex 服务器拒绝含斜杠的 ID。Plex 令牌只在服务端 URL 中使用，日志不记录异常正文。
 - **Plex**：新增 `get_sync_item`、`get_item_image`，同步记录增加 `Thumb`。未给 Plex 添加 `get_iteminfo`：唯一调用方是 Emby/Jellyfin 的 webhook，行为不变。
-- **剧集状态**：`__summary_series_status` 仅在每集都有中文字幕时才显示“已有”；部分覆盖为 `unknown` 并显示“已覆盖 X/Y 集”。列表项新增 `episode_total`、`episode_covered`、`audio_language`、响应新增 `library_total`、`synced_at`。页码越界由服务端钳制，前端跟随返回页。
+- **剧集状态**：`__summary_series_status` 只聚合整理历史中已关联的剧集，只有这些已知集全部有中文字幕时才显示“已有”，不代表媒体服务器中的全部剧集已覆盖；部分覆盖为 `unknown` 并显示“已覆盖 X/Y 集”。列表项新增 `episode_total`、`episode_covered`、`audio_language`、响应新增 `library_total`、`synced_at`。页码越界由服务端钳制，前端跟随返回页。
 - **筛选与计数**：`subtitle` 增加 `unknown`、`problem`；新增 `audio_language`（eng/jpn/kor/other/unknown，按默认音轨，仅电影，具体语言排除剧集）。`POST /library/summary` 与列表共用 `__candidate_items`，状态计数不应用字幕状态筛选。单纯翻页不重取计数。
-- **抽屉与上传**：被取代的“选择剧集”和“上传字幕”弹窗已移除，控件 ID 保留并移入抽屉；在线检索与整季字幕包仍是对话框，打开时 `library_drawer_hide_for_modal()` 收起抽屉，关闭时恢复（OpenSubtitles 配额确认期间由 `library_online_serialized` 区分，不视为退出）。有浏览器上传在途时拒绝切换到其他媒体。拖放只绑定在上传区，window 级 `dragover/drop` 监听全局只装一次，且仅在字幕库页面存在拖放区时才拦截文件拖入，避免浏览器跳转。`POST /library/subtitle/preview` 只接收文件名，复用 `Subtitle.preview_upload_names` 与真实上传同一套命名函数，不读取字幕内容；无语言标记时提示将按正文识别。
-- **连续补齐**：队列在点击时固定（最多 100 部，电影，需 `can_upload`），不依赖实时分页；保存后由用户点击“下一部”，不自动下载。关闭在线对话框即退出并刷新当前页。
+- **抽屉与上传**：被取代的“选择剧集”和“上传字幕”弹窗已移除，控件 ID 保留并移入抽屉；在线检索与整季字幕包仍是对话框，打开时 `library_drawer_hide_for_modal()` 收起抽屉，关闭时恢复（OpenSubtitles 配额确认期间由 `library_online_serialized` 区分，不视为退出）。有浏览器上传在途时拒绝切换到其他媒体。拖放只绑定在上传区，window 级 `dragover/drop` 监听全局只装一次，且仅在字幕库页面存在拖放区时才拦截文件拖入，避免浏览器跳转。`POST /library/subtitle/preview` 只接收文件名，复用 `Subtitle.preview_upload_names` 与真实上传同一套命名函数，不读取字幕内容、不写文件，但目标路径校验和重名检查会读取文件系统元数据；无语言标记时提示将按正文识别。列表重载先填充新缓存，再更新抽屉概览；预览回调同时核验页面实例、原 DOM、请求代次与目标媒体。
+- **连续补齐**：队列在点击时固定（最多 100 部，电影，需 `can_upload`），不依赖实时分页；保存后由用户点击“下一部”，不自动下载。关闭在线对话框即退出并刷新当前页。队列请求的成功、错误、完成回调及确认/关闭弹窗后的继续操作均核验页面实例与原列表 DOM，离页后不再弹出确认或启动检索。
 - **未实现**：抽屉内的字幕删除/管理、批量安全补齐（需要新的持久任务类型和路径安全校验）、下载后自动对齐；本次未做。
 
-验证：新增 `tests/test_library_refresh_poster.py`（22 项）、`tests/test_media_library_cards.js`；`tests/test_media_library_ui.js` 在真实 Chrome 中覆盖标签、菜单裁剪（已做突变验证：卡片改回 `overflow: hidden` 即失败）、抽屉、拖放、阻止上传、剧集目标、连续补齐和 390px 布局。直接运行 `tests.test_media_library` 有 6 项审计写库用例报 `DatabaseWriteError`，改动前即存在，原因是未使用隔离配置；经 `python3 -m tests.run_stability` 运行时全部通过。未在真实 NAS、真实 Emby/Jellyfin/Plex 上验证 `ImageTags`、`maxWidth`、Plex 转码接口和音轨语言覆盖率。
+验证入口与范围：
+
+- `python3 -m tests.run_stability` 使用临时配置和数据库，默认套件包含 `tests.test_database_review_fixes` 中真实 SQLite 的同步/刷新交错回归；不包含 `tests.test_media_library` 或 `tests.test_library_refresh_poster`。
+- 字幕库专项需显式运行：`python3 -m tests.run_stability tests.test_media_library tests.test_library_refresh_poster tests.test_online_subtitles`。不要直接运行读取真实 `config/` 的媒体库审计测试。
+- `node tests/test_media_library_history.js` 覆盖页面/DOM 失效、预览计数器重用、抽屉刷新、补齐晚响应及确认后的延迟继续；卡片、在线字幕和整季字幕包回归分别为 `tests/test_media_library_cards.js`、`tests/test_media_library_online.js`、`tests/test_subtitle_season_pack.js`。
+- 浏览器回归为 `node tests/test_media_library_ui.js` 和 `node tests/test_media_library_online_ui.js`，均使用 Playwright 的 headless Firefox 与独立临时浏览器目录。需要环境提供 `playwright` 模块及 Firefox；可用 `NODE_PATH` 指定模块目录、`FIREFOX_PATH` 指定 Playwright Firefox 可执行文件。字幕库 UI 截图默认保存在 `/tmp/nas-tools-library-ui`，可用 `TEST_ARTIFACT_DIR` 改变位置，在线字幕窄屏截图为 `/tmp/nas-tools-opensubtitles-online-mobile.png`。
+- UI 回归覆盖标签、菜单裁剪、抽屉、拖放、阻止上传、剧集目标、连续补齐、390px 布局，以及抽屉状态更新、SPA 重建后的旧预览、离页后的旧补齐响应。
+
+本次四项评审修复已通过：默认稳定性 332 项、显式字幕库专项 122 项、上述四组 Node 回归，以及两组 headless Firefox UI 回归；Python/JavaScript 语法检查和 `git diff --check` 通过。测试配置、数据库、浏览器配置及截图/日志均使用临时目录。
+
+未在真实 NAS、真实 Emby/Jellyfin/Plex 上验证 `ImageTags`、`maxWidth`、Plex 转码接口和音轨语言覆盖率。
