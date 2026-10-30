@@ -7,9 +7,11 @@ import subprocess
 import threading
 import time
 from datetime import datetime
+from urllib.parse import quote
 
 import log
 from app.db.media_db import MediaDb
+from app.db.transactions import DatabaseBusy, DatabaseWriteError
 from app.helper.db_helper import DbHelper
 from app.helper.subtitle_health import SubtitleHealth
 from app.helper.online_subtitles import OnlineSubtitles
@@ -32,6 +34,15 @@ class MediaLibrary:
     _poster_cache_lock = threading.RLock()
     _poster_success_ttl = 3600
     _poster_failure_ttl = 300
+    refresh_item_limit = 18
+    audio_language_filters = ("all", "eng", "jpn", "kor", "other", "unknown")
+    _audio_language_codes = {
+        "en": "eng", "eng": "eng", "ja": "jpn", "jpn": "jpn", "jp": "jpn",
+        "ko": "kor", "kor": "kor",
+        "": "unknown", "und": "unknown", "unknown": "unknown", "mis": "unknown", "mul": "unknown"
+    }
+    _poster_tag_re = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+    _plex_thumb_tag_re = re.compile(r"/thumb/(\d+)$")
     _chinese_sub_re = re.compile(
         r"(^|[.\-_\[\( ])(zh[-_]?(cn|hans|chs|sg|sc|tw|hant|cht|hk)|"
         r"zho|chi|chs|cht|cn|sc|tc|简|简中|简体|繁|繁中|繁体|中文|中文字幕)"
@@ -51,11 +62,7 @@ class MediaLibrary:
         self.media_server = MediaServer()
         self.subtitle_status_store = SubtitleMediaStatusStore()
 
-    def list_items(self, data=None):
-        """
-        查询首页媒体库展示数据
-        """
-        data = data or {}
+    def __resolve_server_type(self, data):
         requested_server = str(data.get("server") or "").strip()
         current_server_type = self.media_server.get_type()
         server_type = requested_server or (
@@ -63,24 +70,26 @@ class MediaLibrary:
             else Config().get_config('media').get('media_server')
         )
         if str(server_type or "").strip().lower() not in ["emby", "jellyfin", "plex"]:
-            return {"code": -1, "msg": "影视服务器配置无效"}
+            return ""
+        return server_type
+
+    def __candidate_items(self, server_type, data):
+        """
+        Apply type, category, keyword and audio-language filters to the synced
+        rows. Subtitle state is deliberately left to the caller so that list and
+        summary share one candidate definition without touching the NAS.
+        """
         media_type = data.get("type") or "all"
         category = data.get("category") or ""
-        subtitle = data.get("subtitle") or "all"
-        sort_by = str(data.get("sort_by") or "default").lower()
-        sort_order = str(data.get("sort_order") or "desc").lower()
-        if sort_by not in ["default", "internal", "external", "audit"]:
-            sort_by = "default"
-        if sort_order not in ["asc", "desc"]:
-            sort_order = "desc"
         keyword = str(data.get("keyword") or "").strip().lower()
-        page = self.__safe_int(data.get("page"), 1)
-        page_size = min(max(self.__safe_int(data.get("page_size"), 24), 1), 100)
-
+        audio_language = str(data.get("audio_language") or "all").strip().lower()
+        if audio_language not in self.audio_language_filters:
+            audio_language = "all"
         rows = self.mediadb.list_items(server_type=server_type)
         transfer_histories = self.dbhelper.get_transfer_histories_with_dest()
         transfer_history_index = self.__build_transfer_history_index(transfer_histories)
         items = []
+        library_total = 0
         categories = {"movie": set(), "tv": set(), "anime": set()}
         for row in rows:
             item = self.__build_item(
@@ -89,6 +98,7 @@ class MediaLibrary:
             )
             if not item:
                 continue
+            library_total += 1
             if item["media_type"] in categories:
                 categories[item["media_type"]].add(item["category"])
             if media_type != "all" and item["media_type"] != media_type:
@@ -97,14 +107,88 @@ class MediaLibrary:
                 continue
             if keyword and keyword not in f"{item['title']} {item['original_title']} {item['year']}".lower():
                 continue
+            # Audio language is known for synced movies only; a concrete
+            # language therefore narrows the result to movies.
+            if audio_language != "all" and (
+                    item["media_type"] != "movie" or item.get("audio_language") != audio_language):
+                continue
             items.append(item)
+        return items, categories, library_total
+
+    def summary_counts(self, data=None):
+        """
+        Tab counters for the current type/category/keyword/audio filters. The
+        subtitle filter itself is not applied; only SQLite state is read.
+        """
+        data = data or {}
+        server_type = self.__resolve_server_type(data)
+        if not server_type:
+            return {"code": -1, "msg": "影视服务器配置无效"}
+        items, _, _ = self.__candidate_items(server_type, data)
+        paths = self.__item_media_paths(items)
+        status_snapshots = self.__status_snapshots_for_paths(server_type, paths)
+        audit_snapshots = self.__latest_audit_snapshots(server_type, paths)
+        movie_audit_snapshot = audit_snapshots.get("movie") or {}
+        counts = {"all": len(items), "missing": 0, "unknown": 0, "problem": 0, "ok": 0}
+        for item in items:
+            self.__fill_snapshot_subtitle_summary(item, status_snapshots, movie_audit_snapshot)
+            status = item.get("subtitle_status")
+            if status == "missing_chinese":
+                counts["missing"] += 1
+            elif status == "unknown":
+                counts["unknown"] += 1
+            elif status in ("has_chinese_external", "has_chinese_internal"):
+                counts["ok"] += 1
+            if self.__has_audit_problem(item):
+                counts["problem"] += 1
+        return {"code": 0, "counts": counts, "server": server_type}
+
+    @staticmethod
+    def __has_audit_problem(item):
+        return item.get("media_type") == "movie" and item.get("subtitle_audit_status") in ("warning", "error")
+
+    @classmethod
+    def __audio_language(cls, media_streams):
+        """Default audio track language of a synced movie, as eng/jpn/kor/other/unknown."""
+        audio = [
+            stream for stream in (media_streams or [])
+            if isinstance(stream, dict)
+            and str(stream.get("Type") or stream.get("codec_type") or "").lower() == "audio"
+        ]
+        if not audio:
+            return "unknown"
+        chosen = next((stream for stream in audio if stream.get("IsDefault")), audio[0])
+        tags = chosen.get("tags") if isinstance(chosen.get("tags"), dict) else {}
+        language = str(chosen.get("Language") or chosen.get("language") or tags.get("language") or "")
+        language = re.split(r"[-_]", language.strip().lower())[0]
+        return cls._audio_language_codes.get(language, "other")
+
+    def list_items(self, data=None):
+        """
+        查询首页媒体库展示数据
+        """
+        data = data or {}
+        server_type = self.__resolve_server_type(data)
+        if not server_type:
+            return {"code": -1, "msg": "影视服务器配置无效"}
+        subtitle = data.get("subtitle") or "all"
+        sort_by = str(data.get("sort_by") or "default").lower()
+        sort_order = str(data.get("sort_order") or "desc").lower()
+        if sort_by not in ["default", "internal", "external", "audit"]:
+            sort_by = "default"
+        if sort_order not in ["asc", "desc"]:
+            sort_order = "desc"
+        page = self.__safe_int(data.get("page"), 1)
+        page_size = min(max(self.__safe_int(data.get("page_size"), 24), 1), 100)
+
+        items, categories, library_total = self.__candidate_items(server_type, data)
 
         # Default browsing is page-first: SQLite subtitle state is fetched only
         # for the visible paths.  Filters/sorts expand the target set solely to
         # already business-filtered candidates and load only the needed state.
         candidate_paths = self.__item_media_paths(items)
         needs_candidate_status = subtitle != "all" or sort_by in ["internal", "external"]
-        needs_candidate_audit = sort_by in ["external", "audit"]
+        needs_candidate_audit = sort_by in ["external", "audit"] or subtitle == "problem"
         status_snapshots = self.__status_snapshots_for_paths(
             server_type, candidate_paths
         ) if needs_candidate_status else {}
@@ -123,6 +207,10 @@ class MediaLibrary:
                 if subtitle == "ok" and item["subtitle_status"] not in [
                         "has_chinese_external", "has_chinese_internal"]:
                     continue
+                if subtitle == "unknown" and item["subtitle_status"] != "unknown":
+                    continue
+                if subtitle == "problem" and not self.__has_audit_problem(item):
+                    continue
                 enriched_items.append(item)
             items = enriched_items
 
@@ -140,6 +228,9 @@ class MediaLibrary:
             )
 
         total = len(items)
+        # A page emptied by finishing its last item must land on the new last
+        # page instead of reporting an empty library.
+        page = min(max(page, 1), max((total + page_size - 1) // page_size, 1))
         start = (page - 1) * page_size
         end = start + page_size
         page_items = items[start:end]
@@ -164,9 +255,122 @@ class MediaLibrary:
             "total": total,
             "page": page,
             "page_size": page_size,
+            "library_total": library_total,
+            "synced_at": self.__synced_at(server_type),
             "categories": {key: sorted(value) for key, value in categories.items()},
             "server": server_type
         }
+
+    def __synced_at(self, server_type):
+        """上次全量同步时间，仅读取统计表。"""
+        try:
+            status = self.mediadb.get_statistics(server_type)
+            value = getattr(status, "UPDATE_TIME", "") if status else ""
+        except Exception as error:
+            ExceptionUtils.exception_traceback(error)
+            return ""
+        return value if isinstance(value, str) else ""
+
+    @classmethod
+    def invalidate_poster_cache(cls, server_type, item_ids):
+        """让指定项目的本地海报回退缓存立即失效。"""
+        server_key = str(getattr(server_type, "value", server_type) or "").lower()
+        with cls._poster_cache_lock:
+            for item_id in item_ids or []:
+                cls._poster_cache.pop((server_key, str(item_id)), None)
+
+    def refresh_items(self, data=None):
+        """
+        手动刷新当前页：逐项向媒体服务器读取最新信息并更新本地同步记录。
+        不触发服务器刮削，不访问 NAS，不做全量同步；读取失败的项目保留原记录。
+        """
+        data = data or {}
+        raw_ids = data.get("item_ids")
+        if not isinstance(raw_ids, list):
+            return {"code": -1, "msg": "缺少需要刷新的项目"}
+        item_ids = []
+        for value in raw_ids:
+            value = str(value or "").strip()
+            if value and value not in item_ids:
+                item_ids.append(value)
+        if not item_ids:
+            return {"code": -1, "msg": "缺少需要刷新的项目"}
+        if len(item_ids) > self.refresh_item_limit:
+            return {"code": -1, "msg": "单次最多刷新 %s 个项目" % self.refresh_item_limit}
+        requested_server = str(data.get("server") or "").strip()
+        current_server_type = self.media_server.get_type()
+        server_type = requested_server or (
+            current_server_type.value if current_server_type
+            else Config().get_config('media').get('media_server')
+        )
+        if str(server_type or "").strip().lower() not in ["emby", "jellyfin", "plex"]:
+            return {"code": -1, "msg": "影视服务器配置无效"}
+        if self.media_server.is_syncing():
+            return {"code": -1, "msg": "媒体库正在同步，请同步完成后再刷新"}
+
+        rows = {str(row.ITEM_ID): row for row in
+                self.mediadb.find_items(server_type=server_type, item_ids=item_ids)}
+        changes = []
+        unchanged = failed = 0
+        # Network reads happen one at a time and outside any lock or transaction.
+        for item_id in item_ids:
+            row = rows.get(item_id)
+            if row is None:
+                failed += 1
+                continue
+            try:
+                fresh = self.media_server.get_sync_item(server_type, item_id)
+            except Exception as error:
+                log.warn("【MediaLibrary】刷新媒体项目失败：%s" % type(error).__name__)
+                failed += 1
+                continue
+            if not isinstance(fresh, dict) or str(fresh.get("id") or "") != item_id:
+                failed += 1
+                continue
+            if self.__sync_record_matches(row, fresh):
+                unchanged += 1
+            else:
+                changes.append((row.SERVER, fresh))
+
+        if changes:
+            if not self.media_server.begin_incremental_write():
+                return {"code": -1, "msg": "媒体库同步已开始，本次刷新结果未写入"}
+            try:
+                staged = sum(len(str(fresh.get("json") or "")) for _, fresh in changes)
+                with self.mediadb.write_transaction(required_bytes=staged * 4):
+                    for stored_server, fresh in changes:
+                        if self.mediadb.insert(stored_server, fresh) is False:
+                            raise DatabaseWriteError("媒体项目刷新写入失败")
+            except Exception as error:
+                reason = str(error) if isinstance(error, (DatabaseBusy, DatabaseWriteError)) \
+                    else type(error).__name__
+                return {"code": -1, "msg": "媒体项目刷新未能保存，已保留原记录：%s" % reason}
+            finally:
+                self.media_server.end_incremental_write()
+        self.invalidate_poster_cache(server_type, item_ids)
+        return {"code": 0, "updated": len(changes), "unchanged": unchanged,
+                "failed": failed, "requested": len(item_ids)}
+
+    @staticmethod
+    def __sync_record_matches(row, fresh):
+        def text(value):
+            return "" if value is None else str(value)
+
+        return all(text(getattr(row, column)) == text(fresh.get(key)) for column, key in (
+            ("LIBRARY", "library"), ("ITEM_TYPE", "type"), ("TITLE", "title"),
+            ("ORGIN_TITLE", "originalTitle"), ("YEAR", "year"), ("TMDBID", "tmdbid"),
+            ("IMDBID", "imdbid"), ("PATH", "path"), ("JSON", "json")))
+
+    @classmethod
+    def __poster_tag(cls, item_json):
+        """海报版本：Emby/Jellyfin 的 ImageTags.Primary，或 Plex 海报路径末段的更新时间。"""
+        tags = item_json.get("ImageTags")
+        tag = tags.get("Primary") if isinstance(tags, dict) else ""
+        if not tag:
+            match = cls._plex_thumb_tag_re.search(str(item_json.get("Thumb") or ""))
+            tag = match.group(1) if match else ""
+        tag = str(tag or "")
+        return tag if cls._poster_tag_re.match(tag) else ""
 
     def get_episodes(self, data=None):
         """
@@ -731,7 +935,7 @@ class MediaLibrary:
             "target_path": target_path,
             "linked": linked,
             "can_upload": bool(target_path and (not verify_paths or os.path.isfile(target_path))),
-            "poster_url": f"/library/image/{row.ITEM_ID}",
+            "poster_url": self.__poster_url(row.ITEM_ID, self.__poster_tag(item_json)),
             "media_streams": item_json.get("MediaStreams") or [],
             "media_streams_known": "MediaStreams" in item_json,
             "linked_episodes": self.__series_history_items(
@@ -749,11 +953,21 @@ class MediaLibrary:
             "subtitle_audit_badge": "",
             "subtitle_audit_checked_at": "",
             "subtitle_audit_count": 0,
-            "missing_count": 0
+            "missing_count": 0,
+            "episode_total": 0,
+            "episode_covered": 0,
+            "audio_language": self.__audio_language(item_json.get("MediaStreams")) if media_type == "movie" else ""
         }
         if include_status:
             self.__fill_subtitle_summary(item)
         return item
+
+    @staticmethod
+    def __poster_url(item_id, tag):
+        # Plex ids are paths such as /library/metadata/1; drop the leading slash
+        # so the id stays one route segment sequence.
+        url = "/library/image/" + quote(str(item_id).lstrip("/"), safe="/")
+        return url + "?tag=" + quote(tag, safe="") if tag else url
 
     def __status_store(self):
         store = getattr(self, "subtitle_status_store", None)
@@ -828,6 +1042,7 @@ class MediaLibrary:
                 if status.get("status") == "missing_chinese"
             )
             item["missing_count"] = missing_count
+            item["episode_total"], item["episode_covered"] = self.__episode_coverage(episode_statuses)
             status = self.__summary_series_status(episode_statuses, missing_count)
             checked = [
                 value.get("checked_at") for value in episode_statuses
@@ -885,6 +1100,7 @@ class MediaLibrary:
             ]
             missing_count = len([status for status in episode_statuses if status.get("status") == "missing_chinese"])
             item["missing_count"] = missing_count
+            item["episode_total"], item["episode_covered"] = self.__episode_coverage(episode_statuses)
             if episode_statuses:
                 status = self.__summary_series_status(episode_statuses, missing_count)
             else:
@@ -1517,13 +1733,30 @@ class MediaLibrary:
 
     @staticmethod
     def __summary_series_status(statuses, missing_count):
+        total = len(statuses)
+        covered = sum(
+            1 for status in statuses
+            if status.get("status") in ("has_chinese_external", "has_chinese_internal")
+        )
         if missing_count:
             return {"status": "missing_chinese", "label": f"缺中文字幕 {missing_count} 集", "badge": "bg-orange"}
-        if any(status.get("status") == "has_chinese_external" for status in statuses):
-            return {"status": "has_chinese_external", "label": "已有外挂中文字幕", "badge": "bg-green"}
-        if any(status.get("status") == "has_chinese_internal" for status in statuses):
+        # Only a fully covered series is complete; one covered episode beside
+        # undetected ones must not turn the whole card green.
+        if total and covered == total:
+            if any(status.get("status") == "has_chinese_external" for status in statuses):
+                return {"status": "has_chinese_external", "label": "已有外挂中文字幕", "badge": "bg-green"}
             return {"status": "has_chinese_internal", "label": "已有内嵌中文字幕", "badge": "bg-azure"}
+        if covered:
+            return {"status": "unknown", "label": f"已覆盖 {covered}/{total} 集", "badge": "bg-secondary"}
         return {"status": "unknown", "label": "未检测", "badge": "bg-secondary"}
+
+    @staticmethod
+    def __episode_coverage(statuses):
+        covered = sum(
+            1 for status in statuses
+            if status.get("status") in ("has_chinese_external", "has_chinese_internal")
+        )
+        return len(statuses), covered
 
     @staticmethod
     def __safe_int(value, default):

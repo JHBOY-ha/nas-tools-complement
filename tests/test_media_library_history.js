@@ -84,4 +84,30 @@ assert.equal(requests.length, 4);
 // Reloading scripts on a new page must not accumulate global event listeners.
 vm.runInContext(fs.readFileSync('web/static/js/media-library.js', 'utf8'), ctx);
 assert.equal(listeners.length, 1);
+// A failed load keeps the page the user still sees instead of the requested one.
+grid = {};
+ctx.library_view_instance = {};
+ctx.library_items_loading = false;
+ctx.library_page = 3;
+ctx.load_library_items(4);
+const failed = requests[requests.length - 1];
+failed.success({code: -1, msg: 'boom'});
+assert.equal(ctx.library_page, 3);
+failed.complete();
+ctx.load_library_items(5);
+requests[requests.length - 1].error();
+assert.equal(ctx.library_page, 3);
+requests[requests.length - 1].complete();
+// A page past the end is clamped by the server; the client follows the returned page.
+ctx.load_library_items(9);
+const clamped = requests[requests.length - 1];
+clamped.success({code: 0, items: [], total: 20, page: 2, library_total: 20});
+assert.equal(ctx.library_page, 2);
+assert.match($('#library_items_grid').content, /没有符合条件的媒体/);
+clamped.complete();
+ctx.load_library_items(1);
+const empty_library = requests[requests.length - 1];
+empty_library.success({code: 0, items: [], total: 0, page: 1, library_total: 0});
+assert.match($('#library_items_grid').content, /字幕库还没有媒体/);
+empty_library.complete();
 console.log('Media library history lifecycle tests passed');

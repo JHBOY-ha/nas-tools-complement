@@ -23,33 +23,58 @@
                         data-bs-toggle="modal" data-bs-target="#index-library-help-modal"
                         aria-label="查看字幕库状态说明" title="查看说明">?</button>
               </h3>
-              <div class="card-subtitle mt-1">筛选媒体后，可上传字幕或按分类检测影视服务器识别情况</div>
+              <div class="card-subtitle mt-1">筛选媒体后，可上传字幕或按分类检测影视服务器识别情况 · <span id="library_synced_at"></span></div>
             </div>
             <div class="card-actions">
-              <button class="btn" type="button" onclick="navmenu('subtitle')">字幕设置</button>
-              <!-- 任务入口共用尺寸类，按钮和链接都继承任务中心的触控高度。 -->
+              <!-- 连续补齐按当前筛选生成固定队列，逐部打开在线检索，不会自动下载。 -->
+              <button class="btn btn-primary" id="library_fill_btn" type="button" onclick="start_library_fill()">
+                {{ SVG.check() }}
+                开始补齐
+              </button>
               <button class="btn lit-library-task-action" type="button" data-subtitle-task-center
                       aria-label="打开字幕任务中心">
                 {{ SVG.check() }}
                 任务中心
                 <span class="badge bg-primary text-white d-none" data-subtitle-task-count>0</span>
               </button>
-              <a class="btn lit-library-task-action" href="/?next=subtitle_task_settings"
-                 onclick="navmenu('subtitle_task_settings'); return false;" aria-label="打开字幕任务设置">
-                {{ SVG.adjustments() }}
-                任务设置
-              </a>
-              <button class="btn btn-outline-primary" type="button" onclick="run_library_subtitle_audit()">
-                {{ SVG.check() }}
-                检测外挂字幕
-              </button>
-              <button class="btn" id="library_refresh_btn" type="button" onclick="load_library_items(1)">
+              <button class="btn" id="library_refresh_btn" type="button" onclick="refresh_library_items()">
                 {{ SVG.refresh() }}
                 刷新
               </button>
+              <div class="dropdown">
+                <button class="btn" id="library_more_trigger" type="button" data-bs-toggle="dropdown"
+                        aria-expanded="false" aria-label="更多操作">
+                  {{ SVG.dots() }}
+                  更多
+                </button>
+                <div class="dropdown-menu dropdown-menu-end" aria-labelledby="library_more_trigger">
+                  <button class="dropdown-item" type="button" onclick="run_library_subtitle_audit()">检测外挂字幕</button>
+                  <button class="dropdown-item" type="button" onclick="navmenu('subtitle')">字幕设置</button>
+                  <a class="dropdown-item" href="/?next=subtitle_task_settings"
+                     onclick="navmenu('subtitle_task_settings'); return false;" aria-label="打开字幕任务设置">任务设置</a>
+                </div>
+              </div>
             </div>
           </div>
           <div class="card-body">
+            <!-- 类型与字幕状态直接切换，计数只读取数据库；筛选值保存在隐藏域中供列表请求使用。 -->
+            <input type="hidden" id="library_filter_type" value="all">
+            <input type="hidden" id="library_filter_subtitle" value="all">
+            <div class="lit-library-tabs">
+              <div class="lit-library-status-tabs" role="group" aria-label="媒体类型" id="library_type_tabs">
+                <button type="button" class="lit-library-status-tab active" data-library-type="all" aria-pressed="true">全部类型</button>
+                <button type="button" class="lit-library-status-tab" data-library-type="movie" aria-pressed="false">电影</button>
+                <button type="button" class="lit-library-status-tab" data-library-type="tv" aria-pressed="false">电视剧</button>
+                <button type="button" class="lit-library-status-tab" data-library-type="anime" aria-pressed="false">动漫</button>
+              </div>
+              <div class="lit-library-status-tabs" role="group" aria-label="字幕状态" id="library_status_tabs">
+                <button type="button" class="lit-library-status-tab active" data-library-subtitle="all" aria-pressed="true">全部 <span class="badge" data-library-count="all">–</span></button>
+                <button type="button" class="lit-library-status-tab" data-library-subtitle="missing" aria-pressed="false">缺字幕 <span class="badge" data-library-count="missing">–</span></button>
+                <button type="button" class="lit-library-status-tab" data-library-subtitle="unknown" aria-pressed="false">未检测 <span class="badge" data-library-count="unknown">–</span></button>
+                <button type="button" class="lit-library-status-tab" data-library-subtitle="problem" aria-pressed="false">有问题 <span class="badge" data-library-count="problem">–</span></button>
+                <button type="button" class="lit-library-status-tab" data-library-subtitle="ok" aria-pressed="false">已完成 <span class="badge" data-library-count="ok">–</span></button>
+              </div>
+            </div>
             <div class="lit-library-toolbar flex-wrap">
               <form class="d-flex gap-2 flex-grow-1" role="search" onsubmit="event.preventDefault(); apply_library_filters();">
                 <input id="library_filter_keyword" type="search" class="form-control" aria-label="按媒体名搜索影片" placeholder="搜索媒体名、原名或年份" maxlength="200">
@@ -75,27 +100,22 @@
                   <div class="p-3">
                     <div class="row g-3 align-items-end">
                       <div class="col-12 col-sm-6 col-lg-4">
-                        <label class="form-label" for="library_filter_type">类型</label>
-                        <select id="library_filter_type" class="form-select">
-                          <option value="all">全部</option>
-                          <option value="movie">电影</option>
-                          <option value="tv">电视剧</option>
-                          <option value="anime">动漫</option>
-                        </select>
-                      </div>
-                      <div class="col-12 col-sm-6 col-lg-4">
                         <label class="form-label" for="library_filter_category">小分类</label>
                         <select id="library_filter_category" class="form-select">
                           <option value="">全部</option>
                         </select>
                       </div>
                       <div class="col-12 col-sm-6 col-lg-4">
-                        <label class="form-label" for="library_filter_subtitle">字幕状态</label>
-                        <select id="library_filter_subtitle" class="form-select">
+                        <label class="form-label" for="library_filter_audio">音轨语言（仅电影）</label>
+                        <select id="library_filter_audio" class="form-select">
                           <option value="all">全部</option>
-                          <option value="missing">缺中文字幕</option>
-                          <option value="ok">已有中文字幕</option>
+                          <option value="eng">英语</option>
+                          <option value="jpn">日语</option>
+                          <option value="kor">韩语</option>
+                          <option value="other">其他语言</option>
+                          <option value="unknown">未知</option>
                         </select>
+                        <div class="form-hint" id="library_filter_audio_hint">按默认音轨判断，不等同于影片原始语言；语言标记缺失归入“未知”。</div>
                       </div>
                       <div class="col-12 col-sm-6 col-lg-4">
                         <label class="form-label" for="library_sort_by">排序字段</label>
@@ -113,7 +133,6 @@
                           <option value="asc">升序</option>
                         </select>
                       </div>
-
                     </div>
                   </div>
                   <div class="lit-library-filter-menu-footer">
@@ -241,13 +260,14 @@
           <h6 class="lit-library-help-title">性能与排查</h6>
           <div class="text-muted mb-2">
             打开页面、刷新、翻页、筛选和排序只读取同步数据与 SQLite 状态快照，不访问 NAS 文件系统。
-            “刷新”只重新读取数据库。默认检测只读取已链接媒体的目标目录，同一目录只枚举一次，并复用未变化字幕的探测缓存。
+            “刷新”只向媒体服务器读取当前页项目的最新信息（含海报版本）并更新本地记录，不访问 NAS 文件、不重新刮削，也不做全库同步；
+            新入库的媒体需等待定时同步，或在首页手动执行“媒体库同步”。默认检测只读取已链接媒体的目标目录，同一目录只枚举一次，并复用未变化字幕的探测缓存。
             深度目录扫描仅在高级选项中提供，受目录、字幕数量和时间上限保护；建议只在排查遗漏时使用。
           </div>
           <ol class="text-muted mb-0 ps-3">
             <li>确认媒体已完成整理/链接，且目标媒体文件存在。</li>
             <li>确认字幕位于目标视频同目录，文件名前缀与视频一致。</li>
-            <li>执行“媒体库同步”，再回到字幕库点击“刷新”。</li>
+            <li>在首页执行“媒体库同步”，再回到字幕库点击“刷新”。</li>
             <li>电视剧或番剧点击“选择剧集”，逐集确认实际状态。</li>
           </ol>
         </section>
@@ -332,84 +352,87 @@
     </div>
   </div>
 </div>
-<div class="modal modal-blur fade" id="index-library-episodes-modal" tabindex="-1" role="dialog" aria-hidden="true">
-  <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable" role="document">
-    <div class="modal-content">
-      <div class="modal-header">
-        <h5 class="modal-title" id="index_library_episodes_title">选择剧集</h5>
-        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
-      </div>
-      <div class="modal-body">
-        <div class="row g-2 mb-3">
-          <div class="col-6"><label class="form-label" for="library_episode_season">选择季</label><select id="library_episode_season" class="form-select" onchange="filter_library_episodes(true)"></select></div>
-          <div class="col-6"><label class="form-label" for="library_episode_number">选择集</label><select id="library_episode_number" class="form-select" onchange="filter_library_episodes(false)"></select></div>
-        </div>
-        <div class="mb-3"><button type="button" class="btn btn-outline-primary" onclick="open_library_season_pack()">上传整季字幕</button></div>
-        <div id="index_library_episodes_body" class="divide-y"></div>
-      </div>
+<!-- 详情抽屉：电影与剧集共用的字幕工作区；上传表单沿用原有控件 ID，由 media-library.js 驱动。 -->
+<div class="offcanvas offcanvas-end lit-library-drawer" tabindex="-1" id="library-drawer"
+     aria-labelledby="library_drawer_title">
+  <div class="offcanvas-header">
+    <div class="min-w-0">
+      <h3 class="offcanvas-title text-break" id="library_drawer_title">字幕详情</h3>
+      <div class="text-muted small text-break" id="library_drawer_meta"></div>
     </div>
+    <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="关闭"></button>
   </div>
-</div>
-<div class="modal modal-blur fade" id="index-upload-subtitle-modal" tabindex="-1" role="dialog" aria-hidden="true"
-     data-bs-backdrop="static" data-bs-keyboard="false">
-  <div class="modal-dialog modal-md modal-dialog-centered" role="document">
-    <div class="modal-content">
-      <div class="modal-header">
-        <h5 class="modal-title">上传字幕</h5>
-        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
+  <div class="offcanvas-body">
+    <section class="lit-library-drawer-section" id="library_drawer_overview" aria-label="字幕状态"></section>
+
+    <section class="lit-library-drawer-section d-none" id="library_drawer_episodes" aria-labelledby="library_drawer_episodes_title">
+      <h4 class="lit-library-drawer-heading" id="library_drawer_episodes_title">剧集</h4>
+      <div class="row g-2 mb-3">
+        <div class="col-6"><label class="form-label" for="library_episode_season">选择季</label><select id="library_episode_season" class="form-select" onchange="filter_library_episodes(true)"></select></div>
+        <div class="col-6"><label class="form-label" for="library_episode_number">选择集</label><select id="library_episode_number" class="form-select" onchange="filter_library_episodes(false)"></select></div>
       </div>
-      <div class="modal-body">
-        <input type="hidden" id="index_upload_subtitle_path">
-        <input type="hidden" id="index_upload_subtitle_target_path">
-        <input type="hidden" id="index_upload_subtitle_request_id">
-        <input type="hidden" id="index_upload_subtitle_server_item_id">
-        <input type="hidden" id="index_upload_subtitle_parent_server_item_id">
-        <input type="hidden" id="index_upload_subtitle_library_id">
-        <div class="mb-3">
-          <label class="form-label" for="index_upload_subtitle_name">媒体文件</label>
-          <input type="text" id="index_upload_subtitle_name" class="form-control" readonly>
-        </div>
-        <div class="mb-3">
-          <label class="form-label required" for="index_upload_subtitle_file">字幕文件</label>
+      <div class="mb-3"><button type="button" class="btn btn-outline-primary" onclick="open_library_season_pack()">上传整季字幕</button></div>
+      <div id="index_library_episodes_body" class="divide-y"></div>
+    </section>
+
+    <section class="lit-library-drawer-section" id="library_drawer_upload" aria-labelledby="library_drawer_upload_title">
+      <h4 class="lit-library-drawer-heading" id="library_drawer_upload_title">上传字幕</h4>
+      <input type="hidden" id="index_upload_subtitle_path">
+      <input type="hidden" id="index_upload_subtitle_target_path">
+      <input type="hidden" id="index_upload_subtitle_request_id">
+      <input type="hidden" id="index_upload_subtitle_server_item_id">
+      <input type="hidden" id="index_upload_subtitle_parent_server_item_id">
+      <input type="hidden" id="index_upload_subtitle_library_id">
+      <div class="mb-3">
+        <label class="form-label" for="index_upload_subtitle_name">目标媒体文件</label>
+        <input type="text" id="index_upload_subtitle_name" class="form-control" readonly>
+      </div>
+      <div id="library_upload_blocked" class="alert alert-warning d-none" role="status"></div>
+      <div class="mb-3">
+        <label class="form-label required" for="index_upload_subtitle_file">字幕文件</label>
+        <!-- 拖放只在此区域生效；“选择文件”始终可用，文件加入列表后仍需点击“上传”确认。 -->
+        <div id="library_upload_dropzone" class="lit-library-dropzone" role="group" aria-label="字幕拖放区">
+          <div class="lit-library-dropzone-title">拖入字幕文件，或选择文件</div>
           <input type="file" id="index_upload_subtitle_file" class="form-control"
                  accept=".srt,.ass,.ssa,.smi,.vtt,.sub,.idx" multiple>
-          <div class="form-hint">单批最多 20 个逻辑字幕；VobSub 请同时选择同名 .sub 与 .idx，两者计为一个。不会覆盖现有字幕。</div>
         </div>
-        <div class="mb-3">
-          <label class="form-label required" for="index_upload_subtitle_server">目标影视服务器</label>
-          <select id="index_upload_subtitle_server" class="form-select">
-            <option value="jellyfin" {% if MediaServerType|lower == "jellyfin" %}selected{% endif %}>Jellyfin</option>
-            <option value="emby" {% if MediaServerType|lower == "emby" %}selected{% endif %}>Emby</option>
-            <option value="plex" {% if MediaServerType|lower == "plex" %}selected{% endif %}>Plex</option>
-          </select>
-        </div>
-        <div class="mb-3">
-          <label class="form-label" for="index_upload_subtitle_align">字幕对齐模式</label>
-          <select id="index_upload_subtitle_align" class="form-select">
-            <option value="none" selected>不对齐</option>
-            <option value="auto">自动选择</option>
-            <option value="offset">仅整体偏移</option>
-            <option value="segmented">多锚点分段</option>
-            <option value="llm">LLM跨语言对齐</option>
-          </select>
-        </div>
-        <div id="index_upload_subtitle_progress" class="subtitle-upload-progress d-none" aria-live="polite">
-          <div class="d-flex justify-content-between gap-2 mb-1">
-            <span class="fw-bold" data-subtitle-progress-title>准备上传</span>
-          </div>
-          <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100">
-            <div class="progress-bar" data-subtitle-progress-bar style="width:0">0%</div>
-          </div>
-          <div class="small mt-2" data-subtitle-progress-message></div>
-          <div class="text-muted small text-break mt-1" data-subtitle-progress-current hidden></div>
-        </div>
+        <div class="form-hint">单批最多 20 个逻辑字幕；VobSub 请同时选择同名 .sub 与 .idx，两者计为一个。不会覆盖现有字幕。拖入的文件不会自动上传。</div>
+        <div id="library_upload_pending" class="mt-2" aria-live="polite"></div>
       </div>
-      <div class="modal-footer">
-        <button type="button" class="btn me-auto" data-bs-dismiss="modal">关闭（后台继续）</button>
+      <div class="mb-3">
+        <label class="form-label required" for="index_upload_subtitle_server">目标影视服务器</label>
+        <select id="index_upload_subtitle_server" class="form-select">
+          <option value="jellyfin" {% if MediaServerType|lower == "jellyfin" %}selected{% endif %}>Jellyfin</option>
+          <option value="emby" {% if MediaServerType|lower == "emby" %}selected{% endif %}>Emby</option>
+          <option value="plex" {% if MediaServerType|lower == "plex" %}selected{% endif %}>Plex</option>
+        </select>
+      </div>
+      <div class="mb-3">
+        <label class="form-label" for="index_upload_subtitle_align">字幕对齐模式</label>
+        <select id="index_upload_subtitle_align" class="form-select">
+          <option value="none" selected>不对齐</option>
+          <option value="auto">自动选择</option>
+          <option value="offset">仅整体偏移</option>
+          <option value="segmented">多锚点分段</option>
+          <option value="llm">LLM跨语言对齐</option>
+        </select>
+      </div>
+      <div id="index_upload_subtitle_progress" class="subtitle-upload-progress d-none" aria-live="polite">
+        <div class="d-flex justify-content-between gap-2 mb-1">
+          <span class="fw-bold" data-subtitle-progress-title>准备上传</span>
+        </div>
+        <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100">
+          <div class="progress-bar" data-subtitle-progress-bar style="width:0">0%</div>
+        </div>
+        <div class="small mt-2" data-subtitle-progress-message></div>
+        <div class="text-muted small text-break mt-1" data-subtitle-progress-current hidden></div>
+      </div>
+      <div class="d-flex flex-wrap gap-2 mt-3">
+        <button type="button" class="btn me-auto" data-bs-dismiss="offcanvas">关闭（后台继续）</button>
         <button type="button" id="index_upload_subtitle_cancel" class="btn btn-outline-danger subtitle-task-cancel-action d-none">取消任务</button>
         <button type="button" id="index_upload_subtitle_btn" class="btn btn-primary">上传</button>
       </div>
-    </div>
+    </section>
   </div>
 </div>
 <div class="modal modal-blur fade" id="season-pack-modal" tabindex="-1" aria-hidden="true" data-bs-backdrop="static" data-bs-keyboard="false">
@@ -459,6 +482,13 @@
         <div class="text-muted small mt-2">按片名、年份和当前季集校验结果；文件特征匹配优先。字幕包仅列出明确匹配本集的文件。Assrt 需在“设置 → 字幕设置”中配置 Token。</div>
         <div class="text-muted small mt-2">OpenSubtitles 复用“设置 → 字幕设置 → OpenSubtitles”的 API Key、账户和语言；检索不消耗下载配额，确认下载时消耗一次。</div>
         <div id="library_online_results" class="mt-3" aria-live="polite"></div>
+      </div>
+      <!-- 连续补齐时显示：进度、跳过、下一部与退出；普通在线字幕检索不显示。 -->
+      <div class="modal-footer d-none" id="library_fill_footer">
+        <div class="me-auto text-break" id="library_fill_progress" aria-live="polite"></div>
+        <button type="button" class="btn btn-outline-danger" id="library_fill_exit">退出补齐</button>
+        <button type="button" class="btn" id="library_fill_skip">跳过</button>
+        <button type="button" class="btn btn-primary" id="library_fill_next" disabled>下一部</button>
       </div>
     </div>
   </div>

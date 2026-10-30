@@ -465,7 +465,7 @@ class DatabaseReviewFixTest(DatabaseCase):
                     transport = NS(get_res=Mock(side_effect=request))
                     cls = load_class('app/mediaserver/client/' + name + '.py', class_name,
                                      ['get_medias_count', 'get_libraries', 'get_items', 'get_iteminfo',
-                                      '__get_' + name + '_librarys'],
+                                      'sync_item_from_info', '__get_' + name + '_librarys'],
                                      {'RequestUtils': lambda: transport, 'log': Mock(),
                                       'ExceptionUtils': Mock(), 'json': json})
                     client = cls()
@@ -487,7 +487,8 @@ class DatabaseReviewFixTest(DatabaseCase):
 
     def test_sync_plex_failure_after_an_item_preserves_previous_snapshot(self):
         from tests.test_sync_reliability import load_class
-        cls = load_class('app/mediaserver/client/plex.py', 'Plex', ['get_libraries', 'get_items'],
+        cls = load_class('app/mediaserver/client/plex.py', 'Plex',
+                         ['get_libraries', 'get_items', '__sync_item'],
                          {'ExceptionUtils': Mock(), 'json': json})
         client = cls()
         client._Plex__item_path = lambda item: '/media/movie.mkv'
@@ -502,6 +503,9 @@ class DatabaseReviewFixTest(DatabaseCase):
             receiver.get_libraries, receiver.get_items = client.get_libraries, client.get_items
             self.assertFalse(sync(receiver))
             self.assertEqual(self.read_sync(), ([('old',)], 1))
+            # The shared mapping really ran for the first item before the stream broke.
+            mapped = next(iter(client.get_items('lib')))
+            self.assertEqual((mapped['id'], mapped['title'], mapped['library']), ('new', 'Movie', 'lib'))
             # List failure and a genuine empty server remain distinguishable.
             library.sections.side_effect = RuntimeError('offline')
             self.assertFalse(sync(receiver))

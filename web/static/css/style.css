@@ -475,9 +475,15 @@ body, .page {
     border: none;
     background: var(--tblr-bg-surface);
     border-radius: 12px;
-    overflow: hidden;
+    /* 卡片菜单需要溢出卡片边界；海报自带圆角与裁剪。 */
+    overflow: visible;
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
     transition: transform 0.18s ease, box-shadow 0.18s ease;
+}
+
+/* 打开菜单的卡片盖住相邻卡片，菜单才不会被后续卡片遮挡。 */
+.lit-library-card:has(.dropdown-menu.show) {
+    z-index: 6;
 }
 
 .lit-library-card:hover {
@@ -517,6 +523,11 @@ body, .page {
         var(--tblr-bg-surface-secondary);
 }
 
+/* 没有海报时隐藏空白图片，占位字才能居中。 */
+.lit-library-card-poster.no-poster img {
+    display: none;
+}
+
 .lit-library-card-fallback {
     display: none;
     font-size: 2rem;
@@ -527,6 +538,21 @@ body, .page {
 
 .lit-library-card-poster.no-poster .lit-library-card-fallback {
     display: block;
+}
+
+/* 海报是打开详情的按钮：去掉原生按钮外观，保留键盘焦点。 */
+button.lit-library-card-poster {
+    width: 100%;
+    padding: 0;
+    border: 0;
+    color: inherit;
+    cursor: pointer;
+    appearance: none;
+}
+
+button.lit-library-card-poster:focus-visible {
+    outline: 2px solid var(--tblr-primary);
+    outline-offset: -2px;
 }
 
 /* --- Badges on poster --- */
@@ -576,6 +602,23 @@ body, .page {
 
 .lit-library-card-subtitle-indicator.unknown {
     background: #a0a0a0;
+}
+
+/* 剧集字幕覆盖进度：贴在海报底边，文字由 aria-label 与卡片正文提供。 */
+.lit-library-card-coverage {
+    position: absolute;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    height: 4px;
+    background: rgba(0, 0, 0, 0.35);
+    pointer-events: none;
+}
+
+.lit-library-card-coverage > span {
+    display: block;
+    height: 100%;
+    background: var(--tblr-green, #2fb344);
 }
 
 /* --- Body --- */
@@ -668,6 +711,25 @@ body, .page {
     padding: 0.375rem 0.625rem 0.625rem;
 }
 
+.lit-library-card-actions {
+    display: flex;
+    align-items: stretch;
+    gap: 0.375rem;
+}
+
+.lit-library-card-actions .btn-icon {
+    flex: 0 0 auto;
+    width: 2rem;
+    padding: 0;
+    font-size: 1rem;
+    line-height: 1;
+}
+
+.lit-library-card-menu .dropdown-menu {
+    min-width: 8.5rem;
+    font-size: 0.8125rem;
+}
+
 .lit-library-card-footer .btn {
     font-size: 0.75rem;
     padding: 0.25rem 0.5rem;
@@ -718,4 +780,109 @@ body, .page {
 .subtitle-help:focus-visible {
     outline: 2px solid var(--tblr-primary);
     outline-offset: 2px;
+}
+
+
+/* --- 字幕库：类型与状态标签 --- */
+
+.lit-library-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.75rem 1rem;
+    margin-bottom: 1rem;
+}
+
+.lit-library-status-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.375rem;
+}
+
+.lit-library-status-tab {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    min-height: 2rem;
+    padding: 0.25rem 0.75rem;
+    border: 1px solid var(--tblr-border-color);
+    border-radius: 999px;
+    background: var(--tblr-bg-surface);
+    color: var(--tblr-body-color);
+    font-size: 0.875rem;
+    cursor: pointer;
+    appearance: none;
+}
+
+.lit-library-status-tab:hover {
+    background: var(--tblr-bg-surface-secondary);
+}
+
+.lit-library-status-tab:focus-visible {
+    outline: 2px solid var(--tblr-primary);
+    outline-offset: 2px;
+}
+
+.lit-library-status-tab.active {
+    border-color: var(--tblr-primary);
+    background: rgba(var(--tblr-primary-rgb), 0.1);
+    color: var(--tblr-primary);
+    font-weight: 600;
+}
+
+.lit-library-status-tab .badge {
+    background: var(--tblr-bg-surface-secondary);
+    color: var(--tblr-body-color);
+}
+
+.lit-library-status-tab.active .badge {
+    background: var(--tblr-primary);
+    color: var(--tblr-primary-fg, #fff);
+}
+
+/* --- 字幕库：详情抽屉与拖放上传 --- */
+
+.lit-library-drawer {
+    --tblr-offcanvas-width: min(34rem, 100vw);
+    width: min(34rem, 100vw);
+}
+
+.lit-library-drawer-section + .lit-library-drawer-section {
+    margin-top: 1.25rem;
+    padding-top: 1.25rem;
+    border-top: 1px solid var(--tblr-border-color);
+}
+
+.lit-library-drawer-heading {
+    margin-bottom: 0.75rem;
+    font-size: 1rem;
+    font-weight: 600;
+}
+
+.lit-library-dropzone {
+    display: grid;
+    gap: 0.5rem;
+    padding: 1rem;
+    border: 2px dashed var(--tblr-border-color);
+    border-radius: 8px;
+    text-align: center;
+}
+
+.lit-library-dropzone.is-dragover {
+    border-color: var(--tblr-primary);
+    background: rgba(var(--tblr-primary-rgb), 0.06);
+}
+
+.lit-library-dropzone.is-disabled {
+    opacity: 0.6;
+}
+
+.lit-library-dropzone-title {
+    color: var(--tblr-muted-color);
+    font-size: 0.875rem;
+}
+
+.lit-library-pending-row {
+    padding: 0.5rem 0;
+    border-bottom: 1px solid var(--tblr-border-color);
 }

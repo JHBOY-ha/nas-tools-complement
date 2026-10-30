@@ -179,13 +179,46 @@ class MediaServer:
             return None
         return self.server.get_image_by_id(item_id, image_type)
 
-    def get_item_image(self, item_id, image_type="Primary"):
+    def get_item_image(self, item_id, image_type="Primary", max_width=None, quality=None, tag=None):
         """
         获取媒体服务器项目图片响应
         """
         if not self.server:
             return None
-        return self.server.get_item_image(item_id, image_type)
+        return self.server.get_item_image(item_id, image_type, max_width=max_width,
+                                          quality=quality, tag=tag)
+
+    def get_sync_item(self, server_type, item_id):
+        """
+        从指定服务器读取单个项目的最新同步记录，只读数据，不触发服务器刮削。
+        读取失败抛出异常；不持有同步锁，网络请求期间不阻塞全量同步。
+        """
+        server_type = str(getattr(server_type, "value", server_type) or "").strip().lower()
+        if server_type == str(getattr(self._server_type, "value", "")).lower():
+            server = self.server
+        else:
+            server = self.get_server_by_type(server_type)
+        if not server:
+            raise RuntimeError("媒体服务器未配置")
+        return server.get_sync_item(item_id)
+
+    @staticmethod
+    def is_syncing():
+        """
+        全量同步是否正在进行
+        """
+        return lock.locked()
+
+    @staticmethod
+    def begin_incremental_write():
+        """
+        单项刷新写库前抢占同步锁，仅在短事务内持有；同步进行中返回 False
+        """
+        return lock.acquire(blocking=False)
+
+    @staticmethod
+    def end_incremental_write():
+        lock.release()
 
     def get_no_exists_episodes(self, meta_info,
                                season_number,
