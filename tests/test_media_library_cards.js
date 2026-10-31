@@ -129,8 +129,10 @@ context.library_fill = {queue: [{id: 'a'}, {id: 'b'}, {id: 'c'}], index: 0, save
 context.library_fill_open(0);
 assert.deepEqual(opened, ['a']);
 assert.equal($('#library_fill_next').prop('disabled'), true);
-context.library_fill_note_saved();
-context.library_fill_note_saved(); // a repeated save of the same movie is counted once
+const fill = context.library_fill;
+const first = fill.queue[0];
+context.library_fill_note_saved(fill, first);
+context.library_fill_note_saved(fill, first); // a repeated save of the same movie is counted once
 assert.equal(context.library_fill.saved, 1);
 assert.equal($('#library_fill_next').prop('disabled'), false);
 context.library_fill_advance(true);
@@ -142,7 +144,7 @@ context.library_fill_advance(false);
 assert.equal(context.library_fill, null);
 assert.match(context.library_refresh_notice, /补齐完成：保存 1 部，跳过 2 部/);
 context.library_fill_exit(); // a second exit is harmless
-context.library_fill_note_saved();
+context.library_fill_note_saved(fill, first);
 
 // Drops are ignored outside the upload area, and only while the library page is alive.
 const zone = {contains: target => target === 'inside', classList: {contains: () => false, toggle() {}, remove() {}},

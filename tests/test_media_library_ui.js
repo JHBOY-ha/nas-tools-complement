@@ -214,14 +214,37 @@ const episodes = [
     await page.locator('#library-drawer .btn-close').click();
     await drawer.waitFor({state: 'hidden'});
 
-    // Series: the only season is preselected and an episode retargets the upload form.
+    // Both API failures and network failures retry when the same series reopens.
+    let episodeCalls = 0;
+    await page.route('**/library/episodes?*', route => {
+      episodeCalls += 1;
+      if (episodeCalls === 1) return route.fulfill({json: {code: -1, msg: '剧集服务暂不可用'}});
+      if (episodeCalls === 2) return route.abort('failed');
+      return route.fulfill({json: {code: 0, items: episodes}});
+    });
+    for (const message of ['剧集服务暂不可用', '剧集加载失败，请关闭并重新打开重试']) {
+      await page.getByRole('button', {name: '查看 剧集 的字幕详情'}).click();
+      await page.waitForFunction(message => document.getElementById('index_library_episodes_body').textContent.includes(message), message);
+      await page.locator('#library-drawer .btn-close').click();
+      await drawer.waitFor({state: 'hidden'});
+    }
+
+    // Series: successful retry restores the season and episode upload controls.
     await page.getByRole('button', {name: '查看 剧集 的字幕详情'}).click();
     await page.locator('#index_library_episodes_body [data-episode-index]').first().waitFor();
+    assert.equal(episodeCalls, 3);
     assert.equal(await page.locator('#library_episode_season').inputValue(), '1');
     assert.equal(await page.locator('#index_upload_subtitle_btn').isDisabled(), true);
     await page.locator('#index_library_episodes_body').getByRole('button', {name: '上传字幕'}).first().click();
     assert.equal(await page.locator('#index_upload_subtitle_target_path').inputValue(), '/media/s/S01E01.mkv');
     assert.equal(await page.locator('#index_upload_subtitle_btn').isDisabled(), false);
+    await page.locator('#library-drawer .btn-close').click();
+    await drawer.waitFor({state: 'hidden'});
+    await page.getByRole('button', {name: '查看 剧集 的字幕详情'}).click();
+    await drawer.waitFor({state: 'visible'});
+    assert.equal(await page.locator('#index_upload_subtitle_target_path').inputValue(), '/media/s/S01E01.mkv');
+    assert.equal(episodeCalls, 3, 'a successful load and its selected upload target remain cached');
+    await page.screenshot({path: path.join(evidenceDir, 'series-retry-recovered.png'), fullPage: true});
     await page.locator('#library-drawer .btn-close').click();
     await drawer.waitFor({state: 'hidden'});
 
@@ -239,6 +262,29 @@ const episodes = [
     await page.locator('#library_fill_exit').click();
     await page.locator('#library-online-subtitle-modal').waitFor({state: 'hidden'});
     assert.match(await page.locator('#library_items_summary').innerText(), /补齐已结束：保存 0 部，跳过 1 部，未处理 2 部/);
+
+    // Re-search while a save is queued must not strand the continuous-fill footer.
+    await page.route('**/library/subtitle/search', route => route.fulfill({json: {
+      code: 0, items: [{name: 'Movie subtitle', provider: 'thunder', format: 'srt', ticket: 'fixture-ticket'}]
+    }}));
+    await page.route('**/library/subtitle/download', route => route.fulfill({json: {code: 0, task_id: 'fixture-task'}}));
+    await page.evaluate(() => {
+      SubtitleTasks.watch = (_id, callbacks) => { window.fillTaskDone = callbacks.onDone; };
+    });
+    await page.getByRole('button', {name: '开始补齐', exact: true}).click();
+    await page.locator('#system_confirm_btn').click();
+    await page.locator('.library-online-download').click();
+    await page.waitForFunction(() => typeof window.fillTaskDone === 'function');
+    await page.locator('#library_online_search').click();
+    await page.locator('.library-online-download').waitFor();
+    await page.evaluate(() => window.fillTaskDone({status: 'succeeded'}));
+    assert.equal(await page.locator('#library_fill_next').isEnabled(), true);
+    assert.match(await page.locator('#library_fill_progress').innerText(), /已保存 1 部/);
+    await page.screenshot({path: path.join(evidenceDir, 'fill-after-research-saved.png'), fullPage: true});
+    await page.locator('#library_fill_next').click();
+    assert.match(await page.locator('#library_fill_progress').innerText(), /第 2 \/ 3 部/);
+    await page.locator('#library_fill_exit').click();
+    await page.locator('#library-online-subtitle-modal').waitFor({state: 'hidden'});
 
     // Phone width keeps the sixteen-pixel gutter without sideways scrolling.
     await page.setViewportSize({width: 390, height: 800});
@@ -315,7 +361,7 @@ const episodes = [
     assert.equal(await page.evaluate(() => library_fill), null);
     await page.screenshot({path: path.join(evidenceDir, 'fill-after-navigation.png'), fullPage: true});
     assert.deepEqual(errors, []);
-    console.log('Media library UI checks passed: refresh, tabs, menu, drawer, drops, series, fill, 390px layout, drawer reload and stale preview/fill responses.');
+    console.log('Media library UI checks passed: refresh, tabs, menu, drawer, drops, series retries, fill after re-search, 390px layout, drawer reload and stale preview/fill responses.');
   } catch (error) {
     if (page) await page.screenshot({path: path.join(evidenceDir, 'failure.png'), fullPage: true});
     throw error;
