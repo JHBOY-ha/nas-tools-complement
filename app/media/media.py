@@ -1585,6 +1585,8 @@ class Media:
                     result = NumberingResult.verified(meta_info, info)
                 else:
                     result = self._resolve_llm_numbering(meta_info, info)
+                    if result.state == NumberingState.NOT_REQUESTED:
+                        result = self._resolve_absolute_numbering(meta_info, info)
                 if result.ready and not self.__verify_remapped_episodes(
                         meta_info, info, release_season=release_season, release_episodes=release_episodes):
                     result = NumberingResult(NumberingState.UNRESOLVED, "发布季集与目标编号缺少完整映射证据")
@@ -1751,11 +1753,74 @@ class Media:
                  % self.__suggest_episode_mapping(meta_info, info, release_season, release_episodes))
         return False
 
-    def __convert_absolute_episodes(self, meta_info, info, episodes):
+    def _resolve_absolute_numbering(self, meta_info, info, target_season=None, valid_episodes=None):
+        """Resolve seasonless anime totals without treating the display default S01 as evidence."""
+        episodes = self.__episode_list_of(meta_info)
+        # A directory season constrains the target; it does not prove the child
+        # file's episode is already numbered within that season.
+        explicit_season = (meta_info.begin_season is not None
+                           and (meta_info.begin_season != (meta_info.note or {}).get("directory_season")
+                                or meta_info.end_season is not None))
+        if (explicit_season or not episodes or min(episodes) < 1
+                or not info or info.get("media_type") != MediaType.TV
+                or not set(self.__get_genre_ids(info)).intersection(ANIME_GENREIDS)):
+            return NumberingResult(NumberingState.NOT_REQUESTED)
+        if target_season is None and meta_info.begin_season is not None:
+            target_season = meta_info.begin_season
+        unresolved = NumberingResult(NumberingState.UNRESOLVED, "总集号缺少完整的分季集数或目标单集证据")
+        if target_season is None:
+            counts = {item.get("season_number"): item.get("episode_count")
+                      for item in (info.get("seasons") or [])}
+            first_count = counts.get(1)
+            # Ordinary first-season episodes retain their existing numbering;
+            # only totals beyond a known first season need automatic conversion.
+            if type(first_count) is not int or first_count <= 0 or max(episodes) <= first_count:
+                return NumberingResult(NumberingState.NOT_REQUESTED)
+            offset = 0
+            expected_season = 1
+            for number in sorted(number for number in counts if number > 0):
+                count = counts[number]
+                if number != expected_season or type(count) is not int or count <= 0:
+                    return unresolved
+                if min(episodes) <= offset + count:
+                    # A merged file spanning seasons has no single season target.
+                    if max(episodes) > offset + count:
+                        return unresolved
+                    target_season = number
+                    break
+                offset += count
+                expected_season += 1
+            if target_season is None:
+                return unresolved
+        if valid_episodes is None:
+            detail = self.get_tmdb_tv_season_detail(info.get("id"), int(target_season)) or {}
+            valid_episodes = {item.get("episode_number") for item in detail.get("episodes", [])}
+        # Some providers keep absolute episode numbers inside a season (for
+        # example S23E1179). Use their actual numbers before subtracting counts.
+        mapped = (episodes if set(episodes).issubset(valid_episodes) else
+                  self.__convert_absolute_episodes(meta_info, info, episodes,
+                      target_season=target_season, valid_episodes=valid_episodes))
+        if not mapped:
+            return unresolved
+        if meta_info.begin_season == target_season and mapped == episodes:
+            return NumberingResult.verified(meta_info, info)
+        meta_info.begin_season, meta_info.end_season, meta_info.total_seasons = target_season, None, 1
+        meta_info.begin_episode = mapped[0]
+        meta_info.end_episode = mapped[-1] if len(mapped) > 1 else None
+        meta_info.total_episodes = len(mapped)
+        meta_info.note["absolute_episode_mapping"] = {
+            "tmdb_id": info.get("id"), "target_season": target_season,
+            "source_episodes": episodes, "target_episodes": mapped
+        }
+        log.info("【Meta】未标季动漫按前季集数换算总集号：%s -> S%s %s"
+                 % (episodes, str(target_season).rjust(2, "0"), mapped))
+        return NumberingResult.verified(meta_info, info)
+
+    def __convert_absolute_episodes(self, meta_info, info, episodes, target_season=None, valid_episodes=None):
         """
         发布方按绝对集号编号、TMDB 按期分季时，用前几季集数之和换算并核对目标季集列表。
         """
-        target_season = meta_info.begin_season
+        target_season = meta_info.begin_season if target_season is None else target_season
         if target_season is None or int(target_season) <= 1:
             return None
         counts = {item.get("season_number"): item.get("episode_count")
@@ -1770,9 +1835,10 @@ class Media:
         mapped = [episode - offset for episode in episodes]
         if any(episode < 1 for episode in mapped):
             return None
-        detail = self.get_tmdb_tv_season_detail(info.get("id"), int(target_season)) or {}
-        valid = {item.get("episode_number") for item in detail.get("episodes", [])}
-        if not valid or not set(mapped).issubset(valid):
+        if valid_episodes is None:
+            detail = self.get_tmdb_tv_season_detail(info.get("id"), int(target_season)) or {}
+            valid_episodes = {item.get("episode_number") for item in detail.get("episodes", [])}
+        if not valid_episodes or not set(mapped).issubset(valid_episodes):
             return None
         return mapped
 
@@ -1809,13 +1875,11 @@ class Media:
         valid_episodes = {ep.get("episode_number") for ep in detail.get("episodes", [])}
         if not valid_episodes:
             return NumberingResult(NumberingState.UNRESOLVED, "LLM 目标季集列表不可用，保留源文件待重试")
-        # A scalar LLM target cannot represent a multi-episode release.
         episodes = meta_info.get_episode_list()
-        if (len(episodes) > 1 and meta_info.begin_season in (None, int(season))
-                and not set(episodes).issubset(valid_episodes)):
-            raise ValueError("LLM 目标季无法验证完整多集范围")
         applied_episode = None
         llm_episode = llm_note.get("tmdb_episode")
+        # A scalar LLM target cannot represent a multi-episode release. Validate
+        # every episode below, including any absolute-to-season conversion.
         if len(episodes) <= 1 and llm_episode is not None:
             if int(llm_episode) not in valid_episodes:
                 return NumberingResult(NumberingState.UNRESOLVED, "LLM 目标单集不在目标季列表中")
@@ -1825,8 +1889,14 @@ class Media:
             meta_info.total_episodes = 1
         elif episodes and not set(episodes).issubset(valid_episodes):
             if meta_info.begin_season in (None, int(season)):
-                return NumberingResult(NumberingState.UNRESOLVED, "目标季无法核验完整发布集号")
-            log.warn("【Meta】LLM季号已验证但集号%s不在该季集列表中，保留原集号" % episodes)
+                # A verified season alone does not turn a release total into a
+                # season-local episode. Require the same conversion as preview.
+                absolute = self._resolve_absolute_numbering(meta_info, info, target_season=int(season),
+                                                            valid_episodes=valid_episodes)
+                if absolute.state != NumberingState.VERIFIED:
+                    return NumberingResult(NumberingState.UNRESOLVED, "目标季无法核验完整发布集号")
+            else:
+                log.warn("【Meta】LLM季号已验证但集号%s不在该季集列表中，保留原集号" % episodes)
         note = dict(meta_info.note or {})
         note["season_binding"] = {
             "tmdb_id": info.get("id"),
@@ -2385,12 +2455,30 @@ class Media:
         if target.begin_season is None:
             for field in season_fields:
                 setattr(target, field, getattr(source, field))
+            if source.begin_season is not None:
+                target.note["directory_season"] = source.begin_season
         choices = source.note.get("ordinal_candidates") or source.note.get("ordinal_default")
         if choices:
             # The two-digit release default concerns that release's episode;
             # it cannot choose a directory's identity for a different child file.
             target.note["ordinal_candidates"] = [dict(fields, **retained) for fields in choices]
             target.skip_reason = "目录名称的序数季解释尚未唯一确认"
+
+    @staticmethod
+    def _inherit_directory_season(target, parent_name, mtype=None):
+        """Use the same nearest-directory season hint with and without a bound work."""
+        if (target.begin_season is not None
+                or not re.search(r"(?i)(?:\bS\d{1,2}(?:\b|[ ._-])|\bSeason\b|季)", parent_name)):
+            return
+        # Generic staging directories must not trigger another title parse or
+        # consume a second set of LLM release-extraction evidence.
+        directory = MetaInfo(parent_name, mtype=mtype, use_llm=False)
+        if directory.begin_season is None:
+            return
+        target.begin_season = directory.begin_season
+        target.end_season = directory.end_season
+        target.total_seasons = directory.total_seasons
+        target.note["directory_season"] = directory.begin_season
 
     @staticmethod
     def _reject_multiseason_fractional(meta_info):
@@ -2545,9 +2633,10 @@ class Media:
                             parent_parent_info = MetaInfo(parent_parent_name)
                             self._inherit_directory_identity(parent_info, parent_parent_info)
                         self._inherit_directory_identity(meta_info, parent_info)
-                    # 上级目录只能补足名称，不能覆盖手动选择的媒体类型。
+                    # 手动媒体类型优先于目录兜底；明确的目录季号单独继承并核验。
                     if media_type:
                         meta_info.type = media_type
+                    self._inherit_directory_season(meta_info, parent_name, media_type)
                     if not meta_info.get_name() or not meta_info.type:
                         log.warn("【Rmt】%s 未识别出有效信息！" % meta_info.org_string)
                         if (meta_info.note or {}).get("fractional_episode"):
@@ -2606,18 +2695,7 @@ class Media:
                     bound_type = tmdb_info.get("media_type") or media_type
                     meta_info = MetaInfo(title=file_name, mtype=bound_type,
                                          use_llm=not bool(download_context), _prepared=prepared[file_path])
-                    if (meta_info.begin_season is None
-                            and re.search(r"(?i)(?:\bS\d{1,2}(?:\b|[ ._-])|\bSeason\b|季)", parent_name)):
-                        # A bound work still needs the nearest directory's season
-                        # when the child filename carries only an episode number.
-                        # Only season-shaped directories are parsed here: a generic
-                        # staging directory must not trigger another title parse or
-                        # consume a second set of release-extraction evidence.
-                        directory_info = MetaInfo(parent_name, mtype=bound_type, use_llm=False)
-                        if directory_info.begin_season is not None:
-                            meta_info.begin_season = directory_info.begin_season
-                            meta_info.end_season = directory_info.end_season
-                            meta_info.total_seasons = directory_info.total_seasons
+                    self._inherit_directory_season(meta_info, parent_name, bound_type)
                     ordinal = any((meta_info.note or {}).get(key) for key in
                                   ("ordinal_candidates", "ordinal_default"))
                     if ordinal:

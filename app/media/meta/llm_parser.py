@@ -257,12 +257,14 @@ class LLMMetaParser(object):
                 meta_info.year = source_year
             original_season = meta_info.begin_season
             rule_names = [name for name in (meta_info.cn_name, meta_info.en_name) if name]
-            # Explicit season/episode ranges are release evidence. LLM hints
-            # may refine names, but range conversion requires full TMDB evidence.
+            # Ranges and an episode without a season are release evidence. An
+            # LLM-filled season must not silently turn a total into a local EP;
+            # verified TMDB season/episode hints are resolved together later.
             range_fields = ("begin_season", "end_season", "total_seasons",
                             "begin_episode", "end_episode", "total_episodes")
             release_range = ({key: getattr(meta_info, key) for key in range_fields}
                              if len(meta_info.get_episode_list()) > 1 or len(meta_info.get_season_list()) > 1
+                             or (original_season is None and meta_info.begin_episode is not None)
                              else None)
             self.__apply_result(meta_info, llm_result)
             if release_range:

@@ -31,6 +31,7 @@ RECOGNITION_MODULES = (
     "tests.test_review_regressions",
     "tests.test_recognition_performance",
     "tests.test_llm_season_binding",
+    "tests.test_absolute_episode_numbering",
     "tests.test_media_cn_fallback",
     # Keep crawler link normalization in the offline regression suite.
     "tests.test_spider_response",

@@ -99,6 +99,21 @@ class LlmCrossingsTest(TestCase):
         self.assertIsNone(meta.skip_reason)
         self.assert_numbering(meta, 2, 3, 5)
 
+    def test_llm_season_fill_does_not_relabel_an_existing_release_total(self):
+        self.fx.tv(123, "Example Anime", genres=(16,), seasons={1: 12, 2: 12})
+        title = "[Group] Example Anime - 15 [1080p].mkv"
+        for entry in ("title", "file"):
+            with self.subTest(entry=entry):
+                self.fx.cache.clear()
+                with self.llm_response({"type": "tv", "tmdb_id": 123, "tmdb_type": "tv",
+                                        "begin_season": 2},
+                                       [{"id": 123, "name": "Example Anime", "type": "tv"}]):
+                    meta = self.recognize(title, entry=entry)
+                self.assertEqual(123, meta.tmdb_id)
+                self.assertIsNone(meta.skip_reason)
+                self.assert_numbering(meta, 2, 3)
+                self.assertEqual([15], meta.note["absolute_episode_mapping"]["source_episodes"])
+
     def test_fix03_name_modes_keep_existing_year_numbers_and_resource_fields(self):
         for mode, expected in (("conservative", "Original Show"), ("balanced", "Renamed Show")):
             with self.subTest(mode=mode):
