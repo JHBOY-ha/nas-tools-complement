@@ -121,6 +121,17 @@ const episodes = [
     await page.waitForFunction(() => document.getElementById('library_filter_type').value === 'movie');
     assert.equal(lastList().type, 'movie');
     await page.locator('#library_filter_trigger').click();
+    // Filter fields form an even grid: same-row controls share a top edge, same-column controls a left edge.
+    const labelBox = async id => page.locator(id).evaluate(el => {
+      const r = el.closest('[class*="col-"]').querySelector('label').getBoundingClientRect();
+      return {x: Math.round(r.left), y: Math.round(r.top)};
+    });
+    const [category, audio, sortBy, sortOrder] = [await labelBox('#library_filter_category'), await labelBox('#library_filter_audio'),
+      await labelBox('#library_sort_by'), await labelBox('#library_sort_order')];
+    assert.equal(category.y, audio.y, 'first row labels share a top edge');
+    assert.equal(sortBy.y, sortOrder.y, 'second row labels share a top edge');
+    assert.equal(category.x, sortBy.x, 'left column is aligned');
+    assert.equal(audio.x, sortOrder.x, 'right column is aligned');
     await page.locator('#library_filter_audio').selectOption('eng');
     await page.locator('#library_filter_btn').click();
     await page.getByRole('button', {name: /^缺字幕/}).click();
