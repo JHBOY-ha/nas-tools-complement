@@ -9,7 +9,7 @@ from pathlib import Path
 from jinja2 import Environment, FileSystemLoader, ChainableUndefined
 env = Environment(loader=FileSystemLoader('web/templates'), undefined=ChainableUndefined, autoescape=True)
 library = env.get_template('rename/medialibrary.html').render(MediaServerType='emby')
-online = library[library.index('<div class="modal modal-blur fade" id="library-online-subtitle-modal"'):]
+online = library[library.index('<div class="modal modal-blur fade lit-library-modal" id="library-online-subtitle-modal"'):]
 shell = Path('web/templates/navigation.html').read_text()
 confirm = shell[shell.index('<!-- 危险确认提示框 -->'):shell.index('<!-- 成功带后续操作提示框 -->')]
 confirm = env.from_string("{% import 'macro/svg.html' as SVG %}" + confirm).render()

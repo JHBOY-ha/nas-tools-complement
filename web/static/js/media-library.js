@@ -879,6 +879,9 @@ function library_upload_block_label(item) {
   return item.target_path ? "媒体文件不存在" : "缺少目标文件";
 }
 
+// Same glyph as the header's SVG.dots() macro, which is not available to rendered cards.
+var library_dots_icon = '<svg xmlns="http://www.w3.org/2000/svg" class="icon icon-tabler icon-tabler-dots" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path stroke="none" d="M0 0h24v24H0z" fill="none"></path><circle cx="5" cy="12" r="1"></circle><circle cx="12" cy="12" r="1"></circle><circle cx="19" cy="12" r="1"></circle></svg>';
+
 function library_card_primary(item) {
   const status = item.subtitle_status || "unknown";
   const is_movie = item.media_type === "movie";
@@ -934,7 +937,7 @@ function library_card_actions(item, item_id, title) {
         ${primary_button}
         <div class="dropdown lit-library-card-menu">
           <button type="button" class="btn btn-sm btn-icon" data-bs-toggle="dropdown" aria-expanded="false"
-                  aria-label="更多操作：${title}" title="更多操作">⋯</button>
+                  aria-label="更多操作：${title}" title="更多操作">${library_dots_icon}</button>
           <div class="dropdown-menu dropdown-menu-end">${menu_items}</div>
         </div>
       </div>`;
