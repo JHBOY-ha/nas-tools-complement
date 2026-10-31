@@ -1180,8 +1180,15 @@ class MediaLibraryTest(TestCase):
         self.assertEqual(detect([audio("ja"), audio("eng")]), "jpn")
         self.assertEqual(detect([audio("en-US")]), "eng")
         self.assertEqual(detect([audio("kor")]), "kor")
-        self.assertEqual(detect([audio("fra")]), "other")
-        self.assertEqual(detect([audio("chi")]), "other")
+        self.assertEqual(detect([audio("fra")]), "fra")
+        self.assertEqual(detect([audio("fre")]), "fra")
+        self.assertEqual(detect([audio("fr-CA")]), "fra")
+        self.assertEqual(detect([audio("rus")]), "rus")
+        self.assertEqual(detect([audio("chi")]), "zho")
+        self.assertEqual(detect([audio("zh-CN")]), "zho")
+        self.assertEqual(detect([audio("cmn")]), "zho")
+        self.assertEqual(detect([audio("spa")]), "other")
+        self.assertEqual(detect([audio("ara")]), "other")
         self.assertEqual(detect([audio("und")]), "unknown")
         self.assertEqual(detect([audio("")]), "unknown")
         self.assertEqual(detect([{"Type": "Subtitle", "Language": "eng"}]), "unknown")
@@ -1211,6 +1218,18 @@ class MediaLibraryTest(TestCase):
         self.assertEqual(library.list_items({"audio_language": "bogus", "page_size": 20})["total"], 7)
         problem = library.list_items({"subtitle": "problem", "page_size": 20})
         self.assertEqual([item["id"] for item in problem["items"]], ["6"])
+
+    def test_permanent_member_languages_are_separate_filters(self):
+        audio = lambda language: [{"Type": "Audio", "Language": language, "IsDefault": True}]
+        entries = [(audio(code), "missing_chinese", "", "movie") for code in ("chi", "fra", "rus", "eng", "spa")]
+        library = self._filter_library(entries)
+        ids = lambda language: [
+            item["id"] for item in library.list_items({"audio_language": language, "page_size": 20})["items"]]
+        self.assertEqual(ids("zho"), ["0"])
+        self.assertEqual(ids("fra"), ["1"])
+        self.assertEqual(ids("rus"), ["2"])
+        self.assertEqual(ids("eng"), ["3"])
+        self.assertEqual(ids("other"), ["4"])
 
     def test_summary_counts_follow_other_filters_but_not_the_subtitle_filter(self):
         eng = [{"Type": "Audio", "Language": "eng", "IsDefault": True}]

@@ -35,9 +35,11 @@ class MediaLibrary:
     _poster_success_ttl = 3600
     _poster_failure_ttl = 300
     refresh_item_limit = 18
-    audio_language_filters = ("all", "eng", "jpn", "kor", "other", "unknown")
+    audio_language_filters = ("all", "zho", "eng", "fra", "rus", "jpn", "kor", "other", "unknown")
     _audio_language_codes = {
-        "en": "eng", "eng": "eng", "ja": "jpn", "jpn": "jpn", "jp": "jpn",
+        "zh": "zho", "zho": "zho", "chi": "zho", "cmn": "zho", "yue": "zho",
+        "en": "eng", "eng": "eng", "fr": "fra", "fra": "fra", "fre": "fra",
+        "ru": "rus", "rus": "rus", "ja": "jpn", "jpn": "jpn", "jp": "jpn",
         "ko": "kor", "kor": "kor",
         "": "unknown", "und": "unknown", "unknown": "unknown", "mis": "unknown", "mul": "unknown"
     }
@@ -149,7 +151,7 @@ class MediaLibrary:
 
     @classmethod
     def __audio_language(cls, media_streams):
-        """Default audio track language of a synced movie, as eng/jpn/kor/other/unknown."""
+        """Default audio track language of a synced movie, as zho/eng/fra/rus/jpn/kor/other/unknown."""
         audio = [
             stream for stream in (media_streams or [])
             if isinstance(stream, dict)

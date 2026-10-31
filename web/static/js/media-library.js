@@ -1167,7 +1167,7 @@ function library_drawer_resume() {
 }
 
 function library_audio_language_label(code) {
-  return {eng: "英语", jpn: "日语", kor: "韩语", other: "其他语言", unknown: "未知"}[code] || "";
+  return {zho: "中文", eng: "英语", fra: "法语", rus: "俄语", jpn: "日语", kor: "韩语", other: "其他语言", unknown: "未知"}[code] || "";
 }
 
 function render_library_drawer_overview(item) {
