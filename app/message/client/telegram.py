@@ -81,6 +81,41 @@ class Telegram(_IMessageClient):
         """
         return self._telegram_user_ids
 
+    def bot_request(self, method, payload):
+        """Call the Bot API without exposing its token-bearing URL in errors."""
+        try:
+            response = requests.post(
+                f"https://api.telegram.org/bot{self._telegram_token}/{method}",
+                json=payload, proxies=Config().get_proxies(), timeout=(5, 10))
+            data = response.json()
+        except (requests.RequestException, ValueError):
+            raise RuntimeError('Telegram 暂时无法连接') from None
+        if not data.get('ok'):
+            description = data.get('description', '')
+            if 'message is not modified' in description:
+                return {'message_id': payload.get('message_id')}
+            if method == 'editMessageText' and ('message to edit not found' in description
+                                               or "message can't be edited" in description):
+                payload = dict(payload)
+                payload.pop('message_id')
+                return self.bot_request('sendMessage', payload)
+            raise RuntimeError('Telegram 操作未成功，请稍后重试')
+        return data.get('result')
+
+    def search_message(self, chat_id, text, keyboard, message_id=None):
+        # Plain text keeps resource titles literal; buttons carry opaque IDs,
+        # never signed torrent URLs or credentials.
+        payload = {'chat_id': chat_id, 'text': text,
+                   'reply_markup': {'inline_keyboard': keyboard},
+                   'disable_web_page_preview': True}
+        if message_id:
+            payload['message_id'] = message_id
+        result = self.bot_request('editMessageText' if message_id else 'sendMessage', payload)
+        return result['message_id']
+
+    def answer_search_callback(self, callback_id, text='已收到'):
+        return self.bot_request('answerCallbackQuery', {'callback_query_id': callback_id, 'text': text})
+
     def send_msg(self, title, text="", image="", url="", user_id=""):
         """
         发送Telegram消息

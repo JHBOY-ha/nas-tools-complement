@@ -66,6 +66,7 @@ class MetaHelper(object):
                     self.update_meta_data({key: info})
                 elif expire and self._tmdb_cache_expire:
                     self.delete_meta_data(key)
+                    return {}
             return info or {}
 
     def dump_meta_data(self, search, page, num):

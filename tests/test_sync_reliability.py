@@ -15,6 +15,7 @@ import time
 import traceback
 import unittest
 import uuid
+from collections.abc import MutableMapping
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -87,29 +88,53 @@ class RecognitionTests(unittest.TestCase):
         self.ns["prepare_title"] = prepare_title
         # New special classification is pure and safe in the AST harness.
         from app.media.meta.special import extract_special
-        from app.media.meta.special_resolver import identity
+        from app.media.meta.special_resolver import SpecialResolver, identity
+        from app.media.meta.release_groups import ReleaseGroupsMatcher
+        from app.media.meta.ordinal import Evidence
+        from app.media.meta.recognition import NumberingResult, NumberingState, RecognitionPending, query_tmdb
+        from app.utils import StringUtils
+        from app.media.meta.special import download_block_reason
         self.ns["extract_special"] = extract_special
         self.ns["identity"] = identity
+        self.ns["SpecialResolver"] = SpecialResolver
+        self.ns["ReleaseGroupsMatcher"] = ReleaseGroupsMatcher
+        self.ns["Evidence"] = Evidence
+        self.ns.update(NumberingResult=NumberingResult, NumberingState=NumberingState,
+                       RecognitionPending=RecognitionPending, download_block_reason=download_block_reason,
+                       query_tmdb=query_tmdb, StringUtils=StringUtils)
+        # Per-recognition candidate detail reuse uses the production decorator.
+        from contextlib import contextmanager
+        from app.media.media import _shares_candidate_details
+        from app.media.meta.recognition import CANDIDATE_DETAIL_LIMIT
+        self.ns.update(threading=threading, contextmanager=contextmanager,
+                       _shares_candidate_details=_shares_candidate_details,
+                       CANDIDATE_DETAIL_LIMIT=CANDIDATE_DETAIL_LIMIT)
         cls = load_class('app/media/media.py', 'Media', [
             '__search_media_with_name', '__extract_llm_tmdb_target', '__resolve_tmdb_mtype',
             'get_media_info_on_files', 'get_cache_info', '__make_cache_key', '_valid_media_identity',
             '__expect_anime_genre', '__get_genre_ids',
             '__search_media_info', '__confirm_search_result', '__search_media_by_alias_candidates',
-            '_prepare_media_identity', '_apply_episode_mapping', '_apply_llm_season',
+            '_prepare_media_identity', '_apply_episode_mapping',
+            '_resolve_numbering', '_resolve_llm_numbering', '_finalize_recognition',
+            '__lookup_media_identity', '__select_tv_candidate', '__query_tv_candidates',
+            '__known_seasons_match',
             # File recognition now shares manual overrides across both identity paths.
-            '_apply_manual_numbering',
+            '_apply_manual_numbering', '_inherit_directory_identity',
             '__verify_remapped_episodes', '__convert_absolute_episodes', '__suggest_episode_mapping',
             '__episode_list_of', '__lacks_anime_genre', '__normalize_identity_name',
             '__candidate_all_names', '__is_other_work_by_prefix', '__is_other_work',
             '__load_cached_identity',
-            '__search_tv_by_name'], self.ns, keep_attrs=True)
+            # Match the production search and cache guards in the AST harness.
+            '__is_release_group_name', '__cacheable_release', '__tv_year_matches', '__llm_year_matches',
+            '__search_tv_by_name', '__identity_conflict',
+            '_recognition_details', '__detail_key', '__detail_reused', '__candidate_detail'], self.ns, keep_attrs=True)
         self.media = cls()
 
     def test_explicit_work_mapping_is_verified_and_not_applied_twice(self):
         rules = [{'tmdb_id': 65942, 'source_season': 4, 'source_begin': 1,
                   'source_end': 19, 'target_season': 1, 'offset': 66}]
         self.ns['Config'] = lambda: NS(get_config=lambda key: {'episode_mappings': rules})
-        meta = NS(type=MediaType.ANIME, begin_season=4, begin_episode=14, note={})
+        meta = NS(type=MediaType.ANIME, begin_season=4, begin_episode=14, note={}, skip_reason=None)
         meta.get_episode_list = lambda: [meta.begin_episode]
         meta.get_season_list = lambda: [meta.begin_season]
         info = {'id': 65942, 'media_type': MediaType.TV,
@@ -135,7 +160,8 @@ class RecognitionTests(unittest.TestCase):
         self.media._rmt_match_mode = 'strict'
         self.media._Media__search_tmdb = Mock(side_effect=[{}, {'id': 309974}])
         meta = NS(type=MediaType.ANIME, year='2025', begin_season=1,
-                  note={'llm': {'inferred_year': True}})
+                  note={'llm': {'inferred_year': True}},
+                  get_season_list=lambda: [1], get_episode_list=lambda: [])
         result = self.media._Media__search_media_with_name(meta, '透明之夜', strict=True)
         self.assertEqual(309974, result['id'])
         self.assertNotIn('first_media_year', self.media._Media__search_tmdb.call_args.kwargs)
@@ -144,7 +170,8 @@ class RecognitionTests(unittest.TestCase):
         for year in ['2024', None]:
             self.media._Media__search_tmdb = Mock(return_value={'id': 123})
             self.media._Media__search_media_with_name(
-                NS(type=MediaType.ANIME, year=year, begin_season=2), 'Example')
+                NS(type=MediaType.ANIME, year=year, begin_season=2,
+                   get_season_list=lambda: [2], get_episode_list=lambda: []), 'Example')
             self.assertEqual(MediaType.TV, self.media._Media__search_tmdb.call_args.kwargs['search_type'])
 
     def test_llm_id_requires_candidate_and_matching_type(self):
@@ -252,18 +279,26 @@ class RecognitionTests(unittest.TestCase):
                   begin_season=int(season_match[1]) if season_match else None,
                   note={}, skip_reason=None, tmdb_info=info, tmdb_id=456,
                   set_tmdb_info=Mock())
-        meta.get_episode_list = lambda: [meta.begin_episode] if meta.begin_episode else []
+        # Use the production range reader rather than duplicating the new guard.
+        base = load_class('app/media/meta/_base.py', 'MetaBase', ['get_season_list', 'get_episode_list'], self.ns)
+        meta.get_season_list = base.get_season_list.__get__(meta)
+        meta.get_episode_list = base.get_episode_list.__get__(meta)
         def parse(title=None, **kwargs):
             if title == source_title:
                 # RSS 原标题只用来读取发布季标记
                 source_season = re.search(r"S(\d+)E", title or "")
-                return NS(begin_season=int(source_season[1]) if source_season else None)
+                source_meta = NS(type=MediaType.TV, end_season=None,
+                                 begin_season=int(source_season[1]) if source_season else None)
+                source_meta.get_season_list = base.get_season_list.__get__(source_meta)
+                return source_meta
             return meta
         self.ns['MetaInfo'] = Mock(side_effect=parse)
         self.ns['PathUtils'] = NS(get_parent_paths=lambda p, n: str(Path(p).parents[n - 1]),
                                   get_bluray_dir=lambda p: None)
         self.media.tmdb = True
         self.media.save_rename_cache = Mock()
+        self.media.get_tmdb_tv_season_detail = Mock(return_value={'episodes': [
+            {'episode_number': ep, 'season_number': seasons[0], 'show_id': 456} for ep in episodes]})
         with tempfile.TemporaryDirectory() as directory:
             path = str(Path(directory) / name)
             Path(path).touch()
@@ -277,9 +312,11 @@ class RecognitionTests(unittest.TestCase):
                                   get_bluray_dir=lambda p: None)
         self.media.tmdb = True
         self.media.save_rename_cache = Mock()
-        metas = [NS(type=MediaType.MOVIE, note={}, skip_reason=None, begin_season=None,
+        metas = [NS(type=MediaType.MOVIE, note={}, skip_reason=None, tmdb_info=None, begin_season=None,
                     end_season=None, begin_episode=None, end_episode=None,
-                    get_episode_list=lambda: [], set_tmdb_info=Mock()) for _ in range(3)]
+                    get_episode_list=lambda: [], get_name=lambda: 'Film', set_tmdb_info=Mock()) for _ in range(3)]
+        for meta in metas:
+            meta.set_tmdb_info.side_effect = lambda info, current=meta: setattr(current, 'tmdb_info', info)
         self.ns['MetaInfo'] = Mock(side_effect=metas)
         with tempfile.TemporaryDirectory() as directory:
             paths = [str(Path(directory) / ('film%s.mkv' % i)) for i in range(3)]
@@ -321,17 +358,18 @@ class RecognitionTests(unittest.TestCase):
 
     def test_absolute_episode_maps_only_with_verified_previous_seasons(self):
         result, meta = self.identify_file('Name - 15.mkv', [3], parsed_episode=15,
-            tmdb_seasons=[{'season_number': 1, 'episode_count': 12}])
+            tmdb_seasons=[{'season_number': 1, 'episode_count': 12}, {'season_number': 2, 'episode_count': 12}])
         self.assertEqual(1, len(result))
         self.assertEqual(3, meta.begin_episode)
         result, _ = self.identify_file('Name S02E15.mkv', [3], parsed_episode=15,
-            tmdb_seasons=[{'season_number': 1, 'episode_count': 12}])
+            tmdb_seasons=[{'season_number': 1, 'episode_count': 12}, {'season_number': 2, 'episode_count': 12}])
         self.assertEqual({}, result)
 
     def test_single_file_can_use_rss_episode(self):
-        result, meta = self.identify_file('abbreviation.mkv', [3], parsed_episode=None)
-        self.assertEqual(1, len(result))
-        self.assertEqual(3, meta.begin_episode)
+        for episode in (0, 3):
+            result, meta = self.identify_file('abbreviation.mkv', [episode], parsed_episode=None)
+            self.assertEqual(1, len(result))
+            self.assertEqual(episode, meta.begin_episode)
 
 
 class JellyfinTests(unittest.TestCase):
@@ -423,7 +461,7 @@ class DownloadTests(unittest.TestCase):
             return True
         self.d.dbhelper.save_download_context.side_effect = save
         self.d.dbhelper.get_download_context.side_effect = lambda k, d: json.loads(records[(k, d)])
-        namespace = {'sys': __import__('sys'), 'TMDbException': RuntimeError}
+        namespace = {'sys': __import__('sys'), 'TMDbException': RuntimeError, 'MutableMapping': MutableMapping}
         tree = ast.parse((ROOT / 'app/media/tmdbv3api/as_obj.py').read_text())
         tree.body = [node for node in tree.body if isinstance(node, ast.ClassDef)]
         exec(compile(tree, 'as_obj.py', 'exec'), namespace)

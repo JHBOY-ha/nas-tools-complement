@@ -10,6 +10,8 @@ from unittest.mock import Mock, patch
 from app.media.media import Media
 from app.media.meta import MetaInfo
 from app.media.meta.special import download_block_reason
+from app.media.tmdbv3api import TV
+from app.media.tmdbv3api.as_obj import AsObj
 from app.utils import EpisodeFormat
 from app.utils.types import MediaType, MatchMode
 
@@ -41,6 +43,12 @@ class OrdinalSeasonTest(TestCase):
                 "number_of_seasons": 1,
                 "seasons": [{"season_number": season, "episode_count": 24}]}
 
+    @staticmethod
+    def movie(name, ident):
+        # A typed contrary fact: unlike a missing season, it disproves a title.
+        return {"name": name, "title": name, "id": ident, "media_type": MediaType.MOVIE,
+                "genres": [{"id": 16}], "release_date": "2020-01-01"}
+
     def candidates(self, *works):
         def found(name):
             return [copy.deepcopy(w) for w in works if w['name'].casefold() == name.casefold()]
@@ -49,6 +57,35 @@ class OrdinalSeasonTest(TestCase):
             {k: v for k, v in w.items() if k not in ('genres', 'seasons')} for w in found(args['query'])]
         self.media.get_tmdb_info = Mock(side_effect=lambda **kw:
             copy.deepcopy(next((w for w in works if w['id'] == kw['tmdbid']), {})))
+
+    def test_real_adapter_preserves_ordinal_evidence_and_task_completion(self):
+        work = self.info('Show', 3, 1)
+        work.pop('media_type')  # SDK payload before Media assigns the provider type.
+        episodes = {'episodes': [dict(episode_number=n, season_number=3, show_id=1)
+                                 for n in range(1, 25)]}
+        self.media.tv = TV()
+        season_detail = Media.get_tmdb_tv_season_detail.__get__(self.media)
+        with patch.object(TV, '_call', side_effect=lambda url, *args, **kwargs:
+                copy.deepcopy(episodes if '/season/' in url else work)), \
+                patch.object(self.media, 'get_tmdb_tv_season_detail', wraps=season_detail), \
+                tempfile.TemporaryDirectory() as root:
+            bound = self.media.get_tmdb_info(mtype=MediaType.TV, tmdbid=1)
+            self.assertIsInstance(bound['seasons'][0], AsObj)
+            for title, season in (('Show 3rd Season 5.mkv', None), ('Show 4th Season 5.mkv', 3)):
+                path = str(Path(root) / title)
+                Path(path).touch()
+                result = self.media.get_media_info_on_files([path], tmdb_info=bound, season=season)[path]
+                self.assertFalse(result.skip_reason)
+                self.assertEqual((3, [5]), (result.begin_season, result.get_episode_list()))
+            # The formal title identifies a pack; a task supplies its missing EP.
+            work['name'] = 'Show 4th'
+            path = str(Path(root) / 'Show 4th Season 3.mkv')
+            Path(path).touch()
+            bound = self.media.get_tmdb_info(mtype=MediaType.TV, tmdbid=1)
+            result = self.media.get_media_info_on_files([path], download_context=dict(
+                tmdb_info=bound, seasons=[3], episodes=[5], numbering='tmdb', allow_episode_fallback=True))[path]
+            self.assertFalse(result.skip_reason)
+            self.assertEqual([5], result.get_episode_list())
 
     def test_explicit_written_season_preserves_ordinal_title(self):
         # Both ordinal suffixes and explicit anime routing retain the full work name.
@@ -89,8 +126,14 @@ class OrdinalSeasonTest(TestCase):
         ambiguous = self.media.get_media_info('Major 2nd Season 2', cache=False)
         self.assertTrue(ambiguous.skip_reason)
         self.assertFalse(ambiguous.tmdb_id)
-        # Exclusion requires actual contrary facts, not an empty search response.
+        # A missing season is not a contrary fact: Major may simply lack S2 on TMDB.
         self.candidates(self.info('Major', 9, 1), self.info('Major 2nd', 2, 2))
+        unproven = self.media.get_media_info('Major 2nd Season 2', cache=False)
+        self.assertTrue(unproven.skip_reason)
+        self.assertFalse(unproven.tmdb_id)
+        self.assertIn('未知', unproven.note['ordinal_evidence'])
+        # Exclusion requires actual contrary facts, here the original title's type.
+        self.candidates(self.movie('Major', 1), self.info('Major 2nd', 2, 2))
         resolved = self.media.get_media_info('Major 2nd Season 2', cache=False)
         self.assertEqual(('major 2nd', 2, []),
                          (resolved.get_name().casefold(), resolved.begin_season, resolved.get_episode_list()))
@@ -98,7 +141,7 @@ class OrdinalSeasonTest(TestCase):
         self.assertFalse(resolved.skip_reason)
 
     def test_public_lookup_confirms_single_episode_with_tmdb_evidence(self):
-        self.candidates(self.info('Show', 4, 1), self.info('Show 4th', 9, 2))
+        self.candidates(self.info('Show', 4, 1), self.movie('Show 4th', 2))
         resolved = self.media.get_media_info('Show 4th Season 5 1080p', cache=False)
         self.assertEqual((1, 4, [5]), (resolved.tmdb_id, resolved.begin_season, resolved.get_episode_list()))
         self.assertFalse(download_block_reason(resolved))
@@ -108,7 +151,7 @@ class OrdinalSeasonTest(TestCase):
         self.assertFalse(rejected.tmdb_id)
 
     def test_unbound_file_lookup_and_incomplete_episode_lists_fail_safely(self):
-        self.candidates(self.info('Show', 4, 1), self.info('Show 4th', 9, 2))
+        self.candidates(self.info('Show', 4, 1), self.movie('Show 4th', 2))
         with tempfile.TemporaryDirectory() as directory:
             path = str(Path(directory) / 'Show 4th Season 5.mkv')
             Path(path).touch()
@@ -141,7 +184,8 @@ class OrdinalSeasonTest(TestCase):
             Path(path).touch()
             result = self.media.get_media_info_on_files([path], tmdb_info=work)
             self.assertEqual('major 2nd', result[path].get_name().casefold())
-            self.assertFalse(result[path].skip_reason)
+            self.assertEqual('bound', result[path].note['ordinal_resolution']['source'])
+            self.assertIn('缺少可验证集号', result[path].skip_reason)
             other = self.media.get_media_info_on_files([path], tmdb_info=self.info('Unrelated', 2, 3))
             self.assertTrue(other[path].skip_reason)
             episode_path = str(Path(directory) / 'Show 4th Season 5.mkv')
@@ -174,6 +218,19 @@ class OrdinalSeasonTest(TestCase):
             session_http.assert_not_called()
         third = MetaInfo('Show 3rd Season 12 1080p', use_llm=False)
         self.assertEqual((3, [12]), (third.begin_season, third.get_episode_list()))
+        # The work cache must not validate an old release season before applying
+        # a correction; both lookup paths must verify the same explicit target.
+        self.candidates(self.info('Show', 2, 1), self.movie('Show 4th', 2))
+        with tempfile.TemporaryDirectory() as root:
+            path = str(Path(root) / 'Show 4th Season 05.mkv')
+            Path(path).touch()
+            for cached in (True, False):
+                if not cached:
+                    self.cache.clear()
+                result = self.media.get_media_info_on_files([path], season=2,
+                    episode_format=EpisodeFormat(None, '5'))[path]
+                self.assertFalse(result.skip_reason)
+                self.assertEqual((1, 2, [5]), (result.tmdb_id, result.begin_season, result.get_episode_list()))
         self.assertFalse(third.skip_reason)
 
     def test_cache_isolation_for_public_and_unbound_file_lookup(self):
@@ -192,8 +249,19 @@ class OrdinalSeasonTest(TestCase):
                     resolved = self.media.get_media_info_on_files([path])[path]
                 else:
                     resolved = self.media.get_media_info(title)
-                self.assertEqual(2, resolved.tmdb_id)
+                # Major S2 lists only one episode; a missing E2 does not disprove it.
+                self.assertTrue(resolved.skip_reason)
+                self.assertFalse(resolved.tmdb_id)
                 self.assertFalse(self.cache)
+                if file_lookup:
+                    for directory in (title, 'Major 2nd Season 02'):
+                        child = Path(root) / directory / '01.mkv'
+                        child.parent.mkdir()
+                        child.touch()
+                        unresolved = self.media.get_media_info_on_files([str(child)])[str(child)]
+                        self.assertTrue(unresolved.skip_reason)
+                        self.assertEqual([1], unresolved.get_episode_list())
+                        self.assertFalse(self.cache)
                 ordinary = self.media.get_media_info('Major S02E01 1080p')
                 self.assertEqual(1, ordinary.tmdb_id)
                 self.assertFalse(ordinary.skip_reason)
@@ -234,7 +302,8 @@ class OrdinalSeasonTest(TestCase):
             self.candidates(self.info('Show', seasons[0], 1), self.info('Show 4th', seasons[1], 2))
             meta = self.media.get_media_info('Show 4th Season 5', cache=False)
             self.assertTrue(download_block_reason(meta))
-            expected = '成立' if seasons == (4, 5) else '不成立'
+            # Seasons absent from both works are unknown, not two disproofs.
+            expected = '成立' if seasons == (4, 5) else '未知'
             self.assertEqual([expected, expected], meta.note['ordinal_evidence'])
 
     def test_manual_targets_precede_name_ambiguity_but_require_target_evidence(self):
@@ -254,6 +323,19 @@ class OrdinalSeasonTest(TestCase):
                 self.assertFalse(self.cache)
             # The ordinary manual UI is sufficient; the special-episode dialog need not claim this file.
             self.assertIsNone(special_file(path))
+            for target_season, rejected in ((3, False), (4, True)):
+                partial = self.media.get_media_info_on_files([path], tmdb_info=self.info('Show', 3, 1),
+                    season=target_season)[path]
+                self.assertEqual(rejected, bool(partial.skip_reason))
+                if not rejected:
+                    self.assertEqual((3, [5]), (partial.begin_season, partial.get_episode_list()))
+            self.candidates(self.info('Show', 4, 1), self.movie('Show 4th', 2))
+            for target_season, rejected in ((4, False), (5, True)):
+                selected = self.media.get_media_info_on_files([path], season=target_season,
+                    episode_format=EpisodeFormat('', '6'))[path]
+                self.assertEqual(rejected, bool(selected.skip_reason))
+                if not rejected:
+                    self.assertEqual((4, [6]), (selected.begin_season, selected.get_episode_list()))
             self.media.get_tmdb_tv_season_detail.return_value = {}
             unknown = self.media.get_media_info_on_files([path], tmdb_info=work,
                 season=4, episode_format=EpisodeFormat('', '5'))[path]
@@ -318,7 +400,7 @@ class OrdinalSeasonTest(TestCase):
     def test_configured_and_external_names_are_verified_for_each_interpretation(self):
         for external in (False, True):
             with self.subTest(external=external):
-                self.candidates(self.info('Official Show', 4, 1), self.info('Show 4th', 9, 2))
+                self.candidates(self.info('Official Show', 4, 1), self.movie('Show 4th', 2))
                 self.config.get_config.return_value = {'episode_mappings': [], 'name_aliases':
                     {} if external else {'Show': 'Official Show'}}
                 self.aliases.return_value.get_alias_candidates.side_effect = (
@@ -348,7 +430,7 @@ class OrdinalSeasonTest(TestCase):
                          (movie.get_name(), movie.type, movie.get_episode_list()))
 
     def test_batch_evidence_reuse_and_next_batch_retry(self):
-        self.candidates(self.info('Show', 4, 1), self.info('Show 4th', 9, 2))
+        self.candidates(self.info('Show', 4, 1), self.movie('Show 4th', 2))
         with tempfile.TemporaryDirectory() as root:
             paths = [str(Path(root) / f'Show 4th Season {n}.mkv') for n in (5, 6, 7)]
             for path in paths:
@@ -362,7 +444,7 @@ class OrdinalSeasonTest(TestCase):
             self.assertFalse(self.cache)
             self.media.get_tmdb_search_page.side_effect = RuntimeError('temporary failure')
             self.assertTrue(self.media.get_media_info_on_files(paths)[paths[0]].skip_reason)
-            self.candidates(self.info('Show', 4, 1), self.info('Show 4th', 9, 2))
+            self.candidates(self.info('Show', 4, 1), self.movie('Show 4th', 2))
             self.assertFalse(self.media.get_media_info_on_files(paths)[paths[0]].skip_reason)
 
     def test_bound_identity_can_override_two_digit_compatibility(self):
@@ -373,7 +455,8 @@ class OrdinalSeasonTest(TestCase):
             meta = self.media.get_media_info_on_files([path], tmdb_info=work)[path]
             self.assertEqual(('major 2nd', 2, []),
                              (meta.get_name().casefold(), meta.begin_season, meta.get_episode_list()))
-            self.assertFalse(meta.skip_reason)
+            self.assertEqual('bound', meta.note['ordinal_resolution']['source'])
+            self.assertIn('缺少可验证集号', meta.skip_reason)
 
     def test_positive_lookup_evidence_overrides_default_without_work_cache_pollution(self):
         full = self.info('Major 2nd', 2, 2)
@@ -391,7 +474,7 @@ class OrdinalSeasonTest(TestCase):
     def test_batch_mapping_is_applied_once_and_reuses_target_detail(self):
         self.config.get_config.return_value = {'episode_mappings': [dict(
             tmdb_id=1, source_season=4, source_begin=1, source_end=9, target_season=1, offset=10)]}
-        self.candidates(self.info('Show', 1, 1), self.info('Show 4th', 9, 2))
+        self.candidates(self.info('Show', 1, 1), self.movie('Show 4th', 2))
         with tempfile.TemporaryDirectory() as root:
             paths = [str(Path(root) / f'Show 4th Season {n}.mkv') for n in (5, 6)]
             for path in paths:

@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import time
@@ -363,7 +364,18 @@ class Qbittorrent(_IDownloadClient):
                                             seeding_time_limit=seeding_time_limit,
                                             use_auto_torrent_management=use_auto_torrent_management,
                                             cookie=cookie)
-            return True if qbc_ret and str(qbc_ret).find("Ok") != -1 else False
+            if qbc_ret == "Ok.":
+                return True
+            # WebAPI 2.14+ 返回 JSON 计数；pending 表示链接已接受、等待获取元数据。
+            # bundled client 返回响应文本，HTTP 错误仍由它抛出并在下方处理。
+            try:
+                result = json.loads(qbc_ret)
+            except (ValueError, TypeError):
+                return False
+            if not isinstance(result, dict):
+                return False
+            return any(type(result.get(key)) is int and result[key] > 0
+                       for key in ("success_count", "pending_count"))
         except Exception as err:
             ExceptionUtils.exception_traceback(err)
             return False

@@ -597,31 +597,45 @@ class FileTransfer:
                     # Explicit special clips can be smaller than the ordinary media limit.
                     extras_enabled = ((Config().get_config("media") or {}).get("extras") or {}).get("enabled") is True
                     # 查找目录下的文件
+                    diagnostics = {}
                     try:
                         file_list = PathUtils.get_dir_files(in_path=in_path,
                                                             episode_format=episode[0],
                                                             exts=RMT_MEDIAEXT,
-                                                            filesize=0, raise_errors=True)
+                                                            filesize=0, raise_errors=True,
+                                                            diagnostics=diagnostics)
+                    except ValueError as error:
+                        return __finish_transfer(False, "集数参数无效：%s" % error)
                     except OSError as error:
                         # os.walk 默认吞掉子目录访问错误；不能把扫描失败当成空目录成功。
                         return __finish_transfer(False, "目录扫描失败：%s" % error)
                     def eligible(path):
                         try:
-                            return (os.path.getsize(path) >= now_filesize
-                                    or bool(extract_special(os.path.basename(path), extras_enabled)[1]))
+                            if (os.path.getsize(path) >= now_filesize
+                                    or bool(extract_special(os.path.basename(path), extras_enabled)[1])):
+                                return True
+                            diagnostics["below_min_size"] = diagnostics.get("below_min_size", 0) + 1
+                            return False
                         except OSError:
                             # Let per-file recognition report a disappearing special.
                             return True
                     file_list = [path for path in file_list if eligible(path)]
                     log.debug("【Rmt】文件清单：" + str(file_list))
                     if len(file_list) == 0:
-                        log.warn("【Rmt】%s 目录下未找到媒体文件，当前最小文件大小限制为 %s"
-                                 % (in_path, StringUtils.str_filesize(now_filesize)))
+                        # Explain actual rejections, rather than implying that
+                        # an unrelated configured size limit caused every empty scan.
+                        reasons = ["%s %s 个" % (label, diagnostics[key]) for key, label in (
+                            ("invalid_path", "隐藏、回收站等无效路径"),
+                            ("unsupported_extension", "不支持的文件后缀"),
+                            ("episode_mismatch", "集数定位或筛选范围不匹配")) if diagnostics.get(key)]
+                        if diagnostics.get("below_min_size"):
+                            reasons.append("小于最小文件大小 %s 个（限制 %s）" % (
+                                diagnostics["below_min_size"], StringUtils.str_filesize(now_filesize)))
+                        message = "目录下未找到媒体文件：%s" % "；".join(reasons or ["未发现文件"])
+                        log.warn("【Rmt】%s %s" % (in_path, message))
                         # 监控目录没有合格媒体是正常跳过；下载整理仍需失败，
                         # 不能据此授权下载器删除尚未处理的源数据。
-                        return __finish_transfer(in_from == SyncType.MON,
-                                                 "目录下未找到媒体文件，当前最小文件大小限制为 %s"
-                                                 % StringUtils.str_filesize(now_filesize))
+                        return __finish_transfer(in_from == SyncType.MON, message)
             # 传入的是个文件
             else:
                 if not os.path.exists(in_path):
@@ -645,6 +659,16 @@ class FileTransfer:
         file_list, msg = self.check_ignore(file_list=file_list)
         if not file_list:
             return __finish_transfer(True, msg)
+
+        # Validate every selected target before publishing the first file. This
+        # checks numeric results only, not whether TMDB has recorded the episode.
+        if (episode[0] and media_type != MediaType.MOVIE
+                and (tmdb_info or {}).get("media_type") != MediaType.MOVIE):
+            for file_path in file_list:
+                try:
+                    episode[0].split_episode(os.path.basename(file_path))
+                except ValueError as error:
+                    return __finish_transfer(False, "%s：%s" % (os.path.basename(file_path), error))
 
         # Resolve downloader identity before consulting the transfer blacklist.
         # Older tasks may have been blacklisted after a wrong filename match; an
@@ -673,7 +697,8 @@ class FileTransfer:
                 download_context.get("source_title"), media_type.value, tmdb_info.get("id")))
         Medias = self.media.get_media_info_on_files(
             file_list, tmdb_info, media_type, season, episode[0],
-            download_context=download_context, download_contexts=contexts)
+            download_context=download_context, download_contexts=contexts,
+            bluray=bool(bluray_disk_dir))
         if len(Medias or {}) != len(file_list):
             return __finish_transfer(False, "部分文件未能识别或与下载任务季集冲突，请核对")
         if not Medias:

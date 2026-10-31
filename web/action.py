@@ -9,12 +9,13 @@ import re
 import shutil
 import signal
 import subprocess
+import time
 from copy import deepcopy
 from math import floor
 from urllib.parse import unquote, urlsplit
 
 import cn2an
-from flask import g, has_request_context, copy_current_request_context, request
+from flask import g, has_request_context, copy_current_request_context, request, session
 from flask_login import logout_user, current_user
 from werkzeug.security import generate_password_hash
 
@@ -641,13 +642,17 @@ class WebAction:
             else:
                 media_type = MediaType.TV
         if search_word:
+            from app.helper.search_sessions import SearchSessions
+            record, _ = SearchSessions().create(current_user.username, current_user.username, search_word, channel='web')
+            session['search_id'] = record['id']
             ret, ret_msg = search_medias_for_web(content=search_word,
                                                  ident_flag=ident_flag,
                                                  filters=filters,
                                                  tmdbid=tmdbid,
-                                                 media_type=media_type)
+                                                 media_type=media_type, search_id=record["id"])
             if ret != 0:
-                return {"code": ret, "msg": ret_msg}
+                return {"code": ret, "msg": ret_msg, "search_id": record["id"]}
+            return {"code": 0, "search_id": record["id"]}
         return {"code": 0}
 
     def __download(self, data):
@@ -657,6 +662,34 @@ class WebAction:
         dl_id = data.get("id")
         dl_dir = data.get("dir")
         dl_setting = data.get("setting")
+        if ':' in str(dl_id):
+            from app.helper.search_sessions import SearchSessions, unpack_media
+            sid, rid = str(dl_id).split(':', 1)
+            try:
+                record = SearchSessions().owned(sid, current_user.username, current_user.username)
+                if record['channel'] != 'web' or record['expires_at'] < time.time():
+                    raise ValueError('搜索已过期，请重新搜索')
+                media = unpack_media(record['results'][rid])
+            except (ValueError, KeyError) as error:
+                return {"retcode": -1, "retmsg": '搜索资源不存在或已过期'}
+            with SearchSessions().edit(sid) as current:
+                prior = current['downloads'].get(rid)
+                if prior:
+                    return {"retcode": 0 if prior['state'] == 'accepted' else -1, "retmsg": prior['message']}
+                current['downloads'][rid] = {'state': 'submitting', 'message': '正在提交，请勿重复点击'}
+            # A failed/uncertain submission is retained, not silently retried by
+            # a repeated browser POST after a response timeout.
+            try:
+                ret, message = Downloader().download(media, download_dir=dl_dir, download_setting=dl_setting)
+            except Exception:
+                ret, message = None, '提交状态待确认，请检查下载器'
+            with SearchSessions().edit(sid) as current:
+                current['downloads'][rid] = {'state': 'accepted' if ret else 'unknown',
+                    'message': '已提交下载' if ret else '提交状态待确认，请检查下载器'}
+            if ret:
+                media.user_name = current_user.username
+                Message().send_download_message(SearchType.WEB, media)
+            return {"retcode": 0 if ret else -1, "retmsg": '' if ret else message}
         results = self.dbhelper.get_search_result_by_id(dl_id)
         for res in results:
             media = Media().get_media_info(title=res.TORRENT_NAME, subtitle=res.DESCRIPTION)
@@ -1032,6 +1065,13 @@ class WebAction:
             outpath = os.path.normpath(outpath)
         if not os.path.exists(inpath):
             return False, "输入路径不存在"
+        try:
+            # Reject malformed controls before TMDB lookup; movie inputs do not
+            # consume hidden episode fields left over from the TV form.
+            episode = (EpisodeFormat(None) if media_type == MediaType.MOVIE else
+                       EpisodeFormat(episode_format, episode_details, episode_offset))
+        except ValueError as error:
+            return False, str(error)
         if tmdbid:
             # 有输入TMDBID
             tmdb_info = Media().get_tmdb_info(mtype=media_type, tmdbid=tmdbid)
@@ -1045,11 +1085,7 @@ class WebAction:
                                                                tmdb_info=tmdb_info,
                                                                media_type=media_type,
                                                                season=season,
-                                                               episode=(
-                                                                   EpisodeFormat(episode_format,
-                                                                                 episode_details,
-                                                                                 episode_offset),
-                                                                   need_fix_all),
+                                                               episode=(episode, need_fix_all),
                                                                min_filesize=min_filesize,
                                                                udf_flag=True)
         else:
@@ -1061,11 +1097,7 @@ class WebAction:
                                                                target_dir=outpath,
                                                                media_type=media_type,
                                                                season=season,
-                                                               episode=(
-                                                                   EpisodeFormat(episode_format,
-                                                                                 episode_details,
-                                                                                 episode_offset),
-                                                                   need_fix_all),
+                                                               episode=(episode, need_fix_all),
                                                                min_filesize=min_filesize,
                                                                udf_flag=True)
         return succ_flag, ret_msg
@@ -3874,7 +3906,29 @@ class WebAction:
         查询所有搜索结果
         """
         SearchResults = {}
-        res = self.dbhelper.get_search_results()
+        if has_request_context():
+            from app.helper.search_sessions import SearchSessions, unpack_media
+            sid = (data or {}).get('search_id') or request.args.get('search_id') or session.get('search_id')
+            res = []
+            # Older message channels still link to the legacy table explicitly;
+            # native web/Telegram sessions never write to that shared table.
+            if request.args.get('legacy') == '1' or not sid:
+                res = self.dbhelper.get_search_results()
+                sid = None
+            if sid:
+                try:
+                    record = SearchSessions().owned(sid, current_user.username, current_user.username)
+                    if record['channel'] == 'web':
+                        ids = list(record['results'])
+                        res = self.dbhelper.make_search_results(
+                            [unpack_media(record['results'][rid]) for rid in ids],
+                            title=record['query'], ident_flag=record.get('ident_flag', True))
+                        for row, rid in zip(res, ids):
+                            row.ID = sid + ':' + rid
+                except ValueError:
+                    pass
+        else:
+            res = self.dbhelper.get_search_results()
         total = len(res)
         for item in res:
             # 质量(来源、效果)、分辨率

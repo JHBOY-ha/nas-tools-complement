@@ -11,6 +11,9 @@ from config import Config
 
 lock = threading.Lock()
 server_lock = threading.Lock()
+# Guarded by the sync lock when changed or checked before an incremental write.
+# An idle lock alone cannot tell whether a full sync completed during remote reads.
+sync_generation = 0
 
 
 @singleton
@@ -179,13 +182,55 @@ class MediaServer:
             return None
         return self.server.get_image_by_id(item_id, image_type)
 
-    def get_item_image(self, item_id, image_type="Primary"):
+    def get_item_image(self, item_id, image_type="Primary", max_width=None, quality=None, tag=None):
         """
         获取媒体服务器项目图片响应
         """
         if not self.server:
             return None
-        return self.server.get_item_image(item_id, image_type)
+        return self.server.get_item_image(item_id, image_type, max_width=max_width,
+                                          quality=quality, tag=tag)
+
+    def get_sync_item(self, server_type, item_id):
+        """
+        从指定服务器读取单个项目的最新同步记录，只读数据，不触发服务器刮削。
+        读取失败抛出异常；不持有同步锁，网络请求期间不阻塞全量同步。
+        """
+        server_type = str(getattr(server_type, "value", server_type) or "").strip().lower()
+        if server_type == str(getattr(self._server_type, "value", "")).lower():
+            server = self.server
+        else:
+            server = self.get_server_by_type(server_type)
+        if not server:
+            raise RuntimeError("媒体服务器未配置")
+        return server.get_sync_item(item_id)
+
+    @staticmethod
+    def is_syncing():
+        """
+        全量同步是否正在进行
+        """
+        return lock.locked()
+
+    @staticmethod
+    def get_sync_generation():
+        return sync_generation
+
+    @staticmethod
+    def begin_incremental_write(expected_generation):
+        """
+        非阻塞抢占同步锁并核验读取前的代次；期间启动过全量同步也拒绝写入。
+        """
+        if not lock.acquire(blocking=False):
+            return False
+        if sync_generation != expected_generation:
+            lock.release()
+            return False
+        return True
+
+    @staticmethod
+    def end_incremental_write():
+        lock.release()
 
     def get_no_exists_episodes(self, meta_info,
                                season_number,
@@ -270,9 +315,13 @@ class MediaServer:
         from app.db.settings import DatabaseSettings
         from app.db.transactions import DatabaseBusy, DatabaseWriteError
 
+        global sync_generation
         if not self.server:
             return
         with lock:
+            # Even a sync that finishes before a refresh's final write makes
+            # that refresh stale. Reads remain outside this lock in refresh_items.
+            sync_generation += 1
             log.info("【MediaServer】开始同步媒体库数据...")
             self.progress.start("mediasync")
             try:

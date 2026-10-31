@@ -36,12 +36,22 @@ python3 -m tests.run_recognition tests.test_media_identity_matrix
 | 下游处理 | RSS/搜索、下载选集、手动季集覆盖、任务冲突、保留源文件、目标碰撞、失败重试 | `test_media_cache_numbering`、`test_meta_parser_boundaries`、`test_sync_reliability`、`test_special_episodes` |
 | 手动 EP 优先级 | 数字标题与小数集、固定集数及定位偏移、作品搜索/缓存/ID 入口一致性、特殊内容目标核验与覆盖保护、确认窗口及资源字段保留 | `test_manual_episode_precedence` |
 | 手动 EP 表单 | 固定 EP 无定位规则提交、区间筛选/偏移限制、失败恢复、键盘重试、桌面与窄屏；WebKit 无头运行 | `test_manual_episode_ui.js` |
+| 集数与筛选保护 | 偏移后非负性、范围顺序、第 0 集定位及标题、目录过滤原因、待恢复凭据与完成去重；保留强制覆盖和普通未收录集数策略 | `test_episode_transfer_guards` |
+| 剧名完整性 | 数字标题与明确集号、中文括号和短英文标题、发布组缓存隔离、同名候选重试、缺分类动漫详情核验及失败回滚 | `test_series_name_integrity` |
+| 识别链路约束矩阵 | 人工编号不被改写、未知证据不扩大不降级、缺季不改选同名作品、缓存准入、编号快照、范围不压缩；覆盖名称、缓存、LLM 直出 ID、文件、绑定、下载任务、特殊集/序数季、IMDb 入口 | `test_recognition_invariants` |
+| 跨分支识别回归 | 特殊标签与小数集联合约束、源剧名/源季保全、LLM 单点和独立季名证据、ID/年份及缓存冲突、外部多作品消歧、查询去重及失败重试 | `test_recognition_special_crossings`、`test_recognition_llm_crossings`、`test_recognition_query_crossings` |
 
 文件名解析阶段的动漫常先得到电视剧类型；TMDB 电视剧详情中的动画分类才决定最终 `ANIME` 类型。动画电影仍属于 `MOVIE`。测试分别检查解析阶段和最终分类，不能用“文件名解析为 TV”直接判定动漫识别失败。
+
+跨分支回归断言正确结果，不保留审查阶段“断言错误行为存在”的临时探针。查询用例分别检查 SDK 调用和模拟 HTTP 传输边界：同一识别/文件批次内可以复用明确的空结果和原始候选，不复用身份确认结论；失败不作为空结果缓存，下一次识别可以重试。查询键保留类型、年份、分页、语言及服务配置，名称去重仍允许正式中文兜底展开此前未展开的配置别名。
 
 手动转移明确指定 EP（固定集数或成功匹配的集数定位规则）时，目标集数优先于文件名的小数集判断；固定集数也不会被旧定位规则在目录扫描时过滤。小数集保护路径中的目标季及范围内每一集仍须通过 TMDB 核验，并保留下载任务约束和目标文件冲突检查。空规则、未匹配规则及仅填写偏移量均不视为明确 EP；没有手动 EP 时，原有小数集确认规则保持生效。
 
 普通文件在作品搜索、缓存命中和显式 TMDB ID 三个入口应用相同手动季集覆盖。特殊集确认可处理单个数字标题歧义，但仍拒绝多集范围只确认一端、文件作用域错误及失效目标；解析不会因该歧义吞掉分辨率和来源字段。共享表单允许固定 EP 或合并集范围不填定位规则，逗号筛选区间及单独偏移仍需要定位规则。浏览器回归使用 `node tests/test_manual_episode_ui.js`，需可用的 Playwright WebKit；截图、跟踪与报告保存到 `docs/validation/manual-episode-precedence/`。
+
+手动集数的格式、范围顺序和偏移后非负性在识别/转移前检查；合法负偏移和第 0 集继续可用，不因普通人工集号未被 TMDB 收录而强制拒绝。目录空筛选结果按实际首个排除原因汇总路径、后缀、定位或区间、大小；监控空目录继续正常跳过，下载整理及扫描故障继续失败。字幕回归区分有待恢复凭据的失败任务与完整历史且无凭据的已完成任务，后者不重复字幕或历史写入。
+
+已知片名解析缺口（未知发布组作片名、纯数字括号片名、中文季范围、中英文连写目录名）保留在 `tests/test_recognition_naming_gaps.py`，不在默认入口中，需单独运行：`python3 -m tests.run_recognition tests.test_recognition_naming_gaps`。
 
 原始 `tests/cases/meta_cases.py` 有 61 条非空命名样例，期望类型为电影 17 条、电视剧 44 条。新增矩阵的同义格式变体用于检验规则一致性；它们和 unittest 方法数都不是独立真实作品数量。第三方 anitopy 的已知失败样例不计入本项目通过率。
 

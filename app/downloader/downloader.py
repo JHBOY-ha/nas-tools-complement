@@ -16,6 +16,7 @@ from app.subtitle import Subtitle
 from app.conf import SystemConfig
 from app.utils import Torrent, StringUtils, SystemUtils, ExceptionUtils
 from app.utils.commons import singleton
+from app.utils.search_cancellation import SearchCancelled
 from app.utils.types import MediaType, DownloaderType, SearchType, RmtMode
 from app.utils.workload import TaskQueueFull
 from config import Config, PT_TAG, RMT_MEDIAEXT
@@ -261,7 +262,7 @@ class Downloader:
                  tag=None,
                  download_dir=None,
                  download_setting=None,
-                 torrent_file=None):
+                 torrent_file=None, task_tag=None, before_submit=None):
         """
         添加下载任务，根据当前使用的下载器分别调用不同的客户端处理
         :param media_info: 需下载的媒体信息，含URL地址
@@ -269,7 +270,9 @@ class Downloader:
         :param tag: 种子标签
         :param download_dir: 指定下载目录
         :param download_setting: 下载设置id
+        :param task_tag: 交互搜索提交的持久化关联标签
         :param torrent_file: 种子文件路径
+        :param before_submit: 可选的提交前校验；种子及目录查询结束后、调用下载器前执行
         :return: 种子或状态，错误信息
         """
         # Direct/manual downloads must obey the same evidence gate as batch RSS.
@@ -362,6 +365,8 @@ class Downloader:
             else:
                 if tag:
                     tags = [tag]
+            if task_tag:
+                tags = list(tags or []) + [task_tag]
             # 通过持久化任务标签传递作品身份；标签由下载器保存，重启后仍可恢复。
             if dl_type in [DownloaderType.QB, DownloaderType.TR]:
                 context_tag = self._create_download_context(media_info, dl_type)
@@ -397,6 +402,10 @@ class Downloader:
                 download_label = download_info.get('label')
                 if not category:
                     category = download_label
+            # Torrent fetching and directory lookup can outlive an interactive
+            # stop. Recheck at the last boundary before sending to the client.
+            if before_submit:
+                before_submit()
             # 添加下载
             print_url = content if isinstance(content, str) else url
             if is_paused:
@@ -462,6 +471,10 @@ class Downloader:
                 return ret, ""
             else:
                 return ret, "请检查下载任务是否已存在"
+        except SearchCancelled:
+            # The caller needs to distinguish a safe cancellation from an
+            # uncertain downloader response; never translate it to a failure.
+            raise
         except Exception as e:
             ExceptionUtils.exception_traceback(e)
             log.error("【Downloader】添加下载任务出错：%s" % str(e))
@@ -550,6 +563,32 @@ class Downloader:
             tag = None
         return self.default_client.get_downloading_progress(tag=tag)
 
+    def get_search_task_status(self, tag, setting=None, site=None):
+        """Resolve a search submission by its durable downloader tag, not title."""
+        setting = setting or (self.sites.get_site_download_setting(site) if site else None)
+        attributes = self.get_download_setting(setting or self.get_default_download_setting()) or {}
+        kind = self.__get_client_type(attributes.get('downloader')) or self._default_client_type
+        if kind not in (DownloaderType.QB, DownloaderType.TR):
+            return {'message': '此下载器暂不支持按搜索标签查询，请在下载器核对'}
+        client = self.__get_client(kind)
+        tasks, failed = client.get_torrents(tag=tag)
+        if failed:
+            return {'lookup_failed': True}
+        if not tasks:
+            return {}
+        task = tasks[0]
+        if kind == DownloaderType.QB:
+            task_id, progress = task.hash, float(task.progress)
+        else:
+            task_id, progress = str(task.id), float(task.percent_done)
+        tags = str(task.tags or '').split(',') if kind == DownloaderType.QB else (task.labels or [])
+        if '已整理' in [value.strip() for value in tags]:
+            return {'task_id': task_id, 'state': 'organized', 'message': '下载与整理完成', 'progress': progress}
+        complete = progress >= 1
+        return {'task_id': task_id, 'state': 'complete' if complete else 'downloading',
+                'message': '下载完成，整理状态以整理通知为准' if complete else f'下载中 {progress * 100:.1f}%',
+                'progress': progress}
+
     def get_torrents(self, torrent_ids):
         """
         根据ID或状态查询下载器中的种子信息
@@ -617,13 +656,15 @@ class Downloader:
                        in_from: SearchType,
                        media_list: list,
                        need_tvs: dict = None,
-                       user_name=None):
+                       user_name=None, task_tag=None, before_submit=None):
         """
         根据命中的种子媒体信息，添加下载，由RSS或Searcher调用
         :param in_from: 来源
         :param media_list: 命中并已经识别好的媒体信息列表，包括名称、年份、季、集等信息
         :param need_tvs: 缺失的剧集清单，对于剧集只有在该清单中的季和集才会下载，对于电影无需输入该参数
         :param user_name: 用户名称
+        :param task_tag: 可选的交互任务关联标签，不改变原有下载规则
+        :param before_submit: 传给实际下载提交的取消/准入校验
         :return: 已经添加了下载的媒体信息表表、剩余未下载到的媒体信息
         """
 
@@ -643,7 +684,9 @@ class Downloader:
                 download_setting=download_item.download_setting,
                 torrent_file=torrent_file,
                 tag=tag,
-                is_paused=is_paused)
+                task_tag=task_tag,
+                is_paused=is_paused,
+                **({'before_submit': before_submit} if before_submit else {}))
             if state:
                 if download_item not in return_items:
                     return_items.append(download_item)

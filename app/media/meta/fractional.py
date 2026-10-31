@@ -5,6 +5,7 @@ from functools import lru_cache
 
 import cn2an
 from config import RMT_MEDIAEXT
+from app.media.meta.special import extract_special
 
 _LABEL = r"\d{1,4}\.\d{1,2}[A-Za-z]?"
 # A following dot is a release separator only when it does not start another number,
@@ -97,7 +98,10 @@ def protect_fractional_episode(title):
         subtitle = re.match(r"\s*[-–—]\s*([^\[【(]+)", tail)
         # 单集标题只作匹配证据，不应污染用于查作品的片名。
         episode_title = None
-        if subtitle:
+        # A release label after the decimal belongs to the special/extra parser.
+        # Keep it in the cleaned title instead of consuming its evidence as prose.
+        labelled_tail = subtitle and extract_special("Title " + tail, include_extras=True)[1]
+        if subtitle and not labelled_tail:
             episode_title = subtitle[1].strip()
             resource = re.search(r"(?i)(?<!\w)(?:\d{3,4}[pi]|WEB[ ._-]?DL|WEBRip|BluRay|HEVC|[HX]26[45])\b", episode_title)
             metadata_tail = ""

@@ -58,7 +58,7 @@ class Subscribe:
                           total_ep=None,
                           current_ep=None,
                           state="D",
-                          rssid=None):
+                          rssid=None, before_submit=None):
         """
         添加电影、电视剧订阅
         :param mtype: 类型，电影、电视剧、动漫
@@ -81,6 +81,7 @@ class Subscribe:
         :param rssid: 修改订阅时传入
         :param total_ep: 总集数
         :param current_ep: 开始订阅集数
+        :param before_submit: 可选的写入前校验，在媒体查询完成后执行
         :return: 错误码：0代表成功，错误信息
         """
         if not name:
@@ -143,6 +144,10 @@ class Subscribe:
                     lack = total - current_ep - 1
                 else:
                     lack = total
+                # All provider lookups must finish before the cancellation
+                # check; no subscription may be created by a stopped session.
+                if before_submit:
+                    before_submit()
                 if rssid:
                     self.dbhelper.delete_rss_tv(rssid=rssid)
                 code = self.dbhelper.insert_rss_tv(media_info=media_info,
@@ -166,6 +171,8 @@ class Subscribe:
                                                    keyword=keyword)
             else:
                 # 电影
+                if before_submit:
+                    before_submit()
                 if rssid:
                     self.dbhelper.delete_rss_movie(rssid=rssid)
                 code = self.dbhelper.insert_rss_movie(media_info=media_info,
@@ -190,6 +197,8 @@ class Subscribe:
             media_info.type = mtype
             if season:
                 media_info.begin_season = int(season)
+            if before_submit:
+                before_submit()
             if mtype == MediaType.MOVIE:
                 if rssid:
                     self.dbhelper.delete_rss_movie(rssid=rssid)

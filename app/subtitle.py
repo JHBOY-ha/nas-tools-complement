@@ -1706,6 +1706,54 @@ class Subtitle:
         raise FileExistsError("字幕文件重名过多")
 
     @classmethod
+    def preview_upload_names(cls, media_file, filenames, server_type=None):
+        """
+        依据文件名预估上传后的语言与目标文件名，供界面在上传前核对。
+        不读取字幕内容；没有语言标记时真实处理会按正文识别，这里只给出占位名并提示。
+        """
+        names = [os.path.basename(str(name or "")) for name in (filenames or [])]
+        stems = {".sub": set(), ".idx": set()}
+        for name in names:
+            stem, ext = os.path.splitext(name)
+            if ext.lower() in stems:
+                stems[ext.lower()].add(stem.lower())
+        used = set()
+        rows = []
+        for name in names:
+            stem, ext = os.path.splitext(name)
+            ext = ext.lower()
+            row = {"name": name, "language": "", "target": "", "note": ""}
+            rows.append(row)
+            if ext not in (".srt", ".ass", ".ssa", ".smi", ".vtt", ".sub", ".idx"):
+                row["note"] = "不支持的字幕格式"
+                continue
+            if ext == ".idx":
+                row["note"] = "与同名 .sub 成对上传" if stem.lower() in stems[".sub"] else "缺少同名 .sub 文件"
+                continue
+            profile = cls.__guess_subtitle_profile(name, default_language="")
+            inferred = not profile.get("language")
+            if inferred:
+                profile["language"] = "zh-CN"
+            profile["source"] = cls.__guess_subtitle_source(name, media_file)
+            companions = [".idx"] if ext == ".sub" and stem.lower() in stems[".idx"] else []
+            try:
+                target = cls.__build_subtitle_path(
+                    media_file, profile, ext, server_type, companion_exts=companions)
+            except FileExistsError:
+                row["note"] = "同名字幕过多，无法生成文件名"
+                continue
+            row["language"] = "" if inferred else profile["language"]
+            row["target"] = os.path.basename(target)
+            notes = []
+            if inferred:
+                notes.append("文件名无语言标记，将按正文识别语言")
+            if target in used:
+                notes.append("同批次同名将自动编号")
+            used.add(target)
+            row["note"] = "；".join(notes)
+        return rows
+
+    @classmethod
     def __subtitle_language_tag(cls, language_tag, server_type=None):
         """
         按媒体服务器规范转换外挂字幕语言标签。

@@ -3,8 +3,10 @@ import difflib
 import os
 import random
 import re
+import threading
 import traceback
-from functools import lru_cache
+from contextlib import contextmanager
+from functools import lru_cache, wraps
 
 import zhconv
 from lxml import etree
@@ -16,17 +18,29 @@ from app.media.meta.llm_parser import LLMMetaParser
 from app.media.meta.metainfo import MetaInfo, prepare_title
 from app.media.meta._base import MetaBase
 from app.media.meta.fractional import episode_key, release_references
-from app.media.meta.special import normalized, requires_confirmation
+from app.media.meta.release_groups import ReleaseGroupsMatcher
+from app.media.meta.special import normalized, requires_confirmation, download_block_reason
 from app.media.meta.special_resolver import SpecialResolver, identity
-from app.media.meta.ordinal import OrdinalResolver
+from app.media.meta.ordinal import OrdinalResolver, Evidence
+from app.media.meta.recognition import CANDIDATE_DETAIL_LIMIT, NumberingResult, NumberingState, RecognitionPending
+from app.media.meta.recognition import recognition_query_scope, query_tmdb
 from app.media.meta.recognition_rules import DEFAULT_EPISODE_MAPPINGS, DEFAULT_NAME_ALIASES
 from app.media.tmdbv3api import TMDb, Search, Movie, TV, Person, Find, TMDbException, Discover, Trending, Episode, Genre
-from app.utils import PathUtils, EpisodeFormat, RequestUtils, NumberUtils, StringUtils, cacheman
+from app.utils import PathUtils, EpisodeFormat, RequestUtils, StringUtils, cacheman
 from app.utils.types import MediaType, MatchMode
 from app.utils.security_utils import normalize_proxies
 from config import Config, KEYWORD_BLACKLIST, KEYWORD_SEARCH_WEIGHT_3, KEYWORD_SEARCH_WEIGHT_2, KEYWORD_SEARCH_WEIGHT_1, \
     KEYWORD_STR_SIMILARITY_THRESHOLD, KEYWORD_DIFF_SCORE_THRESHOLD, TMDB_IMAGE_ORIGINAL_URL, DEFAULT_TMDB_PROXY, \
     TMDB_IMAGE_FACE_URL, TMDB_PEOPLE_PROFILE_URL, TMDB_IMAGE_W500_URL, ANIME_GENREIDS
+
+
+def _shares_candidate_details(method):
+    """Share provider queries and candidate details within one public recognition."""
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with recognition_query_scope(), self._recognition_details():
+            return method(self, *args, **kwargs)
+    return wrapper
 
 
 class Media:
@@ -45,6 +59,10 @@ class Media:
     _rmt_match_mode = None
     _search_keyword = None
     _search_tmdbweb = None
+    # Candidate details read per selection round, including exact-name checks.
+    CANDIDATE_DETAIL_LIMIT = CANDIDATE_DETAIL_LIMIT
+    # Detail reads shared by one title/file recognition; never shared across threads.
+    _recognition_scope = threading.local()
 
     def __init__(self):
         self.init_config()
@@ -144,6 +162,41 @@ class Media:
                 max_ratio = ratio
         return max_ratio if max_ratio >= 0.8 else 0
 
+    @contextmanager
+    def _recognition_details(self):
+        """Reuse candidate details within one recognition; nested scopes share it."""
+        outer = getattr(Media._recognition_scope, "details", None)
+        if outer is None:
+            Media._recognition_scope.details = {}
+        try:
+            yield
+        finally:
+            if outer is None:
+                Media._recognition_scope.details = None
+
+    @staticmethod
+    def __detail_key(mtype, tmdbid, chinese=True, append_to_response=None):
+        kind = MediaType.MOVIE if mtype == MediaType.MOVIE else MediaType.TV
+        return kind.name, str(tmdbid), bool(chinese), append_to_response
+
+    def __detail_reused(self, mtype, tmdbid):
+        """This work's details were already read in the current recognition (any options)."""
+        memo = getattr(Media._recognition_scope, "details", None)
+        work = self.__detail_key(mtype, tmdbid)[:2]
+        return memo is not None and any(key[:2] == work for key in memo)
+
+    def __candidate_detail(self, mtype, tmdbid, chinese=True, append_to_response=None):
+        """get_tmdb_info, memoized (including failures) for the current recognition."""
+        memo = getattr(Media._recognition_scope, "details", None)
+        key = self.__detail_key(mtype, tmdbid, chinese, append_to_response)
+        if memo is not None and key in memo:
+            return copy.deepcopy(memo[key])
+        info = self.get_tmdb_info(mtype=mtype, tmdbid=tmdbid, chinese=chinese,
+                                  append_to_response=append_to_response)
+        if memo is not None:
+            memo[key] = copy.deepcopy(info)
+        return info
+
     def __search_tmdb_allnames(self, mtype: MediaType, tmdb_id):
         """
         检索tmdb中所有的标题和译名，用于名称匹配
@@ -153,40 +206,15 @@ class Media:
         """
         if not mtype or not tmdb_id:
             return {}, []
-        ret_names = []
-        tmdb_info = self.get_tmdb_info(mtype=mtype, tmdbid=tmdb_id)
-        if not tmdb_info:
-            return tmdb_info, []
-        if mtype == MediaType.MOVIE:
-            alternative_titles = tmdb_info.get("alternative_titles", {}).get("titles", [])
-            for alternative_title in alternative_titles:
-                title = alternative_title.get("title")
-                if title and title not in ret_names:
-                    ret_names.append(title)
-            translations = tmdb_info.get("translations", {}).get("translations", [])
-            for translation in translations:
-                title = translation.get("data", {}).get("title")
-                if title and title not in ret_names:
-                    ret_names.append(title)
-        else:
-            alternative_titles = tmdb_info.get("alternative_titles", {}).get("results", [])
-            for alternative_title in alternative_titles:
-                name = alternative_title.get("title")
-                if name and name not in ret_names:
-                    ret_names.append(name)
-            translations = tmdb_info.get("translations", {}).get("translations", [])
-            for translation in translations:
-                name = translation.get("data", {}).get("name")
-                if name and name not in ret_names:
-                    ret_names.append(name)
-        return tmdb_info, ret_names
+        info = self.get_tmdb_info(mtype=mtype, tmdbid=tmdb_id)
+        return info, self.__candidate_all_names(info) if info else []
 
     def __search_tmdb(self, file_media_name,
                       search_type,
                       first_media_year=None,
                       media_year=None,
                       season_number=None,
-                      language=None, anime_only=False):
+                      language=None, anime_only=False, candidate_check=None):
         """
         检索tmdb中的媒体信息，匹配返回一条尽可能正确的信息
         :param file_media_name: 剑索的名称
@@ -226,17 +254,19 @@ class Media:
                     break
         else:
             # 有当前季和当前季集年份，使用精确匹配
-            if media_year and season_number:
+            if media_year and season_number is not None:
                 log.debug(
                     f"【Meta】正在识别{search_type.value}：{file_media_name}, 季集={season_number}, 季集年份={media_year} ...")
                 info = self.__search_tv_by_season(file_media_name,
                                                   media_year,
-                                                  season_number, anime_only=anime_only)
+                                                  season_number, anime_only=anime_only,
+                                                  candidate_check=candidate_check)
             if not info:
                 log.debug(
                     f"【Meta】正在识别{search_type.value}：{file_media_name}, 年份={StringUtils.xstr(first_media_year)} ...")
                 info = self.__search_tv_by_name(file_media_name,
-                                                first_media_year, anime_only=anime_only)
+                                                first_media_year, anime_only=anime_only,
+                                                candidate_check=candidate_check)
             if info:
                 info['media_type'] = MediaType.TV
                 log.info("【Meta】%s 识别到 电视剧：TMDBID=%s, 名称=%s, 首播日期=%s" % (
@@ -261,9 +291,9 @@ class Media:
         """
         try:
             if first_media_year:
-                movies = self.search.movies({"query": file_media_name, "year": first_media_year})
+                movies = query_tmdb(self.search, "movies", {"query": file_media_name, "year": first_media_year})
             else:
-                movies = self.search.movies({"query": file_media_name})
+                movies = query_tmdb(self.search, "movies", {"query": file_media_name})
         except TMDbException as err:
             log.error(f"【Meta】连接TMDB出错：{str(err)}")
             return None
@@ -347,15 +377,15 @@ class Media:
         if len(words) >= 2:
             search_queries.append(words[0])
 
-        for query in search_queries:
+        for query in dict.fromkeys(search_queries):
             if not query or len(query) < 2:
                 continue
             try:
                 log.debug(f"【Meta】模糊搜索尝试：{query}")
                 if first_media_year:
-                    movies = self.search.movies({"query": query, "year": first_media_year})
+                    movies = query_tmdb(self.search, "movies", {"query": query, "year": first_media_year})
                 else:
-                    movies = self.search.movies({"query": query})
+                    movies = query_tmdb(self.search, "movies", {"query": query})
                 if movies and len(movies) > 0:
                     log.info(f"【Meta】模糊搜索 {query} 找到 {len(movies)} 个结果")
                     return movies
@@ -364,79 +394,34 @@ class Media:
                 continue
         return []
 
-    def __search_tv_by_name(self, file_media_name, first_media_year, anime_only=False):
+    def __query_tv_candidates(self, name, year=None):
+        """An empty result is a search miss; a failed/missing response is UNKNOWN."""
+        params = {"query": name}
+        if year:
+            params["first_air_date_year"] = year
+        try:
+            candidates = query_tmdb(self.search, "tv_shows", params)
+        except Exception as error:
+            raise RecognitionPending("TMDB 剧集查询失败，保留待重试") from error
+        if candidates is None:
+            raise RecognitionPending("TMDB 剧集查询结果不可用，保留待重试")
+        return candidates
+
+    def __search_tv_by_name(self, file_media_name, first_media_year, anime_only=False, candidate_check=None):
         """
         根据名称查询电视剧TMDB匹配
         :param file_media_name: 识别的文件名或者种子名
         :param first_media_year: 电视剧的首播年份
         :return: 匹配的媒体信息
         """
-        try:
-            if first_media_year:
-                tvs = self.search.tv_shows({"query": file_media_name, "first_air_date_year": first_media_year})
-            else:
-                tvs = self.search.tv_shows({"query": file_media_name})
-        except TMDbException as err:
-            log.error(f"【Meta】连接TMDB出错：{str(err)}")
-            return None
-        except Exception as e:
-            log.error(f"【Meta】连接TMDB出错：{str(e)}")
-            return None
+        tvs = self.__query_tv_candidates(file_media_name, first_media_year)
         log.debug(f"【Meta】API返回：{str(self.search.total_results)}")
         # 如果没有结果，尝试模糊搜索（去掉可能拼错的单词，只用主要关键词搜索）
         if len(tvs) == 0:
             log.debug(f"【Meta】{file_media_name} 未找到相关剧集信息，尝试模糊搜索...")
             tvs = self.__fuzzy_search_tv(file_media_name, first_media_year)
-        if anime_only:
-            tvs = [tv for tv in tvs if 16 in (tv.get("genre_ids") or
-                   [g.get("id") for g in tv.get("genres", [])])]
-        if len(tvs) == 0:
-            log.debug(f"【Meta】{file_media_name} 未找到相关剧集信息!")
-            return {}
-        else:
-            # Prefer exact names across the whole result set before accepting
-            # any fuzzy match from a more popular, different work.
-            for tv in tvs:
-                if first_media_year and str(tv.get('first_air_date') or '')[:4] != str(first_media_year):
-                    continue
-                if any(self.__compare_tmdb_names(file_media_name, tv.get(key), fuzzy=False)
-                       for key in ('name', 'original_name')):
-                    return tv
-            info = {}
-            if first_media_year:
-                for tv in tvs:
-                    if tv.get('first_air_date'):
-                        if self.__compare_tmdb_names(file_media_name, tv.get('name')) \
-                                and tv.get('first_air_date')[0:4] == str(first_media_year):
-                            return tv
-                        if self.__compare_tmdb_names(file_media_name, tv.get('original_name')) \
-                                and tv.get('first_air_date')[0:4] == str(first_media_year):
-                            return tv
-            else:
-                for tv in tvs:
-                    if self.__compare_tmdb_names(file_media_name, tv.get('name')) \
-                            or self.__compare_tmdb_names(file_media_name, tv.get('original_name')):
-                        return tv
-            if not info:
-                index = 0
-                for tv in tvs:
-                    if first_media_year:
-                        if not tv.get('first_air_date'):
-                            continue
-                        if tv.get('first_air_date')[0:4] != str(first_media_year):
-                            continue
-                        index += 1
-                        info, names = self.__search_tmdb_allnames(MediaType.TV, tv.get("id"))
-                        if self.__compare_tmdb_names(file_media_name, names):
-                            return info
-                    else:
-                        index += 1
-                        info, names = self.__search_tmdb_allnames(MediaType.TV, tv.get("id"))
-                        if self.__compare_tmdb_names(file_media_name, names):
-                            return info
-                    if index > 5:
-                        break
-        return {}
+        return self.__select_tv_candidate(tvs, file_media_name, year=first_media_year,
+                                          anime_only=anime_only, candidate_check=candidate_check)
 
     def __fuzzy_search_tv(self, file_media_name, first_media_year):
         """
@@ -463,76 +448,169 @@ class Media:
         if len(words) >= 2:
             search_queries.append(words[0])
 
-        for query in search_queries:
+        for query in dict.fromkeys(search_queries):
             if not query or len(query) < 2:
                 continue
-            try:
-                log.debug(f"【Meta】模糊搜索尝试：{query}")
-                if first_media_year:
-                    tvs = self.search.tv_shows({"query": query, "first_air_date_year": first_media_year})
-                else:
-                    tvs = self.search.tv_shows({"query": query})
-                if tvs and len(tvs) > 0:
-                    log.info(f"【Meta】模糊搜索 {query} 找到 {len(tvs)} 个结果")
-                    return tvs
-            except Exception as e:
-                log.debug(f"【Meta】模糊搜索出错：{str(e)}")
-                continue
+            log.debug(f"【Meta】模糊搜索尝试：{query}")
+            tvs = self.__query_tv_candidates(query, first_media_year)
+            if tvs:
+                log.info(f"【Meta】模糊搜索 {query} 找到 {len(tvs)} 个结果")
+                return tvs
         return []
 
-    def __search_tv_by_season(self, file_media_name, media_year, season_number, anime_only=False):
-        """
-        根据电视剧的名称和季的年份及序号匹配TMDB
-        :param file_media_name: 识别的文件名或者种子名
-        :param media_year: 季的年份
-        :param season_number: 季序号
-        :return: 匹配的媒体信息
-        """
+    def __search_tv_by_season(self, file_media_name, media_year, season_number, anime_only=False, candidate_check=None):
+        """Use the same candidate ordering, interpreting the year as a season date."""
+        candidates = self.__query_tv_candidates(file_media_name)
+        return self.__select_tv_candidate(candidates, file_media_name, year=media_year,
+                                          season_number=season_number, anime_only=anime_only,
+                                          candidate_check=candidate_check)
 
-        def __season_match(tv_info, season_year):
-            if not tv_info:
-                return False
-            try:
-                seasons = self.get_tmdb_tv_seasons(tv_info=tv_info)
-                for season in seasons:
-                    if season.get("air_date") and season.get("season_number"):
-                        if season.get("air_date")[0:4] == str(season_year) \
-                                and season.get("season_number") == int(season_number):
-                            return True
-            except Exception as e1:
-                log.error(f"【Meta】连接TMDB出错：{e1}")
-                return False
+    @staticmethod
+    def __tv_year_matches(info, year, season_number=None):
+        """Share explicit release-year evidence between name and direct-ID lookup."""
+        if not year:
+            return True
+        first_year = str(info.get("first_air_date") or "")[:4]
+        if first_year == str(year):
+            return True
+        if season_number is None:
+            if not first_year:
+                raise RecognitionPending("候选作品年份不可用，保留待确认")
             return False
+        seasons = info.get("seasons")
+        if not isinstance(seasons, list) or any(not hasattr(season, "get") for season in seasons):
+            raise RecognitionPending("候选作品季列表不可用，保留待确认")
+        selected = [season for season in seasons if season.get("season_number") == season_number]
+        if not selected:
+            raise RecognitionPending("候选作品缺少请求的季，无法核对季年份，保留待确认")
+        if len(selected) != 1 or not selected[0].get("air_date"):
+            raise RecognitionPending("候选作品的季年份不可用，保留待确认")
+        return str(selected[0]["air_date"])[:4] == str(year)
 
-        try:
-            tvs = self.search.tv_shows({"query": file_media_name})
-        except TMDbException as err:
-            log.error(f"【Meta】连接TMDB出错：{str(err)}")
-            return None
-        except Exception as e:
-            log.error(f"【Meta】连接TMDB出错：{e}")
-            return None
+    @staticmethod
+    def __llm_year_matches(meta_info, info):
+        season = meta_info.begin_season
+        binding = (meta_info.note or {}).get("llm") or {}
+        # An independently verified arc may map the release season elsewhere.
+        # Its target season owns the year check; numbering is still validated
+        # by _prepare_media_identity before this candidate can be admitted.
+        if binding.get("season_verified") and str(binding.get("tmdb_id")) == str(info.get("id")):
+            season = binding.get("tmdb_season", season)
+        return Media.__tv_year_matches(info, meta_info.year, season)
 
+    def __select_tv_candidate(self, candidates, name, year=None, season_number=None,
+                              anime_only=False, candidate_check=None):
+        """
+        Select by name tier: exact (formal, original, alias, translation), then fuzzy.
+        A tier accepts only a unique VALID work: several distinct exact matches need
+        year/type/binding evidence, never "only one has the season" (C3). A
+        name-matched UNKNOWN blocks; a failed detail without name evidence is ignored.
+        Every candidate read shares one per-round limit; while any candidate stays
+        unread, its aliases are unknown, so neither a match nor a miss is declared.
+        """
         if anime_only:
-            tvs = [tv for tv in tvs if 16 in (tv.get("genre_ids") or
-                   [g.get("id") for g in tv.get("genres", [])])]
-        if len(tvs) == 0:
-            log.debug("【Meta】%s 未找到季%s相关信息!" % (file_media_name, season_number))
-            return {}
-        else:
-            for tv in tvs:
-                if (self.__compare_tmdb_names(file_media_name, tv.get('name'))
-                    or self.__compare_tmdb_names(file_media_name, tv.get('original_name'))) \
-                        and (tv.get('first_air_date') and tv.get('first_air_date')[0:4] == str(media_year)):
-                    return tv
+            candidates = [candidate for candidate in candidates
+                          if not self.__get_genre_ids(candidate)
+                          or set(self.__get_genre_ids(candidate)).intersection(ANIME_GENREIDS)]
+        budget = [self.CANDIDATE_DETAIL_LIMIT]
+        # Read with the identity check's own options so its detail is reused.
+        options = getattr(candidate_check, "detail_options", None) or {}
 
-            for tv in tvs[:5]:
-                info, names = self.__search_tmdb_allnames(MediaType.TV, tv.get("id"))
-                if not self.__compare_tmdb_names(file_media_name, names):
-                    continue
-                if __season_match(tv_info=info, season_year=media_year):
-                    return info
-        return {}
+        def summary_match(candidate, fuzzy):
+            return any(self.__compare_tmdb_names(name, candidate.get(key), fuzzy=fuzzy)
+                       for key in ("name", "original_name"))
+
+        def claim(candidate):
+            """Spend one read on a work not yet read in this recognition."""
+            if self.__detail_reused(MediaType.TV, candidate["id"]):
+                return True
+            if budget[0] <= 0:
+                return False
+            budget[0] -= 1
+            return True
+
+        def evaluate(candidate, info=None):
+            """Return (Evidence, accepted info) for one name-matched candidate."""
+            try:
+                first_year = str(candidate.get("first_air_date") or "")[:4]
+                needs_detail = (season_number is not None or (year and first_year != str(year))
+                                or (anime_only and not self.__get_genre_ids(candidate)))
+                if needs_detail and not info:
+                    info = self.__candidate_detail(MediaType.TV, candidate["id"])
+                    if not info:
+                        return Evidence.UNKNOWN, None
+                if not self.__tv_year_matches(info or candidate, year, season_number):
+                    return Evidence.INVALID, None
+                if anime_only and self.__lacks_anime_genre(info or candidate):
+                    return Evidence.INVALID, None
+                if not candidate_check:
+                    return Evidence.VALID, info or candidate
+                accepted = candidate_check(candidate)
+                return (Evidence.VALID, accepted) if accepted else (Evidence.INVALID, None)
+            except RecognitionPending as error:
+                log.info("【Meta】候选 %s 证据不足：%s" % (candidate.get("id"), error))
+                return Evidence.UNKNOWN, None
+
+        def valid_of(group, blocked=False):
+            """(score, info) of every VALID member; any UNKNOWN or unchecked named candidate blocks."""
+            if blocked:
+                raise RecognitionPending("存在详情不可用或未检查的近似名称候选，保留待确认")
+            valid = []
+            for candidate, info, score in group:
+                state, accepted = evaluate(candidate, info)
+                if state == Evidence.UNKNOWN:
+                    # The result is pending whatever the rest show; stop reading.
+                    raise RecognitionPending("存在证据不足的同名候选，不能排除，保留待确认")
+                if state == Evidence.VALID:
+                    valid.append((score, accepted))
+            return valid
+
+        exact, fuzzy = [], []
+        unknown_named = unchecked = False
+        # Name evidence is read first (stable, provider order within each group).
+        ordered = sorted(candidates, key=lambda c: (not summary_match(c, False), not summary_match(c, True)))
+        for candidate in ordered:
+            formal = summary_match(candidate, False)
+            named = formal or summary_match(candidate, True)
+            if not claim(candidate):
+                # An unread candidate is never INVALID: its aliases are unknown.
+                unchecked = True
+                unknown_named = unknown_named or named
+                continue
+            if formal:
+                # Its name is already exact; the reserved read happens only if
+                # the identity check needs the details.
+                exact.append((candidate, None, 0))
+                continue
+            info = self.__candidate_detail(MediaType.TV, candidate["id"], **options)
+            if not info:
+                # Only an unavailable candidate with name evidence may be the work.
+                unknown_named = unknown_named or named
+                continue
+            names = self.__candidate_all_names(info)
+            if self.__compare_tmdb_names(name, names, fuzzy=False):
+                exact.append((candidate, info, 0))
+            elif self.__compare_tmdb_names(name, names):
+                fuzzy.append((candidate, info, self.__match_tmdb_name_score(name, names)))
+        limit_reason = "候选详情读取已达上限，仍有未检查的候选，无法确认唯一作品，保留待确认"
+        valid = valid_of(exact, blocked=unknown_named)
+        if len(valid) > 1:
+            raise RecognitionPending("多部作品名称精确匹配，缺少年份、类型等区分证据，保留待确认")
+        if unchecked:
+            # An unread candidate may match by alias: neither a unique match nor
+            # a miss is proven, and a miss would authorize name fallbacks.
+            raise RecognitionPending(limit_reason)
+        if valid:
+            return valid[0][1]
+        # Eligibility and ranking are different: an earlier fuzzy response must
+        # not hide a later, closer title; equally close works stay unconfirmed.
+        valid = valid_of(sorted(fuzzy, key=lambda item: item[2], reverse=True))
+        if not valid:
+            return {}
+        best = [accepted for score, accepted in valid if score == valid[0][0]]
+        if len(best) > 1:
+            raise RecognitionPending("多部作品名称同样接近，缺少区分证据，保留待确认")
+        return best[0]
 
     def __search_multi_tmdb(self, file_media_name):
         """
@@ -541,13 +619,11 @@ class Media:
         :return: 匹配的媒体信息
         """
         try:
-            multis = self.search.multi({"query": file_media_name}) or []
-        except TMDbException as err:
-            log.error(f"【Meta】连接TMDB出错：{str(err)}")
-            return None
-        except Exception as e:
-            log.error(f"【Meta】连接TMDB出错：{str(e)}")
-            return None
+            multis = query_tmdb(self.search, "multi", {"query": file_media_name})
+            if multis is None:
+                raise RecognitionPending("TMDB 综合检索结果不可用，保留待重试")
+        except Exception as error:
+            raise RecognitionPending("TMDB 综合检索失败，保留待重试") from error
         log.debug(f"【Meta】API返回：{str(self.search.total_results)}")
         if len(multis) == 0:
             log.debug(f"【Meta】{file_media_name} 未找到相关媒体息!")
@@ -579,13 +655,24 @@ class Media:
                     )
                     if score > 0 and (not best_movie or score > best_movie[0]):
                         best_movie = (score, multi)
-                elif multi.get("media_type") == "tv":
-                    score = max(
-                        self.__match_tmdb_name_score(file_media_name, multi.get('name')),
-                        self.__match_tmdb_name_score(file_media_name, multi.get('original_name'))
-                    )
-                    if score > 0 and (not best_tv or score > best_tv[0]):
-                        best_tv = (score, multi)
+            # Unknown-type lookups still send every TV candidate through the
+            # same name selector. Load full TV details so aliases and
+            # translations participate even when the multi-search summary only
+            # contains the formal name. Keep the existing exact-movie tie preference.
+            if not best_movie or best_movie[0] < 1:
+                def load_tv(candidate):
+                    info = self.__candidate_detail(MediaType.TV, candidate.get("id"))
+                    if not info:
+                        raise RecognitionPending("候选作品详情不可用，保留待重试")
+                    return info
+
+                tv = self.__select_tv_candidate(
+                    [item for item in multis if item.get("media_type") == "tv"],
+                    file_media_name, candidate_check=load_tv)
+                if tv:
+                    score = self.__match_tmdb_name_score(file_media_name, self.__candidate_all_names(tv))
+                    if score > 0:
+                        best_tv = (score, tv)
 
             info = __pick_best()
             if not info:
@@ -597,11 +684,6 @@ class Media:
                         score = self.__match_tmdb_name_score(file_media_name, names)
                         if score > 0 and (not best_movie or score > best_movie[0]):
                             best_movie = (score, movie_info)
-                    elif multi.get("media_type") == "tv":
-                        tv_info, names = self.__search_tmdb_allnames(MediaType.TV, multi.get("id"))
-                        score = self.__match_tmdb_name_score(file_media_name, names)
-                        if score > 0 and (not best_tv or score > best_tv[0]):
-                            best_tv = (score, tv_info)
                 info = __pick_best()
         # 返回
         if info:
@@ -747,7 +829,7 @@ class Media:
         """Fetch a real multi-search page, retaining non-media entries for completeness checks."""
         if not self.tmdb or not title:
             raise ValueError("TMDB 未配置或作品名称为空")
-        results = self.search.multi({"query": title, "page": page})
+        results = query_tmdb(self.search, "multi", {"query": title, "page": page})
         if results is None:
             raise ValueError("TMDB 作品查询失败")
         items = []
@@ -792,7 +874,7 @@ class Media:
         if not title:
             return []
         ret_infos = []
-        multis = self.search.multi({"query": title}) or []
+        multis = query_tmdb(self.search, "multi", {"query": title}) or []
         for multi in multis:
             if multi.get("media_type") in ["movie", "tv"]:
                 multi['media_type'] = MediaType.MOVIE if multi.get("media_type") == "movie" else MediaType.TV
@@ -807,9 +889,9 @@ class Media:
             return []
         ret_infos = []
         if year:
-            movies = self.search.movies({"query": title, "year": year}) or []
+            movies = query_tmdb(self.search, "movies", {"query": title, "year": year}) or []
         else:
-            movies = self.search.movies({"query": title}) or []
+            movies = query_tmdb(self.search, "movies", {"query": title}) or []
         for movie in movies:
             if title in movie.get("title"):
                 movie['media_type'] = MediaType.MOVIE
@@ -824,9 +906,9 @@ class Media:
             return []
         ret_infos = []
         if year:
-            tvs = self.search.tv_shows({"query": title, "first_air_date_year": year}) or []
+            tvs = query_tmdb(self.search, "tv_shows", {"query": title, "first_air_date_year": year}) or []
         else:
-            tvs = self.search.tv_shows({"query": title}) or []
+            tvs = query_tmdb(self.search, "tv_shows", {"query": title}) or []
         for tv in tvs:
             if title in tv.get("name"):
                 tv['media_type'] = MediaType.TV
@@ -847,6 +929,10 @@ class Media:
         根据名称查询是否已经有缓存
         """
         if not meta_info:
+            return {}
+        if self.__is_release_group_name(meta_info):
+            # A publisher is not a stable work alias; never reuse a historical
+            # misparse across unrelated releases from that same publisher.
             return {}
         # Work-level caches contain no special-episode proof. Force RSS/indexer
         # callers through full recognition instead of leaving a valid special
@@ -869,6 +955,22 @@ class Media:
                 and cached.get("type") != MediaType.ANIME):
             return {}
         return cached
+
+    @staticmethod
+    def __cacheable_release(meta_info):
+        # File-scoped interpretations must not teach a reusable ordinary alias.
+        note = meta_info.note or {}
+        return (not any(note.get(key) for key in ("special_episode", "fractional_episode", "extra",
+                                                  "ordinal_candidates", "ordinal_resolution"))
+                and not Media.__is_release_group_name(meta_info))
+
+    @staticmethod
+    def __is_release_group_name(meta_info):
+        name = Media.__normalize_identity_name(meta_info.get_name())
+        groups = getattr(meta_info, "resource_team", None) or ""
+        groups = groups if isinstance(groups, list) else str(groups).split("@")
+        return bool(name and any(name == Media.__normalize_identity_name(group)
+                    and ReleaseGroupsMatcher().is_group_label(group) for group in groups if group))
 
     @staticmethod
     def __is_same_search_name(name1, name2):
@@ -1095,27 +1197,42 @@ class Media:
         return True
 
     @staticmethod
-    def _valid_media_identity(meta_info, info):
-        if not info:
+    def __known_seasons_match(meta_info, info):
+        """Reject catalogue contradictions without inventing data for legacy bindings."""
+        if info.get("media_type") != MediaType.TV or meta_info.begin_season is None:
+            return True
+        seasons = info.get("seasons")
+        if seasons is None:
+            # Legacy bound identities may lack a manifest. Search candidates
+            # separately require one before selecting an otherwise unknown work.
+            return True
+        if not isinstance(seasons, list) or any(not hasattr(s, "get") for s in seasons):
             return False
+        return set(meta_info.get_season_list()).issubset(s.get("season_number") for s in seasons)
+
+    @staticmethod
+    def _valid_media_identity(meta_info, info):
+        return bool(info) and Media.__identity_conflict(meta_info, info) is None
+
+    @staticmethod
+    def __identity_conflict(meta_info, info):
+        """Name the failed check: prefix/anime disprove a work, a missing season does not."""
         short_name = getattr(meta_info, "cn_name", None) or ""
         candidate_name = info.get("name") or info.get("title") or ""
         if (short_name and len(short_name) <= 4 and candidate_name.startswith(short_name)
                 and candidate_name != short_name
                 and Media.__is_other_work_by_prefix(meta_info, info, short_name, candidate_name)):
             log.warn("【Meta】短片名仅与候选前缀相同，拒绝绑定另一作品")
-            return False
+            return "prefix"
         if Media.__expect_anime_genre(meta_info):
             if Media.__lacks_anime_genre(info):
                 log.warn("【Meta】动漫候选缺少动画分类，拒绝绑定：%s" % candidate_name)
-                return False
-        if (info.get("media_type") == MediaType.TV and meta_info.begin_season is not None
-                and not (getattr(meta_info, "note", None) or {}).get("fractional_episode")):
-            seasons = {s.get("season_number") for s in info.get("seasons", [])}
-            if not set(meta_info.get_season_list()).issubset(seasons):
-                log.warn("【Meta】候选作品不存在请求的季，拒绝绑定")
-                return False
-        return True
+                return "anime"
+        if (not (getattr(meta_info, "note", None) or {}).get("fractional_episode")
+                and not Media.__known_seasons_match(meta_info, info)):
+            log.warn("【Meta】候选作品不存在请求的季，拒绝绑定")
+            return "season"
+        return None
 
     @staticmethod
     def __is_other_work(meta_info, info, mtype_hint=None):
@@ -1136,24 +1253,54 @@ class Media:
         return False
 
     def __load_cached_identity(self, meta_info, cache_info, media_key, mtype_hint=None,
-                               chinese=True, append_to_response=None):
+                               chinese=True, append_to_response=None, manual=None, evidence_cache=None):
         """
         使用历史缓存的作品身份并重新核验本条资源的季集映射。
-        返回 (TMDB信息, 是否需要重新检索)：详情获取失败或季集无法核验时不重新检索；
-        缓存绑定的是另一部作品（早期同名误识别）时丢弃缓存并重新检索。
+        返回 (TMDB信息, 是否需要重新检索)：证据未知或本次候选身份冲突时保留待确认；
+        缓存身份/明确年份被证伪时丢弃该条缓存并重新检索。
         """
+        proposed_id, proposed_type = self.__extract_llm_tmdb_target(meta_info, mtype_hint)
+        if proposed_id and (str(proposed_id) != str(cache_info.get("id"))
+                            or proposed_type != self.__resolve_tmdb_mtype(cache_info.get("type"))):
+            # Neither a historical alias nor model candidate membership proves
+            # which conflicting identity is correct. Keep the file for review.
+            meta_info.skip_reason = "缓存作品与本次 LLM 候选身份冲突，请核对作品"
+            return None, False
         info = self.get_tmdb_info(mtype=cache_info.get("type"),
                                   tmdbid=cache_info.get("id"),
                                   chinese=chinese,
                                   append_to_response=append_to_response)
         if not info:
+            meta_info.skip_reason = "缓存作品详情不可用，保留源文件待重试"
             return None, False
-        if self._prepare_media_identity(meta_info, info, mtype_hint=mtype_hint):
+        if (proposed_id and info.get("media_type") == MediaType.TV and meta_info.year
+                and not (meta_info.note or {}).get("llm", {}).get("inferred_year")):
+            try:
+                if not self.__llm_year_matches(meta_info, info):
+                    self.meta.delete_meta_data(media_key)
+                    return None, True
+            except RecognitionPending as error:
+                meta_info.skip_reason = str(error)
+                return None, False
+        if manual and any(meta_info.note.get(key) for key in ("ordinal_candidates", "ordinal_default")):
+            # A cached ID is the same work constraint as an explicit binding;
+            # validate the manual target before applying any release mapping.
+            resolved = self.resolve_ordinal_identity(meta_info, bound=info, mtype_hint=mtype_hint,
+                                                      manual=manual, evidence_cache=evidence_cache)
+            return resolved or None, False
+        evidence = {}
+        if self._prepare_media_identity(meta_info, info, mtype_hint=mtype_hint, evidence=evidence):
             return info, False
+        # A warm cache must retain the source just like an unresolved search.
+        # Do not reinterpret missing genre/mapping data as a different work.
+        if evidence["state"] == Evidence.UNKNOWN:
+            meta_info.skip_reason = "缓存作品的季集证据不足，保留源文件待重试"
+            return None, False
         if self.__is_other_work(meta_info, info, mtype_hint=mtype_hint):
             log.warn("【Meta】历史识别缓存与发布名不符，忽略缓存并重新检索：%s" % cache_info.get("id"))
             self.meta.delete_meta_data(media_key)
             return None, True
+        meta_info.skip_reason = "缓存作品与请求季集不符，保留源文件待确认"
         return None, False
 
     def _apply_episode_mapping(self, meta_info, info, season_fetch=None):
@@ -1273,6 +1420,13 @@ class Media:
             if len(targets) != last - begin + 1:
                 fraction["reason"] = "手动目标集数在 TMDB 中不存在或范围不完整，保留源文件"
                 return False
+            try:
+                SpecialResolver(self, cache).validate_fractional_target(
+                    meta_info.note.get("special_episode"), info, target_season,
+                    [targets[number] for number in range(begin, last + 1)], manual=True)
+            except ValueError as error:
+                fraction["reason"] = str(error)
+                return False
             meta_info.begin_season, meta_info.end_season = target_season, None
             meta_info.begin_episode, meta_info.end_episode = begin, end
             meta_info.total_seasons, meta_info.total_episodes = 1, len(targets)
@@ -1285,6 +1439,7 @@ class Media:
                 "source_episode": fraction["raw"], "source_season": source_season,
                 "target_season": target_season, "target_episode": begin,
                 "target_end_episode": end, "evidence": "manual"}
+            meta_info._numbering_result = NumberingResult.verified(meta_info, info)
             return True
         # Automatic recognition still requires an unambiguous release label.
         # A file-scoped review may resolve one malformed label (e.g. a numeric
@@ -1392,6 +1547,12 @@ class Media:
             fraction["reason"] = "小数集无唯一 TMDB 候选"
             return False
         (season, number), (ep, evidence) = next(iter(candidates.items()))
+        try:
+            SpecialResolver(self, cache).validate_fractional_target(
+                meta_info.note.get("special_episode"), info, season, [ep])
+        except ValueError as error:
+            fraction["reason"] = str(error)
+            return False
         meta_info.begin_season, meta_info.end_season = season, None
         meta_info.begin_episode, meta_info.end_episode = number, None
         meta_info.total_seasons = meta_info.total_episodes = 1
@@ -1404,38 +1565,122 @@ class Media:
         meta_info.note["episode_mapping"] = {
             "source_episode": fraction["raw"], "source_season": source_season,
             "target_season": season, "target_episode": number, "evidence": evidence}
+        meta_info._numbering_result = NumberingResult.verified(meta_info, info)
         return True
 
-    def _prepare_media_identity(self, meta_info, info, mtype_hint=None):
+    def _resolve_numbering(self, meta_info, info, manual=False, manual_season=False):
+        """Resolve required numbering atomically; absence and failed evidence are distinct."""
+        fields = ("begin_season", "end_season", "total_seasons", "begin_episode",
+                  "end_episode", "total_episodes", "note")
+        original = {field: copy.deepcopy(value) for field, value in vars(meta_info).items() if field in fields}
+        previous = getattr(meta_info, "_numbering_result", None)
+        release_season = meta_info.begin_season
+        release_episodes = self.__episode_list_of(meta_info)
+        result = NumberingResult(NumberingState.NOT_REQUESTED)
+        manual_fields = (meta_info.note or {}).get("_manual_numbering") or {}
+        try:
+            if not manual and not manual_fields:
+                self._apply_episode_mapping(meta_info, info)
+                if (meta_info.note or {}).get("episode_mapping"):
+                    result = NumberingResult.verified(meta_info, info)
+                else:
+                    result = self._resolve_llm_numbering(meta_info, info)
+                if result.ready and not self.__verify_remapped_episodes(
+                        meta_info, info, release_season=release_season, release_episodes=release_episodes):
+                    result = NumberingResult(NumberingState.UNRESOLVED, "发布季集与目标编号缺少完整映射证据")
+                elif result.ready and result.state == NumberingState.VERIFIED:
+                    # Absolute conversion may refine the verified season's episode.
+                    result = NumberingResult.verified(meta_info, info)
+            else:
+                # An explicit EP does not authorize changing or ignoring the
+                # file's season. Only an explicit season or provider proof can.
+                result = NumberingResult.verified(meta_info, info,
+                    season_authorized=manual_season or "begin_season" in manual_fields
+                    or bool(previous and previous.authorizes_season(meta_info, info)))
+        except (ValueError, TypeError, KeyError) as error:
+            result = NumberingResult(NumberingState.UNRESOLVED, "季集映射无法核验：%s" % error)
+        if not result.ready:
+            for field in fields:
+                if field in original:
+                    setattr(meta_info, field, original[field])
+                else:
+                    vars(meta_info).pop(field, None)
+            meta_info.skip_reason = result.reason
+        elif previous is not None and meta_info.skip_reason == previous.reason:
+            # A successful retry replaces this resolver's own failure reason,
+            # without clearing an unrelated special/identity rejection.
+            meta_info.skip_reason = None
+        meta_info._numbering_result = result
+        return result
+
+    def _prepare_media_identity(self, meta_info, info, mtype_hint=None, evidence=None):
+        # Keep the Boolean API for existing callers. Search retries also need
+        # to know whether a failed check disproved the work or lacked evidence.
+        if evidence is not None:
+            evidence["state"] = Evidence.UNKNOWN
+
+        def finish(valid, definitive=True):
+            if evidence is not None:
+                evidence["state"] = (Evidence.VALID if valid else
+                                     Evidence.INVALID if definitive else Evidence.UNKNOWN)
+            return valid
+
+        def identity_result():
+            if (info.get("media_type") == MediaType.TV and meta_info.begin_season is not None
+                    and not (meta_info.note or {}).get("fractional_episode")):
+                seasons = info.get("seasons")
+                if (not isinstance(seasons, list) or any(not hasattr(season, "get")
+                        or type(season.get("season_number")) is not int for season in seasons)):
+                    # Null or malformed manifests are unavailable evidence, not
+                    # an exception or a reason to pick another same-name work.
+                    return finish(False, False)
+            if self._valid_media_identity(meta_info, info):
+                return finish(True)
+            conflict = self.__identity_conflict(meta_info, info)
+            # TMDB often lags a newly airing season: absence never proves another
+            # work. Name and genre conflicts are definitive when genres are known.
+            definitive = (conflict in (None, "prefix") or (conflict == "anime"
+                          and bool(Media.__get_genre_ids(info) or info.get("original_language"))))
+            return finish(False, definitive)
+
+        if not info:
+            return False
+        if (info.get("media_type") == MediaType.MOVIE and meta_info.type in (MediaType.TV, MediaType.ANIME)
+                and (meta_info.begin_season is not None or meta_info.begin_episode is not None)
+                and not requires_confirmation(meta_info)):
+            # The parser's default MOVIE remains unknown, but explicit TV
+            # numbering must survive auxiliary/mixed search candidate paths.
+            return finish(False)
         # A verified provider/LLM identity can contradict the two-digit title default.
         # Reuse that evidence without issuing another name search or changing ordinary
         # release-season cache semantics. Candidate validation clears this flag first.
         if info and (meta_info.note or {}).get("ordinal_default"):
             resolver = OrdinalResolver(self)
             if resolver.prefers_alternate(meta_info, info):
-                return bool(resolver.resolve(meta_info, bound=info, mtype_hint=mtype_hint))
+                return finish(bool(resolver.resolve(meta_info, bound=info, mtype_hint=mtype_hint)), False)
         # 默认电影只是解析器的未知类型回退；仅用户明确指定的类型约束候选身份。
         if mtype_hint:
             expected = self.__resolve_tmdb_mtype(meta_type=mtype_hint)
             actual = self.__resolve_tmdb_mtype(meta_type=(info or {}).get("media_type"))
             if expected != actual:
                 log.warn("【Meta】候选作品与明确指定的媒体类型冲突，拒绝绑定")
-                return False
+                return finish(False, actual is not None)
             if mtype_hint == MediaType.ANIME:
                 if Media.__lacks_anime_genre(info):
                     log.warn("【Meta】明确指定动漫但候选缺少动画分类，拒绝绑定")
-                    return False
+                    return finish(False, bool(Media.__get_genre_ids(info) or info.get("original_language")))
         # 小数集的发布季不能参与普通整数映射；具体单集稍后独立核验。
         if (meta_info.note or {}).get("fractional_episode"):
-            return self._valid_media_identity(meta_info, info)
+            return identity_result()
         if (meta_info.note or {}).get("_manual_numbering"):
             # The file lookup already carries explicit target numbers. Validate
             # work/type/season identity without applying release mappings again.
-            return self._valid_media_identity(meta_info, info)
+            self._resolve_numbering(meta_info, info)
+            return identity_result()
         # Reject a wrong adaptation before using its episode metadata.
         if Media.__expect_anime_genre(meta_info) and info:
             if Media.__lacks_anime_genre(info):
-                return self._valid_media_identity(meta_info, info)
+                return finish(False, bool(Media.__get_genre_ids(info) or info.get("original_language")))
         # 候选校验会临时改写季集；失败时完整恢复，避免名称回退把改写结果当成发布编号。
         fields = ("begin_season", "end_season", "total_seasons", "begin_episode",
                   "end_episode", "total_episodes", "note")
@@ -1443,20 +1688,10 @@ class Media:
                     if key in fields}
         accepted = False
         try:
-            release_season = getattr(meta_info, "begin_season", None)
-            release_episodes = self.__episode_list_of(meta_info)
-            try:
-                self._apply_episode_mapping(meta_info, info)
-                if not (getattr(meta_info, "note", None) or {}).get("episode_mapping"):
-                    self._apply_llm_season(meta_info, info)
-            except (ValueError, TypeError, KeyError) as error:
-                log.warn("【Meta】无法确认季集映射：%s" % error)
-                return False
-            if not self.__verify_remapped_episodes(meta_info, info,
-                                                   release_season=release_season,
-                                                   release_episodes=release_episodes):
-                return False
-            accepted = self._valid_media_identity(meta_info, info)
+            numbering = self._resolve_numbering(meta_info, info)
+            if not numbering.ready:
+                return finish(False, False)
+            accepted = identity_result()
             return accepted
         finally:
             if not accepted:
@@ -1548,29 +1783,32 @@ class Media:
                 % (info.get("id"), release_season, min(episodes), max(episodes),
                    meta_info.begin_season if meta_info.begin_season is not None else "?"))
 
-    def _apply_llm_season(self, meta_info, info):
+    def _resolve_llm_numbering(self, meta_info, info):
         """
         采用经校验的 LLM 季号：季号需存在于该作品的季列表，集号需存在于该季的集列表。
         仅当作品级季集映射规则未命中时生效。
         """
         if not info or meta_info.type == MediaType.MOVIE:
-            return False
+            return NumberingResult(NumberingState.NOT_REQUESTED)
         llm_note = {}
         if isinstance(getattr(meta_info, "note", None), dict):
             llm_note = meta_info.note.get("llm") or {}
         if not isinstance(llm_note, dict) or not llm_note.get("season_verified"):
-            return False
+            return NumberingResult(NumberingState.NOT_REQUESTED)
+        # One verified season cannot represent an explicit multi-season release.
+        # Preserve the range for the downstream task/file checks.
+        if len(meta_info.get_season_list()) > 1:
+            return NumberingResult(NumberingState.UNRESOLVED, "LLM 单季目标不能替代原始多季范围")
         season = llm_note.get("tmdb_season")
         if season is None:
-            return False
+            return NumberingResult(NumberingState.UNRESOLVED, "LLM 已请求季绑定但缺少目标季号")
         if str(llm_note.get("tmdb_id")) != str(info.get("id")):
             log.warn("【Meta】LLM季号与已识别作品不一致，暂不采用：%s" % season)
-            return False
+            return NumberingResult(NumberingState.NOT_REQUESTED)
         detail = self.get_tmdb_tv_season_detail(info.get("id"), int(season)) or {}
         valid_episodes = {ep.get("episode_number") for ep in detail.get("episodes", [])}
         if not valid_episodes:
-            log.warn("【Meta】LLM季号%s缺少TMDB集列表，暂不采用" % season)
-            return False
+            return NumberingResult(NumberingState.UNRESOLVED, "LLM 目标季集列表不可用，保留源文件待重试")
         # A scalar LLM target cannot represent a multi-episode release.
         episodes = meta_info.get_episode_list()
         if (len(episodes) > 1 and meta_info.begin_season in (None, int(season))
@@ -1578,12 +1816,16 @@ class Media:
             raise ValueError("LLM 目标季无法验证完整多集范围")
         applied_episode = None
         llm_episode = llm_note.get("tmdb_episode")
-        if len(episodes) <= 1 and llm_episode is not None and int(llm_episode) in valid_episodes:
+        if len(episodes) <= 1 and llm_episode is not None:
+            if int(llm_episode) not in valid_episodes:
+                return NumberingResult(NumberingState.UNRESOLVED, "LLM 目标单集不在目标季列表中")
             applied_episode = int(llm_episode)
             meta_info.begin_episode = applied_episode
             meta_info.end_episode = None
             meta_info.total_episodes = 1
         elif episodes and not set(episodes).issubset(valid_episodes):
+            if meta_info.begin_season in (None, int(season)):
+                return NumberingResult(NumberingState.UNRESOLVED, "目标季无法核验完整发布集号")
             log.warn("【Meta】LLM季号已验证但集号%s不在该季集列表中，保留原集号" % episodes)
         note = dict(meta_info.note or {})
         note["season_binding"] = {
@@ -1603,7 +1845,7 @@ class Media:
                     "E%s" % applied_episode if applied_episode else "",
                     llm_note.get("season_evidence") or "llm",
                     llm_note.get("release_season")))
-        return True
+        return NumberingResult.verified(meta_info, info)
 
     def __extract_llm_tmdb_target(self, meta_info, mtype_hint=None):
         if not meta_info:
@@ -1644,12 +1886,54 @@ class Media:
             return None, None
         return tmdb_id, mtype
 
-    def __search_media_with_name(self, meta_info, query_name, strict=None, allow_aliases=True):
+    def __search_media_with_name(self, meta_info, query_name, strict=None, allow_aliases=True,
+                                 chinese=True, append_to_response=None, queried=None):
         """
         根据指定检索词执行媒体检索（含 tmdbweb/关键词辅助）
         """
         if not meta_info or not query_name:
             return {}
+        queried = queried if queried is not None else set()
+        query_key = (StringUtils.handler_special_chars(query_name).upper(), meta_info.type,
+                     meta_info.year, tuple(meta_info.get_season_list()), tuple(meta_info.get_episode_list()),
+                     strict, chinese, append_to_response, allow_aliases)
+        if query_key in queried:
+            return {}
+        queried.add(query_key)
+
+        checked_candidates = {}
+
+        def check_tv_candidate(candidate):
+            if not candidate or not candidate.get("id"):
+                return None
+            key = str(candidate["id"])
+            if key not in checked_candidates:
+                detail = self.__candidate_detail(MediaType.TV, candidate["id"],
+                                                 chinese=chinese, append_to_response=append_to_response)
+                if not detail or not isinstance(detail.get("seasons"), list):
+                    # Unavailable evidence is not a disproved identity. Retain
+                    # the original candidate for the normal fail-closed path,
+                    # rather than switching works because one lookup failed.
+                    raise RecognitionPending("候选作品详情或季清单不可用，保留待确认")
+                # Candidate attempts must not mutate the live release numbering
+                # or leak a rejected mapping into the next work. The selected
+                # candidate is prepared once on the live object by the caller.
+                probe = copy.copy(meta_info)
+                probe.note = copy.deepcopy(getattr(meta_info, "note", None) or {})
+                evidence = {}
+                valid = self._prepare_media_identity(probe, detail, mtype_hint=meta_info.type, evidence=evidence)
+                # Numbering lookup/configuration failures are UNKNOWN, just as
+                # in ordinal resolution. Only a definite identity mismatch may
+                # advance to a different work from the same search response.
+                if valid:
+                    checked_candidates[key] = detail
+                elif evidence.get("state") == Evidence.INVALID:
+                    checked_candidates[key] = None
+                else:
+                    raise RecognitionPending(probe.skip_reason or "候选作品的季集证据不足，保留待确认")
+            return checked_candidates[key]
+
+        check_tv_candidate.detail_options = dict(chinese=chinese, append_to_response=append_to_response)
 
         if meta_info.type not in [MediaType.TV, MediaType.ANIME] and not meta_info.year:
             file_media_info = self.__search_multi_tmdb(file_media_name=query_name)
@@ -1660,13 +1944,15 @@ class Media:
                                                      search_type=MediaType.TV,
                                                      media_year=meta_info.year,
                                                      season_number=meta_info.begin_season,
-                                                     anime_only=meta_info.type == MediaType.ANIME)
+                                                     anime_only=meta_info.type == MediaType.ANIME,
+                                                     candidate_check=check_tv_candidate)
                 inferred_year = (getattr(meta_info, "note", None) or {}).get("llm", {}).get("inferred_year")
                 if not file_media_info and meta_info.year and (
                         inferred_year or (self._rmt_match_mode == MatchMode.NORMAL and not strict)):
                     file_media_info = self.__search_tmdb(file_media_name=query_name,
                                                          search_type=MediaType.TV,
-                                                         anime_only=meta_info.type == MediaType.ANIME)
+                                                         anime_only=meta_info.type == MediaType.ANIME,
+                                                         candidate_check=check_tv_candidate)
             else:
                 file_media_info = self.__search_tmdb(file_media_name=query_name,
                                                      first_media_year=meta_info.year,
@@ -1689,7 +1975,13 @@ class Media:
                 cacheman["tmdb_supply"].set(query_name, cache_name)
             if cache_name:
                 log.info("【Meta】开始辅助查询：%s ..." % cache_name)
-                if is_movie:
+                if meta_info.type in (MediaType.TV, MediaType.ANIME):
+                    file_media_info = self.__search_tmdb(
+                        file_media_name=cache_name, search_type=MediaType.TV,
+                        first_media_year=meta_info.year, media_year=meta_info.year,
+                        season_number=meta_info.begin_season,
+                        anime_only=meta_info.type == MediaType.ANIME, candidate_check=check_tv_candidate)
+                elif is_movie:
                     file_media_info = self.__search_tmdb(file_media_name=cache_name, search_type=MediaType.MOVIE)
                 else:
                     file_media_info = self.__search_multi_tmdb(file_media_name=cache_name)
@@ -1706,37 +1998,52 @@ class Media:
             for name in fallback_names:
                 if name and not self.__is_same_search_name(query_name, name):
                     file_media_info = self.__search_media_with_name(
-                        meta_info, name, strict=strict, allow_aliases=False)
+                        meta_info, name, strict=strict, allow_aliases=False,
+                        chinese=chinese, append_to_response=append_to_response, queried=queried)
                     if file_media_info:
                         break
         return file_media_info
 
     def __confirm_search_result(self, meta_info, file_media_info,
-                                chinese=True, append_to_response=None, mtype_hint=None):
+                                chinese=True, append_to_response=None, mtype_hint=None, validate_year=False):
         """
-        补全候选作品的全量信息并校验作品身份；与发布名对不上时返回空，交给后续兜底检索。
-        返回的候选已完成身份准备（季集映射已应用），调用方不能再次准备。
+        返回 (候选, 证据状态)；只有未命中或明确不符才能继续名称兜底。
+        成功候选已完成季集映射，未知结果必须保源，不能授权改绑另一作品。
         """
         if not file_media_info:
-            return {}
+            return {}, Evidence.INVALID
         if not file_media_info.get("genres"):
-            file_media_info = self.get_tmdb_info(mtype=file_media_info.get("media_type"),
-                                                 tmdbid=file_media_info.get("id"),
-                                                 chinese=chinese,
-                                                 append_to_response=append_to_response)
+            file_media_info = self.__candidate_detail(file_media_info.get("media_type"),
+                                                      file_media_info.get("id"),
+                                                      chinese=chinese,
+                                                      append_to_response=append_to_response)
         if not file_media_info:
-            return {}
-        if not self._prepare_media_identity(meta_info, file_media_info, mtype_hint=mtype_hint):
-            log.warn("【Meta】%s 的TMDB候选与发布名不符，放弃候选：%s"
-                     % (getattr(meta_info, "org_string", "") or "",
-                        file_media_info.get("name") or file_media_info.get("title") or ""))
-            return {}
-        return file_media_info
+            meta_info.skip_reason = "候选作品详情不可用，保留待确认"
+            return {}, Evidence.UNKNOWN
+        if (validate_year and file_media_info.get("media_type") == MediaType.TV and meta_info.year
+                and not (meta_info.note or {}).get("llm", {}).get("inferred_year")):
+            try:
+                if not self.__llm_year_matches(meta_info, file_media_info):
+                    return {}, Evidence.INVALID
+            except RecognitionPending as error:
+                meta_info.skip_reason = str(error)
+                return {}, Evidence.UNKNOWN
+        evidence = {}
+        if not self._prepare_media_identity(meta_info, file_media_info, mtype_hint=mtype_hint, evidence=evidence):
+            # Explain missing evidence separately from a disproved identity.
+            reason = ("候选证据不足，保留待确认" if evidence.get("state") == Evidence.UNKNOWN
+                      else "候选与发布名不符，放弃候选")
+            log.warn("【Meta】%s 的TMDB%s：%s" % (getattr(meta_info, "org_string", "") or "",
+                     reason, file_media_info.get("name") or file_media_info.get("title") or ""))
+            if evidence["state"] == Evidence.UNKNOWN:
+                meta_info.skip_reason = reason
+            return {}, evidence["state"]
+        return file_media_info, Evidence.VALID
 
     def __search_media_by_alias_candidates(self, meta_info, strict=None,
-                                           chinese=True, append_to_response=None, mtype_hint=None):
+                                           chinese=True, append_to_response=None, mtype_hint=None, queried=None):
         """
-        TMDB 名称检索没有结果（或候选身份不符）时，用 Bangumi 候选名再查一次 TMDB。
+        TMDB 名称检索未命中时，合并 Bangumi 候选名对应的作品，唯一确认后采用。
 
         案例：zh-CN 下用 “Hundred” 搜不到《百武装战记》(66109)，只能搜到同名剧集；
         Bangumi 候选里有中文名与原名，用它检索即可命中正确条目。
@@ -1749,21 +2056,63 @@ class Media:
         try:
             alias_names = LLMMetaParser().get_alias_candidates(
                 title=query_name, subtitle=getattr(meta_info, "subtitle", None))
+        except RecognitionPending:
+            raise
         except Exception as err:
             log.debug("【Meta】外部候选名称检索失败：%s" % str(err))
             return {}
-        for name in alias_names or []:
+        accepted = {}
+        for name in dict.fromkeys(alias_names or []):
             if not name or self.__is_same_search_name(query_name, name):
                 continue
-            file_media_info = self.__confirm_search_result(
-                meta_info,
-                self.__search_media_with_name(meta_info=meta_info, query_name=name,
-                                              strict=strict, allow_aliases=False),
+            # External names can belong to different subjects, not merely to
+            # one work. Validate each interpretation without mutating the live
+            # release, and commit numbering only after identity is unique.
+            probe = copy.copy(meta_info)
+            probe.note = copy.deepcopy(meta_info.note)
+            file_media_info, state = self.__confirm_search_result(
+                probe,
+                self.__search_media_with_name(meta_info=probe, query_name=name,
+                                              strict=strict, allow_aliases=False,
+                                              chinese=chinese, append_to_response=append_to_response, queried=queried),
                 chinese=chinese, append_to_response=append_to_response, mtype_hint=mtype_hint)
+            if state == Evidence.UNKNOWN:
+                meta_info.skip_reason = probe.skip_reason
+                return {}
             if file_media_info:
-                log.info("【Meta】%s 使用外部候选名识别：%s" % (query_name, name))
-                return file_media_info
+                accepted[identity(file_media_info)] = (file_media_info, probe)
+                if len(accepted) > 1:
+                    meta_info.skip_reason = "外部候选名称对应多部作品，保留待确认"
+                    return {}
+        if accepted:
+            file_media_info, probe = next(iter(accepted.values()))
+            meta_info.__dict__.update(probe.__dict__)
+            return file_media_info
         return {}
+
+    def prepare_bound_release(self, meta_info, bound_info, mtype_hint=None):
+        """
+        An independently matched work (IMDb) still needs this release's numbering
+        and the same final admission as name and file recognition.
+        """
+        if not bound_info:
+            return False
+        note = meta_info.note or {}
+        # An explicit type (including ANIME's animation genre) constrains the
+        # identity check and the final admission alike.
+        if any(note.get(key) for key in ("ordinal_candidates", "ordinal_default")):
+            prepared = self.resolve_ordinal_identity(meta_info, bound=bound_info, mtype_hint=mtype_hint)
+            if prepared and not meta_info.note.get("ordinal_resolution"):
+                # The compatibility default still needs the original identity
+                # and number-mapping checks; it is not a bypass.
+                prepared = self._prepare_media_identity(meta_info, bound_info, mtype_hint=mtype_hint)
+        else:
+            prepared = self._prepare_media_identity(meta_info, bound_info, mtype_hint=mtype_hint)
+        if not prepared:
+            return False
+        meta_info.set_tmdb_info(bound_info)
+        self._finalize_recognition(meta_info, mtype_hint=mtype_hint)
+        return not meta_info.skip_reason
 
     def resolve_ordinal_identity(self, meta_info, bound=None, mtype_hint=None,
                                  evidence_cache=None, manual=None):
@@ -1777,54 +2126,69 @@ class Media:
                 return bound
         return resolver.resolve(meta_info, bound=bound, mtype_hint=mtype_hint, manual=manual)
 
-    def __search_media_info(self, meta_info, mtype_hint=None, strict=None,
-                            chinese=True, append_to_response=None, evidence_cache=None):
+    def __search_media_info(self, meta_info, **options):
+        """Do not collapse provider/candidate UNKNOWN into an ordinary search miss."""
+        try:
+            return self.__lookup_media_identity(meta_info, **options)
+        except RecognitionPending as error:
+            meta_info.skip_reason = str(error)
+            return {}
+
+    def __lookup_media_identity(self, meta_info, mtype_hint=None, strict=None,
+                            chinese=True, append_to_response=None, evidence_cache=None, manual=None):
         """
         按发布名检索作品：LLM 直出 ID → 名称检索 → 中文兜底 → 外部（Bangumi）候选名。
-        每个候选只准备一次作品身份（含季集映射），与发布名对不上的候选会被丢弃并继续兜底；
+        每个候选只准备一次作品身份（含季集映射），明确不符才继续兜底，证据不足保留待确认；
         返回的结果已完成准备，调用方不能再次准备，否则会重复偏移集号。
         """
-        if (meta_info.note or {}).get("ordinal_candidates"):
+        if ((meta_info.note or {}).get("ordinal_candidates")
+                or (manual and (meta_info.note or {}).get("ordinal_default"))):
             return self.resolve_ordinal_identity(meta_info, mtype_hint=mtype_hint,
-                                                 evidence_cache=evidence_cache)
+                                                 evidence_cache=evidence_cache, manual=manual)
         file_media_info = None
+        queried = set()
         llm_tmdb_id, llm_tmdb_type = self.__extract_llm_tmdb_target(meta_info=meta_info,
                                                                     mtype_hint=mtype_hint)
         if llm_tmdb_id:
             log.info("【Meta】尝试使用LLM直出TMDBID：%s ..." % llm_tmdb_id)
-            file_media_info = self.get_tmdb_info(mtype=llm_tmdb_type,
-                                                 tmdbid=llm_tmdb_id,
-                                                 chinese=chinese,
-                                                 append_to_response=append_to_response)
-            if file_media_info and not self._prepare_media_identity(
-                    meta_info, file_media_info, mtype_hint=mtype_hint):
-                file_media_info = None
+            file_media_info, state = self.__confirm_search_result(
+                meta_info, {"id": llm_tmdb_id, "media_type": llm_tmdb_type},
+                chinese=chinese, append_to_response=append_to_response, mtype_hint=mtype_hint,
+                validate_year=True)
+            if state == Evidence.UNKNOWN:
+                return {}
             if not file_media_info:
                 log.warn("【Meta】LLM直出TMDBID无效或未命中，回退名称检索：%s" % llm_tmdb_id)
         main_query_name = meta_info.get_name()
         if not file_media_info:
-            file_media_info = self.__confirm_search_result(
+            file_media_info, state = self.__confirm_search_result(
                 meta_info,
                 self.__search_media_with_name(meta_info=meta_info,
                                               query_name=main_query_name,
-                                              strict=strict),
+                                              strict=strict, chinese=chinese,
+                                              append_to_response=append_to_response, queried=queried),
                 chinese=chinese,
                 append_to_response=append_to_response,
                 mtype_hint=mtype_hint)
+            if state == Evidence.UNKNOWN:
+                return {}
         # 主检索失败或候选与发布名不符时，尝试使用中文名兜底检索
         cn_fallback_name = None
         if not file_media_info:
             cn_fallback_name = self.__extract_cn_fallback_name(meta_info)
             if cn_fallback_name and not self.__is_same_search_name(main_query_name, cn_fallback_name):
                 log.info("【Meta】%s 使用中文兜底识别：%s" % (main_query_name, cn_fallback_name))
-                file_media_info = self.__confirm_search_result(
+                file_media_info, state = self.__confirm_search_result(
                     meta_info,
                     self.__search_media_with_name(meta_info=meta_info,
                                                   query_name=cn_fallback_name,
-                                                  strict=strict),
+                                                  strict=strict, chinese=chinese,
+                                                  append_to_response=append_to_response, queried=queried),
                     chinese=chinese,
                     append_to_response=append_to_response,
                     mtype_hint=mtype_hint)
+                if state == Evidence.UNKNOWN:
+                    return {}
                 if file_media_info:
                     meta_info.cn_name = cn_fallback_name
             # 双重失败时默认展示中文名
@@ -1838,9 +2202,10 @@ class Media:
                 strict=strict,
                 chinese=chinese,
                 append_to_response=append_to_response,
-                mtype_hint=mtype_hint)
+                mtype_hint=mtype_hint, queried=queried)
         return file_media_info or {}
 
+    @_shares_candidate_details
     def get_media_info(self, title,
                        subtitle=None,
                        mtype=None,
@@ -1868,7 +2233,8 @@ class Media:
         # 识别
         meta_info = MetaInfo(title, subtitle=subtitle, mtype=mtype)
         if requires_confirmation(meta_info) and not (meta_info.note or {}).get("fractional_episode"):
-            return SpecialResolver(self).resolve(meta_info, mtype_hint=mtype)
+            return self._finalize_recognition(
+                SpecialResolver(self).resolve(meta_info, mtype_hint=mtype), mtype_hint=mtype)
         if not meta_info.get_name() or not meta_info.type:
             log.warn("【Rmt】%s 未识别出有效信息！" % meta_info.org_string)
             return None
@@ -1890,16 +2256,17 @@ class Media:
                                                        strict=strict,
                                                        chinese=chinese,
                                                        append_to_response=append_to_response)
-            # 保存到缓存
-            if file_media_info and not (meta_info.note or {}).get("ordinal_resolution"):
-                self.__insert_media_cache(media_key=media_key,
-                                          file_media_info=file_media_info)
         # 赋值TMDB信息并返回
         meta_info.set_tmdb_info(file_media_info)
         if (meta_info.note or {}).get("fractional_episode"):
-            if not self._confirm_fractional_episode(meta_info, file_media_info):
+            if (not self._reject_multiseason_fractional(meta_info)
+                    and not self._confirm_fractional_episode(meta_info, file_media_info)):
                 meta_info.skip_reason = (meta_info.note["fractional_episode"].get("reason")
                                          or "小数集缺少唯一且可核验的 TMDB 单集映射")
+        self._finalize_recognition(meta_info, mtype_hint=mtype)
+        if (need_search and file_media_info and meta_info.tmdb_info and not meta_info.skip_reason
+                and self.__cacheable_release(meta_info)):
+            self.__insert_media_cache(media_key=media_key, file_media_info=file_media_info)
         return meta_info
 
     def __insert_media_cache(self, media_key, file_media_info):
@@ -1944,23 +2311,97 @@ class Media:
             self.meta.update_meta_data({media_key: {'id': 0}})
 
     @staticmethod
-    def _apply_manual_numbering(meta_info, season, episode_format, file_name):
-        """Apply the same ordinary-file overrides after either identity lookup path."""
+    def _finalize_recognition(meta_info, file=False, mtype_hint=None):
+        """The sole final admission check, shared by title and file entry points."""
+        reason = download_block_reason(meta_info, allow_extra=file)
+        numbering = getattr(meta_info, "_numbering_result", None)
+        if (not reason and meta_info.tmdb_info and not (meta_info.note or {}).get("extra")
+                and not (numbering and numbering.authorizes_season(meta_info, meta_info.tmdb_info))
+                and not Media.__known_seasons_match(meta_info, meta_info.tmdb_info)):
+            reason = "最终季号未获作品季清单确认，保留源文件"
+        if not reason and mtype_hint and meta_info.tmdb_info:
+            expected = Media.__resolve_tmdb_mtype(meta_type=mtype_hint)
+            actual = Media.__resolve_tmdb_mtype(meta_type=meta_info.tmdb_info.get("media_type"))
+            if expected != actual:
+                reason = "最终作品类型与明确指定的类型冲突"
+            elif mtype_hint == MediaType.ANIME and Media.__lacks_anime_genre(meta_info.tmdb_info):
+                reason = "最终作品缺少所要求的动画分类"
+        if reason:
+            meta_info.skip_reason = reason
+        elif (file and meta_info.tmdb_info and meta_info.type != MediaType.MOVIE
+              and not (meta_info.note or {}).get("extra")):
+            if not meta_info.get_episode_list():
+                meta_info.skip_reason = "单文件缺少可验证集号，保留源文件"
+            elif len(meta_info.get_season_list()) != 1:
+                meta_info.skip_reason = "单文件包含多季集号，无法确定目标季，请手动指定单季"
+        return meta_info
+
+    def _apply_manual_numbering(self, meta_info, season, episodes=None, info=None, evidence_cache=None):
+        """Apply per-file targets, verifying final ordinal numbers before mutation."""
         # Switching the form to movies may leave hidden EP fields populated.
-        if meta_info.type == MediaType.MOVIE:
+        if meta_info.type == MediaType.MOVIE or (season is None and episodes is None):
             return
+        target = copy.copy(meta_info)
         if season is not None:
             # A manual single season replaces any parsed season range.
-            meta_info.begin_season = season
-            meta_info.end_season = None
-            meta_info.total_seasons = 1
-        if episode_format:
-            begin, end = episode_format.split_episode(file_name)
-            if begin is not None:
-                # Replace the whole range; a single EP must clear the old endpoint.
-                meta_info.begin_episode, meta_info.end_episode = begin, end
-                meta_info.total_episodes = len(meta_info.get_episode_list())
+            target.begin_season, target.end_season, target.total_seasons = season, None, 1
+        if episodes is not None:
+            begin, end = episodes
+            target.begin_episode, target.end_episode = begin, end
+            target.total_episodes = (end if end is not None else begin) - begin + 1
+        ordinal = info and any(meta_info.note.get(key) for key in
+                               ("ordinal_candidates", "ordinal_default", "ordinal_resolution"))
+        if ordinal:
+            # Reuse the same verifier and batch evidence as explicitly bound
+            # ordinal files. A later override cannot reuse proof for old numbers.
+            resolver = OrdinalResolver(self, evidence_cache)
+            if resolver.validate(target, info, manual=True) != Evidence.VALID:
+                meta_info.skip_reason = "人工序数季目标缺少可核验的作品或季集证据"
+                return
+        for field in ("begin_season", "end_season", "total_seasons",
+                      "begin_episode", "end_episode", "total_episodes"):
+            setattr(meta_info, field, getattr(target, field))
+        if info:
+            self._resolve_numbering(meta_info, info, manual=True,
+                                    manual_season=season is not None or bool(ordinal))
 
+    @staticmethod
+    def _inherit_directory_identity(target, source):
+        """Fill a missing title without detaching its interpretations from evidence."""
+        season_fields = ("begin_season", "end_season", "total_seasons")
+        episode_fields = ("begin_episode", "end_episode", "total_episodes")
+        # A directory cannot supply an individual file's episode number. Nearer
+        # explicit seasons also constrain every inherited title interpretation.
+        retained = {field: getattr(target, field) for field in episode_fields}
+        if target.begin_episode is not None:
+            retained["total_episodes"] = len(target.get_episode_list())
+        if target.begin_season is not None:
+            retained.update({field: getattr(target, field) for field in season_fields})
+        target.cn_name, target.en_name = source.cn_name, source.en_name
+        if not target.year:
+            target.year = source.year
+        if target.type != MediaType.TV and source.type:
+            target.type = source.type
+        if target.begin_season is None:
+            for field in season_fields:
+                setattr(target, field, getattr(source, field))
+        choices = source.note.get("ordinal_candidates") or source.note.get("ordinal_default")
+        if choices:
+            # The two-digit release default concerns that release's episode;
+            # it cannot choose a directory's identity for a different child file.
+            target.note["ordinal_candidates"] = [dict(fields, **retained) for fields in choices]
+            target.skip_reason = "目录名称的序数季解释尚未唯一确认"
+
+    @staticmethod
+    def _reject_multiseason_fractional(meta_info):
+        """Do not collapse one fractional label that explicitly spans seasons."""
+        fraction = (meta_info.note or {}).get("fractional_episode")
+        if fraction and len(meta_info.get_season_list()) > 1:
+            meta_info.skip_reason = "小数集来源包含多个发布季，不能安全映射为单季"
+            return True
+        return False
+
+    @_shares_candidate_details
     def get_media_info_on_files(self,
                                 file_list,
                                 tmdb_info=None,
@@ -1968,7 +2409,8 @@ class Media:
                                 season=None,
                                 episode_format: EpisodeFormat = None,
                                 chinese=True,
-                                download_context=None, download_contexts=None):
+                                download_context=None, download_contexts=None,
+                                bluray=False):
         """
         根据文件清单，搜刮TMDB信息，用于文件名称的识别
         :param file_list: 文件清单，如果是列表也可以是单个文件，也可以是一个目录
@@ -1977,6 +2419,7 @@ class Media:
         :param season: 季号，如有传入以该季号赋于所有文件，否则从名称中识别
         :param episode_format: EpisodeFormat
         :param chinese: 原标题为英文时是否从别名中检索中文名称
+        :param bluray: 当前条目是蓝光整季目录；目录不要求单文件集号
         :return: 带有TMDB信息的每个文件对应的MetaInfo对象字典
         """
         # Invalid batch parameters must fail before per-file exception handling hides them.
@@ -1993,6 +2436,11 @@ class Media:
         prepared = {path: prepare_title(os.path.basename(path)) for path in file_list}
         fractions = {path: value["fractional"] for path, value in prepared.items()}
         specials = {path: value["special"] for path, value in prepared.items()}
+        # Keep the directory form explicit at the admission boundary.  Direct
+        # Media callers may pass an original-disc path without going through
+        # FileTransfer, so do not rely solely on its optional hint.
+        bluray_paths = {path for path in file_list
+                        if os.path.isdir(path) and PathUtils.get_bluray_dir(path)}
         file_list = sorted(file_list, key=lambda path: (bool(fractions[path] or specials[path]), bool(fractions[path])))
         fractional_cache = {}
         task_identities = {}
@@ -2005,6 +2453,8 @@ class Media:
         # 遍历每个文件，看得出来的名称是不是不一样，不一样的先搜索媒体信息
         for file_path in file_list:
             identity_prepared = False
+            pending_cache = None
+            manual_cache = False
             tmdb_info, media_type, download_context = default_info, default_type, default_context
             context = (download_contexts or {}).get(file_path) or download_context
             try:
@@ -2029,19 +2479,44 @@ class Media:
                 # 先用自己的名称
                 file_name = os.path.basename(file_path)
                 # An empty formatter or a nonmatching rule is not an EP override.
-                begin, end = episode_format.split_episode(file_name) if episode_format else (None, None)
-                manual_episode = (season, begin, end) if begin is not None else None
+                try:
+                    begin, end = (episode_format.split_episode(file_name)
+                                  if episode_format and media_type != MediaType.MOVIE
+                                  and (tmdb_info or {}).get("media_type") != MediaType.MOVIE else (None, None))
+                except ValueError as error:
+                    # Direct recognition callers also get an explicit per-file failure,
+                    # instead of losing the file or silently accepting a negative EP.
+                    invalid = MetaBase(file_name, fileflag=True)
+                    invalid.skip_reason = str(error)
+                    return_media_infos[file_path] = invalid
+                    continue
+                episode_target = (begin, end) if begin is not None else None
+                manual_episode = (season, begin, end) if episode_target is not None else None
+                # Retained fields belong to the chosen title interpretation;
+                # pass only explicit overrides into ordinal resolution.
+                manual_numbering = {}
+                if season is not None:
+                    manual_numbering.update(begin_season=season, end_season=None, total_seasons=1)
+                if episode_target is not None:
+                    manual_numbering.update(begin_episode=begin, end_episode=end,
+                        total_episodes=(end if end is not None else begin) - begin + 1)
                 if specials[file_path] and not fractions[file_path]:
                     meta_info = MetaInfo(file_name, use_llm=not bool(download_context), _prepared=prepared[file_path])
                     manual = None
                     # Existing manual controls are explicit target evidence, not a guess.
-                    if tmdb_info and not download_context:
-                        begin, end = episode_format.split_episode(file_name) if episode_format else (None, None)
-                        if tmdb_info.get("media_type") == MediaType.MOVIE:
+                    if not download_context:
+                        if (tmdb_info or {}).get("media_type") == MediaType.MOVIE:
                             manual = {"media_type": "movie", "tmdb_id": tmdb_info["id"]}
-                        elif season is not None and begin is not None and (end is None or begin == end):
-                            manual = {"media_type": "tv", "tmdb_id": tmdb_info["id"],
-                                      "season": int(season), "episode": begin}
+                        elif begin is not None and not meta_info.note.get("extra"):
+                            if end is not None and end != begin:
+                                meta_info.skip_reason = "特殊集只支持核验单个目标集，请逐文件确认"
+                                return_media_infos[file_path] = meta_info
+                                continue
+                            manual = {"media_type": "tv", "season": season if season is not None
+                                      else requires_confirmation(meta_info).get("source_season"),
+                                      "episode": begin}
+                            if tmdb_info:
+                                manual["tmdb_id"] = tmdb_info["id"]
                     # A task target constrains independently verified file evidence;
                     # it must never act as a manual override for every task member.
                     meta_info = SpecialResolver(self, fractional_cache).resolve(
@@ -2064,25 +2539,12 @@ class Media:
                     # 避免因“年份缺失”触发目录名（如 动漫/video3）进入LLM，导致季数被误覆盖。
                     if not meta_info.get_name():
                         parent_info = MetaInfo(parent_name)
-                        if not parent_info.get_name() or not parent_info.year:
+                        if not parent_info.get_name():
+                            # A nearer title owns its identity/year. Ascend only
+                            # to find a missing title, preserving local season clues.
                             parent_parent_info = MetaInfo(parent_parent_name)
-                            parent_info.type = parent_parent_info.type if parent_parent_info.type and parent_info.type != MediaType.TV else parent_info.type
-                            parent_info.cn_name = parent_parent_info.cn_name if parent_parent_info.cn_name else parent_info.cn_name
-                            parent_info.en_name = parent_parent_info.en_name if parent_parent_info.en_name else parent_info.en_name
-                            parent_info.year = parent_parent_info.year if parent_parent_info.year else parent_info.year
-                            parent_info.begin_season = NumberUtils.max_ele(parent_info.begin_season,
-                                                                           parent_parent_info.begin_season)
-                        if not meta_info.get_name():
-                            meta_info.cn_name = parent_info.cn_name
-                            meta_info.en_name = parent_info.en_name
-                        if not meta_info.year:
-                            meta_info.year = parent_info.year
-                        if parent_info.type and parent_info.type == MediaType.TV \
-                                and meta_info.type != MediaType.TV:
-                            meta_info.type = parent_info.type
-                        if meta_info.type == MediaType.TV:
-                            meta_info.begin_season = NumberUtils.max_ele(parent_info.begin_season,
-                                                                         meta_info.begin_season)
+                            self._inherit_directory_identity(parent_info, parent_parent_info)
+                        self._inherit_directory_identity(meta_info, parent_info)
                     # 上级目录只能补足名称，不能覆盖手动选择的媒体类型。
                     if media_type:
                         meta_info.type = media_type
@@ -2099,8 +2561,8 @@ class Media:
                         and not any(meta_info.note.get(key) for key in
                             ("fractional_episode", "ordinal_candidates", "ordinal_default")))
                     if manual_lookup:
-                        self._apply_manual_numbering(meta_info, season, episode_format, file_name)
-                        meta_info.note["_manual_numbering"] = True
+                        self._apply_manual_numbering(meta_info, season, episode_target)
+                        meta_info.note["_manual_numbering"] = manual_numbering
                     # 区配缓存及TMDB
                     media_key = self.__make_cache_key(meta_info)
                     file_media_info = None
@@ -2109,31 +2571,34 @@ class Media:
                     if cache_info.get("id"):
                         # 缓存只确认作品，本条资源的季集映射仍需重新核验
                         file_media_info, need_search = self.__load_cached_identity(
-                            meta_info, cache_info, media_key, mtype_hint=media_type, chinese=chinese)
+                            meta_info, cache_info, media_key, mtype_hint=media_type, chinese=chinese,
+                            manual=manual_numbering or None, evidence_cache=fractional_cache)
                     if need_search:
                         # 返回结果已完成身份准备，不能再次准备
                         file_media_info = self.__search_media_info(meta_info=meta_info,
                                                                    mtype_hint=media_type,
                                                                    chinese=chinese,
-                                                                   evidence_cache=fractional_cache)
-                        # 保存到缓存
-                        if file_media_info and not (meta_info.note or {}).get("ordinal_resolution"):
-                            self.__insert_media_cache(media_key=media_key,
-                                                      file_media_info=file_media_info)
+                                                                   evidence_cache=fractional_cache,
+                                                                   manual=manual_numbering or None)
+                        # A publisher is never a reusable work alias (read and write side).
+                        if file_media_info and self.__cacheable_release(meta_info):
+                            pending_cache = (media_key, file_media_info)
                     # This flag is local to candidate validation, never reusable evidence.
                     meta_info.note.pop("_manual_numbering", None)
                     # 赋值TMDB信息
                     meta_info.set_tmdb_info(file_media_info)
                     if (meta_info.note or {}).get("fractional_episode"):
                         meta_info.note["fractional_episode"]["file_path"] = file_path
-                        if not self._confirm_fractional_episode(
-                                meta_info, file_media_info, fractional_cache, manual=manual_episode):
+                        if (not self._reject_multiseason_fractional(meta_info)
+                                and not self._confirm_fractional_episode(
+                                meta_info, file_media_info, fractional_cache, manual=manual_episode)):
                             meta_info.skip_reason = (meta_info.note["fractional_episode"].get("reason")
                                                      or "小数集缺少唯一且可核验的 TMDB 单集映射")
                     elif file_media_info:
                         # Leaving TMDB ID blank only changes how the work is found;
                         # it must not discard the user's explicit season/EP controls.
-                        self._apply_manual_numbering(meta_info, season, episode_format, file_name)
+                        self._apply_manual_numbering(meta_info, season, episode_target,
+                                                     info=file_media_info, evidence_cache=fractional_cache)
                 # 自带TMDB信息
                 else:
                     # 已绑定作品身份时不再让LLM根据缩写文件名改写类型和季集。
@@ -2141,6 +2606,18 @@ class Media:
                     bound_type = tmdb_info.get("media_type") or media_type
                     meta_info = MetaInfo(title=file_name, mtype=bound_type,
                                          use_llm=not bool(download_context), _prepared=prepared[file_path])
+                    if (meta_info.begin_season is None
+                            and re.search(r"(?i)(?:\bS\d{1,2}(?:\b|[ ._-])|\bSeason\b|季)", parent_name)):
+                        # A bound work still needs the nearest directory's season
+                        # when the child filename carries only an episode number.
+                        # Only season-shaped directories are parsed here: a generic
+                        # staging directory must not trigger another title parse or
+                        # consume a second set of release-extraction evidence.
+                        directory_info = MetaInfo(parent_name, mtype=bound_type, use_llm=False)
+                        if directory_info.begin_season is not None:
+                            meta_info.begin_season = directory_info.begin_season
+                            meta_info.end_season = directory_info.end_season
+                            meta_info.total_seasons = directory_info.total_seasons
                     ordinal = any((meta_info.note or {}).get(key) for key in
                                   ("ordinal_candidates", "ordinal_default"))
                     if ordinal:
@@ -2150,47 +2627,53 @@ class Media:
                             meta_info.skip_reason = "人工作品与下载任务身份冲突"
                             return_media_infos[file_path] = meta_info
                             continue
-                        begin, end = episode_format.split_episode(file_name) if episode_format else (None, None)
-                        manual = None
-                        if season is not None and begin is not None:
-                            manual = dict(begin_season=season, end_season=None, total_seasons=1,
-                                          begin_episode=begin, end_episode=end,
-                                          total_episodes=(end or begin) - begin + 1)
                         if not self.resolve_ordinal_identity(meta_info, bound=tmdb_info,
                                 mtype_hint=default_type or media_type,
-                                evidence_cache=fractional_cache, manual=manual):
+                                evidence_cache=fractional_cache, manual=manual_numbering or None):
                             return_media_infos[file_path] = meta_info
                             continue
                         identity_prepared = bool(meta_info.note.get("ordinal_resolution"))
                     fractional = (meta_info.note or {}).get("fractional_episode")
                     if fractional:
                         fractional["file_path"] = file_path
-                    if fractional and not self._confirm_fractional_episode(
-                            meta_info, tmdb_info, fractional_cache, manual=manual_episode):
+                    if (fractional and not self._reject_multiseason_fractional(meta_info)
+                            and not self._confirm_fractional_episode(
+                            meta_info, tmdb_info, fractional_cache, manual=manual_episode)):
                         meta_info.skip_reason = (meta_info.note["fractional_episode"].get("reason")
                                                  or "小数集缺少唯一且可核验的 TMDB 单集映射")
                         return_media_infos[file_path] = meta_info
                         log.info("【Meta】%s 跳过：%s" % (file_path, meta_info.skip_reason))
                         continue
+                    # 第 0 季是有效手动目标；仅未传入和空字符串表示没有季号覆盖。
+                    has_season_override = season not in (None, "")
+                    # Only a successfully parsed per-file target overrides release
+                    # mappings; a nonmatching pattern supplies no manual evidence.
+                    has_episode_override = episode_target is not None
+                    if not fractional and (has_season_override or has_episode_override):
+                        # Apply explicit user targets before comparing the parsed
+                        # release number with a download task. This is the same
+                        # precedence used by the unbound/cache paths.
+                        self._apply_manual_numbering(meta_info, season, episode_target,
+                                                     info=tmdb_info, evidence_cache=fractional_cache)
                     # 使用解析器实际读出的季号，覆盖中文、罗马数字及 2x03 等格式；
                     # 必须在正式映射前记录，不能把映射或默认季号当作文件标记。
                     explicit_season = meta_info.begin_season is not None
                     release_season = meta_info.begin_season
-                    # 第 0 季是有效手动目标；仅未传入和空字符串表示没有季号覆盖。
-                    has_season_override = season not in (None, "")
-                    # 手动入口总会构造 EpisodeFormat；空对象不代表用户指定了集号。
-                    has_episode_override = episode_format and (
-                        episode_format.format or episode_format.start_ep is not None)
+                    release_seasons = meta_info.get_season_list() if explicit_season else []
+                    # Reject the source range before any automatic numbering
+                    # conversion can make it appear to belong to one task season.
+                    if (download_context and bound_type != MediaType.MOVIE and not fractional
+                            and len(release_seasons) > 1):
+                        meta_info.skip_reason = "下载文件包含多个发布季，不能按单季任务自动改写"
+                        return_media_infos[file_path] = meta_info
+                        continue
                     if (not fractional and not identity_prepared
                             and not has_season_override and not has_episode_override):
-                        release_episodes = self.__episode_list_of(meta_info)
-                        self._apply_episode_mapping(meta_info, tmdb_info)
-                        if not (getattr(meta_info, "note", None) or {}).get("episode_mapping"):
-                            self._apply_llm_season(meta_info, tmdb_info)
-                        if not self.__verify_remapped_episodes(meta_info, tmdb_info,
-                                                               release_season=release_season,
-                                                               release_episodes=release_episodes):
-                            raise ValueError("发布季号与TMDB季号不一致且集号缺少依据：%s" % file_name)
+                        numbering = self._resolve_numbering(meta_info, tmdb_info)
+                        if not numbering.ready:
+                            return_media_infos[file_path] = meta_info
+                            continue
+                    task_filled_season = False
                     if download_context and bound_type != MediaType.MOVIE:
                         seasons = download_context.get("seasons") or []
                         episodes = download_context.get("episodes") or []
@@ -2222,28 +2705,45 @@ class Media:
                                 and fractional["source_season"] in (download_context.get("release_seasons") or []))
                             if conflict and not pack_special:
                                 meta_info.skip_reason = "小数集映射与下载任务编号约束冲突或语义不明"
+                            saved_target = download_context.get("special_target")
+                            if saved_target and (identity(dict(media_type=saved_target.get("media_type"),
+                                                               id=saved_target.get("tmdb_id"))) != identity(tmdb_info)
+                                    or saved_target.get("season") != meta_info.begin_season
+                                    or meta_info.get_episode_list() != [saved_target.get("episode")]):
+                                meta_info.skip_reason = "小数集映射与下载任务特殊集目标冲突"
                             meta_info.set_tmdb_info(tmdb_info)
+                            self._finalize_recognition(meta_info, file=True, mtype_hint=default_type)
                             return_media_infos[file_path] = meta_info
                             continue
-                        if (explicit_season and not fractional and len(seasons) == 1
-                                and meta_info.begin_season not in seasons):
+                        # A manual season is only accepted or rejected by the task (C1).
+                        if (explicit_season and not fractional and not has_season_override
+                                and len(seasons) == 1 and meta_info.begin_season not in seasons):
                             # RSS 阶段已按季名把发布季映射到 TMDB 季（小书痴 S04 -> TMDB S02），
                             # 文件沿用 RSS 原标题的同一发布季标记时按下载任务的季号整理。
                             source_title = download_context.get("source_title")
                             source_meta = MetaInfo(title=source_title, mtype=bound_type,
                                                    use_llm=False) if source_title else None
-                            if (source_meta and source_meta.begin_season is not None
-                                    and release_season is not None
-                                    and int(source_meta.begin_season) == int(release_season)):
+                            if (source_meta and len(release_seasons) == 1
+                                    and source_meta.get_season_list() == release_seasons):
                                 log.info("【Meta】文件沿用RSS发布季标记S%s，按下载任务季号整理为S%s"
                                          % (release_season, seasons[0]))
                                 meta_info.begin_season = seasons[0]
                                 meta_info.end_season = None
-                        if explicit_season and seasons and meta_info.begin_season not in seasons:
+                        # Mapped/LLM seasons are checked too, rather than overwritten below.
+                        if (meta_info.begin_season is not None and seasons
+                                and not set(meta_info.get_season_list()).issubset(seasons)):
+                            if has_season_override:
+                                raise ValueError("手动季号与下载任务冲突：%s" % file_name)
                             raise ValueError("文件季号与RSS下载任务冲突：%s" % file_name)
-                        if len(seasons) == 1 and not explicit_season and not fractional:
+                        if len(seasons) == 1 and meta_info.begin_season is None and not fractional:
+                            # The task constrains, but does not prove, this season;
+                            # final admission still checks the work's season manifest.
                             meta_info.begin_season = seasons[0]
+                            task_filled_season = True
                         file_episodes = meta_info.get_episode_list()
+                        if (has_episode_override and episodes
+                                and not set(file_episodes).issubset(set(episodes))):
+                            raise ValueError("手动集号与下载任务冲突：%s" % file_name)
                         if file_episodes and episodes and not set(file_episodes).issubset(set(episodes)):
                             # 仅在TMDB完整给出之前各季集数、且映射后命中RSS集号时转换绝对集号。
                             counts = {entry.get("season_number"): entry.get("episode_count")
@@ -2260,32 +2760,57 @@ class Media:
                             log.info("【Meta】按已验证的前季集数转换绝对集号：%s -> %s" % (file_episodes, mapped))
                         if (not file_episodes and len(file_list) == 1 and len(episodes) == 1
                                 and download_context.get("allow_episode_fallback", True)):
-                            meta_info.begin_episode = episodes[0]
+                            # A task may complete an absent episode, but must
+                            # verify that new target rather than reuse a pack's
+                            # episode-less proof or refresh a conflicting mapping.
+                            if meta_info.begin_season is None:
+                                meta_info.skip_reason = "下载任务补号缺少明确目标季"
+                                return_media_infos[file_path] = meta_info
+                                continue
+                            resolver = SpecialResolver(self, fractional_cache)
+                            try:
+                                _, target = resolver.target_episode(tmdb_info, meta_info.begin_season,
+                                                                    episodes[0], allow_zero=True)
+                            except ValueError as error:
+                                meta_info.skip_reason = "下载任务补号无法核验：%s" % error
+                                return_media_infos[file_path] = meta_info
+                                continue
+                            meta_info.begin_episode, meta_info.end_episode = target["episode_number"], None
+                            meta_info.total_episodes = 1
+                            meta_info._numbering_result = NumberingResult.verified(meta_info, tmdb_info)
                         if not meta_info.get_episode_list():
                             raise ValueError("下载文件缺少可验证集号：%s" % file_name)
                     meta_info.set_tmdb_info(tmdb_info)
-                    before_override = (meta_info.begin_season, meta_info.end_season,
-                                       meta_info.begin_episode, meta_info.end_episode)
-                    if not fractional:
-                        self._apply_manual_numbering(meta_info, season, episode_format, file_name)
-                    after_override = (meta_info.begin_season, meta_info.end_season,
-                                      meta_info.begin_episode, meta_info.end_episode)
-                    if (download_context and not fractional and bound_type != MediaType.MOVIE
-                            and before_override != after_override):
-                        # 手动修改后的编号仍须满足下载任务约束，不再自动偏移用户指定的集号。
-                        seasons = download_context.get("seasons") or []
-                        episodes = download_context.get("episodes") or []
-                        if seasons and not set(meta_info.get_season_list()).issubset(set(seasons)):
-                            raise ValueError("手动季号与下载任务冲突：%s" % file_name)
-                        final_episodes = meta_info.get_episode_list()
-                        if not final_episodes or (episodes and not set(final_episodes).issubset(set(episodes))):
-                            raise ValueError("手动集号与下载任务冲突：%s" % file_name)
-                    # 加入缓存
-                    if (not download_context and not tmdb_info.get("_file_episode_confirmation")
-                            and not (fractional and fractional.get("manual"))):
-                        # File-scoped human evidence must not become a reusable identity-cache override.
+                    manual_cache = (not download_context and not tmdb_info.get("_file_episode_confirmation")
+                                    and self.__cacheable_release(meta_info))
+                    previous = getattr(meta_info, "_numbering_result", None)
+                    current = NumberingResult.target_of(meta_info, tmdb_info)
+                    if (task_filled_season and previous and previous.state == NumberingState.VERIFIED
+                            and previous.target[2] is None and previous.target[:2] == current[:2]
+                            and previous.target[4:] == current[4:]):
+                        # The manual EP proof still covers this file. The task only
+                        # supplied the missing season and proves nothing itself (C5):
+                        # live TMDB episodes may authorize it, otherwise final
+                        # admission checks the season manifest.
+                        resolver = SpecialResolver(self, fractional_cache)
+                        try:
+                            for number in meta_info.get_episode_list():
+                                resolver.target_episode(tmdb_info, meta_info.begin_season, number,
+                                                        allow_zero=True)
+                            live = True
+                        except ValueError:
+                            live = False
+                        meta_info._numbering_result = NumberingResult.verified(
+                            meta_info, tmdb_info, season_authorized=live)
+                bluray_item = file_path in bluray_paths or (bluray and len(file_list) == 1)
+                self._finalize_recognition(
+                    meta_info, file=not bluray_item, mtype_hint=default_type)
+                if meta_info.tmdb_info and not meta_info.skip_reason:
+                    if pending_cache:
+                        self.__insert_media_cache(media_key=pending_cache[0], file_media_info=pending_cache[1])
+                    if manual_cache:
                         self.save_rename_cache(file_name, tmdb_info)
-                # 按文件路程存储
+                # 按文件路径存储
                 if getattr(meta_info, "skip_reason", None):
                     log.info("【Meta】%s 跳过：%s" % (file_path, meta_info.skip_reason))
                 return_media_infos[file_path] = meta_info
@@ -2306,8 +2831,13 @@ class Media:
                     return_media_infos[file_path] = skipped
                 # Keep the existing contextual log as the single error output.
                 log.error("【Rmt】发生错误：%s - %s" % (str(err), traceback.format_exc()))
-        # 循环结束
-        return return_media_infos
+        # Early special/error branches use exactly the same admission rule.
+        return {
+            path: self._finalize_recognition(
+                meta, file=not (path in bluray_paths or (bluray and len(file_list) == 1)),
+                mtype_hint=default_type)
+            for path, meta in return_media_infos.items()
+        }
 
     @staticmethod
     def __dict_tmdbinfos(infos, mtype=None):
@@ -3143,13 +3673,19 @@ class Media:
 
     def get_tmdb_en_title(self, media_info):
         """
-        获取TMDB的英文名称
+        按已确认的媒体 ID 获取英文名，不修改共享语言或执行中文标题转换。
         """
-        en_info = self.get_tmdb_info(mtype=media_info.type,
-                                     tmdbid=media_info.tmdb_id,
-                                     language="en-US")
-        if en_info:
-            return en_info.get("title") if media_info.type == MediaType.MOVIE else en_info.get("name")
+        client = self.movie if media_info.type == MediaType.MOVIE else self.tv
+        if not client or not media_info.tmdb_id:
+            return None
+        try:
+            # Pass language all the way into the request URL/cache key. Using
+            # get_tmdb_info here would change the environment for every worker.
+            en_info = client.details(media_info.tmdb_id, language="en-US")
+            if en_info:
+                return en_info.get("title") if media_info.type == MediaType.MOVIE else en_info.get("name")
+        except Exception as err:
+            log.warn(f"【Meta】获取TMDB英文名称失败：{err}")
         return None
 
     def get_episode_title(self, media_info):
@@ -3159,7 +3695,8 @@ class Media:
         if media_info.type == MediaType.MOVIE:
             return None
         if media_info.tmdb_id:
-            if not media_info.begin_episode:
+            # Zero is a valid explicit episode; only absence prevents a lookup.
+            if media_info.begin_episode is None:
                 return None
             episodes = self.get_tmdb_season_episodes(tmdbid=media_info.tmdb_id,
                                                      season=int(media_info.get_season_seq()))
@@ -3461,6 +3998,9 @@ class Media:
         if not file_name or not cache_info:
             return
         meta_info = MetaInfo(title=file_name)
+        if not meta_info.get_name() or not self.__cacheable_release(meta_info):
+            # Do not learn empty/group-only or file-scoped names as reusable works.
+            return
         # Human/ordinal decisions are file evidence, never reusable shortened names.
         if any(meta_info.note.get(key) for key in ("ordinal_candidates", "ordinal_default")):
             return

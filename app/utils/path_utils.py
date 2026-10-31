@@ -4,10 +4,14 @@ import os
 class PathUtils:
 
     @staticmethod
-    def get_dir_files(in_path, exts="", filesize=0, episode_format=None, raise_errors=False):
+    def get_dir_files(in_path, exts="", filesize=0, episode_format=None, raise_errors=False, diagnostics=None):
         """
         获得目录下的媒体文件列表List ，按后缀、大小、格式过滤
+        diagnostics 可选：记录扫描数量及每个文件首次被排除的原因，不额外扫描目录。
         """
+        if diagnostics is not None:
+            diagnostics.update(scanned=0, invalid_path=0, unsupported_extension=0,
+                               episode_mismatch=0, below_min_size=0)
         if not in_path:
             return []
         # 整理入口需要区分真实空目录与 NAS/权限故障；其他调用保留历史行为。
@@ -16,6 +20,28 @@ class PathUtils:
         if not os.path.exists(in_path):
             return []
         ret_list = []
+        def count(reason):
+            if diagnostics is not None:
+                diagnostics[reason] += 1
+
+        def eligible(path):
+            count("scanned")
+            if PathUtils.is_invalid_path(path):
+                count("invalid_path")
+                return False
+            # Sidecars are not episode candidates; classify their suffix before
+            # applying a media-specific pattern or validating its parsed range.
+            if exts and os.path.splitext(path)[-1].lower() not in exts:
+                count("unsupported_extension")
+                return False
+            if episode_format and not episode_format.match(os.path.basename(path)):
+                count("episode_mismatch")
+                return False
+            if filesize and os.path.getsize(path) < filesize:
+                count("below_min_size")
+                return False
+            return True
+
         def scan_error(error):
             if raise_errors:
                 raise error
@@ -23,33 +49,13 @@ class PathUtils:
             for root, dirs, files in os.walk(in_path, onerror=scan_error):
                 for file in files:
                     cur_path = os.path.join(root, file)
-                    # 检查路径是否合法
-                    if PathUtils.is_invalid_path(cur_path):
-                        continue
-                    # 检查格式匹配
-                    if episode_format and not episode_format.match(file):
-                        continue
-                    # 检查后缀
-                    if exts and os.path.splitext(file)[-1].lower() not in exts:
-                        continue
-                    # 检查文件大小
-                    if filesize and os.path.getsize(cur_path) < filesize:
+                    if not eligible(cur_path):
                         continue
                     # 命中
                     if cur_path not in ret_list:
                         ret_list.append(cur_path)
         else:
-            # 检查路径是否合法
-            if PathUtils.is_invalid_path(in_path):
-                return []
-            # 检查后缀
-            if exts and os.path.splitext(in_path)[-1].lower() not in exts:
-                return []
-            # 检查格式
-            if episode_format and not episode_format.match(os.path.basename(in_path)):
-                return []
-            # 检查文件大小
-            if filesize and os.path.getsize(in_path) < filesize:
+            if not eligible(in_path):
                 return []
             ret_list.append(in_path)
         return ret_list

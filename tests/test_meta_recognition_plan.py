@@ -412,9 +412,11 @@ class SeasonAndRangeRegressionTest(unittest.TestCase):
             self.assertEqual((1, 67), (result.begin_season, result.begin_episode))
             # TMDB 不存在目标集时，空规则不能绕过映射验证。
             detail.return_value = {"episodes": []}
-            self.assertNotIn(path, media.get_media_info_on_files(
+            rejected = media.get_media_info_on_files(
                 [path], tmdb_info=info, media_type=MediaType.TV,
-                episode_format=EpisodeFormat(None)))
+                episode_format=EpisodeFormat(None))[path]
+            self.assertTrue(rejected.skip_reason)
+            self.assertEqual((4, 1), (rejected.begin_season, rejected.begin_episode))
             # 用户实际指定集号时，继续尊重手动覆盖。
             result = media.get_media_info_on_files(
                 [path], tmdb_info=info, media_type=MediaType.TV,
