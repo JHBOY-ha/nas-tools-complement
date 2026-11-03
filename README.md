@@ -219,7 +219,7 @@ Python 中 `"" in ".sql"` 返回 `True`，导致无扩展名文件被错误包�
 | `app/media/media.py` | 支持读取 LLM 直出 `tmdb_id` 并优先按 ID 查询 TMDB |
 | `check_config.py` | 增加 `llm` 配置迁移、默认值补齐与参数校验 |
 | `web/templates/setting/basic.html` | 新增 LLM 设置项（开关/模式/base_url/api_key/model/检索增强）与连接测试入口 |
-| `config/config.yaml` | 增加 `llm` 模板配置区（空占位） |
+| `config/config.example.yaml` | 增加 `llm` 模板配置区（空占位） |
 | `tests/test_meta_llm_parser.py` | 新增/扩展 LLM 解析与异常回退测试 |
 | `tests/run.py` | 纳入 LLM 测试集 |
 
@@ -646,6 +646,8 @@ docker pull jhboy/nastools-comp:2.10.2v1-amd64
    export NASTOOL_CONFIG=config/config.yaml
    python3 app/filetransfer.py -m link -s /from/path -d /to/path
    ```
+
+仓库默认配置模板为 `config/config.example.yaml`。启动时若 `NASTOOL_CONFIG` 指定的文件不存在，会自动复制模板生成实际配置；已有 `config.yaml` 继续使用，不会被模板覆盖。实际配置、数据库和缓存不提交至 Git。旧版源码部署升级前的配置备份说明见 [config 目录说明](config/README.md)。
 
 ### 字幕库在线字幕
 
