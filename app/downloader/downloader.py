@@ -98,6 +98,10 @@ class Downloader:
                 "ratio_limit": download_setting.RATIO_LIMIT / 100,
                 "seeding_time_limit": download_setting.SEEDING_TIME_LIMIT,
                 "downloader": download_setting.DOWNLOADER}
+        # 连接测试使用临时客户端；保存配置后，实际下载也必须重建客户端，
+        # 不能继续复用旧地址、旧凭据或启动时登录失败的实例。
+        with client_lock:
+            self.clients = {}
 
     def __build_class(self, ctype, conf=None):
         for downloader_schema in self._downloader_schema:
@@ -351,6 +355,8 @@ class Downloader:
         dl_type = self.__get_client_type(download_attr.get("downloader")) or self._default_client_type
         # 下载器客户端
         downloader = self.__get_client(dl_type)
+        if not downloader:
+            return None, "未找到可用的下载器，请检查下载设置中的下载器配置"
 
         # 开始添加下载
         try:
@@ -409,9 +415,9 @@ class Downloader:
             # 添加下载
             print_url = content if isinstance(content, str) else url
             if is_paused:
-                log.info("【Downloader】添加下载任务并暂停：%s，目录：%s，Url：%s" % (title, download_dir, print_url))
+                log.info("【Downloader】正在提交下载任务（添加后暂停）：%s，目录：%s，Url：%s" % (title, download_dir, print_url))
             else:
-                log.info("【Downloader】添加下载任务：%s，目录：%s，Url：%s" % (title, download_dir, print_url))
+                log.info("【Downloader】正在提交下载任务：%s，目录：%s，Url：%s" % (title, download_dir, print_url))
             if dl_type == DownloaderType.TR:
                 ret = downloader.add_torrent(content,
                                              is_paused=is_paused,
@@ -435,7 +441,8 @@ class Downloader:
                                              download_limit=download_limit,
                                              ratio_limit=ratio_limit,
                                              seeding_time_limit=seeding_time_limit,
-                                             cookie=site_info.get("cookie"))
+                                             cookie=site_info.get("cookie"),
+                                             raise_on_error=True)
             else:
                 ret = downloader.add_torrent(content,
                                              is_paused=is_paused,
@@ -470,7 +477,7 @@ class Downloader:
                             log.warn("【Downloader】字幕下载队列繁忙，下载任务已添加，可稍后补下载字幕")
                 return ret, ""
             else:
-                return ret, "请检查下载任务是否已存在"
+                return ret, "下载器未确认添加成功，请检查下载器连接和日志，并核对任务列表"
         except SearchCancelled:
             # The caller needs to distinguish a safe cancellation from an
             # uncertain downloader response; never translate it to a failure.

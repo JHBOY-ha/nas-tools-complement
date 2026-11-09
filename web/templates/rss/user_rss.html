@@ -850,8 +850,8 @@
         show_success_modal("添加下载成功！", function() {
           show_rss_articles_modal(id);//
         });
-      } else if (ret.code == 1) {
-        show_fail_modal(" 添加下载失败！", function() {
+      } else {
+        show_fail_modal(ret.msg || "添加下载失败，请检查下载器日志", function() {
           show_rss_articles_modal(id);//
         });
       }
@@ -879,10 +879,15 @@
         } else {
           flag_a.append(`<br><span class="badge badge-outline text-red me-1 mb-1">不匹配</span>`);
         }
-        if (ret.data.exist_flag) {
+        if (ret.data.exist_flag === true) {
           flag_a.append(`<br><span class="badge badge-outline text-green me-1 mb-1">本地已存在</span>`);
-        } else {
+        } else if (ret.data.exist_flag === false) {
           flag_a.append(`<br><span class="badge badge-outline text-orange me-1 mb-1">本地不存在</span>`);
+        } else {
+          flag_a.append(`<br><span class="badge badge-outline text-orange me-1 mb-1">存在状态未确认</span>`);
+        }
+        if (ret.data.recognition_reason) {
+          flag_a.append($('<div class="small text-orange text-break" role="status"></div>').text(ret.data.recognition_reason));
         }
       }
     })

@@ -1754,23 +1754,30 @@ class Media:
         return False
 
     def _resolve_absolute_numbering(self, meta_info, info, target_season=None, valid_episodes=None):
-        """Resolve seasonless anime totals without treating the display default S01 as evidence."""
+        """Resolve anime totals using the same season/episode evidence in titles and files."""
         episodes = self.__episode_list_of(meta_info)
         # A directory season constrains the target; it does not prove the child
         # file's episode is already numbered within that season.
         explicit_season = (meta_info.begin_season is not None
                            and (meta_info.begin_season != (meta_info.note or {}).get("directory_season")
                                 or meta_info.end_season is not None))
-        if (explicit_season or not episodes or min(episodes) < 1
+        if (not episodes or min(episodes) < 1
                 or not info or info.get("media_type") != MediaType.TV
                 or not set(self.__get_genre_ids(info)).intersection(ANIME_GENREIDS)):
             return NumberingResult(NumberingState.NOT_REQUESTED)
+        counts = {item.get("season_number"): item.get("episode_count")
+                  for item in (info.get("seasons") or [])}
+        if explicit_season:
+            # 发布标题可能同时写 Season 2 和累计集号（如 43）。季号限定
+            # 目标季；只有超出该季集数时才尝试换算，普通季内编号保持不变。
+            count = counts.get(meta_info.begin_season)
+            if (meta_info.end_season is not None or meta_info.begin_season <= 1
+                    or type(count) is not int or count <= 0 or max(episodes) <= count):
+                return NumberingResult(NumberingState.NOT_REQUESTED)
         if target_season is None and meta_info.begin_season is not None:
             target_season = meta_info.begin_season
         unresolved = NumberingResult(NumberingState.UNRESOLVED, "总集号缺少完整的分季集数或目标单集证据")
         if target_season is None:
-            counts = {item.get("season_number"): item.get("episode_count")
-                      for item in (info.get("seasons") or [])}
             first_count = counts.get(1)
             # Ordinary first-season episodes retain their existing numbering;
             # only totals beyond a known first season need automatic conversion.
@@ -1812,7 +1819,7 @@ class Media:
             "tmdb_id": info.get("id"), "target_season": target_season,
             "source_episodes": episodes, "target_episodes": mapped
         }
-        log.info("【Meta】未标季动漫按前季集数换算总集号：%s -> S%s %s"
+        log.info("【Meta】动漫按前季集数换算总集号：%s -> S%s %s"
                  % (episodes, str(target_season).rjust(2, "0"), mapped))
         return NumberingResult.verified(meta_info, info)
 

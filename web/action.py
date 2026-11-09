@@ -3253,7 +3253,8 @@ class WebAction:
         if not media_info:
             return {"code": 0, "data": {"name": "无法识别"}}
         media_dict = self.mediainfo_dict(media_info)
-        media_dict.update({"match_flag": match_flag, "exist_flag": exist_flag})
+        media_dict.update({"match_flag": match_flag, "exist_flag": exist_flag,
+                           "recognition_reason": media_info.skip_reason or ""})
         return {"code": 0, "data": media_dict}
 
     def __list_rss_history(self, data):
@@ -3286,13 +3287,13 @@ class WebAction:
     @staticmethod
     def __rss_articles_download(data):
         if not data.get("articles"):
-            return {"code": 2}
-        res = RssChecker().download_rss_articles(
+            return {"code": 2, "msg": "未选择需要下载的报文"}
+        res, message = RssChecker().download_rss_articles(
             taskid=data.get("taskid"), articles=data.get("articles"))
         if res:
             return {"code": 0}
         else:
-            return {"code": 1}
+            return {"code": 1, "msg": message}
 
     def __add_custom_word_group(self, data):
         try:
