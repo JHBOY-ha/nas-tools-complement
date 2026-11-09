@@ -210,56 +210,6 @@ class Downloader:
         payload["tmdb_info"]["media_type"] = MediaType[payload["tmdb_info"]["media_type"]]
         return payload
 
-    def get_monitored_download_contexts(self, file_list):
-        """Resolve exact downloader file membership; never infer identity from a parent folder."""
-        client = self.default_client
-        if not client:
-            return {}
-        torrents, error = client.get_torrents()
-        if error:
-            raise ValueError("无法查询下载任务身份，稍后重试目录同步")
-        wanted = {os.path.realpath(path): path for path in file_list}
-        result = {}
-        for torrent in torrents:
-            is_qb = self._default_client_type == DownloaderType.QB
-            tags = torrent.get("tags") if is_qb else getattr(torrent, "labels", [])
-            save_path = torrent.get("save_path") if is_qb else torrent.download_dir
-            if not save_path:
-                continue
-            root = os.path.realpath(client.get_replace_path(save_path))
-            if not any(os.path.commonpath([root, path]) == root for path in wanted):
-                continue
-            tid = torrent.get("hash") if is_qb else torrent.id
-            files = client.get_files(tid)
-            if not files:
-                raise ValueError("无法读取下载文件清单，稍后重试目录同步")
-            if isinstance(files, dict):
-                files = files.values()
-            members = set()
-            for item in files:
-                name = item.get("name") if hasattr(item, "get") else item.name
-                if name:
-                    path = os.path.realpath(os.path.join(root, name))
-                    if os.path.commonpath([root, path]) == root:
-                        members.add(path)
-            matches = members.intersection(wanted)
-            if not matches:
-                continue
-            progress = torrent.get("progress", 0) if is_qb else torrent.progress / 100
-            if progress < 1:
-                raise ValueError("下载任务尚未完成，稍后重试目录同步")
-            context = self._get_download_context(
-                {"id": tid, "tags": tags}, self._default_client_type)
-            if not context:
-                continue
-            # Monitor batches can contain only one file of a multi-file torrent.
-            context["allow_episode_fallback"] = len(members) == 1
-            for path in matches:
-                if wanted[path] in result:
-                    raise ValueError("文件属于多个带身份的下载任务，需核对")
-                result[wanted[path]] = context
-        return result
-
     def download(self,
                  media_info,
                  is_paused=None,

@@ -670,22 +670,11 @@ class FileTransfer:
                 except ValueError as error:
                     return __finish_transfer(False, "%s：%s" % (os.path.basename(file_path), error))
 
-        # Resolve downloader identity before consulting the transfer blacklist.
-        # Older tasks may have been blacklisted after a wrong filename match; an
-        # exact RSS/hash association must be allowed to repair those files.
-        contexts = {}
-        if in_from == SyncType.MON and not tmdb_info and not download_context:
-            from app.downloader import Downloader
-            try:
-                contexts = Downloader().get_monitored_download_contexts(file_list)
-            except Exception as err:
-                log.warn("【Rmt】%s" % err)
-                return __finish_transfer(False, str(err))
-
-        # 目录同步模式下，过滤掉文件列表中已处理过的
+        # 目录同步直接处理本地文件；未完成下载由下载器的临时目录隔离。
+        # 已成功转移的文件继续按转移记录去重，不再反查下载任务身份或进度。
         if in_from == SyncType.MON:
             file_list = [file_path for file_path in file_list
-                         if file_path in contexts or self.dbhelper.is_transfer_notin_blacklist(file_path)]
+                         if self.dbhelper.is_transfer_notin_blacklist(file_path)]
             if not file_list:
                 log.info("【Rmt】所有文件均已成功转移过，没有需要处理的文件！如需重新处理，请清理缓存（服务->清理转移缓存）")
                 return __finish_transfer(True, "没有新文件需要处理")
@@ -697,7 +686,7 @@ class FileTransfer:
                 download_context.get("source_title"), media_type.value, tmdb_info.get("id")))
         Medias = self.media.get_media_info_on_files(
             file_list, tmdb_info, media_type, season, episode[0],
-            download_context=download_context, download_contexts=contexts,
+            download_context=download_context,
             bluray=bool(bluray_disk_dir))
         if len(Medias or {}) != len(file_list):
             return __finish_transfer(False, "部分文件未能识别或与下载任务季集冲突，请核对")

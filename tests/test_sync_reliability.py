@@ -424,7 +424,7 @@ class DownloadTests(unittest.TestCase):
         from app.media.meta.special import download_block_reason
         self.ns['download_block_reason'] = download_block_reason
         cls = load_class('app/downloader/downloader.py', 'Downloader',
-                         ['transfer', '_get_download_context', '_create_download_context', 'check_exists_medias', 'get_monitored_download_contexts'], self.ns)
+                         ['transfer', '_get_download_context', '_create_download_context', 'check_exists_medias'], self.ns)
         self.d = cls()
         self.d.default_client = Mock()
         self.d._default_client_type = NS(value='QB')
@@ -555,58 +555,6 @@ class DownloadTests(unittest.TestCase):
             self.d.media.get_tmdb_season_episodes_num.return_value = count
             self.assertIsNone(self.d.check_exists_medias(meta)[0])
         self.d.mediaserver.get_no_exists_episodes.assert_not_called()
-
-    def test_monitor_exact_membership_completion_and_conflicts(self):
-        self.ns['DownloaderType'] = NS(QB=self.d._default_client_type)
-        client = self.d.default_client
-        client.get_replace_path.side_effect = lambda p: p
-        torrent = {'hash': 'a', 'save_path': '/downloads', 'progress': 1,
-                   'tags': 'NASTOOL_CTX_one'}
-        client.get_torrents.return_value = ([torrent], False)
-        client.get_files.return_value = [{'name': 'show/01.mkv'}, {'name': 'show/02.mkv'}]
-        self.d.dbhelper.get_download_context.side_effect = lambda *args: {
-            'tmdb_info': {'id': 285743, 'media_type': 'TV'}, 'episodes': [1, 2]}
-        wanted = ['/downloads/show/01.mkv', '/downloads/show/other.mkv', '/downloads2/show/01.mkv']
-        contexts = self.d.get_monitored_download_contexts(wanted)
-        self.assertEqual([wanted[0]], list(contexts))
-        self.assertFalse(contexts[wanted[0]]['allow_episode_fallback'])
-        torrent['progress'] = .5
-        with self.assertRaises(ValueError):
-            self.d.get_monitored_download_contexts(wanted)
-        torrent['progress'] = 1
-        client.get_torrents.return_value = ([torrent, torrent], False)
-        with self.assertRaises(ValueError):
-            self.d.get_monitored_download_contexts(wanted)
-        client.get_torrents.return_value = ([], True)
-        with self.assertRaises(ValueError):
-            self.d.get_monitored_download_contexts(wanted)
-
-    def test_monitor_recovers_legacy_rss_identity_by_hash(self):
-        self.ns['DownloaderType'] = NS(QB=self.d._default_client_type)
-        client = self.d.default_client
-        client.get_replace_path.side_effect = lambda p: p
-        client.get_torrents.return_value = ([{
-            'hash': 'f99ef0a1705d43ac1ca19c59727e7d5b534cc9b4',
-            'save_path': '/downloads', 'content_path': '/downloads/show',
-            'progress': 1, 'tags': 'NASTOOL'
-        }], False)
-        client.get_files.return_value = [{'name': 'show/05.mkv'}, {'name': 'show/06.mkv'}]
-        client.get_legacy_download_context = Mock()
-        self.d.dbhelper.get_legacy_download_context.return_value = {
-            'tmdb_info': {'id': 285743, 'media_type': MediaType.TV},
-            'source_title': 'RSS title', 'seasons': [1], 'episodes': []}
-        self.d.media = Mock()
-        self.d.media.get_tmdb_info.return_value = {
-            'id': 285743, 'media_type': MediaType.TV, 'name': '和青梅竹马之间不会有恋爱喜剧',
-            'genre_ids': [16], 'seasons': [{'season_number': 1, 'episode_count': 12}]
-        }
-        path = '/downloads/show/05.mkv'
-        contexts = self.d.get_monitored_download_contexts([path])
-        self.assertEqual(285743, contexts[path]['tmdb_info']['id'])
-        self.assertFalse(contexts[path]['allow_episode_fallback'])
-        self.d.dbhelper.get_legacy_download_context.assert_called_once_with(
-            'f99ef0a1705d43ac1ca19c59727e7d5b534cc9b4')
-        self.d.media.get_tmdb_info.assert_called_once_with(mtype=MediaType.TV, tmdbid=285743)
 
 
 class QueueTests(unittest.TestCase):
