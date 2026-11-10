@@ -83,7 +83,7 @@ class DoubanSync:
                     if not search_state or search_state[0] == "NEW":
                         if self._auto_search:
                             # 需要检索
-                            if media.begin_season:
+                            if media.begin_season is not None:
                                 subtitle = "第%s季" % media.begin_season
                             else:
                                 subtitle = None
@@ -103,8 +103,7 @@ class DoubanSync:
                                 self.dbhelper.insert_douban_media_state(media, "DOWNLOADED")
                                 continue
                             if not self._auto_rss:
-                                # 合并季
-                                media_info.begin_season = media.begin_season
+                                # 识别入口已处理发布季与 TMDB 季的映射，保留核验结果。
                                 # 开始检索
                                 search_result, no_exists, search_count, download_count = self.searcher.search_one_media(
                                     media_info=media_info,

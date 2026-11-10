@@ -32,6 +32,7 @@ from app.helper import DbHelper, ProgressHelper, ThreadHelper, \
 from app.indexer import Indexer
 from app.media import Category, Media, Bangumi, DouBan
 from app.media.meta import MetaInfo, MetaBase
+from app.media.meta.special import download_block_reason
 from app.media.tmdbv3api import TMDb, TMDbException
 from app.mediaserver import MediaServer
 from app.message import Message, MessageCenter
@@ -2373,8 +2374,9 @@ class WebAction:
             return {}
         tmdb_id = media_info.tmdb_id
         tmdb_link = media_info.get_detail_url()
+        recognition_reason = download_block_reason(media_info) or ""
         tmdb_S_E_link = ""
-        if tmdb_id:
+        if tmdb_id and not recognition_reason:
             if media_info.get_season_string():
                 tmdb_S_E_link = "%s/season/%s" % (tmdb_link,
                                                   media_info.get_season_seq())
@@ -2387,6 +2389,7 @@ class WebAction:
             "title": media_info.title,
             "year": media_info.year,
             "season_episode": media_info.get_season_episode_string(),
+            "recognition_reason": recognition_reason,
             "part": media_info.part,
             "tmdbid": tmdb_id,
             "tmdblink": tmdb_link,
@@ -2399,9 +2402,9 @@ class WebAction:
             "video_codec": media_info.video_encode,
             "audio_codec": media_info.audio_encode,
             "org_string": media_info.org_string,
-            "ignored_words": media_info.ignored_words,
-            "replaced_words": media_info.replaced_words,
-            "offset_words": media_info.offset_words
+            "ignored_words": media_info.ignored_words or [],
+            "replaced_words": media_info.replaced_words or [],
+            "offset_words": media_info.offset_words or []
         }
 
     @staticmethod
@@ -3249,12 +3252,11 @@ class WebAction:
         if not title:
             return {"code": -1}
         media_info, match_flag, exist_flag = RssChecker(
-        ).test_rss_articles(taskid=taskid, title=title)
+        ).test_rss_articles(taskid=taskid, title=title, year=data.get("year"), mtype=data.get("type"))
         if not media_info:
             return {"code": 0, "data": {"name": "无法识别"}}
         media_dict = self.mediainfo_dict(media_info)
-        media_dict.update({"match_flag": match_flag, "exist_flag": exist_flag,
-                           "recognition_reason": media_info.skip_reason or ""})
+        media_dict.update({"match_flag": match_flag, "exist_flag": exist_flag})
         return {"code": 0, "data": media_dict}
 
     def __list_rss_history(self, data):

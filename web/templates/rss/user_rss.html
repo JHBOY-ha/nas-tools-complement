@@ -734,9 +734,10 @@
   function show_rss_articles_modal(id) {
     ajax_post("list_rss_articles", { "id": id }, function (ret) {
       let content;
-      $("#table-rss-articles").empty();
+      $("#table-rss-articles").empty().data("articles", []);
       if (ret.code === 0) {
         const articles = ret.data;
+        $("#table-rss-articles").data("articles", articles);
         let content_th = `<thead><tr>
                           <th class="w-1">
                             <input class="form-check-input m-0 align-middle" type="checkbox" aria-label="全选"
@@ -762,7 +763,7 @@
                               <input type="hidden" id="enclosure_${i}" value="${article.enclosure}">
                               <input type="hidden" id="title_${i}" value="${title_param}">`;
             title = `<span style="word-break: keep-all">${article.title}</span>`;
-            recognization = `<a title="识别匹配" href='javascript:rss_article_test("${i}", "${id}", "${title_param}")' data-bs-toggle="tooltip">
+            recognization = `<a title="识别匹配" href='javascript:rss_article_test("${i}", "${id}")' data-bs-toggle="tooltip">
                               {{ SVG.text_recognition() }}
                               </a>`;
             if (article.link) {
@@ -806,16 +807,8 @@
 
   // 获取选中按钮
   function get_article_checked(){
-    let articles = [];
-    let articles_id = select_GetSelectedVAL("rss_articles_item");
-    for (let id of articles_id) {
-      let enclosure = $(`#enclosure_${id}`).val();
-      articles.push({
-        "title": $(`#title_${id}`).val(),
-        "enclosure": enclosure === "null" ? "" : enclosure
-      });
-    }
-    return articles;
+    const articles = $("#table-rss-articles").data("articles") || [];
+    return select_GetSelectedVAL("rss_articles_item").map(id => articles[id]).filter(Boolean);
   }
 
 
@@ -860,16 +853,18 @@
 
   // 单个报文下载
   function single_article_download(id, article_id) {
-    const article = [{ title: $(`#title_${article_id}`).val(), enclosure: $(`#enclosure_${article_id}`).val() }];
-    articles_download(id, article);
+    const article = ($("#table-rss-articles").data("articles") || [])[article_id];
+    if (article) articles_download(id, [article]);
   }
 
   // rss报文测试
-  function rss_article_test(id, taskid, title) {
+  function rss_article_test(id, taskid) {
     const info_id = `info_${id}`;
     const flag_a = $(`#flag_${id}`);
+    const article = ($("#table-rss-articles").data("articles") || [])[id];
+    if (!article) return;
     make_cursor_busy();
-    ajax_post("rss_article_test", { "taskid": taskid, "title": title }, function (ret) {
+    ajax_post("rss_article_test", { "taskid": taskid, "title": article.title, "year": article.year, "type": article.type }, function (ret) {
       cancel_cursor_busy();
       if (ret.code === 0) {
         flag_a.empty();
@@ -885,9 +880,6 @@
           flag_a.append(`<br><span class="badge badge-outline text-orange me-1 mb-1">本地不存在</span>`);
         } else {
           flag_a.append(`<br><span class="badge badge-outline text-orange me-1 mb-1">存在状态未确认</span>`);
-        }
-        if (ret.data.recognition_reason) {
-          flag_a.append($('<div class="small text-orange text-break" role="status"></div>').text(ret.data.recognition_reason));
         }
       }
     })

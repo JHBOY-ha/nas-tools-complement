@@ -366,8 +366,9 @@ class OrdinalSeasonTest(TestCase):
         rss.subscribe = Mock()
         rss.subscribe.get_subscribe_tv_episodes.return_value = [5]
         subscription = dict(id=1, name='Major 2nd', rss_sites=['Offline'], season='S02', over_edition=False)
-        self.assertFalse(rss._Rss__should_skip_rss_article_before_identify(
-            title='Major 2nd Season 2', site_name='Offline', rss_tvs={'1': subscription}))
+        self.assertFalse(rss._Rss__should_skip_identified_rss_article(
+            media_info=MetaInfo('Major 2nd Season 2', use_llm=False),
+            site_name='Offline', rss_tvs={'1': subscription}))
 
     def test_imdb_constraint_resolves_before_download_gate(self):
         from app.filter import Filter

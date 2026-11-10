@@ -1869,7 +1869,16 @@
                         "type","category","name","title","tmdbid","year","season_episode","part",
                         "restype","effect","pix","video_codec","audio_codec","team"]
     // 调用组件实例的自定义方法.. 一次性添加chips
-    document.querySelector(`#${result_div}`).add_chips_all(sort_array, data);
+    document.querySelector(`#${result_div}`).add_chips_all(sort_array, {
+      ...data,
+      ignored_words: data.ignored_words || [],
+      replaced_words: data.replaced_words || [],
+      offset_words: data.offset_words || []
+    });
+    // 名称测试、订阅预览共用待确认原因，不能只展示已匹配的作品信息。
+    if (data.recognition_reason) {
+      $(`#${result_div}`).append($('<div class="small text-orange text-break mt-1" role="status"></div>').text(data.recognition_reason));
+    }
   }
 
   // 显示手动识别转移框

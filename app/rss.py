@@ -2,14 +2,12 @@ import re
 import xml.dom.minidom
 from threading import Lock
 
-import zhconv
-
 import log
 from app.downloader import Downloader
 from app.filter import Filter
 from app.helper import DbHelper
 from app.media import Media
-from app.media.meta import MetaInfo
+from app.media.meta.special import download_block_reason
 from app.sites import Sites
 from app.subscribe import Subscribe
 from app.utils import DomUtils, RequestUtils, StringUtils, ExceptionUtils, RssTitleUtils, Torrent
@@ -147,11 +145,6 @@ class Rss:
                         if self.dbhelper.is_torrent_rssd(enclosure):
                             log.info(f"【Rss】{title} 已成功订阅过")
                             continue
-                        # 先按订阅标题和规则解析出的集数做轻量预过滤，避免非缺失集触发完整识别/LLM。
-                        if self.__should_skip_rss_article_before_identify(title=title,
-                                                                          site_name=site_name,
-                                                                          rss_tvs=rss_tvs):
-                            continue
                         # 识别种子名称，开始检索TMDB
                         # 作品缓存只能省略名称检索；每条资源仍须完成正式季集映射和校验。
                         media_info = self.media.get_media_info(title=title)
@@ -160,6 +153,9 @@ class Rss:
                             continue
                         elif not media_info.tmdb_info:
                             log.info(f"【Rss】{title} 识别为 {media_info.get_name()} 未匹配到TMDB媒体信息")
+                        # 缺集清单使用 TMDB 编号，必须先完成与转移相同的季集映射。
+                        if self.__should_skip_identified_rss_article(media_info, site_name, rss_tvs):
+                            continue
                         # 大小及种子页面
                         media_info.set_torrent_info(size=size,
                                                     page_url=page_url,
@@ -634,48 +630,6 @@ class Rss:
         else:
             log.info("【Rss】未下载到任何资源")
 
-    @staticmethod
-    def __normalize_match_text(text):
-        """
-        订阅标题预匹配用的轻量归一化，处理简繁、大小写和常见分隔符。
-        """
-        if not text:
-            return ""
-        try:
-            text = zhconv.convert(str(text), "zh-hans")
-        except Exception:
-            text = str(text)
-        text = StringUtils.handler_special_chars(text, allow_space=False) or ""
-        return text.lower()
-
-    @classmethod
-    def __rss_title_matches_subscribe_text(cls, title, site_name, rss_info):
-        """
-        只用订阅名判断 RSS 标题是否可能属于该订阅。
-        """
-        if not title or not rss_info:
-            return False
-        rss_sites = rss_info.get("rss_sites")
-        if rss_sites and site_name not in rss_sites:
-            return False
-
-        fuzzy_match = rss_info.get("fuzzy_match")
-        name = rss_info.get("name")
-        normalized_title = cls.__normalize_match_text(title)
-
-        if fuzzy_match and name:
-            try:
-                if re.search(name, title, re.I):
-                    return True
-            except Exception:
-                pass
-
-        normalized_name = cls.__normalize_match_text(name)
-        if normalized_name and normalized_name in normalized_title:
-            return True
-
-        return False
-
     def __get_subscribe_tv_episode_list(self, rss_info):
         """
         获取订阅当前仍需要的集数；无法确定时返回空列表，调用方不得据此跳过。
@@ -695,32 +649,26 @@ class Rss:
         except Exception:
             return []
 
-    def __should_skip_rss_article_before_identify(self, title, site_name, rss_tvs):
-        """
-        RSS feed 会返回同站点大量文章。若文章标题已能按订阅名匹配到剧集订阅，
-        且规则解析出的集数明确不在该订阅缺失集里，则在完整识别/LLM前跳过。
-        """
-        if not title or not rss_tvs:
+    def __should_skip_identified_rss_article(self, media_info, site_name, rss_tvs):
+        """只用已确认的作品身份和正式季集与订阅缺集比较。"""
+        if (not rss_tvs or not media_info.tmdb_id or media_info.type == MediaType.MOVIE
+                or download_block_reason(media_info)):
             return False
 
         matched_rss_infos = [
             rss_info for _, rss_info in rss_tvs.items()
-            if self.__rss_title_matches_subscribe_text(title=title,
-                                                       site_name=site_name,
-                                                       rss_info=rss_info)
+            if not rss_info.get("fuzzy_match")
+            and str(rss_info.get("tmdbid")) == str(media_info.tmdb_id)
+            and (not rss_info.get("rss_sites") or site_name in rss_info["rss_sites"])
         ]
         if not matched_rss_infos:
             return False
 
-        quick_meta = MetaInfo(title=title, use_llm=False)
-        # An unresolved ordinal candidate is not episode coverage evidence.
-        if (quick_meta.note or {}).get("ordinal_candidates"):
-            return False
-        title_episodes = quick_meta.get_episode_list()
+        title_episodes = media_info.get_episode_list()
         if not title_episodes:
             return False
         title_episode_set = set(title_episodes)
-        title_seasons = quick_meta.get_season_list() or [1]
+        title_seasons = media_info.get_season_list()
         title_season_set = set(title_seasons)
 
         comparable = False
@@ -729,12 +677,12 @@ class Rss:
                 return False
 
             rss_season = rss_info.get("season")
-            if rss_season:
+            if rss_season not in (None, ""):
                 try:
                     rss_season = int(str(rss_season).replace("S", ""))
                 except Exception:
                     rss_season = None
-                if rss_season and rss_season not in title_season_set:
+                if rss_season is not None and rss_season not in title_season_set:
                     continue
 
             need_episodes = self.__get_subscribe_tv_episode_list(rss_info)
@@ -745,9 +693,9 @@ class Rss:
                 return False
 
         if comparable:
-            log.info("【Rss】%s %s 不在订阅缺失集，跳过完整识别" % (
-                title,
-                quick_meta.get_season_episode_string()
+            log.info("【Rss】%s %s 不在订阅缺失集，跳过下载匹配" % (
+                media_info.org_string,
+                media_info.get_season_episode_string()
             ))
             return True
 

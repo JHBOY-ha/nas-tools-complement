@@ -58,7 +58,7 @@ class CacheNumberingTest(TestCase):
         rss.dbhelper = Mock()
         rss.dbhelper.is_torrent_rssd.return_value = False
         rss.parse_rssxml = Mock(return_value=[{"title": self.title, "enclosure": "offline"}])
-        rss._Rss__should_skip_rss_article_before_identify = Mock(return_value=False)
+        rss._Rss__should_skip_identified_rss_article = Mock(return_value=False)
         rss.check_torrent_rss = Mock(return_value=(False, [], {}))
         rss.download_rss_torrent = Mock()
 
@@ -68,7 +68,7 @@ class CacheNumberingTest(TestCase):
 
     def test_rss_checker_uses_the_same_cached_numbering(self):
         # Load just the actual preview method, avoiding the singleton's scheduler.
-        checker_type = load_class("app/rsschecker.py", "RssChecker", ["test_rss_articles"],
+        checker_type = load_class("app/rsschecker.py", "RssChecker", ["test_rss_articles", "_article_title_and_type"],
                                   {"log": Mock(), "MediaType": MediaType})
         checker = checker_type()
         checker.media = self.media

@@ -2505,7 +2505,7 @@ class Media:
                                 episode_format: EpisodeFormat = None,
                                 chinese=True,
                                 download_context=None, download_contexts=None,
-                                bluray=False):
+                                bluray=False, check_files=True):
         """
         根据文件清单，搜刮TMDB信息，用于文件名称的识别
         :param file_list: 文件清单，如果是列表也可以是单个文件，也可以是一个目录
@@ -2515,6 +2515,7 @@ class Media:
         :param episode_format: EpisodeFormat
         :param chinese: 原标题为英文时是否从别名中检索中文名称
         :param bluray: 当前条目是蓝光整季目录；目录不要求单文件集号
+        :param check_files: 是否检查本地文件；种子清单仅做识别时为 False，不扫描本地目录
         :return: 带有TMDB信息的每个文件对应的MetaInfo对象字典
         """
         # Invalid batch parameters must fail before per-file exception handling hides them.
@@ -2535,7 +2536,7 @@ class Media:
         # Media callers may pass an original-disc path without going through
         # FileTransfer, so do not rely solely on its optional hint.
         bluray_paths = {path for path in file_list
-                        if os.path.isdir(path) and PathUtils.get_bluray_dir(path)}
+                        if check_files and os.path.isdir(path) and PathUtils.get_bluray_dir(path)}
         file_list = sorted(file_list, key=lambda path: (bool(fractions[path] or specials[path]), bool(fractions[path])))
         fractional_cache = {}
         task_identities = {}
@@ -2565,7 +2566,7 @@ class Media:
                     tmdb_info = context_info or tmdb_info or confirmed_tasks.get(task_key)
                     if tmdb_info:
                         media_type = tmdb_info.get("media_type") or media_type
-                if not os.path.exists(file_path):
+                if check_files and not os.path.exists(file_path):
                     log.warn("【Meta】%s 不存在" % file_path)
                     if fractions[file_path] or specials[file_path]:
                         raise FileNotFoundError("特殊内容源文件已消失：%s" % file_path)
@@ -2622,7 +2623,7 @@ class Media:
                 parent_name = os.path.basename(os.path.dirname(file_path))
                 parent_parent_name = os.path.basename(PathUtils.get_parent_paths(file_path, 2))
                 # 过滤掉蓝光原盘目录下的子文件
-                if not os.path.isdir(file_path) \
+                if check_files and not os.path.isdir(file_path) \
                         and PathUtils.get_bluray_dir(file_path):
                     log.info("【Meta】%s 跳过蓝光原盘文件：" % file_path)
                     continue

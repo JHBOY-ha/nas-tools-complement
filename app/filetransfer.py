@@ -1348,7 +1348,7 @@ class FileTransfer:
         # 电视剧
         else:
             dir_name, season_name, _ = self.get_tv_dest_path(meta_info)
-            if not season or not total_num:
+            if season is None or not total_num:
                 return []
             if meta_info.type == MediaType.ANIME:
                 dest_paths = self._anime_path

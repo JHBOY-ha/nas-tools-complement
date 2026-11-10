@@ -8,6 +8,7 @@ from app.media.media import Media
 from app.media.meta import MetaInfo
 from app.media.meta.metaanime import MetaAnime
 from app.utils.types import DownloaderType, MediaType
+from tests.recognition_fixture import FakeTmdb
 
 
 class MetaParserBoundaryTest(unittest.TestCase):
@@ -81,6 +82,10 @@ class MetaParserBoundaryTest(unittest.TestCase):
 
     def test_pack_description_does_not_disable_requested_download_file(self):
         downloader = object.__new__(type(Downloader()))
+        fixture = FakeTmdb(self)
+        fixture.tv(42, "Show", seasons={1: 12})
+        downloader.media = fixture.media
+        media = fixture.media.get_media_info("Show S01")
         client = MagicMock()
         client.get_files.return_value = [
             {"name": "Show.S01E02.全12集.mkv", "index": 0},
@@ -88,7 +93,7 @@ class MetaParserBoundaryTest(unittest.TestCase):
             {"name": "Show.S01E04.mkv", "index": 2},
         ]
         with patch.object(downloader, "_Downloader__get_client", return_value=client):
-            selected = downloader.set_files_status("torrent", [2, 3], DownloaderType.QB)
+            selected = downloader.set_files_status("torrent", [2, 3], DownloaderType.QB, media_info=media)
         self.assertEqual({2, 3}, set(selected))
         client.set_files.assert_called_once_with(torrent_hash="torrent", file_ids=[2], priority=0)
 

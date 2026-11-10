@@ -424,7 +424,7 @@ class DownloadTests(unittest.TestCase):
         from app.media.meta.special import download_block_reason
         self.ns['download_block_reason'] = download_block_reason
         cls = load_class('app/downloader/downloader.py', 'Downloader',
-                         ['transfer', '_get_download_context', '_create_download_context', 'check_exists_medias'], self.ns)
+                         ['transfer', '_get_download_context', '_build_download_context', '_create_download_context', 'check_exists_medias'], self.ns)
         self.d = cls()
         self.d.default_client = Mock()
         self.d._default_client_type = NS(value='QB')

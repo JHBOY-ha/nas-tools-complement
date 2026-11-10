@@ -7,6 +7,7 @@ from app.helper import DbHelper, ProgressHelper
 from app.indexer import Indexer
 from app.media import Media, DouBan
 from app.media.meta import MetaInfo
+from app.media.meta.special import download_block_reason
 from app.message import Message
 from app.searcher import Searcher
 from app.sites import Sites
@@ -55,12 +56,18 @@ def search_medias_for_web(content, ident_flag=True, filters=None, tmdbid=None, m
             media_info = searcher.media.get_media_info(mtype=media_type or mtype,
                                                 title=content)
 
-        # 整合集
-        if media_info:
-            if season_num:
-                media_info.begin_season = int(season_num)
-            if episode_num:
-                media_info.begin_episode = int(episode_num)
+        # 标题识别已经完成编号映射，不能再写回查询文本里的发布编号。
+        # 按 ID 选作品时，明确输入的目标季集走与手动转移相同的覆盖入口。
+        if tmdbid and media_info and media_info.tmdb_info:
+            searcher.media._apply_manual_numbering(
+                media_info, season_num,
+                (episode_num, None) if episode_num is not None else None,
+                info=media_info.tmdb_info)
+            searcher.media._finalize_recognition(media_info)
+        blocked = download_block_reason(media_info) if media_info else None
+        if blocked:
+            search_process.end('search')
+            return -1, blocked
 
         if media_info and media_info.tmdb_info:
             # 查询到TMDB信息
