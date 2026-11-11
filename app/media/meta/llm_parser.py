@@ -198,10 +198,10 @@ class LLMMetaParser(object):
             if external_candidates:
                 user_prompt += f"external_candidates: {external_candidates}\n"
             user_prompt += "若字段无法判断请省略该字段。"
+            # Let the shared client use the configured output budget for this model.
             content = client.complete_text(
                 system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                max_tokens=512
+                user_prompt=user_prompt
             )
             # A stopped request is not a negative recognition result. Do not
             # poison the shared cache for another search of the same release.

@@ -62,6 +62,26 @@ class LLMMetaParserTest(TestCase):
         self.assertEqual({}, result)
         mock_client.assert_not_called()
 
+    def test_parse_uses_configured_max_tokens_in_sdk_request(self):
+        for max_tokens in (1024, 4096):
+            with self.subTest(max_tokens=max_tokens):
+                self.parser._max_tokens = max_tokens
+                self.parser._client = None
+                self.parser._parse_cache = {}
+                sdk = Mock()
+                sdk.chat.completions.create.return_value = {
+                    "choices": [{"message": {"content": '{"type":"movie","en_name":"Dune"}'}}]
+                }
+                # Keep parser and shared client real; replace only external boundaries.
+                with patch("app.utils.llm_client.OpenAI", return_value=sdk), \
+                        patch.object(self.parser, "_LLMMetaParser__build_external_candidates",
+                                     return_value=("", {})):
+                    result = self.parser.parse(title="Dune 2021")
+
+                self.assertEqual("Dune", result["en_name"])
+                sdk.chat.completions.create.assert_called_once()
+                self.assertEqual(max_tokens, sdk.chat.completions.create.call_args.kwargs["max_tokens"])
+
     def test_stopped_parse_skips_providers_without_caching_a_negative_result(self):
         for stage in ('before', 'candidates', 'response'):
             with self.subTest(stage=stage):
