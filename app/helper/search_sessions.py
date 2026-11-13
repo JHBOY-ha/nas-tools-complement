@@ -105,11 +105,21 @@ class SearchSessions:
                 os.close(directory)
 
     def _prune(self):
-        cutoff = time.time() - 7 * 86400
+        now = time.time()
+        cutoff = now - 7 * 86400
         for sid, record in list(self._records.items()):
             if record['created_at'] < cutoff:
                 os.unlink(os.path.join(self.root, sid + '.json'))
                 del self._records[sid]
+            elif (record['expires_at'] < now and record['state'] not in ACTIVE_SEARCH_STATES
+                  and record['downloads'] and not record.get('archived')
+                  and all(operation['state'] != 'submitting' for operation in record['downloads'].values())):
+                # Receipts outlive the search quota for status checks and dedupe.
+                # Drop the heavy snapshot while preserving owner, callback IDs and
+                # download tags; expiry already prevents new download actions.
+                archived = dict(record, archived=True, results={}, candidates=[], selected=None, report={})
+                self._save(sid, archived)
+                self._records[sid] = archived
 
     def create(self, owner, chat, query, channel='telegram', request_id=None):
         with self._lock:
@@ -120,14 +130,16 @@ class SearchSessions:
                     if (record['channel'], record['owner'], record['chat'], record['request_id']) == (
                             channel, str(owner), str(chat), str(request_id)):
                         return copy.deepcopy(record), False
-            if len(self._records) >= 100:
+            count = sum(not item.get('archived') for item in self._records.values())
+            if count >= 100:
                 expired = sorted((item for item in self._records.values() if item['expires_at'] < time.time()
                                   and not item['downloads'] and item['state'] not in ACTIVE_SEARCH_STATES),
                                  key=lambda item: item['updated_at'])
-                for old in expired[:len(self._records) - 99]:
+                for old in expired[:count - 99]:
                     os.unlink(os.path.join(self.root, old['id'] + '.json'))
                     del self._records[old['id']]
-            if len(self._records) >= 100:
+                    count -= 1
+            if count >= 100:
                 raise TaskQueueFull('搜索记录已满，请清理旧搜索后再试')
             now = time.time()
             record = dict(id=secrets.token_hex(8), owner=str(owner), chat=str(chat),

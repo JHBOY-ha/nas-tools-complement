@@ -25,6 +25,10 @@ lock = Lock()
 client_lock = Lock()
 
 
+class DownloadNotReady(ValueError):
+    """A monitored download must remain queued without publishing or recording failure."""
+
+
 @singleton
 class Downloader:
     clients = {}
@@ -219,6 +223,51 @@ class Downloader:
         payload["task_key"] = "%s:%s" % (dl_type.value, task.get("id"))
         payload["tmdb_info"]["media_type"] = MediaType[payload["tmdb_info"]["media_type"]]
         return payload
+
+    def check_monitored_files_complete(self, file_list):
+        """Delay monitored files belonging to unfinished local torrent tasks."""
+        wanted = {os.path.realpath(path) for path in file_list}
+        for kind, section, host in ((DownloaderType.QB, 'qbittorrent', 'qbhost'),
+                                    (DownloaderType.TR, 'transmission', 'trhost')):
+            if not (Config().get_config(section) or {}).get(host):
+                continue
+            client = self.__get_client(kind)
+            if not client:
+                raise DownloadNotReady('无法确认下载完成状态，稍后重试目录同步')
+            torrents, error = client.get_torrents()
+            if error:
+                raise DownloadNotReady('无法查询下载完成状态，稍后重试目录同步')
+            for torrent in torrents:
+                if kind == DownloaderType.QB:
+                    complete = torrent.get('progress', 0) >= 1 and torrent.get('state') not in {
+                        'checkingUP', 'checkingDL', 'checkingResumeData', 'moving', 'error', 'missingFiles'}
+                else:
+                    # The adapter's progress property rounds to two decimals;
+                    # 100.00% can still have bytes left to write.
+                    complete = torrent.left_until_done == 0 and not torrent.error and torrent.status not in {
+                        'checking', 'check_pending'}
+                if complete:
+                    continue
+                save_path = torrent.get('save_path') if kind == DownloaderType.QB else torrent.download_dir
+                if not save_path:
+                    raise DownloadNotReady('下载任务保存目录未知，稍后重试目录同步')
+                root = os.path.realpath(client.get_replace_path(save_path))
+                # Only fetch manifests that can overlap this batch (including
+                # selected Blu-ray directories). Unrelated local files stay usable.
+                if not any(os.path.commonpath([root, path]) in (root, path) for path in wanted):
+                    continue
+                tid = torrent.get('hash') if kind == DownloaderType.QB else torrent.id
+                files = client.get_files(tid)
+                if not files:
+                    raise DownloadNotReady('无法读取下载文件清单，稍后重试目录同步')
+                for item in files:
+                    name = item.get('name') if kind == DownloaderType.QB else item.name
+                    if not name:
+                        continue
+                    member = os.path.realpath(os.path.join(root, name))
+                    if any(member == path or (os.path.isdir(path) and os.path.commonpath([path, member]) == path)
+                           for path in wanted):
+                        raise DownloadNotReady('下载任务尚未完成，稍后重试目录同步')
 
     def download(self,
                  media_info,
@@ -1055,6 +1104,10 @@ class Downloader:
         :return: 返回选中的集的列表
         """
         sucess_epidised = []
+        seasons = media_info.get_season_list()
+        if len(seasons) != 1:
+            return []
+        wanted = {(seasons[0], episode) for episode in need_episodes}
         _client = self.__get_client(downloader)
         if downloader == DownloaderType.TR:
             files_info = {}
@@ -1064,9 +1117,9 @@ class Downloader:
             episode_map = self._get_torrent_file_episodes([item.name for item in torrent_files], media_info)
             for file_id, torrent_file in enumerate(torrent_files):
                 episodes = episode_map.get(torrent_file.name, [])
-                selected = bool(episodes) and set(episodes).issubset(need_episodes)
+                selected = bool(episodes) and set(episodes).issubset(wanted)
                 if selected:
-                    sucess_epidised = list(set(sucess_epidised).union(episodes))
+                    sucess_epidised = list(set(sucess_epidised).union(episode for _, episode in episodes))
                 if not files_info.get(tid):
                     files_info[tid] = {file_id: {'priority': 'normal', 'selected': selected}}
                 else:
@@ -1082,10 +1135,10 @@ class Downloader:
             episode_map = self._get_torrent_file_episodes([item.get("name") for item in torrent_files], media_info)
             for torrent_file in torrent_files:
                 episodes = episode_map.get(torrent_file.get("name"), [])
-                if not episodes or not set(episodes).issubset(need_episodes):
+                if not episodes or not set(episodes).issubset(wanted):
                     file_ids.append(torrent_file.get("index"))
                 else:
-                    sucess_epidised = list(set(sucess_epidised).union(episodes))
+                    sucess_epidised = list(set(sucess_epidised).union(episode for _, episode in episodes))
             if sucess_epidised and file_ids:
                 if _client.set_files(torrent_hash=tid, file_ids=file_ids, priority=0) is False:
                     return []
@@ -1258,7 +1311,7 @@ class Downloader:
                 return dict_type
 
     def _get_torrent_file_episodes(self, file_names, media_info):
-        """种子文件尚未落盘时复用自动转移识别，避免维护另一套季集换算。"""
+        """返回已核验的 (季, 集) 坐标；整季包里的番外不能补位正片。"""
         context = self._build_download_context(media_info)
         if not context or download_block_reason(media_info):
             return {}
@@ -1267,8 +1320,10 @@ class Downloader:
         names = [name for name in file_names if name and os.path.splitext(name)[1].lower() in RMT_MEDIAEXT]
         recognized = self.media.get_media_info_on_files(
             names, download_context=context, check_files=False)
-        return {name: meta.get_episode_list() for name, meta in recognized.items()
-                if meta.tmdb_info and not download_block_reason(meta) and meta.get_episode_list()}
+        return {name: [(meta.begin_season, episode) for episode in meta.get_episode_list()]
+                for name, meta in recognized.items()
+                if meta.tmdb_info and not download_block_reason(meta)
+                and len(meta.get_season_list()) == 1 and meta.get_episode_list()}
 
     def get_torrent_episodes(self, url, media_info, page_url=None):
         """
@@ -1289,7 +1344,10 @@ class Downloader:
             return [], None
         names = [os.path.join(folder, name) if folder else name for name in files]
         episode_map = self._get_torrent_file_episodes(names, media_info)
-        episodes = sorted({episode for numbers in episode_map.values() for episode in numbers})
+        # This preview counts coverage for the requested single season only.
+        seasons = media_info.get_season_list()
+        episodes = sorted({episode for numbers in episode_map.values() for season, episode in numbers
+                           if len(seasons) == 1 and season == seasons[0]})
         return episodes, file_path
 
     def get_download_setting(self, sid=None):

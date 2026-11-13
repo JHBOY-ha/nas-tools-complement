@@ -76,6 +76,60 @@ class EpisodeTransferGuardsTest(unittest.TestCase):
         options.update(kwargs)
         return t.transfer_media(**options)
 
+    def test_monitor_defers_unfinished_downloads_then_resumes_without_new_event(self):
+        from types import SimpleNamespace
+        from app.downloader import Downloader, DownloadNotReady
+        from app.sync import Sync
+        from tests.recognition_fixture import FakeTmdb
+        fx = FakeTmdb(self)
+        fx.tv(42, 'Fixture Show', seasons={1: 4})
+        downloader_type = Downloader.__closure__[0].cell_contents
+        downloader = downloader_type.__new__(downloader_type)
+        client = MagicMock()
+        task = {'hash': 'fixture', 'save_path': str(self.root), 'progress': 0.5}
+        client.get_replace_path.side_effect = lambda path: path
+        with patch('app.downloader.Downloader', return_value=downloader), \
+                patch.object(downloader, '_Downloader__get_client', return_value=client), \
+                patch('app.downloader.downloader.Config') as config:
+            config.return_value.get_config.side_effect = lambda key: {'qbhost': 'offline'} if key == 'qbittorrent' else {}
+            for mode, onlylink in ((RmtMode.COPY, False), (RmtMode.MOVE, False), (RmtMode.COPY, True)):
+                with self.subTest(mode=mode, onlylink=onlylink):
+                    source = self.root / 'Fixture.Show.S01E02.mkv'
+                    source.write_bytes(b'partial bytes')
+                    library = self.root / (mode.name + str(onlylink))
+                    library.mkdir()
+                    transfer = self.transfer_fixture()
+                    transfer.media = fx.media
+                    sync_type = Sync.__closure__[0].cell_contents
+                    sync = sync_type.__new__(sync_type)
+                    sync.filetransfer, sync.dbhelper = transfer, transfer.dbhelper
+                    sync._synced_files = [str(source)]
+                    sync._need_sync_paths = {str(source): dict(source=str(self.root), target=str(library),
+                        syncmod=mode, files=[str(source)], onlylink=onlylink)}
+                    client.get_files.return_value = [{'name': source.name}]
+                    task['progress'] = 0.5
+                    for unavailable in (True, False):
+                        client.get_torrents.return_value = ([task], unavailable)
+                        sync.transfer_mon_files()
+                        self.assertIn(str(source), sync._need_sync_paths)
+                        self.assertEqual(list(library.rglob('*.mkv')), [])
+                        sync.dbhelper.insert_transfer_unknown.assert_not_called()
+                        sync.dbhelper.insert_transfer_blacklist.assert_not_called()
+                    source.write_bytes(b'complete bytes')
+                    task['progress'] = 1
+                    sync.transfer_mon_files()
+                    self.assertEqual(sync._need_sync_paths, {})
+                    self.assertEqual(next(library.rglob('*.mkv')).read_bytes(), b'complete bytes')
+            config.return_value.get_config.side_effect = lambda key: {'trhost': 'offline'} if key == 'transmission' else {}
+            task = SimpleNamespace(id=1, download_dir=str(self.root), progress=100,
+                                   left_until_done=1, status='stopped', error=0)
+            client.get_torrents.return_value = ([task], False)
+            client.get_files.return_value = [SimpleNamespace(name=source.name)]
+            with self.assertRaises(DownloadNotReady):
+                downloader.check_monitored_files_complete([str(source)])
+            task.left_until_done = 0
+            downloader.check_monitored_files_complete([str(source)])
+
     def test_invalid_batch_target_stops_before_any_transfer_or_lookup(self):
         paths = [self.root / 'Show.E03.mkv', self.root / 'Show.E01.mkv']
         for path in paths:

@@ -98,6 +98,10 @@ class MediaFileSubtitlesTest(TestCase):
         return self.target.with_suffix(suffix)
 
     def test_download_hardlinks_to_recorded_name_then_refreshes_that_video(self):
+        # A sibling cut's subtitle must not satisfy this video's download.
+        sibling = self.source.with_name(self.source.stem + '.Extended.mkv')
+        sibling.write_bytes(b'extended cut')
+        sibling.with_suffix('.chi.zh-cn.srt').write_text(SRT.replace('测试', '加长版'))
         def refresh(_payload, media_path, server):
             self.assertEqual(media_path, str(self.target))
             self.assertEqual(server, "jellyfin")

@@ -33,6 +33,9 @@ def resource_key(media):
     url = media.enclosure or ''
     hashes = parse_qs(urlparse(url).query).get('xt', []) if url.startswith('magnet:') else []
     identity = next((value.lower() for value in hashes if value.lower().startswith('urn:btih:')), url)
+    if url.startswith(('[', '#')):
+        # Extraction rules are shared by a site's releases, not torrent IDs.
+        identity = repr((media.site, media.page_url, url, media.org_string if not media.page_url else None))
     return hashlib.sha256(identity.encode()).hexdigest()[:16]
 
 

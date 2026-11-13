@@ -2387,6 +2387,13 @@ class Subtitle:
                        "zh-hans": "zh-cn", "chs": "zh-cn", "cn": "zh-cn",
                        "zh-hant": "zh-tw", "cht": "zh-tw", "tw": "zh-tw",
                        "ze": "zh-cn"}
+            # Only language/accessibility/collision tags may follow the exact
+            # video stem. A release suffix such as Extended belongs to another cut.
+            tags = set(aliases) | set(aliases.values()) | wanted | {
+                'zh', 'chi', 'zho', 'chinese', 'forced', 'default', 'sdh', 'cc', 'hi', 'full'}
+            if stem != media_name and any(
+                    token not in tags and not re.fullmatch(r'source-\d+', token) for token in tokens):
+                continue
             languages = {aliases.get(token, token) for token in tokens}
             if not languages.intersection({"zh-cn", "zh-tw"}) and tokens.intersection(
                     {"zh", "chi", "zho", "chinese"}):

@@ -560,7 +560,7 @@ class OpenSubtitlesApiTest(TestCase):
             (".CHT.ASS", "字幕", True),
             (".zh-Hans.srt", "字幕", True),
             (".chi.zh-tw.srt", "字幕", True),
-            (".extended.chi.srt", "字幕", True),
+            (".extended.chi.srt", "字幕", False),
         ]
         for suffix, content, expected in cases:
             with self.subTest(suffix=suffix, content=content), tempfile.TemporaryDirectory() as directory:

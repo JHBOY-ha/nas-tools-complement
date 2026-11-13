@@ -210,6 +210,21 @@ class SearchSessionsTest(SearchSessionFixture):
         receipt['state'] = 'changed by caller'
         self.assertEqual(self.store.get(ids[2])['downloads']['r1']['state'], 'unknown')
 
+    def test_expired_download_receipts_leave_search_quota_but_survive_restart(self):
+        for index in range(100):
+            record, _ = self.store.create('alice', 'alice', 'Show', channel='web')
+            with self.store.edit(record['id']) as current:
+                current.update(state='results', expires_at=time.time() - 1,
+                               results={'0': pack_media(torrent())},
+                               downloads={'0': {'state': 'accepted', 'tag': f'task-{index}', 'message': '已提交'}})
+        self.store.create(1, 1, 'New search', channel='telegram')
+        restored = self.store_type(self.directory.name)
+        old = restored.owned(record['id'], 'alice', 'alice')
+        self.assertTrue(old['archived'])
+        self.assertEqual(old['results'], {})
+        self.assertEqual(restored.find_download('task-99')['state'], 'accepted')
+        self.assertIn(record['id'], restored.pending_download_sessions('web', limit=100))
+
 
 
 class TelegramSearchTest(SearchSessionFixture):
@@ -566,6 +581,11 @@ class TelegramSearchTest(SearchSessionFixture):
         self.assertEqual(downloader.download.call_count, 1)
         self.assertEqual(self.store.get(self.sid)['downloads'][rid]['state'], 'accepted')
 
+        from web.backend.telegram_search import _parse_callback
+        _, rows = render_search_message(self.store.get(self.sid))
+        status = next(button for row in rows for button in row if button['text'] == '1 查看状态')
+        self.assertEqual(_parse_callback(status['callback_data']), (self.sid, 0, 'status', None))
+
     def test_uncertain_submission_is_not_retried_after_restart(self):
         rid = self.ready()
         downloader = Mock()
@@ -617,10 +637,14 @@ class TelegramSearchTest(SearchSessionFixture):
         searcher.indexer = Mock()
         item = torrent()
         alternate = torrent(url='magnet:?xt=urn:btih:abc&tr=https://tracker.invalid', site='Other')
+        extracted = [torrent(url='[//a/@href|||]') for _ in range(2)]
+        for index, result in enumerate(extracted):
+            result.page_url = f'https://example.test/release/{index}'
         def index_search(**kwargs):
             kwargs['search_context']['on_progress']([item], {'test': {'name': 'Test', 'state': 'done', 'valid': 1}})
             kwargs['search_context']['on_progress']([alternate], {'other': {'name': 'Other', 'state': 'done', 'valid': 1}})
-            return [item, alternate]
+            kwargs['search_context']['on_progress'](extracted, {})
+            return [item, alternate] + extracted
         searcher.indexer.search_by_keyword.side_effect = index_search
         downloader = Mock()
         downloader.check_exists_medias.return_value = (False, {}, [])
@@ -632,7 +656,7 @@ class TelegramSearchTest(SearchSessionFixture):
             self.service.search(self.sid, 0)
         record = self.store.get(self.sid)
         self.assertEqual(record['state'], 'results')
-        self.assertEqual(len(record['results']), 1)
+        self.assertEqual(len(record['results']), 3)
         self.assertEqual(len(record['results'][resource_key(item)]['sources']), 2)
         searcher.dbhelper.delete_all_search_torrents.assert_not_called()
         searcher.dbhelper.insert_search_results.assert_not_called()
@@ -748,6 +772,7 @@ class WebSearchIsolationTest(SearchSessionFixture):
             session['search_id'] = second['id']
             result = action.get_search_result()
             self.assertEqual(result['total'], 1)
+            self.assertNotIn(':', next(iter(result['result'].values()))['key'])
         with app.test_request_context('/search?search_id=' + first['id']), \
                 patch('app.helper.search_sessions.SearchSessions', return_value=self.store), \
                 patch('web.action.current_user', SimpleNamespace(username='bob')):
@@ -808,6 +833,59 @@ class WebSearchReviewTest(SearchSessionFixture):
             replacement.start()
             self.addCleanup(replacement.stop)
 
+    def test_jwt_search_results_and_download_without_cookies_keep_owner(self):
+        from types import SimpleNamespace
+        import web.main as main
+        user = SimpleNamespace(username='alice', is_authenticated=True,
+                               get_id=lambda: '1', pris='资源搜索,下载管理')
+        with patch('web.security._cached_token_user', return_value=user), \
+                patch('web.backend.search_torrents.Searcher') as searcher, \
+                patch('web.action.MediaServer') as server, \
+                patch('web.action.Downloader') as downloader, patch('web.action.Message'), \
+                main.App.test_client(use_cookies=False) as client:
+            searcher.return_value.search_medias.return_value = [torrent()]
+            server.return_value.check_item_exists.return_value = False
+            downloader.return_value.download.return_value = (True, '')
+            headers = {'Authorization': 'Bearer fixture'}
+            response = client.post('/api/v1/search/keyword', headers=headers,
+                                   data={'search_word': 'Dune', 'unident': '1'})
+            self.assertEqual(response.status_code, 200)
+            sid = response.get_json()['data']['search_id']
+            response = client.post('/api/v1/search/result', headers=headers, json={'search_id': sid})
+            self.assertEqual(response.get_json()['data']['total'], 1)
+            response = client.post('/api/v1/download/search', headers=headers, data={'id': sid + ':0'})
+            self.assertTrue(response.get_json()['success'])
+            user.username = 'bob'
+            response = client.post('/api/v1/search/result', headers=headers, data={'search_id': sid})
+            self.assertEqual(response.get_json()['data']['total'], 0)
+            response = client.post('/api/v1/download/search', headers=headers, data={'id': sid + ':0'})
+            self.assertFalse(response.get_json()['success'])
+            downloader.return_value.download.assert_called_once()
+
+    def test_web_retry_stops_at_actual_client_submission(self):
+        record, _ = self.store.create('alice', 'alice', 'Dune', channel='web')
+        with self.store.edit(record['id']) as current:
+            current.update(state='results', results={'0': pack_media(torrent(url='https://example.test/file'))})
+        kind = Downloader.__closure__[0].cell_contents
+        downloader = kind.__new__(kind)
+        downloader.sites = Mock()
+        downloader.sites.get_site_attr.return_value = {}
+        with patch('web.action.Downloader', return_value=downloader), \
+                patch('app.downloader.downloader.Torrent') as transport:
+            transport.return_value.get_torrent_info.return_value = (None, None, '', [], '站点暂时不可用')
+            for _ in range(2):
+                self.assertEqual(self.action._WebAction__download({'id': record['id'] + ':0'})['retcode'], -1)
+            self.assertEqual(transport.return_value.get_torrent_info.call_count, 2)
+            self.assertEqual(self.store.get(record['id'])['downloads']['0']['state'], 'not_submitted')
+            def uncertain(*args, before_submit, **kwargs):
+                before_submit()
+                raise TimeoutError('response lost')
+            with patch.object(downloader, 'download', side_effect=uncertain) as submit:
+                for _ in range(2):
+                    self.action._WebAction__download({'id': record['id'] + ':0'})
+                submit.assert_called_once()
+            self.assertEqual(self.store.get(record['id'])['downloads']['0']['state'], 'unknown')
+
     def test_quick_and_fallback_downloads_resolve_release_and_keep_resource(self):
         from app.media.meta.special import download_block_reason
         from tests.recognition_fixture import FakeTmdb
@@ -854,7 +932,8 @@ class WebSearchReviewTest(SearchSessionFixture):
                         downloader.return_value.download.assert_called_once()
                         call = downloader.return_value.download.call_args
                         resolved = call.args[0]
-                        self.assertEqual(call.kwargs, {'download_dir': '/downloads/selected', 'download_setting': '7'})
+                        self.assertEqual(call.kwargs['download_dir'], '/downloads/selected')
+                        self.assertEqual(call.kwargs['download_setting'], '7')
                         self.assertEqual(resolved.tmdb_id, tmdbid)
                         self.assertEqual((resolved.begin_season, resolved.get_episode_list()), (season, episodes))
                         self.assertIsNone(download_block_reason(resolved))
@@ -904,7 +983,7 @@ class WebSearchReviewTest(SearchSessionFixture):
                     for _ in range(2):
                         response = self.action._WebAction__download({'id': record['id'] + ':0'})
                         self.assertEqual(response['retcode'], -1)
-                    self.assertEqual(self.store.get(record['id'])['downloads']['0']['state'], 'unknown')
+                    self.assertEqual(self.store.get(record['id'])['downloads']['0']['state'], 'not_submitted')
             downloader.assert_not_called()
             messages.assert_not_called()
 
@@ -961,6 +1040,32 @@ class WebSearchReviewTest(SearchSessionFixture):
 
 
 class TelegramTransportTest(TestCase):
+    def test_upgrade_webhook_and_polling_subscribe_to_callbacks(self):
+        import json
+        from urllib.parse import parse_qs, urlparse
+        import app.message.client.telegram as transport
+        bot = transport.Telegram.__new__(transport.Telegram)
+        bot._telegram_token, bot._webhook_url, bot._enabled = 'offline', 'https://example.test/telegram', True
+        old = Mock()
+        old.json.return_value = {'ok': True, 'result': {'url': bot._webhook_url, 'allowed_updates': ['message']}}
+        success = Mock()
+        success.json.return_value = {'ok': True, 'result': []}
+        with patch.object(transport, 'WEBHOOK_STATUS', False), patch.object(transport, 'RequestUtils') as request:
+            request.return_value.get_res.side_effect = [old, success]
+            bot._Telegram__set_bot_webhook()
+            url = request.return_value.get_res.call_args.args[0]
+            self.assertIn('/setWebhook?', url)
+            self.assertEqual(json.loads(parse_qs(urlparse(url).query)['allowed_updates'][0]),
+                             ['message', 'callback_query'])
+            event = threading.Event()
+            def poll(url):
+                self.assertEqual(json.loads(parse_qs(urlparse(url).query)['allowed_updates'][0]),
+                                 ['message', 'callback_query'])
+                event.set()
+                return success
+            request.return_value.get_res.side_effect = poll
+            bot._Telegram__start_telegram_message_proxy(event)
+
     def test_message_edit_is_plain_text_and_retains_returned_message_id(self):
         from app.message.client.telegram import Telegram
         client = Telegram.__new__(Telegram)

@@ -113,7 +113,7 @@ def render_search_message(record: dict) -> tuple[str, list[list[dict[str, str]]]
                 lines.append(operation['message'])
             retryable = not operation or operation['state'] == 'not_submitted'
             rows.append([button(f'{index} 下载' if retryable else f'{index} 查看状态',
-                                'download' if retryable else 'status', rid), button('详情', 'detail', rid)])
+                                'download' if retryable else 'status', rid if retryable else '0'), button('详情', 'detail', rid)])
         if items:
             rows.append([button('上一页', 'page', str(max(0, page - 1))), button('下一页', 'page', str(page + 1))])
         rows.append([button('筛选与偏好', 'preferences'), button('刷新结果', 'results')])

@@ -1,3 +1,4 @@
+import json
 from threading import Event, Lock
 from urllib.parse import urlencode
 
@@ -11,6 +12,7 @@ from config import Config
 
 lock = Lock()
 WEBHOOK_STATUS = False
+ALLOWED_UPDATES = ['message', 'callback_query']
 
 
 class Telegram(_IMessageClient):
@@ -263,22 +265,22 @@ class Telegram(_IMessageClient):
         if status and status != 1:
             if status == 2:
                 self.__del_bot_webhook()
-            values = {"url": self._webhook_url, "allowed_updates": ["message"]}
+            values = {"url": self._webhook_url, "allowed_updates": json.dumps(ALLOWED_UPDATES)}
             sc_url = "https://api.telegram.org/bot%s/setWebhook?" % self._telegram_token
             res = RequestUtils(proxies=Config().get_proxies()).get_res(sc_url + urlencode(values))
             if res is not None:
-                json = res.json()
-                if json.get("ok"):
+                result = res.json()
+                if result.get("ok"):
                     log.info("【Telegram】Webhook 设置成功，地址为：%s" % self._webhook_url)
                 else:
-                    log.error("【Telegram】Webhook 设置失败：" % json.get("description"))
+                    log.error("【Telegram】Webhook 设置失败：%s" % result.get("description"))
             else:
                 log.error("【Telegram】Webhook 设置失败：网络连接故障！")
 
     def __get_bot_webhook(self):
         """
         获取Telegram已设置的Webhook
-        :return: 状态：1-存在且相等，2-存在不相等，3-不存在，0-网络出错
+        :return: 状态：1-地址与订阅均匹配，2-地址不同，3-不存在或需更新订阅，0-网络出错
         """
         sc_url = "https://api.telegram.org/bot%s/getWebhookInfo" % self._telegram_token
         res = RequestUtils(proxies=Config().get_proxies()).get_res(sc_url)
@@ -293,8 +295,12 @@ class Telegram(_IMessageClient):
                 if pending_update_count and last_error_message:
                     log.warn("【Telegram】Webhook 有 %s 条消息挂起，最后一次失败原因为：%s" % (
                         pending_update_count, last_error_message))
-                if webhook_url == self._webhook_url:
+                # An unchanged URL can still carry the old message-only subscription.
+                if webhook_url == self._webhook_url and set(ALLOWED_UPDATES).issubset(
+                        result.get('allowed_updates') or []):
                     return 1
+                elif webhook_url == self._webhook_url:
+                    return 3
                 else:
                     return 2
             else:
@@ -321,7 +327,8 @@ class Telegram(_IMessageClient):
 
         def consume_messages(_config, _offset, _sc_url, _ds_url):
             try:
-                values = {"timeout": long_poll_timeout, "offset": _offset}
+                values = {"timeout": long_poll_timeout, "offset": _offset,
+                          "allowed_updates": json.dumps(ALLOWED_UPDATES)}
                 res = RequestUtils(proxies=_config.get_proxies()).get_res(_sc_url + urlencode(values))
                 if res and res.json():
                     for msg in res.json().get("result", []):

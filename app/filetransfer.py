@@ -765,8 +765,16 @@ class FileTransfer:
                 except ValueError as error:
                     return __finish_transfer(False, "%s：%s" % (os.path.basename(file_path), error))
 
-        # 目录同步直接处理本地文件；未完成下载由下载器的临时目录隔离。
-        # 已成功转移的文件继续按转移记录去重，不再反查下载任务身份或进度。
+        # Older deployments may write unfinished .mkv files directly into a
+        # watched directory. Check exact task membership before any publication
+        # or blacklist write; filename recognition still uses the local file.
+        if in_from == SyncType.MON:
+            from app.downloader import Downloader, DownloadNotReady
+            try:
+                Downloader().check_monitored_files_complete(file_list)
+            except DownloadNotReady:
+                self.progress.end('filetransfer')
+                raise
         # Old disc attempts could have recorded a blacklist before history completed.
         # Always verify directory contents instead of trusting that marker on retries.
         if in_from == SyncType.MON:
@@ -1561,6 +1569,8 @@ class FileTransfer:
         # 纯链接同步同样不能把无效过滤配置记为成功的同步历史。
         if getattr(self, '_ignore_config_error', ''):
             return -1, "忽略词配置无效，暂停整理直到配置修正"
+        from app.downloader import Downloader
+        Downloader().check_monitored_files_complete([in_file])
         new_file_list, msg = self.check_ignore(file_list=[new_file])
         if not new_file_list:
             return 0, msg

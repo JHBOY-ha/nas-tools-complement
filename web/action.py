@@ -628,6 +628,14 @@ class WebAction:
         return {"retmsg": "服务已启动", "item": sch_item}
 
     @staticmethod
+    def _search_owner():
+        # REST JWTs populate g.api_user; trusted API-key requests have their own
+        # namespace. Browser usernames remain compatible with saved sessions.
+        if getattr(g, 'api_key_authenticated', False):
+            return 'api-key'
+        return (getattr(g, 'api_user', None) or current_user).username
+
+    @staticmethod
     def __search(data):
         """
         WEB检索资源
@@ -645,7 +653,8 @@ class WebAction:
         if search_word:
             from app.helper.search_sessions import SearchSessions
             searches = SearchSessions()
-            record, _ = searches.create(current_user.username, current_user.username, search_word, channel='web')
+            owner = WebAction._search_owner()
+            record, _ = searches.create(owner, owner, search_word, channel='web')
             session['search_id'] = record['id']
             try:
                 ret, ret_msg = search_medias_for_web(content=search_word,
@@ -673,11 +682,12 @@ class WebAction:
         dl_id = data.get("id")
         dl_dir = data.get("dir")
         dl_setting = data.get("setting")
+        owner = self._search_owner()
         if ':' in str(dl_id):
             from app.helper.search_sessions import SearchSessions, unpack_media
             sid, rid = str(dl_id).split(':', 1)
             try:
-                record = SearchSessions().owned(sid, current_user.username, current_user.username)
+                record = SearchSessions().owned(sid, owner, owner)
                 if record['channel'] != 'web' or record['expires_at'] < time.time():
                     raise ValueError('搜索已过期，请重新搜索')
                 media = unpack_media(record['results'][rid])
@@ -685,11 +695,15 @@ class WebAction:
                 return {"retcode": -1, "retmsg": '搜索资源不存在或已过期'}
             with SearchSessions().edit(sid) as current:
                 prior = current['downloads'].get(rid)
-                if prior:
+                if prior and prior['state'] != 'not_submitted':
                     return {"retcode": 0 if prior['state'] == 'accepted' else -1, "retmsg": prior['message']}
                 current['downloads'][rid] = {'state': 'submitting', 'message': '正在提交，请勿重复点击'}
-            # A failed/uncertain submission is retained, not silently retried by
-            # a repeated browser POST after a response timeout.
+            # Retry failures before client submission, but retain uncertain
+            # requests after that boundary to prevent duplicate downloads.
+            attempted = False
+            def before_submit():
+                nonlocal attempted
+                attempted = True
             try:
                 if not media.tmdb_info:
                     # Quick searches (including recognition fallback) only parse
@@ -711,18 +725,24 @@ class WebAction:
                                                upload_volume_factor=resource.upload_volume_factor,
                                                download_volume_factor=resource.download_volume_factor)
                 if media:
-                    ret, message = Downloader().download(media, download_dir=dl_dir, download_setting=dl_setting)
+                    ret, message = Downloader().download(media, download_dir=dl_dir, download_setting=dl_setting,
+                                                         before_submit=before_submit)
                 else:
                     ret, message = None, '识别媒体信息失败'
             except Exception:
-                ret, message = None, '提交状态待确认，请检查下载器'
-            with SearchSessions().edit(sid) as current:
-                current['downloads'][rid] = {'state': 'accepted' if ret else 'unknown',
-                    'message': '已提交下载' if ret else '提交状态待确认，请检查下载器'}
+                ret, message = None, '提交状态待确认，请检查下载器' if attempted else '下载前处理失败，请重试'
             if ret:
-                media.user_name = current_user.username
+                state, receipt_message = 'accepted', '已提交下载'
+            elif attempted:
+                state, receipt_message = 'unknown', '提交状态待确认，请检查下载器'
+            else:
+                state, receipt_message = 'not_submitted', message or '尚未提交下载，请重试'
+            with SearchSessions().edit(sid) as current:
+                current['downloads'][rid] = {'state': state, 'message': receipt_message}
+            if ret:
+                media.user_name = owner
                 Message().send_download_message(SearchType.WEB, media)
-            return {"retcode": 0 if ret else -1, "retmsg": '' if ret else message}
+            return {"retcode": 0 if ret else -1, "retmsg": '' if ret else message or receipt_message}
         results = self.dbhelper.get_search_result_by_id(dl_id)
         for res in results:
             media = Media().get_media_info(title=res.TORRENT_NAME, subtitle=res.DESCRIPTION)
@@ -741,7 +761,7 @@ class WebAction:
                                                  download_setting=dl_setting)
             if ret:
                 # 发送消息
-                media.user_name = current_user.username
+                media.user_name = owner
                 Message().send_download_message(in_from=SearchType.WEB,
                                                 can_item=media)
             else:
@@ -3952,7 +3972,8 @@ class WebAction:
                 sid = None
             if sid:
                 try:
-                    record = SearchSessions().owned(sid, current_user.username, current_user.username)
+                    owner = self._search_owner()
+                    record = SearchSessions().owned(sid, owner, owner)
                     if record['channel'] == 'web':
                         ids = list(record['results'])
                         res = self.dbhelper.make_search_results(
@@ -4096,7 +4117,8 @@ class WebAction:
                 else:
                     exist_flag = False
                 SearchResults[title_string] = {
-                    "key": item.ID,
+                    # DOM/CSS identifiers must not contain the download ID's colon.
+                    "key": str(item.ID).replace(':', '_'),
                     "title": item.TITLE,
                     "year": item.YEAR,
                     "type_key": mtype,
