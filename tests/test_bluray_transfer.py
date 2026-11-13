@@ -299,6 +299,53 @@ class BlurayTransferTest(unittest.TestCase):
         self.assertTrue(self.run_transfer(RmtMode.MOVE)[0])
         self.assertEqual(b'arrived during transfer', (self.destination / 'new-file.txt').read_bytes())
 
+    def test_move_directory_cleanup_resumes_from_receipt_after_restart(self):
+        collection = self.root / 'Collection'
+        collection.mkdir()
+        self.source = self.source.rename(collection / self.source.name)
+        downloader, client = self.downloader()
+        client.get_transfer_task.return_value = [dict(path=str(collection), id='disc-task', tags=[])]
+        rmdir = os.rmdir
+        def fail_cleanup(path, *args, **kwargs):
+            if str(path).startswith(str(self.source) + os.sep):
+                raise PermissionError('directory cleanup interrupted')
+            return rmdir(path, *args, **kwargs)
+        with patch('app.filetransfer.os.rmdir', side_effect=fail_cleanup):
+            downloader.transfer()
+        self.assertFalse((self.source / 'BDMV/index.bdmv').exists())
+        self.assert_complete(self.destination)
+        client.delete_torrents.assert_not_called()
+        # No in-memory transfer state is needed to locate the persisted receipt.
+        restarted = FileTransfer.__new__(FileTransfer)
+        restarted.__dict__.update(self.transfer.__dict__)
+        with patch.object(downloader, 'filetransfer', restarted):
+            arrived = self.source / 'new-file.txt'
+            arrived.write_bytes(b'preserve')
+            downloader.transfer()
+            self.assertEqual(arrived.read_bytes(), b'preserve')
+            client.delete_torrents.assert_not_called()
+            arrived.unlink()
+            target = self.destination / 'BDMV/STREAM/00001.m2ts'
+            original = target.stat()
+            target.write_bytes(b'damaged')
+            downloader.transfer()
+            self.assertTrue(self.source.exists())
+            client.delete_torrents.assert_not_called()
+            target.write_bytes(self.contents['BDMV/STREAM/00001.m2ts'])
+            os.utime(target, ns=(original.st_atime_ns, original.st_mtime_ns))
+            def fail_parent(path, *args, **kwargs):
+                if str(path) == str(collection):
+                    raise PermissionError('collection cleanup interrupted')
+                return rmdir(path, *args, **kwargs)
+            with patch('app.filetransfer.os.rmdir', side_effect=fail_parent):
+                downloader.transfer()
+            client.delete_torrents.assert_not_called()
+            downloader.transfer()
+        client.delete_torrents.assert_called_once_with(delete_file=True, ids='disc-task')
+        self.assertFalse(self.source.exists())
+        self.assertFalse(collection.exists())
+        self.assert_complete(self.destination)
+
     def test_scan_error_cannot_be_acknowledged_as_partial_success(self):
         walk = os.walk
         def broken_walk(path, *args, **kwargs):

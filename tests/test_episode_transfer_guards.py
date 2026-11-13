@@ -130,6 +130,48 @@ class EpisodeTransferGuardsTest(unittest.TestCase):
             task.left_until_done = 0
             downloader.check_monitored_files_complete([str(source)])
 
+            # Windows drive boundaries are normal non-membership, while a
+            # same-drive member still has to wait for its torrent to finish.
+            import ntpath
+            config.return_value.get_config.side_effect = lambda key: {'qbhost': 'offline'} if key == 'qbittorrent' else {}
+            client.get_torrents.return_value = ([dict(hash='fixture', save_path=r'C:\downloads', progress=0.5)], False)
+            client.get_files.return_value = [{'name': 'Show.mkv'}]
+            with patch('app.downloader.downloader.os', SimpleNamespace(path=ntpath)), \
+                    patch('app.utils.path_utils.os', SimpleNamespace(path=ntpath)):
+                downloader.check_monitored_files_complete([r'D:\media\Show.mkv'])
+                with self.assertRaises(DownloadNotReady):
+                    downloader.check_monitored_files_complete([r'C:\downloads\Show.mkv'])
+
+    def test_full_scan_scope_survives_pending_and_later_file_events(self):
+        from app.downloader import Downloader, DownloadNotReady
+        from app.sync import Sync
+        from tests.recognition_fixture import FakeTmdb
+        fx = FakeTmdb(self)
+        fx.tv(42, 'Show', seasons={1: 2})
+        folder = self.root / 'downloads' / 'Show'
+        folder.mkdir(parents=True)
+        first, second = folder / 'Show.S01E01.mkv', folder / 'Show.S01E02.mkv'
+        first.write_bytes(b'first')
+        second.write_bytes(b'second')
+        library = self.root / 'library'
+        library.mkdir()
+        transfer = self.transfer_fixture()
+        transfer.media, transfer._min_filesize = fx.media, 0
+        sync_type = Sync.__closure__[0].cell_contents
+        sync = sync_type.__new__(sync_type)
+        sync.filetransfer, sync.dbhelper = transfer, transfer.dbhelper
+        target = dict(target=str(library), unknown=None, syncmod=RmtMode.COPY)
+        sync.sync_dir_config = {str(folder.parent): dict(target, onlylink=False, id=1)}
+        sync._synced_files = [str(first)]
+        sync._need_sync_paths = {str(folder): dict(target, files=[str(first)])}
+        with patch.object(type(Downloader()), 'check_monitored_files_complete', side_effect=DownloadNotReady('unfinished')):
+            self.assertFalse(sync._Sync__transfer_all_sync())
+        sync._defer_sync(str(folder), dict(target, files=[str(first)]))
+        sync.transfer_mon_files()
+        self.assertCountEqual([path.read_bytes() for path in library.rglob('*.mkv')], [b'first', b'second'])
+        self.assertEqual(sync._need_sync_paths, {})
+        self.assertEqual(sync._synced_files, [])
+
     def test_invalid_batch_target_stops_before_any_transfer_or_lookup(self):
         paths = [self.root / 'Show.E03.mkv', self.root / 'Show.E01.mkv']
         for path in paths:

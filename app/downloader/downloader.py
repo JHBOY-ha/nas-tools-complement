@@ -14,7 +14,7 @@ from app.message import Message
 from app.sites import Sites
 from app.subtitle import Subtitle
 from app.conf import SystemConfig
-from app.utils import Torrent, StringUtils, SystemUtils, ExceptionUtils
+from app.utils import Torrent, StringUtils, SystemUtils, ExceptionUtils, PathUtils
 from app.utils.commons import singleton
 from app.utils.search_cancellation import SearchCancelled
 from app.utils.types import MediaType, DownloaderType, SearchType, RmtMode
@@ -254,7 +254,9 @@ class Downloader:
                 root = os.path.realpath(client.get_replace_path(save_path))
                 # Only fetch manifests that can overlap this batch (including
                 # selected Blu-ray directories). Unrelated local files stay usable.
-                if not any(os.path.commonpath([root, path]) in (root, path) for path in wanted):
+                # Different Windows drives are disjoint, not a failed download check.
+                if not any(PathUtils.is_path_in_path(root, path) or PathUtils.is_path_in_path(path, root)
+                           for path in wanted):
                     continue
                 tid = torrent.get('hash') if kind == DownloaderType.QB else torrent.id
                 files = client.get_files(tid)
@@ -265,7 +267,7 @@ class Downloader:
                     if not name:
                         continue
                     member = os.path.realpath(os.path.join(root, name))
-                    if any(member == path or (os.path.isdir(path) and os.path.commonpath([path, member]) == path)
+                    if any(member == path or (os.path.isdir(path) and PathUtils.is_path_in_path(path, member))
                            for path in wanted):
                         raise DownloadNotReady('下载任务尚未完成，稍后重试目录同步')
 

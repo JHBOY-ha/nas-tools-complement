@@ -2389,8 +2389,11 @@ class Subtitle:
                        "ze": "zh-cn"}
             # Only language/accessibility/collision tags may follow the exact
             # video stem. A release suffix such as Extended belongs to another cut.
-            tags = set(aliases) | set(aliases.values()) | wanted | {
-                'zh', 'chi', 'zho', 'chinese', 'forced', 'default', 'sdh', 'cc', 'hi', 'full'}
+            # A bilingual subtitle can include languages outside the user's
+            # download preference. Reuse the supported ISO code table for tags.
+            tags = (set(aliases) | set(aliases.values()) | wanted | set(self._jellyfin_iso639_2)
+                    | set(self._jellyfin_iso639_2.values()) | {
+                        'zh', 'chi', 'zho', 'chinese', 'forced', 'default', 'sdh', 'cc', 'hi', 'full'})
             if stem != media_name and any(
                     token not in tags and not re.fullmatch(r'source-\d+', token) for token in tokens):
                 continue

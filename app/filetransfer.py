@@ -334,13 +334,14 @@ class FileTransfer:
                             log.info("【Rmt】字幕 %s 出错了,原因: %s" % (new_file, str(reason)))
         return 0
 
-    def __transfer_bluray_dir(self, file_path, new_path, rmt_mode, record_callback):
+    def __transfer_bluray_dir(self, file_path, new_path, rmt_mode, record_callback, cleanup_receipts):
         """
         转移蓝光文件夹
         :param file_path: 原路径
         :param new_path: 新路径
         :param rmt_mode: RmtMode转移方式
         :param record_callback: 整盘校验后提交历史及去重记录；成功才允许清理源目录
+        :param cleanup_receipts: 由整批转移确认完成后清除的目录清理回执
         """
         if rmt_mode not in (RmtMode.COPY, RmtMode.MOVE, RmtMode.LINK, RmtMode.SOFTLINK):
             # Remote commands have no locally verifiable destination. In particular,
@@ -409,6 +410,9 @@ class FileTransfer:
                 if record_callback() is not True:
                     raise ValueError("蓝光原盘转移记录未确认，保留源目录等待重试")
             if rmt_mode == RmtMode.MOVE:
+                from app.media.meta.bluray_cleanup import save_cleanup
+                receipt = save_cleanup(file_path, targets.values())
+                cleanup_receipts[os.path.abspath(file_path)] = receipt
                 # Keep the disc entry point until the last byte-bearing file is
                 # cleaned up, so a failed cleanup can still enter disc retry logic.
                 for source in sorted(originals, key=lambda path: os.path.basename(path).lower() == 'index.bdmv'):
@@ -598,7 +602,14 @@ class FileTransfer:
         :return: 处理状态，错误信息
         """
 
+        cleaned = {}
         def __finish_transfer(status, message):
+            if status:
+                try:
+                    for receipt in cleaned.values():
+                        os.unlink(receipt)
+                except OSError as error:
+                    status, message = False, '原盘清理回执尚未确认：%s' % error
             if status:
                 self.progress.update(ptype="filetransfer",
                                      value=100,
@@ -630,6 +641,20 @@ class FileTransfer:
 
         if not rmt_mode:
             rmt_mode = self._default_rmt_mode
+
+        if rmt_mode == RmtMode.MOVE:
+            from app.media.meta.bluray_cleanup import resume_cleanup, remove_empty_tree
+            try:
+                cleaned = resume_cleanup(files or [in_path])
+                if os.path.abspath(in_path) in cleaned or (cleaned and not os.path.lexists(in_path)):
+                    return __finish_transfer(True, '已完成原盘源目录清理')
+                if files and cleaned:
+                    files = [path for path in files if not any(
+                        PathUtils.is_path_in_path(root, os.path.abspath(path)) for root in cleaned)]
+                    if not files:
+                        return __finish_transfer(True, '已完成原盘源目录清理')
+            except (OSError, ValueError) as error:
+                return __finish_transfer(False, str(error))
 
         log.info("【Rmt】开始处理：%s，转移方式：%s" % (in_path, rmt_mode.value))
 
@@ -689,6 +714,12 @@ class FileTransfer:
                     file_list = [path for path in file_list if eligible(path)]
                     log.debug("【Rmt】文件清单：" + str(file_list))
                     if len(file_list) == 0:
+                        if cleaned:
+                            try:
+                                if remove_empty_tree(in_path):
+                                    return __finish_transfer(True, '已完成原盘源目录清理')
+                            except OSError as error:
+                                return __finish_transfer(False, str(error))
                         # Explain actual rejections, rather than implying that
                         # an unrelated configured size limit caused every empty scan.
                         reasons = ["%s %s 个" % (label, diagnostics[key]) for key, label in (
@@ -1074,7 +1105,7 @@ class FileTransfer:
                         os.makedirs(ret_dir_path)
                 # 转移蓝光原盘
                 if bluray_disk_dir:
-                    ret = self.__transfer_bluray_dir(file_item, ret_dir_path, rmt_mode, record_bluray)
+                    ret = self.__transfer_bluray_dir(file_item, ret_dir_path, rmt_mode, record_bluray, cleaned)
                     if ret != 0:
                         success_flag = False
                         error_message = "蓝光目录转移失败，错误码：%s" % ret

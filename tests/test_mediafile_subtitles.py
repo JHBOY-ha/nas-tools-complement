@@ -118,7 +118,7 @@ class MediaFileSubtitlesTest(TestCase):
         self.refresh.assert_called_once()
 
     def test_existing_source_and_repeated_click_sync_without_consuming_quota(self):
-        self.source_subtitle.write_text(SRT)
+        self.source.with_suffix('.chi.zh-cn.jpn.srt').write_text(SRT)
         self.subtitle.opensubtitles.is_configured.return_value = (False, "凭据已过期")
         for _ in range(2):
             success, message = self.run_download()

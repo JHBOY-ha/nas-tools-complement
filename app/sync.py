@@ -256,9 +256,12 @@ class Sync(object):
                             self._synced_files.remove(event_path)
 
     def _defer_sync(self, path, target_info):
-        # Merge events that arrived while this batch was checking the downloader.
+        # Keep full-directory scope independent of the event list: the latter
+        # still owns dedupe claims that must be released when the batch finishes.
         with lock:
-            pending = self._need_sync_paths.setdefault(path, dict(target_info, files=[]))
+            pending = self._need_sync_paths.setdefault(path, dict(target_info))
+            pending['full_scan'] = (pending.get('full_scan', not pending.get('files'))
+                                    or target_info.get('full_scan', not target_info.get('files')))
             pending['files'] = list(dict.fromkeys(pending['files'] + target_info.get('files', [])))
 
     def transfer_mon_files(self):
@@ -284,7 +287,7 @@ class Sync(object):
                     src_path = PathUtils.get_bluray_dir(path) or path
                     ret, ret_msg = self.filetransfer.transfer_media(
                         in_from=SyncType.MON, in_path=src_path,
-                        files=[] if src_path != path else files,
+                        files=[] if src_path != path or target_info.get('full_scan') else files,
                         target_dir=target_info.get('target'),
                         unknown_dir=target_info.get('unknown'),
                         rmt_mode=target_info.get('syncmod'))

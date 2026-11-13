@@ -557,6 +557,8 @@ class OpenSubtitlesApiTest(TestCase):
             (".srt", "This is an English subtitle with enough letters.", False),
             (".srt", "这是中文字幕内容", True),
             (".chi.zh-cn.srt", "字幕", True),
+            (".chi.zh-cn.jpn.srt", "中文字幕和日文", True),
+            (".zh-cn.ja.srt", "中文字幕和日文", True),
             (".CHT.ASS", "字幕", True),
             (".zh-Hans.srt", "字幕", True),
             (".chi.zh-tw.srt", "字幕", True),
