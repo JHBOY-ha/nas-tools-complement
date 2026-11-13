@@ -644,14 +644,24 @@ class WebAction:
                 media_type = MediaType.TV
         if search_word:
             from app.helper.search_sessions import SearchSessions
-            record, _ = SearchSessions().create(current_user.username, current_user.username, search_word, channel='web')
+            searches = SearchSessions()
+            record, _ = searches.create(current_user.username, current_user.username, search_word, channel='web')
             session['search_id'] = record['id']
-            ret, ret_msg = search_medias_for_web(content=search_word,
-                                                 ident_flag=ident_flag,
-                                                 filters=filters,
-                                                 tmdbid=tmdbid,
-                                                 media_type=media_type, search_id=record["id"])
+            try:
+                ret, ret_msg = search_medias_for_web(content=search_word,
+                                                     ident_flag=ident_flag,
+                                                     filters=filters,
+                                                     tmdbid=tmdbid,
+                                                     media_type=media_type, search_id=record["id"])
+            except Exception:
+                # Failed searches must be terminal so normal TTL eviction can
+                # reclaim their slots, including failures before publication.
+                with searches.edit(record['id']) as current:
+                    current.update(state='failed', message='搜索失败，请重试')
+                raise
             if ret != 0:
+                with searches.edit(record['id']) as current:
+                    current.update(state='failed', message=ret_msg)
                 return {"code": ret, "msg": ret_msg, "search_id": record["id"]}
             return {"code": 0, "search_id": record["id"]}
         return {"code": 0}
@@ -681,7 +691,29 @@ class WebAction:
             # A failed/uncertain submission is retained, not silently retried by
             # a repeated browser POST after a response timeout.
             try:
-                ret, message = Downloader().download(media, download_dir=dl_dir, download_setting=dl_setting)
+                if not media.tmdb_info:
+                    # Quick searches (including recognition fallback) only parse
+                    # releases. Resolve numbering now, keeping the selected site
+                    # and torrent rather than replacing the resource snapshot.
+                    resource = media
+                    media = Media().get_media_info(title=resource.org_string, subtitle=resource.description)
+                    if media:
+                        media.set_torrent_info(site=resource.site,
+                                               site_order=resource.site_order,
+                                               enclosure=resource.enclosure,
+                                               res_order=resource.res_order,
+                                               filter_rule=resource.filter_rule,
+                                               size=resource.size,
+                                               seeders=resource.seeders,
+                                               peers=resource.peers,
+                                               description=resource.description,
+                                               page_url=resource.page_url,
+                                               upload_volume_factor=resource.upload_volume_factor,
+                                               download_volume_factor=resource.download_volume_factor)
+                if media:
+                    ret, message = Downloader().download(media, download_dir=dl_dir, download_setting=dl_setting)
+                else:
+                    ret, message = None, '识别媒体信息失败'
             except Exception:
                 ret, message = None, '提交状态待确认，请检查下载器'
             with SearchSessions().edit(sid) as current:

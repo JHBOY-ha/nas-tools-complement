@@ -780,12 +780,183 @@ class WebSearchIsolationTest(SearchSessionFixture):
         with app.test_request_context('/do'), \
                 patch('app.helper.search_sessions.SearchSessions', return_value=self.store), \
                 patch('web.action.current_user', SimpleNamespace(username='alice')), \
-                patch('web.action.Downloader') as downloader, patch('web.action.Message'):
+                patch('web.action.Downloader') as downloader, patch('web.action.Message'), \
+                patch('web.action.Media') as media:
             downloader.return_value.download.return_value = (True, '')
             for _ in range(2):
                 self.assertEqual(action._WebAction__download({'id': record['id'] + ':0'})['retcode'], 0)
             downloader.return_value.download.assert_called_once()
             self.assertEqual(downloader.return_value.download.call_args.args[0].tmdb_id, 438631)
+            media.assert_not_called()
+
+
+class WebSearchReviewTest(SearchSessionFixture):
+    def setUp(self):
+        super().setUp()
+        from types import SimpleNamespace
+        from flask import Flask
+        from web.action import WebAction
+        self.app = Flask(__name__)
+        self.app.secret_key = 'offline-test'
+        context = self.app.test_request_context('/do')
+        context.push()
+        self.addCleanup(context.pop)
+        self.action = WebAction.__new__(WebAction)
+        for replacement in (
+                patch('app.helper.search_sessions.SearchSessions', return_value=self.store),
+                patch('web.action.current_user', SimpleNamespace(username='alice'))):
+            replacement.start()
+            self.addCleanup(replacement.stop)
+
+    def test_quick_and_fallback_downloads_resolve_release_and_keep_resource(self):
+        from app.media.meta.special import download_block_reason
+        from tests.recognition_fixture import FakeTmdb
+        fx = FakeTmdb(self)
+        fx.tv(42, 'Show', genres=(16,), seasons={0: 2, 1: 1})
+        fx.episodes[(42, 0)][1].update(name='Bonus', overview='Season 1 OVA01; Episode 13.5')
+        fx.movie(43, 'Dune', year='2021')
+        resource = dict(site='Selected site', site_order=3, enclosure='https://example.test/selected.torrent',
+                        res_order=4, filter_rule='selected-rule', size=1024 ** 3, seeders=12, peers=2,
+                        description='Selected release description', page_url='https://example.test/details/1',
+                        upload_volume_factor=2.0, download_volume_factor=0.0)
+        with patch('web.backend.search_torrents.Searcher') as searcher, \
+                patch('web.backend.search_torrents.ProgressHelper'), \
+                patch('web.action.Media', return_value=fx.media), \
+                patch.object(fx.media, 'get_media_info', wraps=fx.media.get_media_info) as recognize, \
+                patch('web.action.Downloader') as downloader, patch('web.action.Message') as messages:
+            searcher.return_value.media.get_media_info.return_value = None
+            downloader.return_value.download.return_value = (True, '')
+            for quick in (True, False):
+                for title, tmdbid, season, episodes in (
+                        ('Dune.2021.1080p', 43, None, []),
+                        ('Show.S01E01.1080p', 42, 1, [1]),
+                        ('Show.S00E02.1080p', 42, 0, [2]),
+                        ('Show S01 [OVA01] [1080p]', 42, 0, [2]),
+                        ('Show.S01E13.5.1080p', 42, 0, [2])):
+                    with self.subTest(quick=quick, title=title):
+                        item = MetaInfo(title, use_llm=False)
+                        item.set_torrent_info(**resource)
+                        searcher.return_value.search_medias.return_value = [item]
+                        result = self.action._WebAction__search({'search_word': 'Show', 'unident': quick})
+                        self.assertEqual(result['code'], 0)
+                        sid = result['search_id']
+                        snapshot = self.store.get(sid)['results']['0']
+                        self.assertFalse(self.store.get(sid)['ident_flag'])
+                        self.assertFalse(unpack_media(snapshot).tmdb_info)
+                        recognize.reset_mock()
+                        downloader.return_value.download.reset_mock()
+                        messages.return_value.send_download_message.reset_mock()
+                        for _ in range(2):
+                            response = self.action._WebAction__download(
+                                {'id': sid + ':0', 'dir': '/downloads/selected', 'setting': '7'})
+                            self.assertEqual(response['retcode'], 0, response)
+                        recognize.assert_called_once_with(title=title, subtitle=resource['description'])
+                        downloader.return_value.download.assert_called_once()
+                        call = downloader.return_value.download.call_args
+                        resolved = call.args[0]
+                        self.assertEqual(call.kwargs, {'download_dir': '/downloads/selected', 'download_setting': '7'})
+                        self.assertEqual(resolved.tmdb_id, tmdbid)
+                        self.assertEqual((resolved.begin_season, resolved.get_episode_list()), (season, episodes))
+                        self.assertIsNone(download_block_reason(resolved))
+                        for field, value in resource.items():
+                            self.assertEqual(getattr(resolved, field), value, field)
+                        context = Downloader.__closure__[0].cell_contents._build_download_context(resolved)
+                        self.assertEqual(context['tmdb_info']['id'], tmdbid)
+                        self.assertEqual(context['episodes'], episodes)
+                        self.assertEqual(context['source_title'], title)
+                        self.assertEqual(self.store.get(sid)['results']['0'], snapshot)
+                        messages.return_value.send_download_message.assert_called_once_with(SearchType.WEB, resolved)
+
+    def test_unconfirmed_special_remains_rejected_by_real_downloader(self):
+        from tests.recognition_fixture import FakeTmdb
+        fx = FakeTmdb(self)
+        fx.tv(42, 'Show', genres=(16,), seasons={0: 1, 1: 1})
+        item = MetaInfo('Show.S00E99.1080p', use_llm=False)
+        item.enclosure = 'https://example.test/unconfirmed.torrent'
+        record, _ = self.store.create('alice', 'alice', 'Show', channel='web')
+        with self.store.edit(record['id']) as current:
+            current.update(state='results', results={'0': pack_media(item)})
+        downloader_type = Downloader.__closure__[0].cell_contents
+        downloader = downloader_type.__new__(downloader_type)
+        # The real download guard must reject before touching any uninitialized
+        # downloader clients or fetching the selected torrent.
+        with patch('web.action.Media', return_value=fx.media), \
+                patch('web.action.Downloader', return_value=downloader), \
+                patch.object(downloader, 'download', wraps=downloader.download) as submit, \
+                patch('web.action.Message') as messages:
+            response = self.action._WebAction__download({'id': record['id'] + ':0'})
+        resolved = submit.call_args.args[0]
+        self.assertEqual(resolved.tmdb_id, 42)
+        self.assertTrue(resolved.skip_reason)
+        self.assertEqual(response, {'retcode': -1, 'retmsg': resolved.skip_reason})
+        messages.assert_not_called()
+
+    def test_recognition_failure_does_not_submit_or_leave_download_submitting(self):
+        with patch('web.action.Media') as media, patch('web.action.Downloader') as downloader, \
+                patch('web.action.Message') as messages:
+            for error in (None, RuntimeError('recognition failed')):
+                with self.subTest(error=error):
+                    record, _ = self.store.create('alice', 'alice', 'Show', channel='web')
+                    with self.store.edit(record['id']) as current:
+                        current.update(state='results', results={'0': pack_media(MetaInfo('Show', use_llm=False))})
+                    media.return_value.get_media_info.return_value = None
+                    media.return_value.get_media_info.side_effect = error
+                    for _ in range(2):
+                        response = self.action._WebAction__download({'id': record['id'] + ':0'})
+                        self.assertEqual(response['retcode'], -1)
+                    self.assertEqual(self.store.get(record['id'])['downloads']['0']['state'], 'unknown')
+            downloader.assert_not_called()
+            messages.assert_not_called()
+
+    def test_unsuccessful_searches_persist_terminal_state_and_reason(self):
+        blocked = MetaInfo('Show [OVA]', use_llm=False)
+        with patch('web.backend.search_torrents.Searcher') as searcher, \
+                patch('web.backend.search_torrents.ProgressHelper'):
+            searcher.return_value.search_medias.return_value = []
+            for title, media, code in (('   ', None, -1), ('Show [OVA]', blocked, -1), ('Show', None, 1)):
+                with self.subTest(title=title):
+                    searcher.return_value.media.get_media_info.return_value = media
+                    result = self.action._WebAction__search({'search_word': title})
+                    self.assertEqual(result['code'], code)
+                    record = self.store.get(result['search_id'])
+                    self.assertEqual(record['state'], 'failed')
+                    self.assertEqual(record['message'], result['msg'])
+                    self.assertEqual(self.store_type(self.directory.name).get(record['id'])['state'], 'failed')
+
+    def test_search_exceptions_are_terminal_and_still_propagate(self):
+        from flask import session
+        with patch('web.backend.search_torrents.Searcher') as searcher, \
+                patch('web.backend.search_torrents.ProgressHelper'):
+            for boundary in (searcher.return_value.media.get_media_info, searcher.return_value.search_medias):
+                with self.subTest(boundary=boundary):
+                    searcher.return_value.media.get_media_info.return_value = None
+                    boundary.side_effect = RuntimeError('search failed')
+                    with self.assertRaisesRegex(RuntimeError, 'search failed'):
+                        self.action._WebAction__search({'search_word': 'Show'})
+                    record = self.store.get(session['search_id'])
+                    self.assertEqual(record['state'], 'failed')
+                    self.assertEqual(self.store_type(self.directory.name).get(record['id'])['state'], 'failed')
+                    boundary.side_effect = None
+
+    def test_expired_web_failures_release_capacity_for_web_and_telegram(self):
+        from flask import session
+        with patch('web.backend.search_torrents.Searcher') as searcher, \
+                patch('web.backend.search_torrents.ProgressHelper'):
+            searcher.return_value.media.get_media_info.return_value = MetaInfo('Show [OVA]', use_llm=False)
+            rejected = self.action._WebAction__search({'search_word': 'Show [OVA]'})['search_id']
+            searcher.return_value.media.get_media_info.side_effect = RuntimeError('search failed')
+            with self.assertRaises(RuntimeError):
+                self.action._WebAction__search({'search_word': 'Show'})
+            failed = session['search_id']
+        for _ in range(98):
+            self.store.create('other', 'other', 'active search')
+        with self.assertRaises(TaskQueueFull):
+            self.store.create('alice', 'alice', 'before expiry', channel='web')
+        with patch('app.helper.search_sessions.time.time', return_value=time.time() + self.store.ttl + 1):
+            for channel in ('web', 'telegram'):
+                self.store.create('alice', 'alice', 'after expiry', channel=channel)
+        self.assertIsNone(self.store.get(rejected))
+        self.assertIsNone(self.store.get(failed))
 
 
 
