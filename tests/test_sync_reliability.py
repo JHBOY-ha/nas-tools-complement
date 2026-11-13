@@ -611,6 +611,9 @@ class HardlinkTests(unittest.TestCase):
 
     def setUp(self):
         self.ns = env()
+        from app.utils import PathUtils
+        # Explicit file lists now pass through the same real disc normalizer.
+        self.ns['PathUtils'] = PathUtils
         self.mode = MediaType.ANIME  # Enum-shaped transfer mode; no app imports needed.
         self.ns['RmtMode'].LINK = self.mode
         cls = load_class('app/filetransfer.py', 'FileTransfer', [
