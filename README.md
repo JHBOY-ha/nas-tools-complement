@@ -684,13 +684,6 @@ docker pull jhboy/nastools-comp:2.10.2v1-amd64
 来源选择“OpenSubtitles”或“全部来源”可检索 OpenSubtitles.com 字幕，复用“设置 → 字幕设置 → OpenSubtitles”中保存的 API Key、账户和语言优先级。手动下载不依赖自动字幕下载开关或当前自动下载器；搜索仅需 API Key，下载还需用户名及密码。检索优先匹配视频 Hash，再按 IMDb 或检索词和季集查询，结果校验 API 作品及季集信息；不使用自动下载的版本相似度门槛。点击“下载并保存”后需确认消耗一次账户配额，同一搜索结果的重复请求复用已有字幕任务，避免再次申请下载链接。媒体改名后的字幕仍保存到选中的视频旁。
 
 在线检索协议和 CID 算法参考 [MeiamSubtitles](https://github.com/91270/MeiamSubtitles)，按 NASTool 的字幕库和上传流程重新实现；上游采用 Apache-2.0，许可见 `third_party/meiamsubtitles/LICENSE`。未接入已停止维护的旧 Shooter 接口。
-
-## 鸣谢
-* 程序UI模板及图标来源于开源项目<a href="https://github.com/tabler/tabler">tabler</a>，此外项目中还使用到了开源模块：<a href="https://github.com/igorcmoura/anitopy" target="_blank">anitopy</a>、<a href="https://github.com/AnthonyBloomer/tmdbv3api" target="_blank">tmdbv3api</a>、<a href="https://github.com/pkkid/python-plexapi" target="_blank">python-plexapi</a>、<a href="https://github.com/rmartin16/qbittorrent-api">qbittorrent-api</a>、<a href="https://github.com/Trim21/transmission-rpc">transmission-rpc</a>等
-* 感谢 <a href="https://github.com/devome" target="_blank">nevinee</a> 完善docker构建
-* 感谢 <a href="https://github.com/tbc0309" target="_blank">tbc0309</a> 适配群晖套件
-* 感谢 PR 代码、完善WIKI、发布教程的所有大佬
-
 ### 上传整季字幕
 
 在字幕库中点击电视剧或动漫的海报，在详情抽屉的剧集列表中选择具体的一季（只有一季时自动选中），点击“上传整季字幕”，直接多选 SRT、ASS、SSA、VTT、SMI 字幕文件，或选择一个 ZIP 包，再点击“预览匹配”。上传和解包不依赖任何外部工具：RAR 请先解压，再多选其中的字幕文件。ZIP 支持包内子目录；不处理嵌套压缩包、加密包及图形字幕。
@@ -700,3 +693,10 @@ docker pull jhboy/nastools-comp:2.10.2v1-amd64
 点击“上传所选字幕”后创建一个持久后台任务，按集保存到对应视频旁，逐集复核路径授权、更新字幕快照并局部刷新媒体服务器。字幕包不会按内部路径直接解压到媒体目录，已有字幕不覆盖。关闭页面后后台继续，可通过任务中心查看逐项结果或取消，重启后按检查点恢复。
 
 “任务设置 → 整季字幕包数量”默认允许 100 个文本字幕，最高 200 个；压缩包及展开内容仍受单批总量、文本单文件、暂存额度和任务时间限制。LLM 对齐仍受 LLM 单批数量限制。一次任务的目标必须处于同一存储卷，跨卷时分开勾选提交。
+## 鸣谢
+* 程序UI模板及图标来源于开源项目<a href="https://github.com/tabler/tabler">tabler</a>，此外项目中还使用到了开源模块：<a href="https://github.com/igorcmoura/anitopy" target="_blank">anitopy</a>、<a href="https://github.com/AnthonyBloomer/tmdbv3api" target="_blank">tmdbv3api</a>、<a href="https://github.com/pkkid/python-plexapi" target="_blank">python-plexapi</a>、<a href="https://github.com/rmartin16/qbittorrent-api">qbittorrent-api</a>、<a href="https://github.com/Trim21/transmission-rpc">transmission-rpc</a>等
+* 感谢 <a href="https://github.com/devome" target="_blank">nevinee</a> 完善docker构建
+* 感谢 <a href="https://github.com/tbc0309" target="_blank">tbc0309</a> 适配群晖套件
+* 感谢 PR 代码、完善WIKI、发布教程的所有大佬
+
+
