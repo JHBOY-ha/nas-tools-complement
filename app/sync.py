@@ -146,6 +146,7 @@ class Sync(object):
         :param text: 事件描述
         :param event_path: 事件文件路径
         """
+        from app.downloader import DownloadNotReady
         if not event.is_directory:
             keep_pending = False
             claimed = False
@@ -240,6 +241,11 @@ class Sync(object):
                         if event_path not in item['files']:
                             item['files'].append(event_path)
                         keep_pending = True
+            except DownloadNotReady as error:
+                self._defer_sync(event_path, dict(source=monitor_dir, target=target_path,
+                    unknown=unknown_path, syncmod=sync_mode, files=[event_path], onlylink=True))
+                keep_pending = True
+                log.info('【Sync】%s：%s' % (event_path, error))
             except Exception as e:
                 ExceptionUtils.exception_traceback(e)
                 log.error("【Sync】发生错误：%s - %s" % (str(e), traceback.format_exc()))
@@ -249,10 +255,20 @@ class Sync(object):
                         if event_path in self._synced_files:
                             self._synced_files.remove(event_path)
 
+    def _defer_sync(self, path, target_info):
+        # Keep full-directory scope independent of the event list: the latter
+        # still owns dedupe claims that must be released when the batch finishes.
+        with lock:
+            pending = self._need_sync_paths.setdefault(path, dict(target_info))
+            pending['full_scan'] = (pending.get('full_scan', not pending.get('files'))
+                                    or target_info.get('full_scan', not target_info.get('files')))
+            pending['files'] = list(dict.fromkeys(pending['files'] + target_info.get('files', [])))
+
     def transfer_mon_files(self):
         """
         批量转移文件，由定时服务定期调用执行
         """
+        from app.downloader import DownloadNotReady
         # 锁只保护领取队列，识别和磁盘操作不阻塞事件入队。
         with lock:
             pending = self._need_sync_paths
@@ -260,22 +276,33 @@ class Sync(object):
         for path, target_info in pending.items():
             files = target_info.get('files') or []
             try:
-                src_path = PathUtils.get_bluray_dir(path) or path
-                ret, ret_msg = self.filetransfer.transfer_media(
-                    in_from=SyncType.MON, in_path=src_path,
-                    files=[] if src_path != path else files,
-                    target_dir=target_info.get('target'),
-                    unknown_dir=target_info.get('unknown'),
-                    rmt_mode=target_info.get('syncmod'))
+                if target_info.get('onlylink'):
+                    code, ret_msg = self.filetransfer.link_sync_file(
+                        src_path=target_info['source'], in_file=path,
+                        target_dir=target_info['target'], sync_transfer_mode=target_info['syncmod'])
+                    ret = code == 0
+                    if ret and not ret_msg:
+                        ret = self.dbhelper.insert_sync_history(path, target_info['source'], target_info['target']) is not False
+                else:
+                    src_path = PathUtils.get_bluray_dir(path) or path
+                    ret, ret_msg = self.filetransfer.transfer_media(
+                        in_from=SyncType.MON, in_path=src_path,
+                        files=[] if src_path != path or target_info.get('full_scan') else files,
+                        target_dir=target_info.get('target'),
+                        unknown_dir=target_info.get('unknown'),
+                        rmt_mode=target_info.get('syncmod'))
                 if not ret:
                     log.warn("【Sync】%s转移失败：%s" % (path, ret_msg))
                     self.__record_unknown_files(files or [path], target_info)
                     continue
-                # 成功后释放事件去重；失败的文件保留在 _synced_files 里，不再自动重试
+                # 成功后释放事件去重；识别/转移失败仍走未识别，等待下载的项留队。
                 with lock:
                     for file in files:
                         if file in self._synced_files:
                             self._synced_files.remove(file)
+            except DownloadNotReady as error:
+                self._defer_sync(path, target_info)
+                log.info('【Sync】%s：%s' % (path, error))
             except Exception as err:
                 ExceptionUtils.exception_traceback(err)
                 log.error("【Sync】%s转移异常：%s" % (path, str(err)))
@@ -348,6 +375,7 @@ class Sync(object):
             _transfer_all_lock.release()
 
     def __transfer_all_sync(self, sid=None):
+        from app.downloader import DownloadNotReady
         # 失败后仍处理其余文件，但后续成功不能抹去此前失败；正常忽略、已同步
         # 和空目录仍视为完成。异常由调用方的任务边界报告失败。
         success = True
@@ -366,10 +394,17 @@ class Sync(object):
                     if self.dbhelper.is_sync_in_history(link_file, target_path):
                         continue
                     log.info("【Sync】开始同步 %s" % link_file)
-                    ret, msg = self.filetransfer.link_sync_file(src_path=monpath,
-                                                                in_file=link_file,
-                                                                target_dir=target_path,
-                                                                sync_transfer_mode=sync_mode)
+                    try:
+                        ret, msg = self.filetransfer.link_sync_file(src_path=monpath,
+                                                                    in_file=link_file,
+                                                                    target_dir=target_path,
+                                                                    sync_transfer_mode=sync_mode)
+                    except DownloadNotReady as error:
+                        self._defer_sync(link_file, dict(source=monpath, target=target_path,
+                            unknown=unknown_path, syncmod=sync_mode, files=[link_file], onlylink=True))
+                        success = False
+                        log.info('【Sync】%s：%s' % (link_file, error))
+                        continue
                     if ret != 0:
                         success = False
                         log.warn("【Sync】%s 同步失败，错误码：%s" % (link_file, ret))
@@ -384,11 +419,18 @@ class Sync(object):
                 for path in PathUtils.get_dir_level1_medias(monpath, RMT_MEDIAEXT):
                     if PathUtils.is_invalid_path(path):
                         continue
-                    ret, ret_msg = self.filetransfer.transfer_media(in_from=SyncType.MON,
-                                                                    in_path=path,
-                                                                    target_dir=target_path,
-                                                                    unknown_dir=unknown_path,
-                                                                    rmt_mode=sync_mode)
+                    try:
+                        ret, ret_msg = self.filetransfer.transfer_media(in_from=SyncType.MON,
+                                                                        in_path=path,
+                                                                        target_dir=target_path,
+                                                                        unknown_dir=unknown_path,
+                                                                        rmt_mode=sync_mode)
+                    except DownloadNotReady as error:
+                        self._defer_sync(path, dict(target=target_path, unknown=unknown_path,
+                                                  syncmod=sync_mode, files=[]))
+                        success = False
+                        log.info('【Sync】%s：%s' % (path, error))
+                        continue
                     if not ret:
                         success = False
                         log.error("【Sync】%s 处理失败：%s" % (monpath, ret_msg))

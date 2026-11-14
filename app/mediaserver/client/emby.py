@@ -1,6 +1,7 @@
 import os
 import json
 import re
+from urllib.parse import quote, urlencode
 
 import log
 from config import Config
@@ -312,7 +313,7 @@ class Emby(_IMediaClient):
             return None
         return None
 
-    def get_item_image(self, item_id, image_type="Primary"):
+    def get_item_image(self, item_id, image_type="Primary", max_width=None, quality=None, tag=None):
         """
         获取Emby当前项目图片响应
         """
@@ -320,7 +321,15 @@ class Emby(_IMediaClient):
             return None
         if not self._host or not self._apikey:
             return None
-        req_url = "%semby/Items/%s/Images/%s?api_key=%s" % (self._host, item_id, image_type, self._apikey)
+        params = {"api_key": self._apikey}
+        if max_width:
+            params["maxWidth"] = int(max_width)
+        if quality:
+            params["quality"] = int(quality)
+        if tag:
+            params["tag"] = str(tag)
+        req_url = "%semby/Items/%s/Images/%s?%s" % (
+            self._host, quote(str(item_id), safe=""), quote(str(image_type), safe=""), urlencode(params))
         try:
             return RequestUtils().get_res(req_url)
         except Exception as e:
@@ -504,6 +513,28 @@ class Emby(_IMediaClient):
             ExceptionUtils.exception_traceback(e)
             return {}
 
+    @staticmethod
+    def sync_item_from_info(item_info, item_id=None):
+        """
+        把项目详情转换为同步记录；全量同步与单项刷新共用，保证字段一致。
+        """
+        return {"id": item_id or item_info.get("Id"),
+                "library": item_info.get("ParentId"),
+                "type": item_info.get("Type"),
+                "title": item_info.get("Name"),
+                "originalTitle": item_info.get("OriginalTitle"),
+                "year": item_info.get("ProductionYear"),
+                "tmdbid": item_info.get("ProviderIds", {}).get("Tmdb"),
+                "imdbid": item_info.get("ProviderIds", {}).get("Imdb"),
+                "path": item_info.get("Path"),
+                "json": json.dumps(item_info, ensure_ascii=False)}
+
+    def get_sync_item(self, item_id):
+        """
+        读取单个项目的最新同步记录；读取失败抛出异常，不触发服务器刮削。
+        """
+        return self.sync_item_from_info(self.get_iteminfo(item_id, strict=True), item_id)
+
     def get_items(self, parent, strict=False):
         """
         获取媒体服务器所有媒体库列表
@@ -531,16 +562,7 @@ class Emby(_IMediaClient):
                         continue
                     if result.get("Type") in ["Movie", "Series"]:
                         item_info = self.get_iteminfo(result.get("Id"), strict=strict)
-                        yield {"id": result.get("Id"),
-                               "library": item_info.get("ParentId"),
-                               "type": item_info.get("Type"),
-                               "title": item_info.get("Name"),
-                               "originalTitle": item_info.get("OriginalTitle"),
-                               "year": item_info.get("ProductionYear"),
-                               "tmdbid": item_info.get("ProviderIds", {}).get("Tmdb"),
-                               "imdbid": item_info.get("ProviderIds", {}).get("Imdb"),
-                               "path": item_info.get("Path"),
-                               "json": json.dumps(item_info, ensure_ascii=False)}
+                        yield self.sync_item_from_info(item_info, result.get("Id"))
                     elif "Folder" in result.get("Type"):
                         for item in self.get_items(parent=result.get('Id'), strict=strict):
                             yield item

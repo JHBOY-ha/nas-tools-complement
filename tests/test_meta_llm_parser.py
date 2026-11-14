@@ -2,6 +2,7 @@
 
 import json
 import os
+import threading
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
@@ -9,6 +10,7 @@ from unittest.mock import Mock, patch
 from app.media.meta import MetaInfo
 from app.media.meta.llm_parser import LLMMetaParser
 from app.utils.types import MediaType
+from app.utils.search_cancellation import search_cancellation
 
 
 class LLMMetaParserTest(TestCase):
@@ -59,6 +61,68 @@ class LLMMetaParserTest(TestCase):
             result = self.parser.parse(title="Dune 2021")
         self.assertEqual({}, result)
         mock_client.assert_not_called()
+
+    def test_parse_uses_configured_max_tokens_in_sdk_request(self):
+        for max_tokens in (1024, 4096):
+            with self.subTest(max_tokens=max_tokens):
+                self.parser._max_tokens = max_tokens
+                self.parser._client = None
+                self.parser._parse_cache = {}
+                sdk = Mock()
+                sdk.chat.completions.create.return_value = {
+                    "choices": [{"message": {"content": '{"type":"movie","en_name":"Dune"}'}}]
+                }
+                # Keep parser and shared client real; replace only external boundaries.
+                with patch("app.utils.llm_client.OpenAI", return_value=sdk), \
+                        patch.object(self.parser, "_LLMMetaParser__build_external_candidates",
+                                     return_value=("", {})):
+                    result = self.parser.parse(title="Dune 2021")
+
+                self.assertEqual("Dune", result["en_name"])
+                sdk.chat.completions.create.assert_called_once()
+                self.assertEqual(max_tokens, sdk.chat.completions.create.call_args.kwargs["max_tokens"])
+
+    def test_stopped_parse_skips_providers_without_caching_a_negative_result(self):
+        for stage in ('before', 'candidates', 'response'):
+            with self.subTest(stage=stage):
+                cancel = threading.Event()
+                if stage == 'before':
+                    cancel.set()
+                def candidates(**kwargs):
+                    if stage == 'candidates':
+                        cancel.set()
+                    return '', {}
+                def response(**kwargs):
+                    if stage == 'response':
+                        cancel.set()
+                    return '{}'
+                client = Mock()
+                client.complete_text.side_effect = response
+                self.parser._parse_cache = {}
+                with patch.object(self.parser, '_LLMMetaParser__is_client_ready', return_value=True), \
+                        patch.object(self.parser, '_LLMMetaParser__get_client', return_value=client), \
+                        patch.object(self.parser, '_LLMMetaParser__build_external_candidates',
+                                     side_effect=candidates) as provider, search_cancellation(cancel):
+                    self.assertEqual(self.parser.parse('Dune 2021'), {})
+                self.assertEqual(self.parser._parse_cache, {})
+                if stage == 'before':
+                    provider.assert_not_called()
+                if stage != 'response':
+                    client.complete_text.assert_not_called()
+
+    def test_stop_during_candidate_lookup_skips_other_queries_and_providers(self):
+        cancel = threading.Event()
+        self.parser._search_context_enable = True
+        def lookup(**kwargs):
+            cancel.set()
+            return []
+        with patch.object(self.parser, '_LLMMetaParser__build_search_queries', return_value=['Dune', '沙丘']), \
+                patch.object(self.parser, '_LLMMetaParser__search_tmdb_candidates', side_effect=lookup) as tmdb, \
+                patch.object(self.parser, '_LLMMetaParser__search_bangumi_candidates') as bangumi, \
+                search_cancellation(cancel):
+            self.parser._LLMMetaParser__build_external_candidates('Dune 2021')
+        tmdb.assert_called_once()
+        bangumi.assert_not_called()
 
     def test_merge_conservative_only_fill_missing(self):
         self.parser._mode = "conservative"
@@ -331,7 +395,8 @@ class LLMMetaParserTest(TestCase):
         verified = self.parser._LLMMetaParser__verify_candidate_binding(
             {"tmdb_id": 45790, "tmdb_type": "tv", "tmdb_season": 6,
              "cn_name": "JoJo的奇妙冒险 飙马野郎"},
-            payload, title)
+            # Publisher-provided subtitle is independent of the model translation.
+            payload, title, subtitle="JoJo的奇妙冒险 飙马野郎")
 
         self.assertTrue(verified.get("season_verified"))
         self.assertEqual(6, verified.get("tmdb_season"))
@@ -352,7 +417,7 @@ class LLMMetaParserTest(TestCase):
         verified = self.parser._LLMMetaParser__verify_candidate_binding(
             {"tmdb_id": 45790, "tmdb_type": "tv", "tmdb_season": 1,
              "cn_name": "JoJo的奇妙冒险 飙马野郎"},
-            payload, title)
+            payload, title, subtitle="JoJo的奇妙冒险 飙马野郎")
 
         self.assertTrue(verified.get("season_verified"))
         self.assertEqual(6, verified.get("tmdb_season"))

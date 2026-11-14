@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
 
 from app.media import Media
 from app.media.meta import MetaInfo
+from app.media.meta.recognition import NumberingState
 from app.utils.types import MediaType
 
 
@@ -102,9 +103,9 @@ class LlmSeasonBindingTest(TestCase):
 
         with patch.object(self.media, "get_tmdb_tv_season_detail",
                           return_value=self._SEASON_6_EPISODES):
-            applied = self.media._apply_llm_season(meta_info, self._JOJO_INFO)
+            result = self.media._resolve_llm_numbering(meta_info, self._JOJO_INFO)
 
-        self.assertTrue(applied)
+        self.assertEqual(NumberingState.VERIFIED, result.state)
         self.assertEqual(6, meta_info.begin_season)
         self.assertEqual(1, meta_info.begin_episode)
         self.assertEqual("S06", meta_info.get_season_string())
@@ -113,38 +114,38 @@ class LlmSeasonBindingTest(TestCase):
     def test_apply_llm_season_requires_verified_flag(self):
         meta_info = self._meta_with_llm_season(season_verified=False)
 
-        applied = self.media._apply_llm_season(meta_info, self._JOJO_INFO)
+        result = self.media._resolve_llm_numbering(meta_info, self._JOJO_INFO)
 
-        self.assertFalse(applied)
+        self.assertEqual(NumberingState.NOT_REQUESTED, result.state)
         self.assertNotIn("season_binding", meta_info.note)
         self.assertIsNone(meta_info.begin_season)
 
     def test_apply_llm_season_rejects_other_work(self):
         meta_info = self._meta_with_llm_season(tmdb_id=999)
 
-        applied = self.media._apply_llm_season(meta_info, self._JOJO_INFO)
+        result = self.media._resolve_llm_numbering(meta_info, self._JOJO_INFO)
 
-        self.assertFalse(applied)
+        self.assertEqual(NumberingState.NOT_REQUESTED, result.state)
         self.assertNotIn("season_binding", meta_info.note)
 
     def test_apply_llm_season_needs_tmdb_episode_list(self):
         meta_info = self._meta_with_llm_season()
 
         with patch.object(self.media, "get_tmdb_tv_season_detail", return_value={}):
-            applied = self.media._apply_llm_season(meta_info, self._JOJO_INFO)
+            result = self.media._resolve_llm_numbering(meta_info, self._JOJO_INFO)
 
-        self.assertFalse(applied)
+        self.assertEqual(NumberingState.UNRESOLVED, result.state)
         self.assertIsNone(meta_info.begin_season)
 
-    def test_apply_llm_season_keeps_release_episode_when_llm_episode_invalid(self):
+    def test_apply_llm_season_rejects_an_invalid_requested_episode(self):
         meta_info = self._meta_with_llm_season(tmdb_episode=99)
 
         with patch.object(self.media, "get_tmdb_tv_season_detail",
                           return_value={"episodes": [{"episode_number": 1}]}):
-            applied = self.media._apply_llm_season(meta_info, self._JOJO_INFO)
+            result = self.media._resolve_llm_numbering(meta_info, self._JOJO_INFO)
 
-        self.assertTrue(applied)
-        self.assertEqual(6, meta_info.begin_season)
+        self.assertEqual(NumberingState.UNRESOLVED, result.state)
+        self.assertIsNone(meta_info.begin_season)
         self.assertEqual(1, meta_info.begin_episode)
 
     def test_prepare_media_identity_applies_llm_season(self):

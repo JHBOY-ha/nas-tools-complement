@@ -1,8 +1,11 @@
 """Confirm special content against typed TMDB identities before any publication."""
+import difflib
+
 from config import Config
 from app.utils.types import MediaType
 from app.media.meta.special import normalized, requires_confirmation, special_references
 from app.media.meta.llm_parser import LLMMetaParser
+from app.media.meta.recognition import CANDIDATE_DETAIL_LIMIT, NumberingResult
 
 
 def tmdb_type(value):
@@ -34,6 +37,9 @@ class SpecialResolver:
                 self.cache[key] = None
         return self.cache[key]
 
+    def detail_cached(self, kind, tmdbid):
+        return ("special", self.language, "detail", kind, str(tmdbid)) in self.cache
+
     def detail(self, kind, tmdbid):
         return self.cached(("detail", kind, str(tmdbid)), lambda: self.media.get_tmdb_info(
             mtype=kind, tmdbid=tmdbid, append_to_response="alternative_titles"))
@@ -46,6 +52,8 @@ class SpecialResolver:
         # Ordinal callers need unmatched details too: absent aliases are unknown,
         # not proof that the alternative interpretation does not exist.
         candidates = {}
+        # One detail-read limit per search; batch-cached details are free.
+        budget = [CANDIDATE_DETAIL_LIMIT]
         for name in dict.fromkeys(name for name in names if name):
             items = []
             seen_pages = set()
@@ -64,13 +72,24 @@ class SpecialResolver:
                     break
             else:
                 raise ValueError("作品候选过多，请使用更具体的片名或人工确认")
+            # Results with name evidence are read first (stable provider order).
+            items.sort(key=lambda item: not self.has_name_evidence(name, item))
             for item in items:
                 kind = tmdb_type(item.get("media_type"))
                 if not kind or not item.get("id"):
                     continue
+                if not self.detail_cached(kind, item["id"]):
+                    if budget[0] <= 0:
+                        # Unread results may match by alias: uniqueness is unproven.
+                        raise ValueError("作品候选超过详情读取上限，无法确认唯一性，保留待确认")
+                    budget[0] -= 1
                 info = self.detail(kind, item["id"])
                 if not info:
-                    raise ValueError("作品详情查询失败")
+                    # Only a result with name evidence may still be the work;
+                    # an unrelated result's failure cannot block uniqueness.
+                    if self.has_name_evidence(name, item):
+                        raise ValueError("作品详情查询失败")
+                    continue
                 genres = info.get("genre_ids") or [g.get("id") for g in info.get("genres") or []]
                 if anime and "16" not in {str(g) for g in genres}:
                     continue
@@ -84,6 +103,18 @@ class SpecialResolver:
                     continue
                 candidates[identity(info)] = info
         return list(candidates.values())
+
+    @staticmethod
+    def has_name_evidence(name, item):
+        """Search-summary names equal to, or closely resembling, the queried name."""
+        wanted = normalized(name)
+        for title in (item.get(k) for k in ("title", "name", "original_title", "original_name")):
+            actual = normalized(title)
+            if wanted and actual and (wanted == actual or (
+                    min(len(wanted), len(actual)) > 4
+                    and difflib.SequenceMatcher(None, wanted, actual).ratio() >= 0.8)):
+                return True
+        return False
 
     def parent(self, meta, bound):
         if bound:
@@ -138,14 +169,14 @@ class SpecialResolver:
         return self.cache[key]
 
     @staticmethod
-    def validate_episode(info, season, ep):
-        if (type(ep.get("episode_number")) is not int or ep["episode_number"] < 1
+    def validate_episode(info, season, ep, allow_zero=False):
+        if (type(ep.get("episode_number")) is not int or ep["episode_number"] < (0 if allow_zero else 1)
                 or ep.get("season_number", season) != season
                 or str(ep.get("show_id", info["id"])) != str(info["id"])):
             raise ValueError("TMDB 单集身份无效")
 
-    def target_episode(self, info, season, number):
-        if type(season) is not int or season < 0 or type(number) is not int or number < 1:
+    def target_episode(self, info, season, number, allow_zero=False):
+        if type(season) is not int or season < 0 or type(number) is not int or number < (0 if allow_zero else 1):
             raise ValueError("正式季集编号无效")
         detail = self.season(info, season)
         if not detail or not isinstance(detail.get("episodes"), list):
@@ -153,7 +184,7 @@ class SpecialResolver:
         items = [ep for ep in detail["episodes"] if ep.get("episode_number") == number]
         if len(items) != 1:
             raise ValueError("目标单集不存在或重复")
-        self.validate_episode(info, season, items[0])
+        self.validate_episode(info, season, items[0], allow_zero=allow_zero)
         return season, items[0]
 
     def configured_target(self, note, parent):
@@ -212,6 +243,33 @@ class SpecialResolver:
                 and not episodes and season == 0 and note.get("source_season") is not None
                 and note["source_season"] in (context.get("release_seasons") or []))
 
+    def validate_fractional_target(self, note, parent, season, episodes, manual=False):
+        """A decimal match cannot authorize contradictory special-release evidence."""
+        if not note:
+            return
+        if note.get("reason"):
+            raise ValueError(note["reason"])
+        target = self.configured_target(note, parent)
+        numbers = [ep["episode_number"] for ep in episodes]
+        if target and (tmdb_type(target.get("media_type")) != identity(parent)[0]
+                       or str(target.get("tmdb_id")) != str(parent["id"])
+                       or target.get("season") != season or numbers != [target.get("episode")]):
+            raise ValueError("小数集目标与特殊集配置映射冲突")
+        # Explicit per-file EP controls may override source labels, but not an
+        # incompatible configured target or an ambiguous special release range.
+        if manual:
+            return
+        if note.get("formal") and (season, numbers[0]) != tuple(note["formal"]):
+            raise ValueError("小数集目标与文件正式季集编号冲突")
+        if not note.get("number"):
+            return
+        for ep in episodes:
+            refs = special_references("%s\n%s" % (ep.get("name") or "", ep.get("overview") or ""))
+            matching = [ref for ref in refs if ref[:2] == (note["kind"], note["number"])]
+            if refs and (not matching or any(ref[2] is not None and note.get("source_season") is not None
+                                            and ref[2] != note["source_season"] for ref in matching)):
+                raise ValueError("小数集目标与特殊集发布编号证据冲突")
+
     @staticmethod
     def validate_type_hint(info, mtype_hint):
         """Constrain the final target, allowing an independently typed parent."""
@@ -237,9 +295,17 @@ class SpecialResolver:
                 if not self.context_allows(note, parent, parent, None, None, context):
                     raise ValueError("附加内容与选集任务约束冲突")
                 note["status"] = "confirmed"
+                meta._numbering_result = NumberingResult.verified(meta, parent)
                 return meta
             target = self.configured_target(note, parent)
             if manual:
+                # Leaving ID blank changes only how the parent is found. Resolve
+                # the work before comparing or validating the explicit EP target.
+                manual = dict(manual)
+                if not manual.get("tmdb_id"):
+                    if tmdb_type(manual.get("media_type")) != identity(parent)[0]:
+                        raise ValueError("手动目标类型与已识别作品冲突，请明确指定作品")
+                    manual["tmdb_id"] = parent["id"]
                 def target_key(value):
                     return (tmdb_type(value.get("media_type")), str(value.get("tmdb_id")),
                             value.get("season"), value.get("episode"))
@@ -336,6 +402,7 @@ class SpecialResolver:
                 "source_episode": note.get("number"), "target_season": season,
                 "target_episode": number, "evidence": evidence, "provider": "tmdb"}
             meta.skip_reason = None
+            meta._numbering_result = NumberingResult.verified(meta, target_info)
         except Exception as err:
             note.update(status="unconfirmed", reason=str(err))
             meta.skip_reason = "特殊内容待确认：%s" % err

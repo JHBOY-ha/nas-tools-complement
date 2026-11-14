@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import time
@@ -5,6 +6,7 @@ from datetime import datetime
 from urllib import parse
 
 from pkg_resources import parse_version as v
+from requests import exceptions
 
 import log
 import qbittorrentapi
@@ -292,7 +294,8 @@ class Qbittorrent(_IDownloadClient):
                     download_limit=None,
                     ratio_limit=None,
                     seeding_time_limit=None,
-                    cookie=None
+                    cookie=None,
+                    raise_on_error=False
                     ):
         """
         添加种子
@@ -307,9 +310,18 @@ class Qbittorrent(_IDownloadClient):
         :param ratio_limit: 分享率限制
         :param seeding_time_limit: 做种时间限制
         :param cookie: 站点Cookie用于辅助下载种子
+        :param raise_on_error: 将具体失败原因抛给下载流程；刷流等旧调用仍返回布尔值
         :return: bool
         """
+        # 启动时下载器可能尚未就绪；仅在尚未提交请求时尝试重新连接。
+        if not self.qbc and content:
+            self.connect()
         if not self.qbc or not content:
+            error = ("qBittorrent 未建立有效连接，请检查下载器地址、端口和认证配置"
+                     if not self.qbc else "种子内容为空，未向 qBittorrent 提交任务")
+            log.error(f"【{self.client_type}】{error}")
+            if raise_on_error:
+                raise RuntimeError(error)
             return False
         if isinstance(content, str):
             urls = content
@@ -363,10 +375,58 @@ class Qbittorrent(_IDownloadClient):
                                             seeding_time_limit=seeding_time_limit,
                                             use_auto_torrent_management=use_auto_torrent_management,
                                             cookie=cookie)
-            return True if qbc_ret and str(qbc_ret).find("Ok") != -1 else False
+            if qbc_ret == "Ok.":
+                return True
+            # WebAPI 2.14+ 返回 JSON 计数；pending 表示链接已接受、等待获取元数据。
+            # bundled client 返回响应文本，HTTP 错误仍由它抛出并在下方处理。
+            try:
+                result = json.loads(qbc_ret)
+            except (ValueError, TypeError):
+                result = None
+            if isinstance(result, dict) and any(
+                    type(result.get(key)) is int and result[key] > 0
+                    for key in ("success_count", "pending_count")):
+                return True
+            if isinstance(result, dict) and type(result.get("failure_count")) is int and result["failure_count"] > 0:
+                error = (f"qBittorrent 返回添加失败（失败 {result['failure_count']} 项），"
+                         "未提供具体原因，请查看 qBittorrent 日志")
+            elif qbc_ret == "Fails.":
+                error = "qBittorrent 拒绝添加种子（Fails.），未提供具体原因，请查看 qBittorrent 日志"
+            elif not qbc_ret:
+                error = "qBittorrent 添加接口返回空响应，无法确认是否成功，请先检查任务列表再重试"
+            else:
+                # 不把代理返回的 HTML 或未知 JSON 原样推送到页面和通知中。
+                error = "qBittorrent 添加接口返回无法识别的响应，请检查版本兼容性和反向代理配置，并核对任务列表"
+        except qbittorrentapi.LoginFailed:
+            error = "qBittorrent 认证失败，请检查账号密码和 WebUI 认证配置"
+        except qbittorrentapi.HTTPError as err:
+            status = err.http_status_code
+            reason = {
+                400: "请求参数无效，请检查下载设置",
+                401: "请求未通过认证或安全校验，请检查 WebUI 和反向代理配置",
+                403: "访问被拒绝，请检查登录会话、账号权限或 IP 封禁",
+                404: "添加接口不存在，请检查 WebUI 地址和反向代理路径",
+                405: "添加接口不接受当前请求方法，请检查版本和反向代理配置",
+                409: "添加请求冲突，尚不能确认任务重复，请查看 qBittorrent 日志",
+                415: "种子文件或下载链接无效，下载器无法解析",
+            }.get(status, "下载器或反向代理返回错误，请检查服务日志")
+            error = f"qBittorrent 添加失败（HTTP {status}）：{reason}"
+        except qbittorrentapi.APIConnectionError as err:
+            cause = err.__cause__ or err.__context__
+            if isinstance(cause, exceptions.Timeout):
+                error = "qBittorrent 请求超时，无法确认任务是否已添加，请先检查任务列表再重试"
+            elif isinstance(cause, exceptions.SSLError):
+                error = "qBittorrent HTTPS 连接失败，请检查证书和代理配置"
+            else:
+                error = "无法连接 qBittorrent，请检查服务、地址、端口和网络；重试前请核对任务列表"
         except Exception as err:
             ExceptionUtils.exception_traceback(err)
-            return False
+            error = f"qBittorrent 添加请求处理异常（{type(err).__name__}），请查看 nas-tools 容器日志"
+        log.error(f"【{self.client_type}】{error}")
+        # 通过本次调用传递错误，避免共享客户端的 last_error 被并发下载覆盖。
+        if raise_on_error:
+            raise RuntimeError(error)
+        return False
 
     def start_torrents(self, ids):
         if not self.qbc:

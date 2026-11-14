@@ -363,7 +363,7 @@ class DatabaseReviewFixTest(DatabaseCase):
         with self.db.managed.maintenance() as connection:
             BaseMedia.metadata.create_all(connection)
         fn = extracted_function((ROOT / 'app/mediaserver/media_server.py').read_text(),
-                                'sync_mediaserver', {'lock': threading.Lock(), 'log': Mock()})
+                                'sync_mediaserver', {'lock': threading.Lock(), 'sync_generation': 0, 'log': Mock()})
         with patch.object(media_db, '_Database', self.db.managed):
             store = media_db.MediaDb()
             # Each subcase starts from the same committed cache, independently.
@@ -398,6 +398,46 @@ class DatabaseReviewFixTest(DatabaseCase):
                 self.assertTrue(sync(receiver))
             self.assertEqual(self.read_sync(), ([('a',), ('b',)], 2))
             receiver.progress.end.assert_called_once_with('mediasync')
+
+    def test_refresh_rejects_results_when_full_sync_completed_during_reads(self):
+        from app.library import MediaLibrary
+        from tests.test_sync_reliability import load_class
+
+        # Real SQLite and production sync/refresh/lock methods. Only remote
+        # responses are fixtures; run a complete full sync between two reads.
+        for surviving_ids in (['second'], ['old', 'second']):
+            with self.subTest(surviving_ids=surviving_ids), self.sync_context() as (sync, receiver, store):
+                store.insert('emby', dict(id='second', type='Movie', title='Before sync'))
+                receiver.get_medias_count = lambda: dict(MovieCount=len(surviving_ids), SeriesCount=0)
+                receiver.get_items = lambda _id, strict=False: [
+                    dict(id=item_id, type='Movie', title='After sync') for item_id in surviving_ids
+                ]
+                cls = load_class('app/mediaserver/media_server.py', 'MediaServer',
+                                 ['get_sync_generation', 'is_syncing', 'begin_incremental_write',
+                                  'end_incremental_write'], sync.__globals__)
+                server = cls()
+                server.get_type = lambda: NS(value='emby')
+
+                def remote_item(_server_type, item_id):
+                    self.assertFalse(server.is_syncing(), 'remote reads must not hold the sync lock')
+                    self.assertEqual(self.db.managed.coordinator.snapshot()['active'], 0)
+                    if item_id == 'second':
+                        self.assertTrue(sync(receiver))
+                    return dict(id=item_id, type='Movie', title='Stale refresh')
+
+                server.get_sync_item = remote_item
+                library = MediaLibrary.__new__(MediaLibrary)
+                library.media_server, library.mediadb = server, store
+                result = library.refresh_items({'item_ids': ['old', 'second']})
+                self.assertEqual(result['code'], -1)
+                self.assertEqual(self.read_sync(), ([(item_id,) for item_id in surviving_ids], len(surviving_ids)))
+                with sqlite3.connect(self.db.path) as connection:
+                    self.assertEqual(connection.execute('SELECT DISTINCT TITLE FROM MEDIASYNC_ITEMS').fetchall(),
+                                     [('After sync',)])
+                self.assertFalse(server.is_syncing(), 'rejecting a stale generation must release the lock')
+                # A subsequent explicit refresh can still write after the rejection.
+                server.get_sync_item = lambda _server, item_id: dict(id=item_id, type='Movie', title='Latest')
+                self.assertEqual(library.refresh_items({'item_ids': ['second']})['updated'], 1)
 
     def test_sync_capacity_or_statistics_failure_preserves_rows_and_progress(self):
         with self.sync_context() as (sync, receiver, store):
@@ -465,7 +505,7 @@ class DatabaseReviewFixTest(DatabaseCase):
                     transport = NS(get_res=Mock(side_effect=request))
                     cls = load_class('app/mediaserver/client/' + name + '.py', class_name,
                                      ['get_medias_count', 'get_libraries', 'get_items', 'get_iteminfo',
-                                      '__get_' + name + '_librarys'],
+                                      'sync_item_from_info', '__get_' + name + '_librarys'],
                                      {'RequestUtils': lambda: transport, 'log': Mock(),
                                       'ExceptionUtils': Mock(), 'json': json})
                     client = cls()
@@ -487,7 +527,8 @@ class DatabaseReviewFixTest(DatabaseCase):
 
     def test_sync_plex_failure_after_an_item_preserves_previous_snapshot(self):
         from tests.test_sync_reliability import load_class
-        cls = load_class('app/mediaserver/client/plex.py', 'Plex', ['get_libraries', 'get_items'],
+        cls = load_class('app/mediaserver/client/plex.py', 'Plex',
+                         ['get_libraries', 'get_items', '__sync_item'],
                          {'ExceptionUtils': Mock(), 'json': json})
         client = cls()
         client._Plex__item_path = lambda item: '/media/movie.mkv'
@@ -502,6 +543,9 @@ class DatabaseReviewFixTest(DatabaseCase):
             receiver.get_libraries, receiver.get_items = client.get_libraries, client.get_items
             self.assertFalse(sync(receiver))
             self.assertEqual(self.read_sync(), ([('old',)], 1))
+            # The shared mapping really ran for the first item before the stream broke.
+            mapped = next(iter(client.get_items('lib')))
+            self.assertEqual((mapped['id'], mapped['title'], mapped['library']), ('new', 'Movie', 'lib'))
             # List failure and a genuine empty server remain distinguishable.
             library.sections.side_effect = RuntimeError('offline')
             self.assertFalse(sync(receiver))

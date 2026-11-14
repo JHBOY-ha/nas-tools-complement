@@ -33,12 +33,13 @@ class TV(TMDb):
     }
 
     def details(
-            self, show_id, append_to_response=""
+            self, show_id, append_to_response="", language=None
     ):
         """
         Get the primary TV show details by id.
         :param show_id:
         :param append_to_response:
+        :param language: Request-only override; leaves the shared default unchanged.
         :return:
         """
         if append_to_response == "all":
@@ -49,6 +50,7 @@ class TV(TMDb):
             **self._call(
                 self._urls["details"] % str(show_id),
                 "append_to_response=" + append_to_response,
+                language=language,
             )
         )
 

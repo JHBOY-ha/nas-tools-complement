@@ -143,3 +143,59 @@ ctx.library_online_generation += 1;
 confirmDownload();
 assert.equal(requests.length, count + 1);
 console.log('OpenSubtitles source, quota confirmation, cancel, duplicate prevention and stale-confirmation checks passed');
+
+// Fill completion belongs to the submitted movie, not the search result DOM.
+const completions = new Map();
+ctx.SubtitleTasks = {
+  watch(id, callbacks) { completions.set(id, callbacks.onDone); },
+  refreshList: () => Promise.resolve()
+};
+ctx.load_library_items = () => {};
+ctx.show_success_modal = () => {};
+ctx.show_fail_modal = () => {};
+const startFillDownload = () => {
+  ctx.library_fill = {queue: [{id: 'a'}, {id: 'b'}], index: 0, saved: 0, skipped: 0, current_saved: false};
+  ctx.library_online_results = [{provider: 'thunder', ticket: 'fill-ticket'}];
+  button.prop('disabled', false).data('confirming', false);
+  $('#library_fill_next').prop('disabled', true);
+  ctx.download_library_online_subtitle(0, button);
+  return ajax;
+};
+
+let download = startFillDownload();
+download.success({code: 0, task_id: 'before-search'});
+ctx.search_library_online_subtitles();
+completions.get('before-search')({status: 'succeeded'});
+completions.get('before-search')({status: 'succeeded'});
+assert.equal(ctx.library_fill.saved, 1, 're-search and duplicate completion must still count exactly once');
+assert.equal($('#library_fill_next').prop('disabled'), false);
+
+download = startFillDownload();
+ctx.search_library_online_subtitles();
+download.success({code: 0, task_id: 'after-search'});
+assert.ok(completions.has('after-search'), 'late task acceptance must still subscribe after re-search');
+completions.get('after-search')({status: 'succeeded'});
+assert.equal(ctx.library_fill.saved, 1);
+assert.equal($('#library_fill_next').prop('disabled'), false);
+
+download = startFillDownload();
+download.success({code: 0, task_id: 'skipped-movie'});
+ctx.library_fill.index = 1;
+ctx.search_library_online_subtitles();
+completions.get('skipped-movie')({status: 'succeeded'});
+assert.equal(ctx.library_fill.saved, 0, 'an old movie must not mark the next movie saved');
+assert.equal($('#library_fill_next').prop('disabled'), true);
+
+download = startFillDownload();
+download.success({code: 0, task_id: 'previous-session'});
+startFillDownload();
+completions.get('previous-session')({status: 'succeeded'});
+assert.equal(ctx.library_fill.saved, 0, 'an old session must not mark a new session saved');
+
+download = startFillDownload();
+download.success({code: 0, task_id: 'failed-save'});
+ctx.search_library_online_subtitles();
+completions.get('failed-save')({status: 'failed'});
+assert.equal(ctx.library_fill.saved, 0);
+assert.equal($('#library_fill_next').prop('disabled'), true);
+console.log('Fill task acceptance, re-search completion, deduplication, failure and session/movie isolation passed');

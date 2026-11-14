@@ -1087,6 +1087,171 @@ class MediaLibraryTest(TestCase):
         )
         self.assertEqual(status["status"], "unknown")
 
+    def test_series_summary_requires_every_episode_before_marking_complete(self):
+        summarize = MediaLibrary._MediaLibrary__summary_series_status
+        ext = {"status": "has_chinese_external"}
+        internal = {"status": "has_chinese_internal"}
+        unknown = {"status": "unknown"}
+        missing = {"status": "missing_chinese"}
+        self.assertEqual(summarize([ext, internal], 0)["status"], "has_chinese_external")
+        self.assertEqual(summarize([internal, internal], 0)["status"], "has_chinese_internal")
+        partial = summarize([ext, unknown, unknown], 0)
+        self.assertEqual(partial["status"], "unknown")
+        self.assertEqual(partial["label"], "已覆盖 1/3 集")
+        self.assertEqual(summarize([unknown], 0)["label"], "未检测")
+        self.assertEqual(summarize([], 0)["label"], "未检测")
+        self.assertEqual(summarize([ext, missing], 1)["label"], "缺中文字幕 1 集")
+        self.assertEqual(
+            MediaLibrary._MediaLibrary__episode_coverage([ext, unknown, internal]), (3, 2)
+        )
+
+    def test_list_items_clamps_page_and_reports_library_total(self):
+        library = MediaLibrary.__new__(MediaLibrary)
+        library.media_server = Mock()
+        library.media_server.get_type.return_value = types.SimpleNamespace(value="emby")
+        library.mediadb = Mock()
+        library.mediadb.list_items.return_value = [1, 2, 3]
+        library.dbhelper = Mock()
+        library.dbhelper.get_transfer_histories_with_dest.return_value = []
+        statuses = {1: "unknown", 2: "has_chinese_external", 3: "unknown"}
+
+        def build(row, **kwargs):
+            return dict(id=str(row), title=f"电影{row}", original_title="", year="2024",
+                        media_type="movie", category="电影", subtitle_status=statuses[row],
+                        media_streams=[], linked_episodes=[])
+
+        def fill(item, snapshots, audit=None):
+            item["subtitle_status"] = statuses[int(item["id"])]
+            return item
+
+        with patch.object(library, "_MediaLibrary__build_item", side_effect=build), \
+                patch.object(library, "_MediaLibrary__fill_snapshot_subtitle_summary", side_effect=fill), \
+                patch.object(library, "_MediaLibrary__status_snapshots_for_paths", return_value={}), \
+                patch.object(library, "_MediaLibrary__latest_audit_snapshots", return_value={"movie": {}}):
+            result = library.list_items({"page": 99, "page_size": 2})
+            self.assertEqual(result["page"], 2)
+            self.assertEqual([item["id"] for item in result["items"]], ["3"])
+            self.assertEqual(result["library_total"], 3)
+            unknown = library.list_items({"subtitle": "unknown", "page_size": 5})
+            self.assertEqual([item["id"] for item in unknown["items"]], ["1", "3"])
+            empty = library.list_items({"keyword": "不存在", "page": 5})
+            self.assertEqual((empty["total"], empty["page"], empty["library_total"]), (0, 1, 3))
+
+    def _filter_library(self, entries):
+        """Library whose synced movies carry the given (audio streams, status, audit) tuples."""
+        library = MediaLibrary.__new__(MediaLibrary)
+        library.media_server = Mock()
+        library.media_server.get_type.return_value = types.SimpleNamespace(value="emby")
+        library.mediadb = Mock()
+        library.mediadb.list_items.return_value = list(range(len(entries)))
+        library.dbhelper = Mock()
+        library.dbhelper.get_transfer_histories_with_dest.return_value = []
+
+        def build(row, **kwargs):
+            streams, _, _, media_type = entries[row]
+            return dict(id=str(row), title=f"电影{row}", original_title="", year="2024",
+                        media_type=media_type, category="外语电影", media_streams=[],
+                        linked_episodes=[], target_path=f"/m/{row}.mkv",
+                        audio_language=MediaLibrary._MediaLibrary__audio_language(streams)
+                        if media_type == "movie" else "")
+
+        def fill(item, snapshots, audit=None):
+            _, status, audit_status, _ = entries[int(item["id"])]
+            item["subtitle_status"] = status
+            item["subtitle_audit_status"] = audit_status
+            return item
+
+        patches = [
+            patch.object(library, "_MediaLibrary__build_item", side_effect=build),
+            patch.object(library, "_MediaLibrary__fill_snapshot_subtitle_summary", side_effect=fill),
+            patch.object(library, "_MediaLibrary__status_snapshots_for_paths", return_value={}),
+            patch.object(library, "_MediaLibrary__latest_audit_snapshots",
+                         return_value={"movie": {}, "tv": {}, "anime": {}}),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return library
+
+    def test_audio_language_uses_default_track_and_normalizes_codes(self):
+        detect = MediaLibrary._MediaLibrary__audio_language
+        audio = lambda language, default=False: {"Type": "Audio", "Language": language, "IsDefault": default}
+        self.assertEqual(detect([audio("jpn"), audio("eng", True)]), "eng")
+        self.assertEqual(detect([audio("ja"), audio("eng")]), "jpn")
+        self.assertEqual(detect([audio("en-US")]), "eng")
+        self.assertEqual(detect([audio("kor")]), "kor")
+        self.assertEqual(detect([audio("fra")]), "fra")
+        self.assertEqual(detect([audio("fre")]), "fra")
+        self.assertEqual(detect([audio("fr-CA")]), "fra")
+        self.assertEqual(detect([audio("rus")]), "rus")
+        self.assertEqual(detect([audio("chi")]), "zho")
+        self.assertEqual(detect([audio("zh-CN")]), "zho")
+        self.assertEqual(detect([audio("cmn")]), "zho")
+        self.assertEqual(detect([audio("spa")]), "other")
+        self.assertEqual(detect([audio("ara")]), "other")
+        self.assertEqual(detect([audio("und")]), "unknown")
+        self.assertEqual(detect([audio("")]), "unknown")
+        self.assertEqual(detect([{"Type": "Subtitle", "Language": "eng"}]), "unknown")
+        self.assertEqual(detect([]), "unknown")
+        self.assertEqual(detect(None), "unknown")
+
+    def test_missing_english_movies_combine_type_status_and_audio_language(self):
+        eng = [{"Type": "Audio", "Language": "eng", "IsDefault": True}]
+        jpn = [{"Type": "Audio", "Language": "jpn", "IsDefault": True}]
+        entries = [
+            (eng, "missing_chinese", "", "movie"),
+            (eng, "has_chinese_external", "ok", "movie"),
+            (jpn, "missing_chinese", "", "movie"),
+            (eng, "unknown", "", "movie"),
+            ([], "missing_chinese", "", "movie"),
+            ([], "missing_chinese", "", "tv"),
+            (eng, "has_chinese_external", "warning", "movie"),
+        ]
+        library = self._filter_library(entries)
+        result = library.list_items({"type": "movie", "subtitle": "missing", "audio_language": "eng"})
+        self.assertEqual([item["id"] for item in result["items"]], ["0"])
+        self.assertEqual(result["total"], 1)
+        # A concrete language excludes series even without a type filter.
+        any_type = library.list_items({"audio_language": "eng", "page_size": 20})
+        self.assertEqual([item["id"] for item in any_type["items"]], ["0", "1", "3", "6"])
+        self.assertEqual(library.list_items({"audio_language": "unknown", "page_size": 20})["total"], 1)
+        self.assertEqual(library.list_items({"audio_language": "bogus", "page_size": 20})["total"], 7)
+        problem = library.list_items({"subtitle": "problem", "page_size": 20})
+        self.assertEqual([item["id"] for item in problem["items"]], ["6"])
+
+    def test_permanent_member_languages_are_separate_filters(self):
+        audio = lambda language: [{"Type": "Audio", "Language": language, "IsDefault": True}]
+        entries = [(audio(code), "missing_chinese", "", "movie") for code in ("chi", "fra", "rus", "eng", "spa")]
+        library = self._filter_library(entries)
+        ids = lambda language: [
+            item["id"] for item in library.list_items({"audio_language": language, "page_size": 20})["items"]]
+        self.assertEqual(ids("zho"), ["0"])
+        self.assertEqual(ids("fra"), ["1"])
+        self.assertEqual(ids("rus"), ["2"])
+        self.assertEqual(ids("eng"), ["3"])
+        self.assertEqual(ids("other"), ["4"])
+
+    def test_summary_counts_follow_other_filters_but_not_the_subtitle_filter(self):
+        eng = [{"Type": "Audio", "Language": "eng", "IsDefault": True}]
+        jpn = [{"Type": "Audio", "Language": "jpn", "IsDefault": True}]
+        entries = [
+            (eng, "missing_chinese", "", "movie"),
+            (eng, "has_chinese_external", "ok", "movie"),
+            (jpn, "missing_chinese", "", "movie"),
+            (eng, "unknown", "", "movie"),
+            (eng, "has_chinese_external", "error", "movie"),
+            ([], "missing_chinese", "", "tv"),
+        ]
+        library = self._filter_library(entries)
+        everything = library.summary_counts({"subtitle": "missing"})
+        self.assertEqual(everything["counts"], {"all": 6, "missing": 3, "unknown": 1, "problem": 1, "ok": 2})
+        english = library.summary_counts({"type": "movie", "audio_language": "eng"})
+        self.assertEqual(english["counts"], {"all": 4, "missing": 1, "unknown": 1, "problem": 1, "ok": 2})
+        library.media_server.get_type.return_value = None
+        with patch("app.library.Config") as config:
+            config.return_value.get_config.return_value = {"media_server": "bogus"}
+            self.assertEqual(library.summary_counts({})["code"], -1)
+
     def test_library_list_paging_filtering_and_sorting_never_touch_nas(self):
         class _ServerType:
             value = "Jellyfin"

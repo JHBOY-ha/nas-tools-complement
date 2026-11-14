@@ -8,6 +8,7 @@ from app.media.media import Media
 from app.media.meta import MetaInfo
 from app.media.meta.metaanime import MetaAnime
 from app.utils.types import DownloaderType, MediaType
+from tests.recognition_fixture import FakeTmdb
 
 
 class MetaParserBoundaryTest(unittest.TestCase):
@@ -81,16 +82,30 @@ class MetaParserBoundaryTest(unittest.TestCase):
 
     def test_pack_description_does_not_disable_requested_download_file(self):
         downloader = object.__new__(type(Downloader()))
+        fixture = FakeTmdb(self)
+        fixture.tv(42, "Show", seasons={0: 2, 1: 12})
+        downloader.media = fixture.media
+        media = fixture.media.get_media_info("Show S01")
         client = MagicMock()
         client.get_files.return_value = [
             {"name": "Show.S01E02.全12集.mkv", "index": 0},
             {"name": "Show.S01E03.mkv", "index": 1},
             {"name": "Show.S01E04.mkv", "index": 2},
+            {"name": "Show.S00E02.mkv", "index": 3},
         ]
         with patch.object(downloader, "_Downloader__get_client", return_value=client):
-            selected = downloader.set_files_status("torrent", [2, 3], DownloaderType.QB)
+            selected = downloader.set_files_status("torrent", [2, 3], DownloaderType.QB, media_info=media)
         self.assertEqual({2, 3}, set(selected))
-        client.set_files.assert_called_once_with(torrent_hash="torrent", file_ids=[2], priority=0)
+        client.set_files.assert_called_once_with(torrent_hash="torrent", file_ids=[2, 3], priority=0)
+        names = ['Show.S01E03.mkv', 'Show.S00E02.mkv']
+        downloader.sites = MagicMock()
+        downloader.sites.get_site_attr.return_value = {}
+        with patch('app.downloader.downloader.Torrent') as torrent:
+            torrent.return_value.get_torrent_info.return_value = ('fixture.torrent', b'torrent', '', names, '')
+            self.assertEqual(downloader.get_torrent_episodes('https://example.test/torrent', media)[0], [3])
+        client.get_files.return_value = [{'name': name, 'index': index} for index, name in enumerate(names)]
+        with patch.object(downloader, '_Downloader__get_client', return_value=client):
+            self.assertEqual(downloader.set_files_status('torrent', [2], DownloaderType.QB, media), [])
 
     def test_latin_title_digits_are_not_season_or_episode_markers(self):
         for name, year in (("Case39", "2009"), ("Cars24", "2020"), ("Sense80", "2021")):

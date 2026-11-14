@@ -17,11 +17,19 @@ class DbHelper:
 
     @DbPersist(_db)
     def insert_search_results(self, media_items: list, title=None, ident_flag=True):
+        # Legacy channels retain their existing table; interactive sessions use
+        # the same presentation mapping without touching those global rows.
+        rows = self.make_search_results(media_items, title, ident_flag)
+        if rows:
+            self._db.insert(rows)
+
+    @staticmethod
+    def make_search_results(media_items: list, title=None, ident_flag=True):
         """
-        将返回信息插入数据库
+        构造页面结果行；会话结果可直接使用，不必写入全局结果表。
         """
         if not media_items:
-            return
+            return []
         data_list = []
         for media_item in media_items:
             if media_item.type == MediaType.TV:
@@ -63,7 +71,7 @@ class DbHelper:
                     UPLOAD_VOLUME_FACTOR=media_item.upload_volume_factor,
                     DOWNLOAD_VOLUME_FACTOR=media_item.download_volume_factor
                 ))
-        self._db.insert(data_list)
+        return data_list
 
     def get_search_result_by_id(self, dl_id):
         """

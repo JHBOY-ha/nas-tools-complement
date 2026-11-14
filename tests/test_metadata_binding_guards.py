@@ -1,7 +1,7 @@
 """Offline regressions for work identity and release-number preservation."""
 import datetime
 import tempfile
-from copy import deepcopy
+from copy import copy, deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import TestCase
@@ -73,14 +73,22 @@ class MetadataBindingGuardsTest(TestCase):
                                 'tmdb_episode': 1, 'season_verified': True}
             self.assertTrue(self.media._prepare_media_identity(meta, self.info))
             self.assertEqual([1, 2, 3], meta.get_episode_list())
+        seasons = MetaInfo('Show S01-S03E01.mkv', use_llm=False)
+        seasons.note['llm'] = {'tmdb_id': 42, 'tmdb_season': 1, 'tmdb_episode': 1, 'season_verified': True}
+        self.assertFalse(self.media._prepare_media_identity(seasons, self.info))
+        self.assertEqual([1, 2, 3], seasons.get_season_list())
 
     def test_llm_merge_preserves_rule_range_before_binding(self):
         parser = LLMMetaParser()
-        meta = MetaInfo('Show S01E01-E03.mkv', use_llm=False)
-        with patch.object(parser, 'parse', return_value={'begin_episode': 2, 'end_episode': 2,
-                'total_episodes': 1, 'confidence': 1, 'field_confidence': {}}):
-            result = parser.merge_into(meta, meta.org_string)
-        self.assertEqual([1, 2, 3], result.get_episode_list())
+        for title in ('Show S01E01-E03.mkv', 'Show S01-S03E01.mkv'):
+            meta = MetaInfo(title, use_llm=False)
+            expected = (meta.get_season_list(), meta.get_episode_list())
+            with patch.object(parser, '_mode', 'balanced'), patch.object(parser, 'parse', return_value={
+                    'begin_season': 1, 'end_season': 1, 'total_seasons': 1,
+                    'begin_episode': 2, 'end_episode': 2, 'total_episodes': 1,
+                    'confidence': 1, 'field_confidence': {}}):
+                result = parser.merge_into(meta, meta.org_string)
+            self.assertEqual(expected, (result.get_season_list(), result.get_episode_list()))
 
     def index_results(self, resource, wanted, imdb=None):
         self.media.get_media_info = Mock(return_value=resource)
@@ -130,6 +138,10 @@ class MetadataBindingGuardsTest(TestCase):
         meta = MetaInfo('Show S01E01', use_llm=False)
         self.assertTrue(self.media._prepare_media_identity(meta, self.info))
         proof = deepcopy(meta.note)
+        drifted = copy(meta)
+        drifted.set_tmdb_info(self.info)
+        drifted.begin_episode = 5
+        self.assertIn('偏离核验结果', self.media._finalize_recognition(drifted, file=True).skip_reason)
         self.assertFalse(self.media._prepare_media_identity(meta, dict(self.info, id=99)))
         self.assertEqual(proof, meta.note)
         self.assertFalse(self.media._prepare_media_identity(meta, dict(self.info, media_type=MediaType.MOVIE)))
@@ -146,6 +158,7 @@ class MetadataBindingGuardsTest(TestCase):
         valid = dict(self.info, seasons=[{'season_number': 2}])
         self.assertTrue(self.media._prepare_media_identity(meta, valid))
         self.assertEqual((2, [2]), (meta.begin_season, meta.get_episode_list()))
+        self.assertIsNone(meta.skip_reason)
         count = self.media.get_tmdb_tv_season_detail.call_count
         self.assertTrue(self.media._prepare_media_identity(meta, valid))
         self.assertEqual(count, self.media.get_tmdb_tv_season_detail.call_count)

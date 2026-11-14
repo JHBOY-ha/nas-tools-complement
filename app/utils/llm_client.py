@@ -4,6 +4,7 @@ from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 import log
 from app.utils import ExceptionUtils, StringUtils
+from app.utils.search_cancellation import search_disables_llm_retries, search_is_canceled
 from config import Config
 
 try:
@@ -86,7 +87,7 @@ class LLMClient:
 
     def complete_text(self, system_prompt, user_prompt, max_tokens=None,
                       timeout=None, max_retries=None):
-        if not self.is_ready(require_enable=False):
+        if search_is_canceled() or not self.is_ready(require_enable=False):
             return ""
         try:
             return self.__complete_openai(
@@ -125,6 +126,13 @@ class LLMClient:
 
     def __request_openai(self, system_prompt, user_prompt, max_tokens=None,
                          timeout=None, max_retries=None):
+        if search_is_canceled():
+            return None
+        if search_disables_llm_retries():
+            # SDK retries cannot observe the session event while a synchronous
+            # request is in flight. Only explicit interactive sessions opt out;
+            # ordinary web/RSS searches retain their configured retry budget.
+            max_retries = 0
         kwargs = {
             "model": self._model,
             "messages": [
@@ -152,6 +160,8 @@ class LLMClient:
                 timeout=self._timeout if timeout is None else timeout,
                 max_retries=self._max_retries if max_retries is None else max_retries
             )
+        if search_is_canceled():
+            return None
         return client.chat.completions.create(**kwargs)
 
     def __get_client(self):

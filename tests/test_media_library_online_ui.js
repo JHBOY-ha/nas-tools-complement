@@ -1,5 +1,5 @@
 /* Real Bootstrap dialogs and source selection with offline subtitle API fixtures. */
-const {chromium} = require('playwright');
+const {firefox} = require('playwright');
 const {spawnSync} = require('child_process');
 const fs = require('fs'), path = require('path'), assert = require('node:assert/strict');
 const root = path.resolve(__dirname, '..');
@@ -9,7 +9,7 @@ from pathlib import Path
 from jinja2 import Environment, FileSystemLoader, ChainableUndefined
 env = Environment(loader=FileSystemLoader('web/templates'), undefined=ChainableUndefined, autoescape=True)
 library = env.get_template('rename/medialibrary.html').render(MediaServerType='emby')
-online = library[library.index('<div class="modal modal-blur fade" id="library-online-subtitle-modal"'):]
+online = library[library.index('<div class="modal modal-blur fade lit-library-modal" id="library-online-subtitle-modal"'):]
 shell = Path('web/templates/navigation.html').read_text()
 confirm = shell[shell.index('<!-- 危险确认提示框 -->'):shell.index('<!-- 成功带后续操作提示框 -->')]
 confirm = env.from_string("{% import 'macro/svg.html' as SVG %}" + confirm).render()
@@ -19,7 +19,7 @@ assert.equal(rendered.status, 0, rendered.stderr);
 const fixtures = JSON.parse(rendered.stdout);
 
 (async () => {
-  const browser = await chromium.launch({headless: true, ...(process.env.CHROME_PATH ? {executablePath: process.env.CHROME_PATH} : {})});
+  const browser = await firefox.launch({headless: true, ...(process.env.FIREFOX_PATH ? {executablePath: process.env.FIREFOX_PATH} : {})});
   try {
     const page = await browser.newPage({viewport: {width: 1100, height: 800}, reducedMotion: 'reduce'});
     const errors = [], downloads = [];

@@ -70,6 +70,9 @@
       </div>
       <div class="modal-body">
       {{ FORM.gen_form_config_elements(Type, Config, Downloader.config) }}
+      {% if Type == 'qbittorrent' %}
+        <div class="text-muted small mt-3">连接测试仅验证登录和状态读取，不会添加下载任务。修改配置后请点击“确定”保存。</div>
+      {% endif %}
       </div>
       <div class="modal-footer">
         <button onclick="test_downloader_config('{{ Type }}')" id="{{ Type }}_test_btn" class="btn me-auto">
@@ -322,7 +325,7 @@
       {% endfor %}
       ajax_post("test_connection", {"command": command, "config": ret.config[type]}, function (ret) {
         if (ret.code === 0) {
-          $("#" + currType + "_test_btn").text("测试成功").attr("disabled", false);
+          $("#" + currType + "_test_btn").text("连接成功").attr("disabled", false);
         } else {
           $("#" + currType + "_test_btn").text("测试失败！").attr("disabled", false);
         }

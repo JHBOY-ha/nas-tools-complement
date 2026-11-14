@@ -1,9 +1,12 @@
-from app.utils import ExceptionUtils
+from urllib.parse import urlencode
+
+from app.utils import ExceptionUtils, RequestUtils
 from app.utils.types import MediaServerType
 
 import log
 import json
 import os
+import re
 from config import Config
 from app.mediaserver.client._base import _IMediaClient
 from plexapi.myplex import MyPlexAccount
@@ -284,27 +287,73 @@ class Plex(_IMediaClient):
                 for item in section.all():
                     if not item:
                         continue
-                    item_path = self.__item_path(item)
-                    provider_ids = self.__provider_ids(item)
-                    yield {"id": item.key,
-                           "library": item.librarySectionID,
-                           "type": item.type,
-                           "title": item.title,
-                           "year": item.year,
-                           "tmdbid": provider_ids.get("tmdbid"),
-                           "imdbid": provider_ids.get("imdbid"),
-                           "path": item_path,
-                           "json": json.dumps({
-                               "Path": item_path,
-                               "ProviderIds": provider_ids,
-                               "MediaStreams": []
-                           }, ensure_ascii=False)}
+                    yield self.__sync_item(item)
         except Exception as err:
             if strict:
                 # 全量同步不能将远端异常转换为空列表或提前结束的迭代器。
                 raise RuntimeError("媒体库读取失败") from None
             ExceptionUtils.exception_traceback(err)
         yield {}
+
+    def __sync_item(self, item):
+        """
+        把Plex项目转换为同步记录；全量同步与单项刷新共用，保证字段一致。
+        """
+        item_path = self.__item_path(item)
+        provider_ids = self.__provider_ids(item)
+        item_json = {
+            "Path": item_path,
+            "ProviderIds": provider_ids,
+            "MediaStreams": []
+        }
+        # 海报路径末段为更新时间，海报变化后随之改变，作为缩略图版本。
+        thumb = getattr(item, "thumb", None)
+        if thumb:
+            item_json["Thumb"] = str(thumb)
+        return {"id": item.key,
+                "library": item.librarySectionID,
+                "type": item.type,
+                "title": item.title,
+                "year": item.year,
+                "tmdbid": provider_ids.get("tmdbid"),
+                "imdbid": provider_ids.get("imdbid"),
+                "path": item_path,
+                "json": json.dumps(item_json, ensure_ascii=False)}
+
+    def get_sync_item(self, item_id):
+        """
+        读取单个项目的最新同步记录；读取失败抛出异常，不触发服务器刮削。
+        """
+        if not item_id or not self._plex:
+            raise RuntimeError("媒体服务器未配置")
+        item = self._plex.fetchItem(item_id)
+        if not item or getattr(item, "type", None) not in ("movie", "show"):
+            raise RuntimeError("媒体项目详情无效")
+        return self.__sync_item(item)
+
+    def get_item_image(self, item_id, image_type="Primary", max_width=None, quality=None, tag=None):
+        """
+        获取Plex项目海报响应；令牌只在服务端请求中使用
+        """
+        key = str(item_id or "").rstrip("/")
+        if image_type != "Primary" or not self._plex or not re.fullmatch(r"/library/metadata/\d+", key):
+            return None
+        thumb = key + "/thumb"
+        if tag and str(tag).isdigit():
+            thumb += "/" + str(tag)
+        try:
+            if max_width:
+                width = int(max_width)
+                query = urlencode({"url": thumb, "width": width, "height": width * 3 // 2,
+                                   "minSize": 1, "upscale": 0})
+                req_url = self._plex.url("/photo/:/transcode?" + query, includeToken=True)
+            else:
+                req_url = self._plex.url(thumb, includeToken=True)
+            return RequestUtils().get_res(req_url)
+        except Exception as e:
+            # Request errors embed the URL, which carries the Plex token: log the type only.
+            log.error(f"【{self.server_type}】读取Plex海报出错：{type(e).__name__}")
+            return None
 
     def get_episodes(self, series_id):
         """返回带真实 ratingKey、父剧集和 section 标识的 Plex 剧集。"""

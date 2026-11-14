@@ -181,7 +181,7 @@ class MediaIdentityMatrixTest(unittest.TestCase):
         media.meta.update_meta_data.side_effect = lambda values: cache.update(deepcopy(values))
         return media, provider, cache
 
-    def assert_identity(self, meta, case):
+    def assert_identity(self, meta, case, file=False):
         self.assertIsNotNone(meta)
         fixture = FIXTURES[case.identifier]
         self.assertEqual(case.identifier, meta.tmdb_id)
@@ -189,7 +189,11 @@ class MediaIdentityMatrixTest(unittest.TestCase):
         self.assertEqual(fixture.get("title") or fixture["name"], meta.title)
         self.assertEqual(case.seasons, tuple(meta.get_season_list()))
         self.assertEqual(case.episodes, tuple(meta.get_episode_list()))
-        self.assertFalse(meta.skip_reason)
+        if file and case.media_type != MediaType.MOVIE and not case.episodes:
+            # Work identity can be known while a season pack cannot name one file.
+            self.assertIn('缺少可验证集号', meta.skip_reason)
+        else:
+            self.assertFalse(meta.skip_reason)
         self.assertEqual(case.identifier, meta.tmdb_info["id"])
 
     @staticmethod
@@ -214,7 +218,7 @@ class MediaIdentityMatrixTest(unittest.TestCase):
         for case in SUCCESS_CASES:
             with self.subTest(case=case.name):
                 media, provider, _ = self.make_media()
-                self.assert_identity(self.file_result(media, case.filename), case)
+                self.assert_identity(self.file_result(media, case.filename), case, file=True)
                 self.assertGreater(provider.search_count(), 0)
 
     def test_title_and_file_cache_preserve_the_same_identity(self):
@@ -225,7 +229,7 @@ class MediaIdentityMatrixTest(unittest.TestCase):
                 search_count = provider.search_count()
                 self.assertTrue(cache)
                 self.assert_identity(media.get_media_info(case.filename), case)
-                self.assert_identity(self.file_result(media, case.filename), case)
+                self.assert_identity(self.file_result(media, case.filename), case, file=True)
                 self.assertEqual(search_count, provider.search_count(),
                                  "warm identity cache should avoid repeating title searches")
 

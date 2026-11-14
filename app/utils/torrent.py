@@ -170,7 +170,8 @@ class Torrent:
                 if files:
                     for item in files:
                         if item.get("path"):
-                            file_names.append(item["path"][0])
+                            # 保留完整相对路径，季目录也是文件识别的输入。
+                            file_names.append(os.path.join(*item["path"]))
                     file_folder = torrent.get("info", {}).get("name")
                 else:
                     file_names.append(torrent.get("info", {}).get("name"))

@@ -1,13 +1,20 @@
 import os
+import re
 
 
 class PathUtils:
 
     @staticmethod
-    def get_dir_files(in_path, exts="", filesize=0, episode_format=None, raise_errors=False):
+    def get_dir_files(in_path, exts="", filesize=0, episode_format=None, raise_errors=False, diagnostics=None,
+                      include_bluray=False):
         """
         获得目录下的媒体文件列表List ，按后缀、大小、格式过滤
+        diagnostics 可选：记录扫描数量及每个文件首次被排除的原因，不额外扫描目录。
+        include_bluray 为 True 时返回原盘根目录并停止扫描其内部文件，不对片段套用大小和集号过滤。
         """
+        if diagnostics is not None:
+            diagnostics.update(scanned=0, invalid_path=0, unsupported_extension=0,
+                               episode_mismatch=0, below_min_size=0)
         if not in_path:
             return []
         # 整理入口需要区分真实空目录与 NAS/权限故障；其他调用保留历史行为。
@@ -16,40 +23,52 @@ class PathUtils:
         if not os.path.exists(in_path):
             return []
         ret_list = []
+        def count(reason):
+            if diagnostics is not None:
+                diagnostics[reason] += 1
+
+        def eligible(path):
+            count("scanned")
+            if PathUtils.is_invalid_path(path):
+                count("invalid_path")
+                return False
+            # Sidecars are not episode candidates; classify their suffix before
+            # applying a media-specific pattern or validating its parsed range.
+            if exts and os.path.splitext(path)[-1].lower() not in exts:
+                count("unsupported_extension")
+                return False
+            if episode_format and not episode_format.match(os.path.basename(path)):
+                count("episode_mismatch")
+                return False
+            if filesize and os.path.getsize(path) < filesize:
+                count("below_min_size")
+                return False
+            return True
+
         def scan_error(error):
             if raise_errors:
                 raise error
         if os.path.isdir(in_path):
             for root, dirs, files in os.walk(in_path, onerror=scan_error):
+                if include_bluray:
+                    bluray = PathUtils.get_bluray_dir(root)
+                    if bluray:
+                        count("scanned")
+                        if PathUtils.is_invalid_path(bluray):
+                            count("invalid_path")
+                        elif bluray not in ret_list:
+                            ret_list.append(bluray)
+                        dirs[:] = []
+                        continue
                 for file in files:
                     cur_path = os.path.join(root, file)
-                    # 检查路径是否合法
-                    if PathUtils.is_invalid_path(cur_path):
-                        continue
-                    # 检查格式匹配
-                    if episode_format and not episode_format.match(file):
-                        continue
-                    # 检查后缀
-                    if exts and os.path.splitext(file)[-1].lower() not in exts:
-                        continue
-                    # 检查文件大小
-                    if filesize and os.path.getsize(cur_path) < filesize:
+                    if not eligible(cur_path):
                         continue
                     # 命中
                     if cur_path not in ret_list:
                         ret_list.append(cur_path)
         else:
-            # 检查路径是否合法
-            if PathUtils.is_invalid_path(in_path):
-                return []
-            # 检查后缀
-            if exts and os.path.splitext(in_path)[-1].lower() not in exts:
-                return []
-            # 检查格式
-            if episode_format and not episode_format.match(os.path.basename(in_path)):
-                return []
-            # 检查文件大小
-            if filesize and os.path.getsize(in_path) < filesize:
+            if not eligible(in_path):
                 return []
             ret_list.append(in_path)
         return ret_list
@@ -128,32 +147,49 @@ class PathUtils:
     @staticmethod
     def get_bluray_dir(path):
         """
-        判断是否蓝光原盘目录，是则返回原盘的根目录，否则返回空
+        将原盘目录或其内部任意条目归一化为根目录；电影合集不是一张原盘。
         """
         if not path or not os.path.exists(path):
             return None
-        if os.path.isdir(path):
-            if os.path.exists(os.path.join(path, "BDMV", "index.bdmv")):
-                return path
-            elif os.path.normpath(path).endswith("BDMV") \
-                    and os.path.exists(os.path.join(path, "index.bdmv")):
-                return os.path.dirname(path)
-            elif os.path.normpath(path).endswith("STREAM") \
-                    and os.path.exists(os.path.join(os.path.dirname(path), "index.bdmv")):
-                return PathUtils.get_parent_paths(path, 2)
-            else:
-                # 电视剧原盘下会存在多个目录形如：Spider Man 2021/DIsc1, Spider Man 2021/Disc2
-                for level1 in PathUtils.get_dir_level1_medias(path):
-                    if os.path.exists(os.path.join(level1, "BDMV", "index.bdmv")):
-                        return path
-                return None
-        else:
-            if str(os.path.splitext(path)[-1]).lower() in [".m2ts", ".ts"] \
-                    and os.path.normpath(os.path.dirname(path)).endswith("STREAM") \
-                    and os.path.exists(os.path.join(PathUtils.get_parent_paths(path, 2), "index.bdmv")):
-                return PathUtils.get_parent_paths(path, 3)
-            else:
-                return None
+        path = os.path.normpath(path)
+        directory = path if os.path.isdir(path) else os.path.dirname(path)
+        if PathUtils._is_bluray_disc_set(directory):
+            return directory
+        # Resolve the nearest real disc ancestor, including PLAYLIST/CERTIFICATE
+        # and index.bdmv events. Never infer a disc from arbitrarily named children.
+        while directory:
+            if os.path.isfile(os.path.join(directory, "BDMV", "index.bdmv")):
+                parent = os.path.dirname(directory)
+                if (re.fullmatch(r"(?:disc|disk)[ ._-]*\d+", os.path.basename(directory), re.IGNORECASE)
+                        and PathUtils._is_bluray_disc_set(parent)):
+                    return parent
+                return directory
+            parent = os.path.dirname(directory)
+            if parent == directory:
+                break
+            directory = parent
+        return None
+
+    @staticmethod
+    def _is_bluray_disc_set(path):
+        """Only explicit Disc1/Disc2-style siblings may share their parent's identity."""
+        if not path or not os.path.isdir(path):
+            return False
+        from config import RMT_MEDIAEXT
+        discs = []
+        for name in os.listdir(path):
+            child = os.path.join(path, name)
+            if PathUtils.is_invalid_path(child):
+                continue
+            if os.path.isdir(child):
+                if (not re.fullmatch(r"(?:disc|disk)[ ._-]*\d+", name, re.IGNORECASE)
+                        or not os.path.isfile(os.path.join(child, "BDMV", "index.bdmv"))):
+                    return False
+                discs.append(child)
+            elif os.path.splitext(name)[1].lower() in RMT_MEDIAEXT:
+                # A separate movie file beside the discs makes this a mixed folder.
+                return False
+        return bool(discs)
 
     @staticmethod
     def get_parent_paths(path, level: int = 1):

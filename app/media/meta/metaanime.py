@@ -14,7 +14,8 @@ class MetaAnime(MetaBase):
     """
     识别动漫
     """
-    _anime_no_words = ['CHS&CHT', 'MP4', 'GB MP4', 'WEB-DL']
+    _anime_no_words = ['CHS&CHT', 'MP4', 'GB MP4', 'WEB-DL', 'GB', 'CHS', 'CHT',
+                       'BIG5', 'ASS', 'SRT', 'AVC', 'HEVC', '2K', '4K', '8K']
     _name_nostring_re = MetaBase._season_episode_marker_re
     _roman_season_map = {
         "I": 1,
@@ -38,28 +39,47 @@ class MetaAnime(MetaBase):
             original_title = title
             # 字幕组信息会被预处理掉
             anitopy_info_origin = anitopy.parse(title)
+            release_group = (anitopy_info_origin or {}).get("release_group")
+            confirmed_group = ReleaseGroupsMatcher().is_group_label(release_group)
+            # Preserve a title already found by anitopy (including bilingual or
+            # category-heavy releases); promotion only repairs a missing title.
+            # anitopy also guesses a title-only first block as release_group.
+            # Only independently confirmed publisher evidence may promote the next block.
+            group_for_title = release_group if confirmed_group and not self._is_title_candidate(
+                (anitopy_info_origin or {}).get("anime_title")) else None
             # Series totals are metadata, not candidates for anitopy's bare episode rule.
             title = re.sub(self._subtitle_episode_all_re, " ", title, flags=re.IGNORECASE)
-            title = self.__prepare_title(title)
-            anitopy_info = anitopy.parse(title)
+            title = title.replace("【", "[").replace("】", "]").strip()
+            grouped = re.match(r"^(\[[^\]]+\])\s*\[([^\]]+)\]", title)
+            promoted = promote_bracket_title(title, release_group=group_for_title) != title
+            title = self.__prepare_title(title, release_group=group_for_title)
+            if grouped and promoted and re.search(r"\s+\d{1,3}$", grouped[2].strip()):
+                # A numeric suffix inside a title block is not the separate EP
+                # block. Mask only that title while anitopy reads the other fields.
+                parse_title = title.replace(grouped[1] + " " + grouped[2], grouped[1] + " NASTOOL_TITLE", 1)
+                anitopy_info = anitopy.parse(parse_title)
+                if anitopy_info:
+                    anitopy_info["anime_title"] = grouped[2]
+            else:
+                anitopy_info = anitopy.parse(title)
             if anitopy_info:
                 # 名称
                 name = anitopy_info.get("anime_title")
                 if name and name.find("/") != -1:
                     name = name.split("/")[-1].strip()
-                # A short numeric title is reliable when a separate season/episode was
-                # found; do not replace ``86 - 01`` with its release-group bracket.
-                numeric_title = bool(name and name.isdigit() and (
-                    anitopy_info.get("anime_season") or anitopy_info.get("episode_number")))
-                if (not name or name in self._anime_no_words
-                        or (len(name) < 5 and not StringUtils.is_chinese(name) and not numeric_title)):
-                    anitopy_info = anitopy.parse("[ANIME]" + title)
-                    if anitopy_info:
-                        name = anitopy_info.get("anime_title")
-                if (not name or name in self._anime_no_words
-                        or (len(name) < 5 and not StringUtils.is_chinese(name) and not numeric_title)):
+                # AIR/K and numeric titles are valid names. Only retry a missing
+                # title; never replace one merely because it is short.
+                if not self._is_title_candidate(name):
+                    retry = anitopy.parse("[ANIME]" + title) or {}
+                    retry_name = retry.get("anime_title")
+                    if retry_name and (not confirmed_group or str(retry_name).casefold() != str(release_group).casefold()):
+                        anitopy_info, name = retry, retry_name
+                    else:
+                        name = None
+                if not self._is_title_candidate(name):
                     name_match = re.search(r'\[(.+?)]', title)
-                    if name_match and name_match.group(1):
+                    if (name_match and name_match.group(1)
+                            and (not confirmed_group or name_match[1].strip().casefold() != str(release_group).strip().casefold())):
                         name = name_match.group(1).strip()
                 # anitopy does not treat a Roman numeral before an episode
                 # separator as a season (for example ``Youjo Senki II - 11``).
@@ -230,8 +250,14 @@ class MetaAnime(MetaBase):
         except Exception as e:
             ExceptionUtils.exception_traceback(e)
 
+    @classmethod
+    def _is_title_candidate(cls, name):
+        # Reject actual metadata/punctuation, not every short Latin title.
+        return bool(name and str(name).strip().upper() not in cls._anime_no_words
+                    and any(character.isalnum() for character in str(name)))
+
     @staticmethod
-    def __prepare_title(title):
+    def __prepare_title(title, release_group=None):
         """
         对命名进行预处理
         """
@@ -239,7 +265,9 @@ class MetaAnime(MetaBase):
             return title
         # 所有【】换成[]
         title = title.replace("【", "[").replace("】", "]").strip()
-        promoted = promote_bracket_title(title)
+        # Resolution normalization must also run on the early promotion path.
+        title = re.sub(r'\[4k]', '2160p', title, flags=re.IGNORECASE)
+        promoted = promote_bracket_title(title, release_group=release_group)
         if promoted != title:
             return promoted
         # 截掉xx番剧漫
@@ -258,8 +286,6 @@ class MetaAnime(MetaBase):
         title = re.sub(r'[0-9.]+\s*[MGT]i?B(?![A-Z]+)', "", title, flags=re.IGNORECASE)
         # 将TVxx改为xx
         title = re.sub(r"\[TV\s+(\d{1,4})", r"[\1", title, flags=re.IGNORECASE)
-        # 将4K转为2160p
-        title = re.sub(r'\[4k]', '2160p', title, flags=re.IGNORECASE)
         # 处理/分隔的中英文标题
         names = title.split("]")
         if len(names) > 1 and title.find("- ") == -1:

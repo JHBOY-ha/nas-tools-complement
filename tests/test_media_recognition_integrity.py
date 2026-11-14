@@ -82,26 +82,22 @@ class MediaRecognitionIntegrityTest(unittest.TestCase):
         self.assertEqual((4, 20), (meta.begin_season, meta.begin_episode))
         self.assertEqual(original_note, meta.note)
 
-    def test_public_name_retry_cannot_accept_a_previously_rejected_remap(self):
+    def test_unverified_remap_preserves_source_without_name_retry(self):
         meta = self._unverified_episode_meta()
         original_note = deepcopy(meta.note)
         episodes = {"episodes": [{"episode_number": number} for number in range(1, 86)]}
 
-        def search_name(**kwargs):
-            # A retry must receive the filename's release numbering, never a failed candidate's.
-            self.assertEqual((4, 20), (kwargs["meta_info"].begin_season,
-                                      kwargs["meta_info"].begin_episode))
-            return self._info()
-
         with patch("app.media.media.MetaInfo", return_value=meta), \
                 patch.object(self.media, "get_tmdb_info", return_value=self._info()), \
                 patch.object(self.media, "get_tmdb_tv_season_detail", return_value=episodes), \
-                patch.object(self.media, "_Media__search_media_with_name", side_effect=search_name) as search, \
+                patch.object(self.media, "_Media__search_media_with_name") as search, \
                 patch.object(self.media, "_Media__insert_media_cache") as cache:
             result = self.media.get_media_info(meta.org_string, cache=False)
-        search.assert_called_once()
+        # Missing numbering evidence cannot authorize another identity lookup.
+        search.assert_not_called()
         cache.assert_not_called()
         self.assertFalse(result.tmdb_id)
+        self.assertTrue(result.skip_reason)
         self.assertEqual((4, 20), (result.begin_season, result.begin_episode))
         self.assertEqual(original_note, result.note)
 

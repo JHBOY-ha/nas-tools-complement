@@ -473,12 +473,18 @@ class SearchKeyword(ClientResource):
 
 @search.route('/result')
 class SearchResult(ClientResource):
-    @staticmethod
-    def post():
+    parser = reqparse.RequestParser()
+    parser.add_argument('search_id', type=str, location=('form', 'args'))
+
+    @search.doc(parser=parser)
+    def post(self):
         """
         查询搜索结果
         """
-        return WebAction().api_action(cmd='get_search_result')
+        parser = self.parser.copy()
+        if request.is_json:
+            parser.replace_argument('search_id', type=str, location='json')
+        return WebAction().api_action(cmd='get_search_result', data=parser.parse_args())
 
 
 @download.route('/search')

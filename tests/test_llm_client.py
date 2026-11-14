@@ -2,13 +2,14 @@
 
 import os
 import sys
+import threading
 import types
 from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
 import httpx
-from openai import APIStatusError
+from openai import APIStatusError, OpenAI
 
 if not os.environ.get("NASTOOL_CONFIG"):
     _ROOT_PATH = os.path.dirname(os.path.dirname(__file__))
@@ -60,9 +61,64 @@ if "cacheout" not in sys.modules:
     sys.modules["cacheout"] = cacheout_stub
 
 from app.utils.llm_client import LLMClient
+from app.utils.search_cancellation import search_cancellation
 
 
 class LLMClientTest(TestCase):
+    def test_web_and_rss_indexer_searches_retain_configured_sdk_retries(self):
+        from app.indexer.indexer import Indexer
+        from app.utils.types import IndexerType, SearchType
+        from app.utils.workload import BoundedExecutor
+
+        requests = []
+        def respond(request):
+            requests.append(request)
+            if len(requests) == 1:
+                return httpx.Response(500, json={'error': {'message': 'temporary offline error'}})
+            return httpx.Response(200, json={'choices': [{'message': {'content': '{"ok": true}'}}]})
+        sdk = OpenAI(api_key='offline-key', base_url='https://llm.invalid/v1', max_retries=1,
+                     http_client=httpx.Client(transport=httpx.MockTransport(respond)))
+        self.addCleanup(sdk.close)
+        client = LLMClient({'base_url': 'https://llm.invalid/v1', 'api_key': 'offline-key',
+                            'model': 'offline', 'max_retries': 1})
+        client._client = sdk
+        indexer_type = Indexer.__closure__[0].cell_contents
+        indexer = indexer_type.__new__(indexer_type)
+        indexer._client_type = IndexerType.JACKETT
+        indexer._client = SimpleNamespace(search=lambda *args: [client.complete_json('system', 'user')])
+        indexer.get_indexers = lambda: [SimpleNamespace(id=1, name='offline', pri=0)]
+        indexer.progress = Mock()
+        indexer._search_executor = BoundedExecutor(1, 2, 'llm-retry-regression')
+        self.addCleanup(indexer._search_executor.shutdown)
+        for source in (SearchType.WEB, SearchType.RSS):
+            with self.subTest(source=source):
+                requests.clear()
+                self.assertEqual(indexer.search_by_keyword('Dune', {}, in_from=source), [{'ok': True}])
+                self.assertEqual(len(requests), 2)
+
+    def test_real_sdk_does_not_retry_request_after_search_is_stopped(self):
+        cancel = threading.Event()
+        requests = []
+        def respond(request):
+            requests.append(request)
+            if len(requests) == 1:
+                cancel.set()
+                return httpx.Response(500, json={'error': {'message': 'offline provider failure'}})
+            return httpx.Response(200, json={'choices': [{'message': {'content': '{"ok": true}'}}]})
+        # Only HTTP transport is replaced; exercise the pinned SDK's real option
+        # cloning, error handling and retry behavior without any network calls.
+        sdk = OpenAI(api_key='offline-key', base_url='https://llm.invalid/v1', max_retries=2,
+                     http_client=httpx.Client(transport=httpx.MockTransport(respond)))
+        self.addCleanup(sdk.close)
+        client = LLMClient({'base_url': 'https://llm.invalid/v1', 'api_key': 'offline-key', 'model': 'offline'})
+        client._client = sdk
+        with search_cancellation(cancel, disable_llm_retries=True):
+            self.assertEqual(client.complete_text('system', 'user'), '')
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(sdk.max_retries, 2)
+        self.assertEqual(client.complete_json('system', 'another search'), {'ok': True})
+        self.assertEqual(len(requests), 2)
+
     @staticmethod
     def make_sdk(response=None, error=None):
         sdk = Mock()

@@ -1524,6 +1524,34 @@ def library_items():
         return {"code": -1, "msg": str(e)}
 
 
+@App.route('/library/summary', methods=['POST'])
+@login_required
+def library_summary():
+    """
+    字幕状态标签计数，仅读取数据库中的同步记录与字幕状态快照
+    """
+    try:
+        data = request.get_json(silent=True) or request.form.to_dict() or {}
+        return MediaLibrary().summary_counts(data)
+    except Exception as e:
+        ExceptionUtils.exception_traceback(e)
+        return {"code": -1, "msg": str(e)}
+
+
+@App.route('/library/refresh', methods=['POST'])
+@login_required
+def library_refresh():
+    """
+    手动刷新当前页：逐项读取媒体服务器最新信息并更新本地记录，不做全量同步
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        return MediaLibrary().refresh_items(data)
+    except Exception as e:
+        ExceptionUtils.exception_traceback(e)
+        return {"code": -1, "msg": "刷新失败，请稍后重试"}
+
+
 @App.route('/library/episodes', methods=['POST'])
 @login_required
 def library_episodes():
@@ -1579,6 +1607,30 @@ def library_online_subtitle_search():
         return {"code": -1, "msg": str(error)}
     except Exception:
         return {"code": -1, "msg": "在线字幕检索失败，请稍后重试"}
+
+
+@App.route('/library/subtitle/preview', methods=['POST'])
+@login_required
+def library_subtitle_preview():
+    """
+    上传前预估语言与目标文件名；只接收文件名，不读取字幕内容，也不写入任何文件
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        path = _online_subtitle_media_path(data.get("media_path"))
+        filenames = data.get("filenames")
+        if not isinstance(filenames, list) or not filenames or len(filenames) > 40 \
+                or any(not isinstance(name, str) or not name or len(name) > 255 for name in filenames):
+            raise ValueError("字幕文件名无效")
+        server = str(data.get("server") or "").strip().lower()
+        if server not in ("emby", "jellyfin", "plex"):
+            server = str((Config().get_config("media") or {}).get("media_server") or "emby").lower()
+        return {"code": 0, "items": Subtitle().preview_upload_names(path, filenames, server)}
+    except ValueError as error:
+        return {"code": -1, "msg": str(error)}
+    except Exception as error:
+        ExceptionUtils.exception_traceback(error)
+        return {"code": -1, "msg": "无法预估字幕文件名"}
 
 
 @App.route('/library/subtitle/download', methods=['POST'])
@@ -1783,31 +1835,74 @@ def library_subtitle_repair():
         return _subtitle_task_error(e)
 
 
-@App.route('/library/image/<itemid>', methods=['GET'])
+_LIBRARY_IMAGE_TYPES = ("Primary", "Backdrop", "Thumb", "Logo", "Banner", "Art")
+_LIBRARY_IMAGE_TAG = re.compile(r"[A-Za-z0-9._-]{1,128}")
+_LIBRARY_IMAGE_ID = re.compile(r"[A-Za-z0-9._:/-]{1,200}")
+_LIBRARY_THUMB_WIDTH = 320
+_LIBRARY_THUMB_QUALITY = 85
+
+
+def _library_image_item_id(itemid):
+    """
+    规范化海报路由中的项目ID。Emby/Jellyfin的ID只允许单段；Plex的ID是
+    /library/metadata/N 形式的路径，路由中省略了开头的斜杠。
+    """
+    itemid = str(itemid or "")
+    if not _LIBRARY_IMAGE_ID.fullmatch(itemid) or ".." in itemid.split("/"):
+        return ""
+    server_type = MediaServer().get_type()
+    if str(getattr(server_type, "value", "")).lower() == "plex":
+        return "/" + itemid.lstrip("/")
+    return "" if "/" in itemid else itemid
+
+
+@App.route('/library/image/<path:itemid>', methods=['GET'])
 @login_required
 def library_image(itemid):
     """
     代理媒体服务器封面，避免前端暴露媒体服务器API Key
     """
-    try:
-        image_type = request.args.get("type") or "Primary"
-        res = MediaServer().get_item_image(itemid, image_type)
-        if not res or res.status_code != 200:
-            poster_file = MediaLibrary().get_local_poster_file(itemid)
-            if poster_file:
-                return send_file(poster_file)
-            response = make_response("", 404)
-            response.headers["Cache-Control"] = "private, max-age=300"
-            return response
-        response = make_response(res.content)
-        response.headers["Content-Type"] = res.headers.get("Content-Type") or "image/jpeg"
-        response.headers["Cache-Control"] = "private, max-age=3600"
-        return response
-    except Exception as e:
-        ExceptionUtils.exception_traceback(e)
+    def not_found():
         response = make_response("", 404)
         response.headers["Cache-Control"] = "private, max-age=300"
         return response
+
+    try:
+        itemid = _library_image_item_id(itemid)
+        if not itemid:
+            return not_found()
+        image_type = request.args.get("type") or "Primary"
+        if image_type not in _LIBRARY_IMAGE_TYPES:
+            return not_found()
+        tag = request.args.get("tag") or ""
+        if not _LIBRARY_IMAGE_TAG.fullmatch(tag):
+            tag = ""
+        try:
+            res = MediaServer().get_item_image(
+                itemid, image_type, max_width=_LIBRARY_THUMB_WIDTH,
+                quality=_LIBRARY_THUMB_QUALITY, tag=tag or None)
+        except Exception as e:
+            ExceptionUtils.exception_traceback(e)
+            res = None
+        content_type = (res.headers.get("Content-Type") or "") if res else ""
+        if not res or res.status_code != 200 or not content_type.lower().startswith("image/"):
+            poster_file = MediaLibrary().get_local_poster_file(itemid)
+            if poster_file:
+                # Local fallback files can change without a version: revalidate.
+                response = send_file(poster_file)
+                response.headers["Cache-Control"] = "private, no-cache"
+                return response
+            return not_found()
+        response = make_response(res.content)
+        response.headers["Content-Type"] = content_type
+        # A versioned URL changes whenever the server's poster changes, so the
+        # browser may keep it; unversioned posters keep the short cache.
+        response.headers["Cache-Control"] = (
+            "private, max-age=31536000, immutable" if tag else "private, max-age=3600")
+        return response
+    except Exception as e:
+        ExceptionUtils.exception_traceback(e)
+        return not_found()
 
 
 # 媒体服务器页面
@@ -2141,30 +2236,49 @@ def telegram():
         log.error("收到来自 %s 的非法Telegram消息：%s" % (request.remote_addr, msg_json))
         return '不允许的IP地址请求'
     if msg_json:
-        message = msg_json.get("message", {})
-        text = message.get("text")
-        user_id = message.get("from", {}).get("id")
-        log.info("收到Telegram消息：from=%s, text=%s" % (user_id, text))
-        # 获取用户名
-        user_name = message.get("from", {}).get("username")
-        if text:
-            # 检查权限
-            if text.startswith("/"):
-                if str(user_id) not in interactive_client.get("client").get_admin():
-                    Message().send_channel_msg(channel=SearchType.TG,
-                                               title="只有管理员才有权限执行此命令",
-                                               user_id=user_id)
-                    return '只有管理员才有权限执行此命令'
-            else:
-                if not str(user_id) in interactive_client.get("client").get_users():
-                    message.send_channel_msg(channel=SearchType.TG,
-                                             title="你不在用户白名单中，无法使用此机器人",
-                                             user_id=user_id)
-                    return '你不在用户白名单中，无法使用此机器人'
-            WebAction().handle_message_job(msg=text,
-                                           in_from=SearchType.TG,
-                                           user_id=user_id,
-                                           user_name=user_name)
+        client = interactive_client['client']
+        callback = msg_json.get('callback_query')
+        message = msg_json.get('message', {})
+        actor = callback.get('from', {}) if callback else message.get('from', {})
+        user_id = actor.get('id')
+        text = message.get('text') or ''
+        allowed = client.get_admin() if text.startswith('/') else client.get_users()
+        if str(user_id) not in allowed:
+            if callback:
+                client.answer_search_callback(callback['id'], '你没有使用此机器人的权限')
+            return '不允许的用户'
+        from web.backend.telegram_search import TelegramSearch
+        try:
+            if callback:
+                TelegramSearch().callback(callback)
+            elif text:
+                # Preserve existing service commands, subscriptions and direct
+                # links. Movie searches use isolated message-bound sessions.
+                from web.backend.search_torrents import SEARCH_MEDIA_TYPE
+                numeric_choice = text.isdigit() and int(text) < 10
+                legacy = (text.startswith(('/', '订阅', 'http', 'magnet:')) or
+                          (numeric_choice and not message.get('reply_to_message') and
+                           SEARCH_MEDIA_TYPE.get(user_id) == 'SUBSCRIBE'))
+                if legacy:
+                    WebAction().handle_message_job(msg=text, in_from=SearchType.TG,
+                                                   user_id=user_id, user_name=actor.get('username'))
+                else:
+                    if not numeric_choice:
+                        # Numeric film titles also start a new search rather
+                        # than continuing a previous subscription selection.
+                        # A new session search supersedes legacy numeric-reply
+                        # mode, but never replaces another session's candidates.
+                        SEARCH_MEDIA_TYPE[user_id] = 'SESSION_SEARCH'
+                    TelegramSearch().receive(text, user_id, message.get('chat', {}).get('id', user_id),
+                                             actor.get('username'), msg_json.get('update_id'),
+                                             message.get('reply_to_message', {}).get('message_id'))
+        except TaskQueueFull:
+            if callback:
+                client.answer_search_callback(callback['id'], '任务队列繁忙，请稍后重试')
+            return 'Busy', 503
+        except RuntimeError:
+            # A transport failure must not consume a webhook update as success.
+            return 'Telegram unavailable', 503
     return 'Ok'
 
 

@@ -65,7 +65,8 @@
   Filter = '{{ Filter or "" }}';
 
   // JSON escapes script delimiters while preserving booleans and null values.
-  Params = {{ Params|tojson }};
+  // Recent downloads and preset discovery routes omit optional filter parameters.
+  Params = {{ Params|default({})|tojson }};
 
   // 插入N个占位卡片 代替loading动画
   var page_card_num = 20;

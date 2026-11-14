@@ -78,8 +78,8 @@ def publish_extra(source, destination, mode, transfer, record):
     return publish_exclusive(source, destination, mode, transfer, record)
 
 
-def publish_exclusive(source, destination, mode, transfer, record, finalize=None):
-    """Shared protected publication for extras and evidence-bound episodes."""
+def publish_exclusive(source, destination, mode, transfer, record, finalize=None, *, retain_source=False):
+    """Publish a file; directory callers may defer MOVE cleanup until their batch commits."""
     if mode not in (RmtMode.LINK, RmtMode.COPY, RmtMode.MOVE, RmtMode.SOFTLINK):
         raise ValueError("受保护内容仅支持本地硬链接、软链接、复制或移动，远程模式无法保证排他发布")
     destination = os.path.abspath(destination)
@@ -90,7 +90,8 @@ def publish_exclusive(source, destination, mode, transfer, record, finalize=None
     # Reserve a future record slot before publication, without retaining the
     # SQLite writer lock while copying/hashing NAS files.
     with MainDb().reserve_write(), _lock_destination(destination):
-        return _publish_extra(source, destination, mode, transfer, record, finalize)
+        return _publish_extra(source, destination, mode, transfer, record, finalize,
+                              retain_source=retain_source)
 
 
 def _publication_pending(source, destination):
@@ -111,7 +112,7 @@ def has_pending_publication(source, destination):
     return os.path.lexists(pending) or os.path.lexists(pending + ".receipt")
 
 
-def _publish_extra(source, destination, mode, transfer, record, finalize=None):
+def _publish_extra(source, destination, mode, transfer, record, finalize=None, *, retain_source=False):
     """The caller holds the destination lock until persistence and source cleanup."""
     stat, pending = _publication_pending(source, destination)
     receipt = pending + ".receipt"
@@ -192,7 +193,9 @@ def _publish_extra(source, destination, mode, transfer, record, finalize=None):
         result = finalize()
         if result != 0:
             return result
-    if mode == RmtMode.MOVE and os.path.abspath(source) != os.path.abspath(destination):
+    # Multi-file discs retain every source until the entire directory and its
+    # history are acknowledged; MOVE still benefits from same-volume staging links.
+    if mode == RmtMode.MOVE and not retain_source and os.path.abspath(source) != os.path.abspath(destination):
         os.unlink(source)
     if os.path.lexists(pending):
         os.unlink(pending)

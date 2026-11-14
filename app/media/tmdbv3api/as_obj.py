@@ -1,10 +1,14 @@
 # encoding: utf-8
 import sys
+from collections.abc import MutableMapping
 
 from app.media.tmdbv3api.exceptions import TMDbException
 
 
+@MutableMapping.register
 class AsObj:
+    # Preserve SDK attribute access and object identity while declaring the
+    # mapping interface used by metadata consumers, including nested objects.
     def __init__(self, **entries):
         if "success" in entries and entries["success"] is False:
             raise TMDbException(entries["status_message"])
@@ -16,10 +20,10 @@ class AsObj:
             setattr(self, key, value)
 
     def __delitem__(self, key):
-        return delattr(self, key)
+        del self.__dict__[key]
 
     def __getitem__(self, key):
-        return getattr(self, key)
+        return self.__dict__[key]
 
     def __iter__(self):
         return iter(self.__dict__)
