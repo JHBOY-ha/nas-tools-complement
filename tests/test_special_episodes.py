@@ -598,7 +598,7 @@ publish_extra(sys.argv[1], sys.argv[2], RmtMode[sys.argv[3]], interrupted_copy, 
 
     def test_small_extras_survive_directory_size_filter_only_when_enabled(self):
         self.t._min_filesize = 150 * 1024 * 1024
-        with patch('app.filetransfer.PathUtils.get_bluray_dir', return_value=None), \
+        with patch('app.filetransfer.PathUtils.get_disc_dir', return_value=None), \
                 patch('app.filetransfer.PathUtils.is_invalid_path', return_value=False):
             self.assertTrue(self.t.transfer_media(in_from=SyncType.MAN, in_path=str(self.root),
                 target_dir=str(self.target), rmt_mode=RmtMode.LINK)[0])

@@ -294,7 +294,7 @@ class RecognitionTests(unittest.TestCase):
             return meta
         self.ns['MetaInfo'] = Mock(side_effect=parse)
         self.ns['PathUtils'] = NS(get_parent_paths=lambda p, n: str(Path(p).parents[n - 1]),
-                                  get_bluray_dir=lambda p: None)
+                                  get_disc_dir=lambda p: None)
         self.media.tmdb = True
         self.media.save_rename_cache = Mock()
         self.media.get_tmdb_tv_season_detail = Mock(return_value={'episodes': [
@@ -309,7 +309,7 @@ class RecognitionTests(unittest.TestCase):
 
     def test_monitored_batch_keeps_each_file_identity(self):
         self.ns['PathUtils'] = NS(get_parent_paths=lambda p, n: str(Path(p).parents[n - 1]),
-                                  get_bluray_dir=lambda p: None)
+                                  get_disc_dir=lambda p: None)
         self.media.tmdb = True
         self.media.save_rename_cache = Mock()
         metas = [NS(type=MediaType.MOVIE, note={}, skip_reason=None, tmdb_info=None, begin_season=None,
@@ -560,7 +560,7 @@ class DownloadTests(unittest.TestCase):
 class QueueTests(unittest.TestCase):
     def test_failed_transfer_drops_queue_and_records_unknown(self):
         ns = env()
-        ns['PathUtils'] = NS(get_bluray_dir=lambda p: None)
+        ns['PathUtils'] = NS(get_disc_dir=lambda p: None)
         cls = load_class('app/sync.py', 'Sync',
                          ['transfer_mon_files', '__record_unknown_files'], ns)
         sync = cls()

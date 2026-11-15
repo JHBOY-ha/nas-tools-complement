@@ -433,17 +433,17 @@ class BlurayNormalizationTest(unittest.TestCase):
 
     def test_named_movies_are_not_a_single_disc(self):
         collection, second = self.collection()
-        self.assertIsNone(PathUtils.get_bluray_dir(str(collection)))
+        self.assertIsNone(PathUtils.get_disc_dir(str(collection)))
         for root in (self.source, second):
-            self.assertEqual(str(root), PathUtils.get_bluray_dir(str(root)))
+            self.assertEqual(str(root), PathUtils.get_disc_dir(str(root)))
         # Even a wrapper with just one named movie must not acquire its identity.
         shutil.rmtree(second)
-        self.assertIsNone(PathUtils.get_bluray_dir(str(collection)))
+        self.assertIsNone(PathUtils.get_disc_dir(str(collection)))
 
     def test_collection_scan_returns_roots_without_stream_fragments(self):
         collection, second = self.collection()
         found = PathUtils.get_dir_files(str(collection), exts=['.m2ts'], filesize=10**9,
-            episode_format=EpisodeFormat('Show.E{ep}.mkv'), include_bluray=True, raise_errors=True)
+            episode_format=EpisodeFormat('Show.E{ep}.mkv'), include_discs=True, raise_errors=True)
         self.assertEqual({str(self.source), str(second)}, set(found))
         self.assertEqual(2, len(found))
         # Other callers retain the ordinary recursive-file contract.
@@ -476,7 +476,7 @@ class BlurayNormalizationTest(unittest.TestCase):
         for relative in ('.', 'BDMV', 'BDMV/STREAM', 'BDMV/index.bdmv',
                          'BDMV/STREAM/00001.m2ts', 'BDMV/PLAYLIST/00001.mpls', 'CERTIFICATE/id.bdmv'):
             with self.subTest(relative=relative):
-                self.assertEqual(str(self.source), PathUtils.get_bluray_dir(str(self.source / relative)))
+                self.assertEqual(str(self.source), PathUtils.get_disc_dir(str(self.source / relative)))
 
     def test_explicit_mixed_disc_paths_are_deduplicated_before_recognition(self):
         entries = [str(self.source / relative) for relative in ('.', 'BDMV', 'BDMV/STREAM',
@@ -532,23 +532,24 @@ class BlurayNormalizationTest(unittest.TestCase):
         for relative in ('.', 'Disc1', 'Disc2/BDMV', 'Disc1/BDMV/index.bdmv',
                          'Disc2/BDMV/STREAM/00001.m2ts'):
             with self.subTest(relative=relative):
-                self.assertEqual(str(pack), PathUtils.get_bluray_dir(str(pack / relative)))
+                self.assertEqual(str(pack), PathUtils.get_disc_dir(str(pack / relative)))
         ok, message = self.run_transfer(files=[str(pack / 'Disc1/BDMV/index.bdmv'),
                                               str(pack / 'Disc2/BDMV/STREAM/00001.m2ts')])
         self.assertTrue(ok, message)
         self.assert_complete(self.destination / 'Disc1')
         self.assert_complete(self.destination / 'Disc2')
         self.assertTrue((self.destination / 'notes.nfo').exists())
+        self.transfer.threadhelper.start_thread.assert_called_once()
 
     def test_numbered_discs_do_not_absorb_named_movies_or_separate_video_files(self):
         pack = self.disc_set()
         extra = pack / 'Coco.2017.mkv'
         extra.write_bytes(b'other movie')
-        self.assertIsNone(PathUtils.get_bluray_dir(str(pack)))
-        self.assertEqual(str(pack / 'Disc1'), PathUtils.get_bluray_dir(str(pack / 'Disc1')))
+        self.assertIsNone(PathUtils.get_disc_dir(str(pack)))
+        self.assertEqual(str(pack / 'Disc1'), PathUtils.get_disc_dir(str(pack / 'Disc1')))
         extra.unlink()
         (pack / 'Interstellar.2014').mkdir()
-        self.assertIsNone(PathUtils.get_bluray_dir(str(pack)))
+        self.assertIsNone(PathUtils.get_disc_dir(str(pack)))
 
     def test_one_failed_disc_keeps_batch_failed_and_retains_other_disc_identity(self):
         collection, second = self.collection()
@@ -569,7 +570,7 @@ class BlurayNormalizationTest(unittest.TestCase):
                 [path for path in file_list if path != str(second)], 'ignored second disc')):
             ok, message = self.run_transfer(RmtMode.MOVE, in_path=str(collection))
         self.assertFalse(ok)
-        self.assertIn('部分蓝光原盘被忽略', message)
+        self.assertIn('部分原盘被忽略', message)
         self.assert_complete(self.destination)
         self.assertTrue((second / 'BDMV/index.bdmv').is_file())
 
@@ -618,6 +619,6 @@ class BlurayNormalizationTest(unittest.TestCase):
             ok, message = self.run_transfer(in_from=SyncType.MON,
                 files=[str(self.source / 'BDMV/index.bdmv'), str(movie)])
         self.assertFalse(ok)
-        self.assertIn('部分蓝光原盘被忽略', message)
+        self.assertIn('部分原盘被忽略', message)
         self.assert_complete(self.source)
         self.assertFalse(self.destination.exists())

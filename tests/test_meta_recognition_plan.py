@@ -39,7 +39,7 @@ class ExtraRecognitionTest(unittest.TestCase):
             path = os.path.join(root, "Show [SP01].mkv")
             open(path, "wb").close()
             with patch("app.media.media.MetaInfo", side_effect=marker) as parser, \
-                    patch("app.media.media.PathUtils.get_bluray_dir", return_value=None):
+                    patch("app.media.media.PathUtils.get_disc_dir", return_value=None):
                 media.get_media_info_on_files([path])
             parser.assert_called_once()
             self.assertEqual("Show [SP01].mkv", parser.call_args.args[0])
@@ -295,7 +295,7 @@ class TransferGuardTest(unittest.TestCase):
                     transfer.dbhelper = MagicMock()
                     transfer._default_rmt_mode = RmtMode.COPY
                     with patch.object(transfer, "check_ignore", return_value=([path], "")), \
-                            patch("app.filetransfer.PathUtils.get_bluray_dir", return_value=None), \
+                            patch("app.filetransfer.PathUtils.get_disc_dir", return_value=None), \
                             patch.object(transfer, "_FileTransfer__transfer_file") as move:
                         success, _ = transfer.transfer_media(
                             in_from=SyncType.MAN, in_path=path, rmt_mode=RmtMode.COPY,

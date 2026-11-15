@@ -6,11 +6,11 @@ class PathUtils:
 
     @staticmethod
     def get_dir_files(in_path, exts="", filesize=0, episode_format=None, raise_errors=False, diagnostics=None,
-                      include_bluray=False):
+                      include_discs=False):
         """
         获得目录下的媒体文件列表List ，按后缀、大小、格式过滤
         diagnostics 可选：记录扫描数量及每个文件首次被排除的原因，不额外扫描目录。
-        include_bluray 为 True 时返回原盘根目录并停止扫描其内部文件，不对片段套用大小和集号过滤。
+        include_discs 为 True 时返回原盘根目录并停止扫描其内部文件，不对片段套用大小和集号过滤。
         """
         if diagnostics is not None:
             diagnostics.update(scanned=0, invalid_path=0, unsupported_extension=0,
@@ -50,14 +50,14 @@ class PathUtils:
                 raise error
         if os.path.isdir(in_path):
             for root, dirs, files in os.walk(in_path, onerror=scan_error):
-                if include_bluray:
-                    bluray = PathUtils.get_bluray_dir(root)
-                    if bluray:
+                if include_discs:
+                    disc = PathUtils.get_disc_dir(root)
+                    if disc:
                         count("scanned")
-                        if PathUtils.is_invalid_path(bluray):
+                        if PathUtils.is_invalid_path(disc):
                             count("invalid_path")
-                        elif bluray not in ret_list:
-                            ret_list.append(bluray)
+                        elif disc not in ret_list:
+                            ret_list.append(disc)
                         dirs[:] = []
                         continue
                 for file in files:
@@ -145,7 +145,16 @@ class PathUtils:
         return False
 
     @staticmethod
-    def get_bluray_dir(path):
+    def get_disc_type(path):
+        """Identify a physical disc root, not a collection or numbered disc set."""
+        if os.path.isfile(os.path.join(path, "BDMV", "index.bdmv")):
+            return "bluray"
+        if os.path.isfile(os.path.join(path, "VIDEO_TS", "VIDEO_TS.IFO")):
+            return "dvd"
+        return None
+
+    @staticmethod
+    def get_disc_dir(path):
         """
         将原盘目录或其内部任意条目归一化为根目录；电影合集不是一张原盘。
         """
@@ -153,15 +162,15 @@ class PathUtils:
             return None
         path = os.path.normpath(path)
         directory = path if os.path.isdir(path) else os.path.dirname(path)
-        if PathUtils._is_bluray_disc_set(directory):
+        if PathUtils._is_disc_set(directory):
             return directory
-        # Resolve the nearest real disc ancestor, including PLAYLIST/CERTIFICATE
-        # and index.bdmv events. Never infer a disc from arbitrarily named children.
+        # Resolve the nearest BDMV/VIDEO_TS disc ancestor, including index and
+        # stream events. Never infer a disc from arbitrarily named children.
         while directory:
-            if os.path.isfile(os.path.join(directory, "BDMV", "index.bdmv")):
+            if PathUtils.get_disc_type(directory):
                 parent = os.path.dirname(directory)
-                if (re.fullmatch(r"(?:disc|disk)[ ._-]*\d+", os.path.basename(directory), re.IGNORECASE)
-                        and PathUtils._is_bluray_disc_set(parent)):
+                if (re.fullmatch(r"(?:disc|disk|dvd)[ ._-]*\d+", os.path.basename(directory), re.IGNORECASE)
+                        and PathUtils._is_disc_set(parent)):
                     return parent
                 return directory
             parent = os.path.dirname(directory)
@@ -171,7 +180,7 @@ class PathUtils:
         return None
 
     @staticmethod
-    def _is_bluray_disc_set(path):
+    def _is_disc_set(path):
         """Only explicit Disc1/Disc2-style siblings may share their parent's identity."""
         if not path or not os.path.isdir(path):
             return False
@@ -182,8 +191,8 @@ class PathUtils:
             if PathUtils.is_invalid_path(child):
                 continue
             if os.path.isdir(child):
-                if (not re.fullmatch(r"(?:disc|disk)[ ._-]*\d+", name, re.IGNORECASE)
-                        or not os.path.isfile(os.path.join(child, "BDMV", "index.bdmv"))):
+                if (not re.fullmatch(r"(?:disc|disk|dvd)[ ._-]*\d+", name, re.IGNORECASE)
+                        or not PathUtils.get_disc_type(child)):
                     return False
                 discs.append(child)
             elif os.path.splitext(name)[1].lower() in RMT_MEDIAEXT:

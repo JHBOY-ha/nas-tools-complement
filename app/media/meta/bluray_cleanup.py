@@ -1,4 +1,4 @@
-"""Resume directory cleanup after a verified, durably recorded Blu-ray MOVE."""
+"""Resume BDMV/DVD cleanup; keep the historical receipt path for existing retries."""
 import hashlib
 import json
 import os

@@ -2514,7 +2514,7 @@ class Media:
         :param season: 季号，如有传入以该季号赋于所有文件，否则从名称中识别
         :param episode_format: EpisodeFormat
         :param chinese: 原标题为英文时是否从别名中检索中文名称
-        :param bluray: 当前条目是蓝光整季目录；目录不要求单文件集号
+        :param bluray: 历史参数名，表示整盘目录（BDMV / VIDEO_TS）；目录不要求单文件集号
         :param check_files: 是否检查本地文件；种子清单仅做识别时为 False，不扫描本地目录
         :return: 带有TMDB信息的每个文件对应的MetaInfo对象字典
         """
@@ -2535,8 +2535,8 @@ class Media:
         # Keep the directory form explicit at the admission boundary.  Direct
         # Media callers may pass an original-disc path without going through
         # FileTransfer, so do not rely solely on its optional hint.
-        bluray_paths = {path for path in file_list
-                        if check_files and os.path.isdir(path) and PathUtils.get_bluray_dir(path)}
+        disc_paths = {path for path in file_list
+                      if check_files and os.path.isdir(path) and PathUtils.get_disc_dir(path)}
         file_list = sorted(file_list, key=lambda path: (bool(fractions[path] or specials[path]), bool(fractions[path])))
         fractional_cache = {}
         task_identities = {}
@@ -2622,10 +2622,10 @@ class Media:
                     continue
                 parent_name = os.path.basename(os.path.dirname(file_path))
                 parent_parent_name = os.path.basename(PathUtils.get_parent_paths(file_path, 2))
-                # 过滤掉蓝光原盘目录下的子文件
+                # 过滤掉 BDMV / VIDEO_TS 原盘内部文件，整理入口应先归一化为根目录。
                 if check_files and not os.path.isdir(file_path) \
-                        and PathUtils.get_bluray_dir(file_path):
-                    log.info("【Meta】%s 跳过蓝光原盘文件：" % file_path)
+                        and PathUtils.get_disc_dir(file_path):
+                    log.info("【Meta】%s 跳过原盘内部文件：" % file_path)
                     continue
                 # 没有自带TMDB信息
                 if not tmdb_info:
@@ -2888,9 +2888,9 @@ class Media:
                             live = False
                         meta_info._numbering_result = NumberingResult.verified(
                             meta_info, tmdb_info, season_authorized=live)
-                bluray_item = file_path in bluray_paths or (bluray and len(file_list) == 1)
+                disc_item = file_path in disc_paths or (bluray and len(file_list) == 1)
                 self._finalize_recognition(
-                    meta_info, file=not bluray_item, mtype_hint=default_type)
+                    meta_info, file=not disc_item, mtype_hint=default_type)
                 if meta_info.tmdb_info and not meta_info.skip_reason:
                     if pending_cache:
                         self.__insert_media_cache(media_key=pending_cache[0], file_media_info=pending_cache[1])
@@ -2920,7 +2920,7 @@ class Media:
         # Early special/error branches use exactly the same admission rule.
         return {
             path: self._finalize_recognition(
-                meta, file=not (path in bluray_paths or (bluray and len(file_list) == 1)),
+                meta, file=not (path in disc_paths or (bluray and len(file_list) == 1)),
                 mtype_hint=default_type)
             for path, meta in return_media_infos.items()
         }

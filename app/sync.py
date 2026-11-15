@@ -228,9 +228,10 @@ class Sync(object):
                     name = os.path.basename(event_path)
                     if not name:
                         return
-                    if name.lower() != "index.bdmv":
-                        ext = os.path.splitext(name)[-1]
-                        if ext.lower() not in RMT_MEDIAEXT:
+                    if name.lower() not in ("index.bdmv", "video_ts.ifo"):
+                        ext = os.path.splitext(name)[-1].lower()
+                        if ext not in RMT_MEDIAEXT and not (
+                                ext in ('.ifo', '.vob', '.bup') and PathUtils.get_disc_dir(event_path)):
                             return
                     # 根目录与子目录使用相同的队列，由定时任务统一转移。
                     queue_path = event_path if is_root_path else from_dir
@@ -284,7 +285,7 @@ class Sync(object):
                     if ret and not ret_msg:
                         ret = self.dbhelper.insert_sync_history(path, target_info['source'], target_info['target']) is not False
                 else:
-                    src_path = PathUtils.get_bluray_dir(path) or path
+                    src_path = PathUtils.get_disc_dir(path) or path
                     ret, ret_msg = self.filetransfer.transfer_media(
                         in_from=SyncType.MON, in_path=src_path,
                         files=[] if src_path != path or target_info.get('full_scan') else files,

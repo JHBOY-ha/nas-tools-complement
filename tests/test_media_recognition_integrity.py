@@ -154,7 +154,7 @@ class MediaRecognitionIntegrityTest(unittest.TestCase):
                 "seasons": [{"season_number": 1}, {"season_number": 2}]}
         with tempfile.TemporaryDirectory() as directory, \
                 patch.object(self.media, "save_rename_cache"), \
-                patch("app.media.media.PathUtils.get_bluray_dir", return_value=None):
+                patch("app.media.media.PathUtils.get_disc_dir", return_value=None):
             path = Path(directory) / filename
             path.write_bytes(b"source video")
             results = self.media.get_media_info_on_files(

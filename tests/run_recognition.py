@@ -26,6 +26,7 @@ RECOGNITION_MODULES = (
     "tests.test_episode_transfer_guards",
     # Disc retries must never authorize deletion before the whole tree is verified.
     "tests.test_bluray_transfer",
+    "tests.test_disc_metadata",
     # Preserve title roles through provider lookup and cache reuse.
     "tests.test_series_name_integrity",
     "tests.test_special_episodes",
