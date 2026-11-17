@@ -480,7 +480,7 @@
         <form class="d-flex flex-wrap gap-2" novalidate onsubmit="event.preventDefault(); search_library_online_subtitles();">
           <input id="library_online_keyword" class="form-control flex-fill" aria-label="字幕检索名称" placeholder="中文名 英文原名 年份，可自由编辑" maxlength="200" required>
           <!-- 来源选择继续使用原生弹出层；OpenSubtitles 复用独立配置卡片中的账户。 -->
-          <select id="library_online_provider" class="form-select w-auto" aria-label="字幕来源"><option value="all">全部来源</option><option value="thunder">迅雷</option><option value="assrt">Assrt</option><option value="opensubtitles">OpenSubtitles</option></select>
+          <select id="library_online_provider" class="form-select w-auto" aria-label="字幕来源" onchange="search_library_online_subtitles()"><option value="all">全部来源</option><option value="thunder">迅雷</option><option value="assrt">Assrt</option><option value="opensubtitles">OpenSubtitles</option></select>
           <button class="btn" type="button" onclick="reset_library_online_keyword()">恢复默认词</button>
           <button id="library_online_search" class="btn btn-primary" type="submit">检索字幕</button>
         </form>

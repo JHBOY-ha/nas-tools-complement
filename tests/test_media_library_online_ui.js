@@ -51,7 +51,9 @@ const fixtures = JSON.parse(rendered.stdout);
         await new Promise(resolve => setTimeout(resolve, 80));
         if (payload.keyword === 'empty') return route.fulfill({json: {code: 0, items: [], warnings: []}});
         if (payload.keyword === 'error') return route.fulfill({json: {code: -1, msg: 'OpenSubtitles请求失败：HTTP 403'}});
-        return route.fulfill({json: {code: 0, items: [{name: 'Movie.2024.1080p', provider: 'opensubtitles',
+        // Echo the requested source so a stale "all" result cannot pass as a filtered one.
+        const provider = payload.provider === 'all' ? 'thunder' : payload.provider;
+        return route.fulfill({json: {code: 0, items: [{name: 'Movie.2024.1080p', provider: provider,
           format: 'srt', language: '简体中文', match_label: '片名与年份匹配', ticket: 'signed-result'}], warnings: []}});
       }
       if (url.pathname === '/library/subtitle/download') {
@@ -71,17 +73,18 @@ const fixtures = JSON.parse(rendered.stdout);
     const online = page.locator('#library-online-subtitle-modal');
     const confirmation = page.locator('#system-confirm-modal');
     await page.getByRole('button', {name: '下载并保存', exact: true}).waitFor();
+    assert.match(await page.locator('#library_online_results').innerText(), /迅雷 ·/);
     // Popup rendering belongs to the OS; verify the native option and the
     // application's real keyboard focus order without automating OS menus.
+    // Changing the source must re-run the search without a second click.
     await page.getByRole('combobox', {name: '字幕来源'}).selectOption('opensubtitles');
+    assert.equal(await page.locator('#library_online_search').isDisabled(), true);
+    await page.locator('#library_online_results').getByText('OpenSubtitles ·').waitFor();
+    assert.doesNotMatch(await page.locator('#library_online_results').innerText(), /迅雷 ·/);
     await page.getByRole('combobox', {name: '字幕来源'}).focus();
     await page.keyboard.press('Tab');
     assert.equal(await page.evaluate(() => document.activeElement.innerText), '恢复默认词');
     assert.equal(await page.locator('#library_online_provider').inputValue(), 'opensubtitles');
-    await page.getByRole('button', {name: '检索字幕', exact: true}).click();
-    assert.equal(await page.locator('#library_online_search').isDisabled(), true);
-    await page.getByRole('button', {name: '下载并保存', exact: true}).waitFor();
-    assert.match(await page.locator('#library_online_results').innerText(), /OpenSubtitles/);
     await page.getByRole('button', {name: '下载并保存', exact: true}).click();
     await confirmation.waitFor({state: 'visible'});
     assert.equal(await online.isVisible(), false);
