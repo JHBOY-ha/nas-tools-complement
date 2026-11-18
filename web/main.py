@@ -1932,8 +1932,15 @@ def notification():
 @App.route('/subtitle', methods=['POST', 'GET'])
 @login_required
 def subtitle():
+    try:
+        auto_download_usage = Subtitle().get_auto_download_usage()
+    except Exception as err:
+        # The usage line is informational; a database error must not hide the settings.
+        ExceptionUtils.exception_traceback(err)
+        auto_download_usage = None
     return render_template("setting/subtitle.html",
-                           Config=Config().get_config())
+                           Config=Config().get_config(),
+                           AutoDownloadUsage=auto_download_usage)
 
 
 # 字幕库的独立任务设置页；同时支持直接读取与 navmenu 的 POST 页面加载。

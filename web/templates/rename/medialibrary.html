@@ -57,8 +57,9 @@
             </div>
           </div>
           <div class="card-body">
-            <!-- 类型与字幕状态直接切换，计数只读取数据库；筛选值保存在隐藏域中供列表请求使用。 -->
+            <!-- 类型、小分类与字幕状态直接切换，计数只读取数据库；筛选值保存在隐藏域中供列表请求使用。 -->
             <input type="hidden" id="library_filter_type" value="all">
+            <input type="hidden" id="library_filter_category" value="">
             <input type="hidden" id="library_filter_subtitle" value="all">
             <div class="lit-library-tabs">
               <div class="lit-library-status-tabs" role="group" aria-label="媒体类型" id="library_type_tabs">
@@ -71,9 +72,18 @@
                 <button type="button" class="btn lit-library-status-tab active" data-library-subtitle="all" aria-pressed="true">全部 <span class="badge" data-library-count="all">–</span></button>
                 <button type="button" class="btn lit-library-status-tab" data-library-subtitle="missing" aria-pressed="false">缺字幕 <span class="badge" data-library-count="missing">–</span></button>
                 <button type="button" class="btn lit-library-status-tab" data-library-subtitle="unknown" aria-pressed="false">未检测 <span class="badge" data-library-count="unknown">–</span></button>
-                <button type="button" class="btn lit-library-status-tab" data-library-subtitle="problem" aria-pressed="false">有问题 <span class="badge" data-library-count="problem">–</span></button>
                 <button type="button" class="btn lit-library-status-tab" data-library-subtitle="ok" aria-pressed="false">已完成 <span class="badge" data-library-count="ok">–</span></button>
+                <!-- 前三项互斥且合计等于“全部”；“有问题”是电影外挂检测结果，与之交叉，用分隔线区分。 -->
+                <span class="lit-library-tab-divider" aria-hidden="true"></span>
+                <button type="button" class="btn lit-library-status-tab" data-library-subtitle="problem" aria-pressed="false"
+                        title="最近一次外挂字幕检测有问题的电影，可能同时属于缺字幕或已完成">有问题 <span class="badge" data-library-count="problem">–</span></button>
               </div>
+            </div>
+            <!-- 小分类平铺为一行标签，点击立即生效；顺序沿用分类 YAML，计数跟随当前字幕状态。 -->
+            <div class="lit-library-category-row" id="library_category_row" hidden>
+              <span class="lit-library-category-label" id="library_category_label">小分类</span>
+              <div class="lit-library-category-chips" role="group" aria-labelledby="library_category_label"
+                   id="library_category_chips"></div>
             </div>
             <div class="lit-library-toolbar flex-wrap">
               <form class="d-flex gap-2 flex-grow-1" role="search" onsubmit="event.preventDefault(); apply_library_filters();">
@@ -99,13 +109,7 @@
                   </div>
                   <div class="p-3">
                     <div class="row g-3 align-items-start">
-                      <div class="col-12 col-sm-6">
-                        <label class="form-label" for="library_filter_category">小分类</label>
-                        <select id="library_filter_category" class="form-select">
-                          <option value="">全部</option>
-                        </select>
-                      </div>
-                      <div class="col-12 col-sm-6">
+                      <div class="col-12">
                         <label class="form-label" for="library_filter_audio">音轨语言（仅电影）</label>
                         <select id="library_filter_audio" class="form-select">
                           <option value="all">全部</option>
@@ -145,7 +149,9 @@
                 </div>
               </div>
               <div class="lit-library-result-bar">
-              <div id="library_items_summary" class="text-muted" aria-live="polite"></div>
+                <div id="library_items_summary" class="text-muted" aria-live="polite"></div>
+                <!-- 只列出收在“筛选与排序”里的条件，便于看清恢复的视图；类型、小分类和状态已在标签上可见。 -->
+                <div id="library_active_filters" class="lit-library-active-filters"></div>
               </div>
             </div>
           </div>
@@ -310,6 +316,7 @@
           <label class="form-label" for="index_library_subtitle_audit_category">检测分类</label>
           <select class="form-select" id="index_library_subtitle_audit_category"
                   onchange="update_library_subtitle_audit_subcategories()">
+            <option value="" hidden disabled>请选择小分类所属的媒体类型</option>
             <option value="movie" selected>电影</option>
             <option value="tv">电视剧</option>
             <option value="anime">动漫</option>
@@ -352,8 +359,11 @@
       <div class="modal-footer">
         <button type="button" class="btn me-auto" data-bs-dismiss="modal">关闭</button>
         <button type="button" id="index_library_subtitle_audit_cancel" class="btn btn-outline-danger subtitle-task-cancel-action d-none">取消任务</button>
-        <button type="button" id="index_library_subtitle_audit_retry" class="btn btn-primary"
-                onclick="run_library_subtitle_audit(true)">开始/重新检测</button>
+        <!-- Scope readiness is independent of the running task's button lock. -->
+        <fieldset id="library_audit_start_scope" class="m-0 p-0 border-0">
+          <button type="button" id="index_library_subtitle_audit_retry" class="btn btn-primary"
+                  onclick="run_library_subtitle_audit(true)">开始/重新检测</button>
+        </fieldset>
       </div>
     </div>
   </div>

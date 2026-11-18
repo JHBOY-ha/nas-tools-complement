@@ -5,6 +5,7 @@ from threading import Condition, Lock
 from apscheduler.executors.base import run_job
 from apscheduler.executors.pool import BasePoolExecutor
 
+from app.llm_source import llm_source
 from app.utils.workload import BoundedExecutor
 from config import Config
 
@@ -42,8 +43,9 @@ class SharedScheduledExecutor(BasePoolExecutor):
         with self._condition:
             if self._closing:
                 raise RuntimeError('Scheduler executor is shutting down')
-            future = self._pool.submit(run_job, job, job._jobstore_alias,
-                                       run_times, self._logger.name)
+            with llm_source(f"{job.name}（定时）"):
+                future = self._pool.submit(run_job, job, job._jobstore_alias,
+                                           run_times, self._logger.name)
             self._futures.add(future)
 
         def completed(done):

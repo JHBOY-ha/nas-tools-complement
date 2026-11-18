@@ -14,6 +14,8 @@ function $(selector) {
     value: '', content: '',
     val() { return this.value; },
     prop() { return this; },
+    attr() { return this; },
+    addClass() { return this; },
     removeClass() { return this; },
     one(event, callback) { this.hidden = callback; return this; },
     html(value) { this.content = value; return this; },

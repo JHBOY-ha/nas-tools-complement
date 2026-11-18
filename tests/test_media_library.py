@@ -515,6 +515,7 @@ class MediaLibraryTest(TestCase):
     def test_media_name_search_filters_before_pagination(self):
         from unittest.mock import Mock
         library = MediaLibrary.__new__(MediaLibrary)
+        library.category = self._AuditCategory()
         library.media_server = Mock()
         library.media_server.get_type.return_value = types.SimpleNamespace(value="emby")
         library.mediadb = Mock()
@@ -591,6 +592,7 @@ class MediaLibraryTest(TestCase):
                 return []
 
         library = MediaLibrary.__new__(MediaLibrary)
+        library.category = self._AuditCategory()
         library.mediadb = _MediaDb()
         library.dbhelper = _DbHelper()
         library.media_server = _MediaServer()
@@ -1072,6 +1074,7 @@ class MediaLibraryTest(TestCase):
                 return []
 
         library = MediaLibrary.__new__(MediaLibrary)
+        library.category = self._AuditCategory()
         library.media_server = _MediaServer()
         library.mediadb = _MediaDb()
         library.dbhelper = _DbHelper()
@@ -1107,6 +1110,7 @@ class MediaLibraryTest(TestCase):
 
     def test_list_items_clamps_page_and_reports_library_total(self):
         library = MediaLibrary.__new__(MediaLibrary)
+        library.category = self._AuditCategory()
         library.media_server = Mock()
         library.media_server.get_type.return_value = types.SimpleNamespace(value="emby")
         library.mediadb = Mock()
@@ -1138,8 +1142,9 @@ class MediaLibraryTest(TestCase):
             self.assertEqual((empty["total"], empty["page"], empty["library_total"]), (0, 1, 3))
 
     def _filter_library(self, entries):
-        """Library whose synced movies carry the given (audio streams, status, audit) tuples."""
+        """Library whose synced media carry (audio streams, status, audit, type[, category]) tuples."""
         library = MediaLibrary.__new__(MediaLibrary)
+        library.category = self._AuditCategory()
         library.media_server = Mock()
         library.media_server.get_type.return_value = types.SimpleNamespace(value="emby")
         library.mediadb = Mock()
@@ -1148,15 +1153,16 @@ class MediaLibraryTest(TestCase):
         library.dbhelper.get_transfer_histories_with_dest.return_value = []
 
         def build(row, **kwargs):
-            streams, _, _, media_type = entries[row]
+            streams, _, _, media_type = entries[row][:4]
+            category = entries[row][4] if len(entries[row]) > 4 else "外语电影"
             return dict(id=str(row), title=f"电影{row}", original_title="", year="2024",
-                        media_type=media_type, category="外语电影", media_streams=[],
+                        media_type=media_type, category=category, media_streams=[],
                         linked_episodes=[], target_path=f"/m/{row}.mkv",
                         audio_language=MediaLibrary._MediaLibrary__audio_language(streams)
                         if media_type == "movie" else "")
 
         def fill(item, snapshots, audit=None):
-            _, status, audit_status, _ = entries[int(item["id"])]
+            _, status, audit_status, _ = entries[int(item["id"])][:4]
             item["subtitle_status"] = status
             item["subtitle_audit_status"] = audit_status
             return item
@@ -1251,6 +1257,30 @@ class MediaLibraryTest(TestCase):
         with patch("app.library.Config") as config:
             config.return_value.get_config.return_value = {"media_server": "bogus"}
             self.assertEqual(library.summary_counts({})["code"], -1)
+
+    def test_category_chips_follow_yaml_order_and_count_the_current_status(self):
+        entries = [
+            ([], "missing_chinese", "", "movie", "动画电影"),
+            ([], "has_chinese_external", "", "movie", "国产电影"),
+            ([], "missing_chinese", "", "movie", "外国电影"),
+            ([], "missing_chinese", "", "movie", "外国电影"),
+            ([], "unknown", "", "movie", "旧分类"),
+            ([], "missing_chinese", "", "tv", "欧美剧"),
+            ([], "missing_chinese", "", "movie", ""),
+        ]
+        library = self._filter_library(entries)
+        listed = library.list_items({"page_size": 20})
+        # YAML order, names no longer configured last, and no empty chip.
+        self.assertEqual(listed["categories"]["movie"], ["国产电影", "外国电影", "动画电影", "旧分类"])
+        self.assertEqual(listed["categories"]["tv"], ["欧美剧"])
+        self.assertEqual(listed["categories"]["anime"], [])
+        missing = library.summary_counts({"subtitle": "missing", "category": "外国电影"})
+        # Chips ignore their own filter but follow the status; tabs keep the category.
+        self.assertEqual(missing["category_counts"], {"动画电影": 1, "外国电影": 2, "欧美剧": 1})
+        self.assertEqual(missing["counts"], {"all": 2, "missing": 2, "unknown": 0, "problem": 0, "ok": 0})
+        movies = library.summary_counts({"type": "movie", "subtitle": "bogus"})
+        self.assertEqual(movies["category_counts"], {"动画电影": 1, "国产电影": 1, "外国电影": 2, "旧分类": 1})
+        self.assertEqual(movies["counts"]["all"], 6)
 
     def test_library_list_paging_filtering_and_sorting_never_touch_nas(self):
         class _ServerType:

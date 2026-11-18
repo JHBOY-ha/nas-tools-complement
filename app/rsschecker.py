@@ -135,6 +135,7 @@ class RssChecker(object):
                 rss_flag = True
                 self._scheduler.add_job(func=with_db_session(self.check_task_rss),
                                         args=[task.get("id")],
+                                        name=f"自定义订阅 #{task['id']}",
                                         trigger='interval',
                                         seconds=int(task.get("interval")) * 60)
         if rss_flag:

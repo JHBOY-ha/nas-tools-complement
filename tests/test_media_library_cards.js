@@ -17,6 +17,7 @@ function node(selector) {
       removeClass(c) { this.classes.delete(c); return this; },
       toggleClass(c, on) { (on ? this.classes.add(c) : this.classes.delete(c)); return this; },
       attr() { return this; }, empty() { this.content = ''; return this; },
+      each() { return this; }, map() { return {get: () => this.optionValues || []}; },
       trigger() { return this; },
       modal(state) { this.modalState = state; return this; }
     };
@@ -115,9 +116,104 @@ assert.equal($('#library_filter_audio').prop('disabled'), true);
 $('#library_filter_type').val('all');
 $('#library_filter_audio').val('eng');
 $('#library_filter_keyword').val(' Movie ');
+// Sub-category counters follow the subtitle state, so the summary request carries it.
 assert.deepEqual(JSON.parse(JSON.stringify(context.library_summary_data())),
-  {type: 'all', category: '', keyword: 'Movie', audio_language: 'eng'});
+  {type: 'all', category: '', subtitle: 'all', keyword: 'Movie', audio_language: 'eng'});
 assert.equal(context.library_filter_data(2).audio_language, 'eng');
+
+// Sub-category chips keep the server's YAML order, list a name shared by TV and anime once,
+// and dim (but keep) categories with nothing in the current status.
+const plain = value => JSON.parse(JSON.stringify(value));
+$('#library_filter_keyword').val('');
+$('#library_filter_audio').val('all');
+$('#library_filter_subtitle').val('missing');
+context.library_categories_cache = {movie: ['华语电影', '外语电影'], tv: ['国产剧', '动漫'], anime: ['动漫']};
+context.library_category_counts = {'华语电影': 3, '外语电影': 0, '动漫': 2};
+context.render_library_category_chips();
+let chips = $('#library_category_chips').html();
+assert.deepEqual([...chips.matchAll(/data-library-category="([^"]*)"/g)].map(match => match[1]),
+  ['', '华语电影', '外语电影', '国产剧', '动漫']);
+assert.ok(chips.includes('lit-library-category-group">电影<') && chips.includes('lit-library-category-group">电视剧<'));
+assert.ok(!chips.includes('lit-library-category-group">动漫<'), 'an anime group holding only a shared name is omitted');
+assert.match(chips, /is-empty" data-library-category="外语电影"/);
+assert.match(chips, /is-empty" data-library-category="国产剧"/);
+assert.match(chips, /data-library-category="华语电影" aria-pressed="false">华语电影 <span class="badge">3<\/span>/);
+assert.equal($('#library_category_row').prop('hidden'), false);
+
+// A movie-only chip under "全部类型" selects its type; clicking it again clears only the chip.
+context.set_library_category('华语电影');
+assert.deepEqual([$('#library_filter_type').val(), $('#library_filter_category').val()], ['movie', '华语电影']);
+assert.match($('#library_category_chips').html(), /active" data-library-category="华语电影" aria-pressed="true"/);
+assert.ok(!$('#library_category_chips').html().includes('lit-library-category-group'), 'one type needs no group names');
+context.set_library_category('华语电影');
+assert.deepEqual([$('#library_filter_type').val(), $('#library_filter_category').val()], ['movie', '']);
+// A shared name keeps both types listed; switching type keeps a chip only where it exists.
+context.set_library_type('all');
+context.set_library_category('动漫');
+assert.deepEqual([$('#library_filter_type').val(), $('#library_filter_category').val()], ['all', '动漫']);
+context.set_library_type('anime');
+assert.equal($('#library_filter_category').val(), '动漫');
+context.set_library_type('movie');
+assert.equal($('#library_filter_category').val(), '');
+
+// Continuous fill only walks movies and refuses a TV scope instead of queueing every movie.
+$('#library_filter_type').val('all');
+$('#library_filter_category').val('国产剧');
+assert.deepEqual(plain(context.library_fill_scope()), {ok: false, label: '国产剧'});
+$('#library_filter_category').val('华语电影');
+assert.deepEqual(plain(context.library_fill_scope()), {ok: true, label: '电影 · 华语电影'});
+$('#library_filter_type').val('tv');
+$('#library_filter_category').val('');
+assert.deepEqual(plain(context.library_fill_scope()), {ok: false, label: '电视剧'});
+const fillGrid = {};
+context.document.getElementById = id => (id === 'library_items_grid' ? fillGrid : null);
+context.library_view_instance = {};
+context.failure = undefined;
+let fillRequests = 0;
+$.ajax = () => { fillRequests++; };
+context.start_library_fill();
+assert.match(context.failure, /连续补齐目前只支持电影。当前筛选是“电视剧”/);
+assert.equal(fillRequests, 0);
+$.ajax = () => {};
+context.document.getElementById = () => null;
+
+// Remembered views accept only known options; the search word and page come from history only.
+$('#library_filter_audio option').optionValues = ['all', 'eng', 'jpn'];
+assert.deepEqual(plain(context.library_normalize_view({type: 'tv', subtitle: 'bogus', sort_by: 'audit', sort_order: 'up',
+  audio_language: 'eng', category: ' 国产剧 ', page: '-3', keyword: 7})),
+  {type: 'tv', category: '国产剧', subtitle: 'all', sort_by: 'audit', sort_order: 'desc', audio_language: 'eng',
+    keyword: '', page: 1});
+assert.equal(context.library_normalize_view({audio_language: 'kor'}).audio_language, 'all');
+
+// An empty status names the combination and offers the same scope without the status.
+$('#library_filter_type').val('movie');
+$('#library_filter_category').val('外语电影');
+$('#library_filter_subtitle').val('missing');
+let emptyState = context.library_empty_state(10);
+assert.match(emptyState, /外语电影中没有“缺字幕”的媒体/);
+assert.match(emptyState, /onclick="set_library_subtitle\('all'\)">查看外语电影的全部媒体/);
+$('#library_filter_keyword').val('Movie');
+assert.match(context.library_empty_state(10), /当前筛选中没有“缺字幕”的媒体/);
+$('#library_filter_subtitle').val('all');
+assert.match(context.library_empty_state(10), /reset_library_filters\(\)/);
+assert.match(context.library_empty_state(0), /字幕库还没有媒体/);
+
+// Filters hidden in the menu appear as removable tags, with one reset for everything.
+$('#library_filter_audio').val('eng');
+$('#library_sort_by').val('audit');
+$('#library_sort_order').val('asc');
+context.render_library_active_filters();
+const activeFilters = $('#library_active_filters').html();
+assert.match(activeFilters, /data-library-clear-filter="audio"[^>]*>音轨：英语/);
+assert.match(activeFilters, /data-library-clear-filter="sort"[^>]*>排序：字幕检测问题程度 · 升序/);
+assert.match(activeFilters, /data-library-clear-filter="all">清除全部筛选/);
+for (const [selector, value] of [['#library_filter_type', 'all'], ['#library_filter_category', ''],
+  ['#library_filter_subtitle', 'all'], ['#library_filter_keyword', ''], ['#library_filter_audio', 'all'],
+  ['#library_sort_by', 'default'], ['#library_sort_order', 'desc']]) {
+  $(selector).val(value);
+}
+context.render_library_active_filters();
+assert.equal($('#library_active_filters').html(), '', 'the default view shows no tags');
 
 // Continuous fill walks a fixed queue, counts saves and skips, and ends cleanly.
 const opened = [];

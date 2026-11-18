@@ -339,6 +339,9 @@ subtitle:
   opensubtitles:
     # 是否启用
     enable: true
+    # 【自动下载上限】：最近 24 小时内整理后自动下载最多消耗的下载次数，0 表示不限制；
+    # 手动下载（字幕库、文件管理）不受此限制，但与自动下载共用账户每日配额
+    auto_download_limit: 0
   # 配置ChineseSubFinder的服务器地址和API Key，API Key在ChineseSubFinder->配置中心->实验室->API Key处生成
   chinesesubfinder:
     # IP地址和端口

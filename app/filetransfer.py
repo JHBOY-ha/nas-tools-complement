@@ -1296,7 +1296,7 @@ class FileTransfer:
         # 启新进程下载字幕
         if download_subtitle_items:
             try:
-                self.threadhelper.start_thread(Subtitle().download_subtitle, (download_subtitle_items,))
+                self.threadhelper.start_thread(Subtitle().download_subtitle_automatically, (download_subtitle_items,))
             except TaskQueueFull:
                 # Media has already been published. Optional subtitle admission
                 # must not turn that successful transfer into a failed retry.

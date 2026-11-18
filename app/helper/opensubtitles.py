@@ -23,6 +23,9 @@ class OpenSubtitles:
     additionally require the short-lived user JWT obtained from /login.
     """
 
+    class UnchargedRequest(str):
+        """Keep the public (payload, error text) contract while identifying refundable uses."""
+
     API_ROOT = "https://api.opensubtitles.com/api/v1"
     DEFAULT_LANGUAGES = "zh-cn,ze,zh-tw"
     RELEASE_SIMILARITY_THRESHOLD = 0.75
@@ -243,7 +246,7 @@ class OpenSubtitles:
         if authenticated:
             ok, error = self.login()
             if not ok:
-                return None, {}, error
+                return None, {}, self.UnchargedRequest(error)
         with self._state_lock:
             used_token = self._token
             base_url = self._base_url
@@ -478,8 +481,12 @@ class OpenSubtitles:
     def download(self, file_id):
         # Serialize only the quota-consuming API stage; content fetching and
         # unrelated searches do not hold this admission slot.
-        if not self._download_slot.acquire(timeout=current_deadline().remaining()):
-            return None, 'OpenSubtitles下载配额等待超过总时限'
+        try:
+            timeout = current_deadline().remaining()
+        except requests.Timeout:
+            return None, self.UnchargedRequest('OpenSubtitles下载请求已超过总时限')
+        if not self._download_slot.acquire(timeout=timeout):
+            return None, self.UnchargedRequest('OpenSubtitles下载配额等待超过总时限')
         try:
             return self._download_one(file_id)
         finally:
@@ -487,13 +494,16 @@ class OpenSubtitles:
 
     def _download_one(self, file_id):
         """Consume at most one quota unit by requesting one temporary URL."""
-        _, payload, error = self._request(
+        response, payload, error = self._request(
             "POST", "/download",
             json_data={"file_id": int(file_id), "sub_format": "srt"},
             authenticated=True,
             retry_server_error=False
         )
         if error:
+            # Only explicit rejections establish that no allowance was spent.
+            if response is not None and response.status_code in (400, 401, 403, 404, 406, 415, 422, 429):
+                error = self.UnchargedRequest(error)
             return None, error
         if not payload.get("link"):
             return None, "OpenSubtitles未返回字幕下载链接"

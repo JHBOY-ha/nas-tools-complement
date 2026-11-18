@@ -21,6 +21,7 @@ const navigation = shell.slice(shell.indexOf('  function navmenu('), shell.index
   try {
     const page = await browser.newPage();
     const errors = [];
+    const actionPages = [];
     page.on('pageerror', error => errors.push(error.message));
     await page.route('http://navigation.test/**', async route => {
       const url = new URL(route.request().url());
@@ -47,7 +48,10 @@ const navigation = shell.slice(shell.indexOf('  function navmenu('), shell.index
       if (url.pathname === '/downloading' || url.pathname === '/history') {
         return route.fulfill({contentType: 'text/html', body: `<h2>${url.pathname === '/history' ? '历史记录' : '正在下载'}</h2>`});
       }
-      if (url.pathname === '/do') return route.fulfill({json: {Items: []}});
+      if (url.pathname === '/do') {
+        actionPages.push(route.request().headers()['x-nastool-page']);
+        return route.fulfill({json: {Items: []}});
+      }
       if (url.pathname.startsWith('/static/')) return route.fulfill({path: path.join(root, 'web', url.pathname)});
       throw new Error(`Unexpected request: ${url}`);
     });
@@ -63,6 +67,7 @@ const navigation = shell.slice(shell.indexOf('  function navmenu('), shell.index
       await page.waitForFunction(title => document.querySelector('#page_content h2')?.textContent === title
         && !document.querySelector('#page_content').classList.contains('content-fade-out'), previous);
     }
+    assert.deepEqual(actionPages, ['/downloaded', '/downloaded', '/downloaded']);
     assert.deepEqual(errors, []);
     if (process.env.TEST_ARTIFACT_DIR) {
       fs.mkdirSync(process.env.TEST_ARTIFACT_DIR, {recursive: true});

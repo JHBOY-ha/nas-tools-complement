@@ -15,7 +15,7 @@ from math import floor
 from urllib.parse import unquote, urlsplit
 
 import cn2an
-from flask import g, has_request_context, copy_current_request_context, request, session
+from flask import current_app, g, has_request_context, copy_current_request_context, request, session
 from flask_login import logout_user, current_user
 from werkzeug.security import generate_password_hash
 
@@ -42,7 +42,7 @@ from app.scheduler import stop_scheduler
 from app.sites import Sites
 from app.sites.sitecookie import SiteCookie
 from app.subscribe import Subscribe
-from app.subtitle import Subtitle
+from app.subtitle import Subtitle, parse_auto_download_limit
 from app.sync import Sync, stop_monitor
 from app.torrentremover import TorrentRemover
 from app.speedlimiter import SpeedLimiter
@@ -52,6 +52,7 @@ from app.utils.types import RmtMode, OsType, SearchType, DownloaderType, SyncTyp
 from app.utils.security_utils import parse_episode_offset, parse_rule_dict, normalize_proxies, compile_ignore_pattern
 from web.backend.uploads import upload_directory, uploaded_path
 from app.utils.exclusive_publish import rename_exclusive
+from app.llm_source import current_llm_source, llm_source
 from app.utils.workload import TaskQueueFull
 from app.helper.action_tasks import ActionTasks, COMMAND_TITLES
 from config import RMT_MEDIAEXT, TMDB_IMAGE_W500_URL, RMT_SUBEXT, Config
@@ -266,7 +267,21 @@ class WebAction:
         func = self._actions.get(cmd)
         if not func:
             return {"code": -1, "msg": "非授权访问！"}
-        else:
+        action_name = COMMAND_TITLES.get(cmd, cmd)
+        parent = current_llm_source()
+        source = f"{parent} · {action_name}" if parent else action_name
+        if has_request_context() and request.endpoint == "do":
+            page = request.headers.get("X-NAStool-Page")
+            # Use only registered static routes. A client-supplied URL can contain secrets.
+            if page and any(rule.rule == page and not rule.arguments for rule in current_app.url_map.iter_rules()):
+                source = {
+                    "/douban_tv": "豆瓣电视剧", "/douban_movie": "豆瓣电影", "/ranking": "榜单推荐",
+                    "/tmdb_tv": "TMDB电视剧", "/tmdb_movie": "TMDB电影", "/recommend": "推荐列表",
+                    "/media_detail": "媒体详情", "/history": "整理历史", "/user_rss": "自定义订阅",
+                }.get(page, f"页面 {page}")
+                if cmd in COMMAND_TITLES:
+                    source = f"{source} · {action_name}"
+        with llm_source(source):
             try:
                 if has_request_context() and not getattr(g, '_action_task_worker', False) \
                         and cmd in COMMAND_TITLES \
@@ -304,7 +319,8 @@ class WebAction:
                 return {'code': -1, 'msg': '未知服务'}
             # Execute the service itself, not its former "thread started" ack.
             def function(_data):
-                result = service()
+                with llm_source(f"{current_llm_source()} → {data['item']}"):
+                    result = service()
                 # 目录同步的 False 包括锁繁忙和逐文件/记录失败，均须保留失败终态。
                 if result is False:
                     return {'code': -1, 'retmsg': '服务未执行或执行失败，请查看日志后重试'}
@@ -515,6 +531,9 @@ class WebAction:
             else:
                 cfg['app']['proxies'] = {"https": None, "http": None}
             return cfg
+        # OpenSubtitles 自动下载上限：保存为整数，非法值拒绝且不改动配置
+        if cfg_key == "subtitle.opensubtitles.auto_download_limit":
+            cfg_value = parse_auto_download_limit(cfg_value)
         # 豆瓣用户列表
         if cfg_key == "douban.users":
             vals = cfg_value.split(",")

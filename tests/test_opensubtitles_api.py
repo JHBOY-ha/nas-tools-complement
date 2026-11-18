@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
 
+import datetime
+import json
 import os
 from pathlib import Path
 import importlib.util
 import sys
 import tempfile
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
 import types
 from enum import Enum
 from unittest import TestCase
@@ -937,3 +940,222 @@ class OpenSubtitlesApiTest(TestCase):
                     {"file": str(Path(directory) / "Movie")}, {"language": "zh-cn"}, "subtitle")
             self.assertFalse(ok)
             self.assertEqual([], list(Path(directory).iterdir()))
+
+    # --- Automatic download cap (rolling 24 hours, automatic downloads only) ---
+
+    SRT = "1\n00:00:01,000 --> 00:00:02,000\n你好\n"
+
+    class MemoryLedger:
+        KEY = ("OpenSubtitles", "AutoDownloadLedger")
+
+        def __init__(self, stamps=None, fail_set=False):
+            self.values = {} if stamps is None else {self.KEY: json.dumps(stamps)}
+            self.fail_set = fail_set
+            self.writes = 0
+
+        def get(self, dtype, key):
+            return self.values.get((dtype, key), "")
+
+        def set(self, dtype, key, value, note=""):
+            if self.fail_set:
+                return False
+            self.writes += 1
+            self.values[(dtype, key)] = value
+            return True
+
+        def stamps(self):
+            return json.loads(self.values.get(self.KEY) or "[]")
+
+    def _automatic_subtitle(self, limit, ledger):
+        subtitle = self._subtitle()
+        subtitle._auto_download_limit = limit
+        subtitle._auto_download_store = ledger
+        subtitle.opensubtitles.search_subtitles.return_value = ([{
+            "file_id": 42, "language": "zh-cn", "high_confidence": True
+        }], "")
+        subtitle.opensubtitles.download.return_value = ({"link": "https://example.test/sub"}, "")
+        return subtitle
+
+    def test_automatic_downloads_stop_at_limit_without_searching_further(self):
+        ledger = self.MemoryLedger()
+        subtitle = self._automatic_subtitle(2, ledger)
+        with tempfile.TemporaryDirectory() as directory:
+            items = [{"name": name, "file": str(Path(directory) / name)} for name in ("A", "B", "C")]
+            with patch.object(subtitle, "_Subtitle__fetch_temporary_subtitle", return_value=(self.SRT, "")):
+                ok, message = subtitle.download_subtitle_automatically(items)
+            self.assertFalse(ok)
+            self.assertIn("C：OpenSubtitles 自动下载已达 24 小时上限（2 次）", message)
+            self.assertTrue(Path(items[0]["file"] + ".chi.zh-cn.srt").is_file())
+            self.assertTrue(Path(items[1]["file"] + ".chi.zh-cn.srt").is_file())
+            self.assertFalse(Path(items[2]["file"] + ".chi.zh-cn.srt").exists())
+        self.assertEqual(2, subtitle.opensubtitles.download.call_count)
+        self.assertEqual(2, subtitle.opensubtitles.search_subtitles.call_count)
+        self.assertEqual(2, len(ledger.stamps()))
+
+    def test_manual_downloads_ignore_the_cap_and_are_not_recorded(self):
+        ledger = self.MemoryLedger([time.time() - 60])
+        subtitle = self._automatic_subtitle(1, ledger)
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(subtitle, "_Subtitle__fetch_temporary_subtitle", return_value=(self.SRT, "")):
+                ok, _ = subtitle.download_subtitle([{"name": "Movie", "file": str(Path(directory) / "Movie")}])
+        self.assertTrue(ok)
+        subtitle.opensubtitles.download.assert_called_once_with(42)
+        self.assertEqual(0, ledger.writes)
+
+    def test_records_older_than_24_hours_no_longer_count(self):
+        ledger = self.MemoryLedger([time.time() - 24 * 60 * 60 - 5])
+        subtitle = self._automatic_subtitle(1, ledger)
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(subtitle, "_Subtitle__fetch_temporary_subtitle", return_value=(self.SRT, "")):
+                ok, _ = subtitle.download_subtitle_automatically(
+                    [{"name": "Movie", "file": str(Path(directory) / "Movie")}])
+        self.assertTrue(ok)
+        stamps = ledger.stamps()
+        self.assertEqual(1, len(stamps))
+        self.assertGreater(stamps[0], time.time() - 60)
+
+    def test_failed_link_request_is_not_counted(self):
+        ledger = self.MemoryLedger()
+        subtitle = self._automatic_subtitle(1, ledger)
+        client = self._client()
+        client._token = "test-token"
+        subtitle.opensubtitles.download.side_effect = client.download
+        with tempfile.TemporaryDirectory() as directory:
+            item = {"name": "Movie", "file": str(Path(directory) / "Movie")}
+            with patch.object(client, "_raw_request", return_value=FakeResponse(status_code=406)):
+                ok, message = subtitle.download_subtitle_automatically([item])
+            self.assertFalse(ok)
+            self.assertIn("HTTP 406", message)
+            self.assertEqual([], ledger.stamps())
+            # The released reservation leaves the single allowed use available.
+            subtitle.opensubtitles.download.side_effect = None
+            subtitle.opensubtitles.download.return_value = ({"link": "https://example.test/sub"}, "")
+            with patch.object(subtitle, "_Subtitle__fetch_temporary_subtitle", return_value=(self.SRT, "")):
+                ok, _ = subtitle.download_subtitle_automatically([item])
+        self.assertTrue(ok)
+        self.assertEqual(1, len(ledger.stamps()))
+
+    def test_uncertain_link_requests_keep_the_only_reservation(self):
+        for response in (None, TimeoutError("response lost"), FakeResponse(status_code=503),
+                         FakeResponse(payload={"link": "http://unsafe.example/sub"})):
+            with self.subTest(response=response), tempfile.TemporaryDirectory() as directory:
+                ledger = self.MemoryLedger()
+                subtitle = self._automatic_subtitle(1, ledger)
+                client = self._client()
+                client._token = "test-token"
+                subtitle.opensubtitles.download.side_effect = client.download
+                item = {"name": "Movie", "file": str(Path(directory) / "Movie")}
+                with patch.object(client, "_raw_request", return_value=response) as post:
+                    if isinstance(response, Exception):
+                        post.side_effect = response
+                        with self.assertRaises(TimeoutError):
+                            subtitle.download_subtitle_automatically([item])
+                    else:
+                        self.assertFalse(subtitle.download_subtitle_automatically([item])[0])
+                    self.assertEqual(1, len(ledger.stamps()))
+                    self.assertIn("上限", subtitle.download_subtitle_automatically([item])[1])
+                    self.assertEqual(1, post.call_count)
+
+    def test_manual_waiter_reclaims_media_skipped_by_capped_owner(self):
+        owner = threading.Event()
+        waiting = threading.Event()
+        ledger = self.MemoryLedger([time.time()])
+        subtitle = self._automatic_subtitle(1, ledger)
+
+        class ObservedFuture(Future):
+            def result(self, timeout=None):
+                waiting.set()
+                return super().result(timeout=timeout)
+
+        def read_ledger(*args):
+            owner.set()
+            self.assertTrue(waiting.wait(3))
+            return ledger.values[args]
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(ledger, "get", side_effect=read_ledger), \
+                patch.object(self.subtitle_module, "Future", ObservedFuture), \
+                patch.object(subtitle, "_Subtitle__fetch_temporary_subtitle", return_value=(self.SRT, "")), \
+                ThreadPoolExecutor(2) as executor:
+            item = {"name": "Movie", "file": str(Path(directory) / "Movie")}
+            automatic = executor.submit(subtitle.download_subtitle_automatically, [item])
+            self.assertTrue(owner.wait(3))
+            ok, _ = subtitle.download_subtitle([item], selected_file_id=42)
+            self.assertTrue(ok)
+            self.assertIn("上限", automatic.result(timeout=3)[1])
+        subtitle.opensubtitles.download.assert_called_once_with(42)
+        self.assertEqual(0, ledger.writes)
+
+    def test_failed_content_fetch_still_counts_the_issued_link(self):
+        ledger = self.MemoryLedger()
+        subtitle = self._automatic_subtitle(3, ledger)
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(subtitle, "_Subtitle__fetch_temporary_subtitle", return_value=(None, "链接失效")):
+                ok, _ = subtitle.download_subtitle_automatically(
+                    [{"name": "Movie", "file": str(Path(directory) / "Movie")}])
+        self.assertFalse(ok)
+        self.assertEqual(1, len(ledger.stamps()))
+
+    def test_existing_subtitle_does_not_consume_the_automatic_allowance(self):
+        ledger = self.MemoryLedger()
+        subtitle = self._automatic_subtitle(1, ledger)
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory) / "Movie"
+            Path(str(base) + ".chi.zh-cn.srt").write_text("字幕", encoding="utf-8")
+            ok, message = subtitle.download_subtitle_automatically([{"name": "Movie", "file": str(base)}])
+        self.assertTrue(ok)
+        self.assertIn("字幕已存在", message)
+        subtitle.opensubtitles.download.assert_not_called()
+        self.assertEqual(0, ledger.writes)
+
+    def test_unrecordable_use_is_skipped_only_when_a_cap_is_set(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(self.subtitle_module, "log", Mock()):
+            item = {"name": "Movie", "file": str(Path(directory) / "Movie")}
+            capped = self._automatic_subtitle(3, self.MemoryLedger(fail_set=True))
+            ok, message = capped.download_subtitle_automatically([item])
+            self.assertFalse(ok)
+            self.assertIn("无法记录", message)
+            capped.opensubtitles.download.assert_not_called()
+
+            unlimited = self._automatic_subtitle(0, self.MemoryLedger(fail_set=True))
+            with patch.object(unlimited, "_Subtitle__fetch_temporary_subtitle", return_value=(self.SRT, "")):
+                ok, _ = unlimited.download_subtitle_automatically([item])
+            self.assertTrue(ok)
+            unlimited.opensubtitles.download.assert_called_once_with(42)
+
+    def test_concurrent_automatic_downloads_stay_within_the_cap(self):
+        ledger = self.MemoryLedger()
+        subtitle = self._automatic_subtitle(1, ledger)
+        start = threading.Barrier(2)
+        with tempfile.TemporaryDirectory() as directory:
+            def request(name):
+                start.wait(timeout=5)
+                return subtitle.download_subtitle_automatically(
+                    [{"name": name, "file": str(Path(directory) / name)}])
+
+            with patch.object(subtitle, "_Subtitle__fetch_temporary_subtitle", return_value=(self.SRT, "")):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    results = [future.result(timeout=10)
+                               for future in [executor.submit(request, name) for name in ("A", "B")]]
+        self.assertEqual([False, True], sorted(ok for ok, _ in results))
+        self.assertEqual(1, subtitle.opensubtitles.download.call_count)
+        self.assertEqual(1, len(ledger.stamps()))
+
+    def test_usage_reports_when_a_lowered_cap_lifts(self):
+        now = time.time()
+        stamps = [now - 3 * 3600, now - 2 * 3600, now - 3600]
+        subtitle = self._automatic_subtitle(2, self.MemoryLedger(stamps))
+        usage = subtitle.get_auto_download_usage()
+        # Two of three uses must age out before fewer than two remain.
+        expected = datetime.datetime.fromtimestamp(stamps[1] + 24 * 3600).strftime("%m-%d %H:%M")
+        self.assertEqual({"used": 3, "limit": 2, "resume_at": expected}, usage)
+        subtitle._auto_download_limit = 0
+        self.assertIsNone(subtitle.get_auto_download_usage()["resume_at"])
+
+    def test_auto_download_limit_parsing(self):
+        parse = self.subtitle_module.parse_auto_download_limit
+        for value, expected in ((None, 0), ("", 0), ("  ", 0), ("0", 0), (" 12 ", 12), (7, 7), ("1000", 1000)):
+            self.assertEqual(expected, parse(value), value)
+        for value in ("1001", "-1", "1.5", "abc", True, 1000.0, "1e3"):
+            with self.assertRaises(ValueError, msg=value):
+                parse(value)

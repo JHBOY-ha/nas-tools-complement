@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from sqlalchemy import and_, func, or_, text as sql_text
 
 import log
+from app.llm_source import llm_source
 from app.db.main_db import MainDb
 from app.db.transactions import write_transaction, read_snapshot, DatabaseBusy, DatabaseWriteError
 from app.db import publication as state_publication
@@ -2289,7 +2290,8 @@ class SubtitleTaskManager:
             self.finish_task(task_id, "failed", error="字幕任务处理器未注册", message="任务无法执行")
             return
         try:
-            processor(self, task_id)
+            with llm_source(f"字幕任务 {task['type']} #{task_id}"):
+                processor(self, task_id)
             current = self.get_task(task_id, owner=None, admin=True)
             if current and current.get("status") not in TERMINAL_STATES:
                 if self.is_cancel_requested(task_id):

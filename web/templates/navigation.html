@@ -2147,6 +2147,14 @@
 <script type="text/javascript">
   //当前页面地址
   let CURRENT_PAGE_URI = "";
+  // /do is shared by all SPA pages. Send only the mounted page path, before
+  // its startup scripts issue requests and without its search parameters.
+  $(document).ajaxSend(function (_event, xhr, settings) {
+    const target = new URL(settings.url, location.href);
+    if (target.origin === location.origin && target.pathname.endsWith("/do") && CURRENT_PAGE_URI) {
+      xhr.setRequestHeader("X-NAStool-Page", new URL(CURRENT_PAGE_URI, location.origin).pathname);
+    }
+  });
   // SPA 导航深度，用于控制返回按钮只在应用内跳转
   window._spa_nav_index = 0;
 
@@ -2393,17 +2401,19 @@
     $content.addClass("content-fade-out");
 
     setTimeout(function() {
-      $content.load(page, {}, function (response, status, xhr) {
+      $.post(page, {}, null, "html").done(function (html) {
+        if (page !== CURRENT_PAGE_URI) {
+          $(window).scrollTop(0);
+        }
+        CURRENT_PAGE_URI = page;
+        $content.html(html);
+      }).always(function () {
         NProgress.done();
         if ($content.find("title").first().text() === "登录 - NAStool") {
           window.location.reload();
         } else {
           fresh_tooltip();
           init_filetree_element();
-        }
-        if (page !== CURRENT_PAGE_URI) {
-          $(window).scrollTop(0);
-          CURRENT_PAGE_URI = page;
         }
         // 并记录当前历史记录
         window_history(!newflag);
@@ -2431,7 +2441,6 @@
           if (e.state.CurrentPage) {
             sessionStorage.CurrentPage = e.state.CurrentPage;
           }
-          CURRENT_PAGE_URI = e.state.page;
           document.querySelector("#navbar-menu").update_active();
           $(window).unbind('scroll');
           document.title = e.state.title;
@@ -2439,6 +2448,7 @@
           var $content = $('#page_content');
           $content.addClass("content-fade-out");
           setTimeout(function() {
+            CURRENT_PAGE_URI = e.state.page;
             $content.html(e.state.html).ready(function() {
               $(window).scrollTop(e.state.scroll);
             });

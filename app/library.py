@@ -119,21 +119,37 @@ class MediaLibrary:
 
     def summary_counts(self, data=None):
         """
-        Tab counters for the current type/category/keyword/audio filters. The
-        subtitle filter itself is not applied; only SQLite state is read.
+        Counters for the status tabs and the sub-category chips; only SQLite
+        state is read.
+
+        Status counts apply type/category/keyword/audio but not the subtitle
+        filter, so each tab shows what it would list. Category counts are the
+        matching facet: they apply every filter, including the subtitle state,
+        except the category itself.
         """
         data = data or {}
         server_type = self.__resolve_server_type(data)
         if not server_type:
             return {"code": -1, "msg": "影视服务器配置无效"}
-        items, _, _ = self.__candidate_items(server_type, data)
+        category = data.get("category") or ""
+        subtitle = data.get("subtitle") or "all"
+        if subtitle not in self.subtitle_filters:
+            subtitle = "all"
+        items, _, _ = self.__candidate_items(server_type, dict(data, category=""))
         paths = self.__item_media_paths(items)
         status_snapshots = self.__status_snapshots_for_paths(server_type, paths)
         audit_snapshots = self.__latest_audit_snapshots(server_type, paths)
         movie_audit_snapshot = audit_snapshots.get("movie") or {}
-        counts = {"all": len(items), "missing": 0, "unknown": 0, "problem": 0, "ok": 0}
+        counts = {"all": 0, "missing": 0, "unknown": 0, "problem": 0, "ok": 0}
+        category_counts = {}
         for item in items:
             self.__fill_snapshot_subtitle_summary(item, status_snapshots, movie_audit_snapshot)
+            item_category = item.get("category") or ""
+            if item_category and self.__matches_subtitle(item, subtitle):
+                category_counts[item_category] = category_counts.get(item_category, 0) + 1
+            if category and item_category != category:
+                continue
+            counts["all"] += 1
             status = item.get("subtitle_status")
             if status == "missing_chinese":
                 counts["missing"] += 1
@@ -143,7 +159,23 @@ class MediaLibrary:
                 counts["ok"] += 1
             if self.__has_audit_problem(item):
                 counts["problem"] += 1
-        return {"code": 0, "counts": counts, "server": server_type}
+        return {"code": 0, "counts": counts, "category_counts": category_counts, "server": server_type}
+
+    subtitle_filters = ("all", "missing", "unknown", "problem", "ok")
+
+    @classmethod
+    def __matches_subtitle(cls, item, subtitle):
+        """One definition of each status tab, shared by the list and its counters."""
+        status = item.get("subtitle_status")
+        if subtitle == "missing":
+            return status == "missing_chinese"
+        if subtitle == "ok":
+            return status in ("has_chinese_external", "has_chinese_internal")
+        if subtitle == "unknown":
+            return status == "unknown"
+        if subtitle == "problem":
+            return cls.__has_audit_problem(item)
+        return True
 
     @staticmethod
     def __has_audit_problem(item):
@@ -204,16 +236,8 @@ class MediaLibrary:
                 self.__fill_snapshot_subtitle_summary(
                     item, status_snapshots, (audit_snapshots.get("movie") or {})
                 )
-                if subtitle == "missing" and item["subtitle_status"] != "missing_chinese":
-                    continue
-                if subtitle == "ok" and item["subtitle_status"] not in [
-                        "has_chinese_external", "has_chinese_internal"]:
-                    continue
-                if subtitle == "unknown" and item["subtitle_status"] != "unknown":
-                    continue
-                if subtitle == "problem" and not self.__has_audit_problem(item):
-                    continue
-                enriched_items.append(item)
+                if self.__matches_subtitle(item, subtitle):
+                    enriched_items.append(item)
             items = enriched_items
 
         if sort_by != "default":
@@ -259,9 +283,22 @@ class MediaLibrary:
             "page_size": page_size,
             "library_total": library_total,
             "synced_at": self.__synced_at(server_type),
-            "categories": {key: sorted(value) for key, value in categories.items()},
+            "categories": self.__ordered_categories(categories),
             "server": server_type
         }
+
+    def __ordered_categories(self, categories):
+        """Library categories in the category YAML's order, unconfigured names last.
+
+        A fixed order lets users find a chip in the same place every time.
+        Names no longer in the YAML still have media, so they stay listed.
+        """
+        ordered = {}
+        for media_type, names in categories.items():
+            names = {name for name in names if name}
+            preferred = [name for name in self.__category_names(media_type) if name in names]
+            ordered[media_type] = preferred + sorted(names.difference(preferred))
+        return ordered
 
     def __synced_at(self, server_type):
         """上次全量同步时间，仅读取统计表。"""

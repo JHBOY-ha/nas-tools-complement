@@ -52,11 +52,12 @@ def load_class(path, name, methods, namespace, keep_attrs=False):
 
 
 def env():
+    from app.llm_source import llm_log_message
     from app.utils.episode_format import EpisodeFormat
     # 季集验证的失败回滚使用深拷贝；AST 加载保留与生产方法相同的依赖。
     return dict(os=os, re=re, time=time, uuid=uuid, json=json, traceback=traceback, copy=copy,
                 MediaType=MediaType, Enum=Enum, MatchMode=NS(NORMAL='normal'), EpisodeFormat=EpisodeFormat,
-                log=Mock(), ExceptionUtils=Mock(), lock=threading.Lock(), urlencode=urlencode,
+                log=Mock(), llm_log_message=llm_log_message, ExceptionUtils=Mock(), lock=threading.Lock(), urlencode=urlencode,
                 Config=lambda: NS(get_config=lambda key: {}),
                 DEFAULT_EPISODE_MAPPINGS=[], DEFAULT_NAME_ALIASES={},
                 ANIME_GENREIDS=['16'], is_fansub_release_name=is_fansub_release_name,

@@ -4,6 +4,8 @@ from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from threading import Condition, Lock, local
 
+from app.llm_source import current_llm_source, llm_source
+
 
 class TaskQueueFull(RuntimeError):
     """Admission failed before a task or any of its side effects started."""
@@ -39,7 +41,12 @@ class BoundedExecutor(Executor):
         calls = list(calls)
         if not calls:
             return []
-        jobs = [(Future(), fn, args, kwargs) for fn, args, kwargs in calls]
+        # Capture at admission: the same worker can run unrelated pages and jobs.
+        origin = current_llm_source()
+        jobs = []
+        for fn, args, kwargs in calls:
+            source = origin or f"后台任务 {getattr(fn, '__qualname__', type(fn).__name__)}"
+            jobs.append((Future(), fn, args, kwargs, source))
         with self._lock:
             if self._shutdown:
                 raise RuntimeError("cannot schedule new futures after shutdown")
@@ -87,12 +94,13 @@ class BoundedExecutor(Executor):
                 if not self._pending:
                     self._workers -= 1
                     return
-                future, fn, args, kwargs = self._pending.popleft()
+                future, fn, args, kwargs, source = self._pending.popleft()
                 self._running += 1
             try:
                 if future.set_running_or_notify_cancel():
                     try:
-                        result = fn(*args, **kwargs)
+                        with llm_source(source):
+                            result = fn(*args, **kwargs)
                     except BaseException as error:
                         future.set_exception(error)
                     else:
@@ -118,7 +126,7 @@ class BoundedExecutor(Executor):
                 self._pending.clear()
         # Callbacks execute outside the queue lock: they may inspect this pool
         # or release a task's coalescing key.
-        for future, _, _, _ in canceled:
+        for future, _, _, _, _ in canceled:
             future.cancel()
             future.set_running_or_notify_cancel()
         self._executor.shutdown(wait=wait)

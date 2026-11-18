@@ -243,7 +243,8 @@ class LLMClientTest(TestCase):
             finish_reason="length"
         )]))
         with patch("app.utils.llm_client.OpenAI", return_value=sdk), \
-                patch("app.utils.llm_client.log.info") as info:
+                patch("app.utils.llm_client.log.info") as info, \
+                patch("app.utils.llm_client.log.debug") as debug:
             client = LLMClient({
                 "base_url": "https://api.deepseek.com/",
                 "api_key": "key",
@@ -254,7 +255,8 @@ class LLMClientTest(TestCase):
         kwargs = sdk.chat.completions.create.call_args.kwargs
         self.assertEqual(4, kwargs["max_tokens"])
         self.assertNotIn("extra_body", kwargs)
-        message = info.call_args.args[0]
+        self.assertIn("达到输出长度上限", info.call_args.args[0])
+        message = debug.call_args.args[0]
         self.assertIn("reasoning_content_len=14", message)
         self.assertIn("finish_reason=length", message)
 
@@ -307,7 +309,8 @@ class LLMClientTest(TestCase):
             }]
         })
         with patch("app.utils.llm_client.OpenAI", return_value=sdk), \
-                patch("app.utils.llm_client.log.info") as info:
+                patch("app.utils.llm_client.log.info") as info, \
+                patch("app.utils.llm_client.log.debug") as debug:
             client = LLMClient({
                 "base_url": "https://api.example/v1",
                 "api_key": "key",
@@ -315,7 +318,8 @@ class LLMClientTest(TestCase):
             })
             self.assertEqual("", client.complete_text("system", "user"))
 
-        message = info.call_args.args[0]
+        self.assertIn("达到输出长度上限", info.call_args.args[0])
+        message = debug.call_args.args[0]
         self.assertIn("补全请求最终内容为空", message)
         self.assertIn("reasoning_content_len=17", message)
         self.assertNotIn("private reasoning", message)

@@ -251,9 +251,10 @@ body, .page {
 .lit-library-result-bar {
     min-height: 2rem;
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     flex: 1 1 auto;
-    gap: 1rem;
+    gap: 0.5rem 1rem;
 }
 
 .lit-library-toolbar {
@@ -312,8 +313,9 @@ body, .page {
     margin: 0 calc(var(--tblr-btn-padding-x) / -4) 0 calc(var(--tblr-btn-padding-x) / 2);
 }
 
-/* 类型、状态标签与已启用筛选的入口共用同一选中态。 */
+/* 类型、小分类、状态标签与已启用筛选的入口共用同一选中态。 */
 .lit-library-status-tab.active,
+.lit-library-category-chip.active,
 .lit-library-filter-trigger.active {
     --tblr-btn-active-color: var(--tblr-primary);
     --tblr-btn-active-bg: rgba(var(--tblr-primary-rgb), 0.1);
@@ -321,7 +323,7 @@ body, .page {
 }
 
 .lit-library-filter-menu {
-    width: min(46rem, calc(100vw - 2rem));
+    width: min(32rem, calc(100vw - 2rem));
     max-width: calc(100vw - 2rem);
     overflow: hidden;
 }
@@ -819,6 +821,109 @@ button.lit-library-card-poster:focus-visible {
 .lit-library-status-tab.active .badge {
     background: var(--tblr-primary);
     color: var(--tblr-primary-fg, #fff);
+}
+
+/* “有问题”与前面互斥的覆盖状态交叉，不是第五种状态，用分隔线区分。 */
+.lit-library-tab-divider {
+    align-self: stretch;
+    width: 1px;
+    margin: 0.375rem 0.25rem;
+    background: var(--tblr-border-color);
+}
+
+/* --- 字幕库：小分类标签行（紧凑按钮，位于类型标签下方） --- */
+
+.lit-library-category-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.75rem;
+    margin: -0.375rem 0 1rem;
+}
+
+.lit-library-category-row[hidden] {
+    display: none;
+}
+
+.lit-library-category-label {
+    flex: 0 0 auto;
+    font-size: 0.75rem;
+    font-weight: 600;
+    line-height: var(--lit-library-btn-sm-height);
+    color: var(--tblr-muted-color);
+}
+
+.lit-library-category-chips {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.375rem;
+    min-width: 0;
+}
+
+/* 全部类型时按电影、电视剧、动漫分组；组名只是引导文字，不可点击。 */
+.lit-library-category-group {
+    margin-left: 0.5rem;
+    font-size: 0.75rem;
+    color: var(--tblr-muted-color);
+}
+
+.lit-library-category-chips > .lit-library-category-group:first-child {
+    margin-left: 0;
+}
+
+.lit-library-category-chip .badge {
+    background: var(--tblr-bg-surface-secondary);
+    color: var(--tblr-body-color);
+}
+
+.lit-library-category-chip.active .badge {
+    background: var(--tblr-primary);
+    color: var(--tblr-primary-fg, #fff);
+}
+
+/* 当前状态下为 0 的分类保留原位、可点击，只降低文字强调。 */
+.lit-library-category-chip.is-empty:not(.active) {
+    color: var(--tblr-muted-color);
+}
+
+/* 新列表返回前保留旧卡片并调淡，避免整页闪白；不使用过渡动画。 */
+.lit-library-grid.is-loading {
+    opacity: 0.55;
+    pointer-events: none;
+}
+
+.lit-library-active-filters {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.375rem;
+}
+
+.lit-library-active-filters:empty {
+    display: none;
+}
+
+@media (max-width: 767.98px) {
+    /* 状态标签换行后分隔线会悬在行尾，窄屏只靠“有问题”另起一行区分。 */
+    .lit-library-tab-divider {
+        display: none;
+    }
+
+    /* 窄屏小分类横向滑动，保持一行，不把卡片挤到首屏之外。 */
+    .lit-library-category-row {
+        align-items: center;
+    }
+
+    .lit-library-category-chips {
+        flex: 1 1 auto;
+        flex-wrap: nowrap;
+        overflow-x: auto;
+        padding-bottom: 0.125rem;
+    }
+
+    .lit-library-category-chips > * {
+        flex: 0 0 auto;
+    }
 }
 
 /* --- 字幕库：详情抽屉与拖放上传 --- */

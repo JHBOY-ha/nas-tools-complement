@@ -11,6 +11,7 @@ from difflib import SequenceMatcher
 from statistics import median
 
 import log
+from app.llm_source import llm_log_message
 from app.utils import ExceptionUtils
 from app.utils.llm_client import LLMClient
 from config import Config
@@ -920,7 +921,7 @@ class SubtitleAligner:
                 translated_cues[cue_id]["text"] = text
             if time.monotonic() >= deadline:
                 return None, "LLM 字幕对齐超时"
-        log.info("【Subtitle】LLM参考字幕翻译完成：protocol=openai, batches=%s" % batch_count)
+        log.info(llm_log_message("Subtitle", "LLM参考字幕翻译完成：protocol=openai, batches=%s" % batch_count))
         return translated_cues, ""
 
     @classmethod

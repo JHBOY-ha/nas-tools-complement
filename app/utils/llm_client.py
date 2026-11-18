@@ -3,6 +3,7 @@ import re
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 import log
+from app.llm_source import llm_log_message
 from app.utils import ExceptionUtils, StringUtils
 from app.utils.search_cancellation import search_disables_llm_retries, search_is_canceled
 from config import Config
@@ -53,9 +54,9 @@ class LLMClient:
     def get_status(self):
         if not self.is_ready(require_enable=False):
             if OPENAI_IMPORT_ERROR:
-                log.warn("【LLM】连接测试失败，OpenAI SDK 加载异常：%s" % str(OPENAI_IMPORT_ERROR))
+                log.warn(llm_log_message("LLM", "连接测试失败，OpenAI SDK 加载异常：%s" % str(OPENAI_IMPORT_ERROR)))
             else:
-                log.warn("【LLM】连接测试配置不完整，请检查 Base URL、API Key 和 Model")
+                log.warn(llm_log_message("LLM", "连接测试配置不完整，请检查 Base URL、API Key 和 Model"))
             return False
         try:
             response = self.__request_openai(
@@ -65,7 +66,7 @@ class LLMClient:
             )
             choices = self.__get_value(response, "choices", []) or []
             if not choices:
-                log.warn("【LLM】连接测试响应成功，但响应中不含 choices")
+                log.warn(llm_log_message("LLM", "连接测试响应成功，但响应中不含 choices"))
                 return False
             self.__log_empty_content(choices[0], context="连接测试")
             return True
@@ -115,7 +116,7 @@ class LLMClient:
             return ""
         choices = self.__get_value(response, "choices", []) or []
         if not choices:
-            log.warn("【LLM】OpenAI兼容接口响应成功，但响应中不含 choices")
+            log.warn(llm_log_message("LLM", "OpenAI兼容接口响应成功，但响应中不含 choices"))
             return ""
         choice = choices[0]
         message = self.__get_value(choice, "message") or {}
@@ -182,10 +183,10 @@ class LLMClient:
             return
         reasoning_content = cls.extract_text_content(cls.__get_value(message, "reasoning_content"))
         finish_reason = cls.__get_value(choice, "finish_reason", "") or ""
-        log.info(
-            "【LLM】%s最终内容为空：reasoning_content_len=%s, finish_reason=%s"
-            % (context, len(reasoning_content), finish_reason)
-        )
+        reason = "达到输出长度上限" if finish_reason == "length" else "没有返回正文"
+        log.info(llm_log_message("LLM", f"{context}结束，{reason}"))
+        log.debug(llm_log_message("LLM", f"{context}最终内容为空：reasoning_content_len={len(reasoning_content)}, "
+                                  f"finish_reason={finish_reason}"))
 
     @staticmethod
     def __parse_base_url(base_url):
@@ -277,13 +278,13 @@ class LLMClient:
             category = "api"
         detail = re.sub(r"\s+", " ", detail or "").strip()[:1000]
         log.error(
-            "【LLM】%s失败：category=%s, error_type=%s%s"
+            llm_log_message("LLM", "%s失败：category=%s, error_type=%s%s"
             % (
                 context,
                 category,
                 err.__class__.__name__,
                 ", detail=%s" % detail if detail else ""
-            )
+            ))
         )
 
     @staticmethod

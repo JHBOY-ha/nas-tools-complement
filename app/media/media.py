@@ -12,6 +12,7 @@ import zhconv
 from lxml import etree
 
 import log
+from app.llm_source import llm_log_message
 from app.helper import MetaHelper
 from app.media.meta._base import is_fansub_release_name
 from app.media.meta.llm_parser import LLMMetaParser
@@ -1876,7 +1877,7 @@ class Media:
         if season is None:
             return NumberingResult(NumberingState.UNRESOLVED, "LLM 已请求季绑定但缺少目标季号")
         if str(llm_note.get("tmdb_id")) != str(info.get("id")):
-            log.warn("【Meta】LLM季号与已识别作品不一致，暂不采用：%s" % season)
+            log.warn(llm_log_message("Meta", "LLM季号与已识别作品不一致，暂不采用：%s" % season))
             return NumberingResult(NumberingState.NOT_REQUESTED)
         detail = self.get_tmdb_tv_season_detail(info.get("id"), int(season)) or {}
         valid_episodes = {ep.get("episode_number") for ep in detail.get("episodes", [])}
@@ -1903,7 +1904,7 @@ class Media:
                 if absolute.state != NumberingState.VERIFIED:
                     return NumberingResult(NumberingState.UNRESOLVED, "目标季无法核验完整发布集号")
             else:
-                log.warn("【Meta】LLM季号已验证但集号%s不在该季集列表中，保留原集号" % episodes)
+                log.warn(llm_log_message("Meta", "LLM季号已验证但集号%s不在该季集列表中，保留原集号" % episodes))
         note = dict(meta_info.note or {})
         note["season_binding"] = {
             "tmdb_id": info.get("id"),
@@ -1917,11 +1918,11 @@ class Media:
         meta_info.begin_season = int(season)
         meta_info.end_season = None
         meta_info.total_seasons = 1
-        log.info("【Meta】采用LLM判定的季号：S%s%s（依据：%s，标题季标记：%s）"
+        log.info(llm_log_message("Meta", "采用LLM判定的季号：S%s%s（依据：%s，标题季标记：%s）"
                  % (str(season).rjust(2, "0"),
                     "E%s" % applied_episode if applied_episode else "",
                     llm_note.get("season_evidence") or "llm",
-                    llm_note.get("release_season")))
+                    llm_note.get("release_season"))))
         return NumberingResult.verified(meta_info, info)
 
     def __extract_llm_tmdb_target(self, meta_info, mtype_hint=None):
@@ -1956,7 +1957,7 @@ class Media:
                        and llm_note.get("candidate_verified"))
         if (expected_type and mtype != expected_type and not anime_movie
                 and (mtype_hint or meta_info.type != MediaType.MOVIE)):
-            log.warn("【Meta】LLM候选类型与作品类型冲突，回退名称检索")
+            log.warn(llm_log_message("Meta", "LLM候选类型与作品类型冲突，回退名称检索"))
             return None, None
         # 仅接受经外部候选列表验证的ID，不能凭LLM生成的数字直接绑定作品。
         if not llm_note.get("candidate_verified"):
@@ -2227,7 +2228,7 @@ class Media:
         llm_tmdb_id, llm_tmdb_type = self.__extract_llm_tmdb_target(meta_info=meta_info,
                                                                     mtype_hint=mtype_hint)
         if llm_tmdb_id:
-            log.info("【Meta】尝试使用LLM直出TMDBID：%s ..." % llm_tmdb_id)
+            log.info(llm_log_message("Meta", "尝试使用LLM直出TMDBID：%s ..." % llm_tmdb_id))
             file_media_info, state = self.__confirm_search_result(
                 meta_info, {"id": llm_tmdb_id, "media_type": llm_tmdb_type},
                 chinese=chinese, append_to_response=append_to_response, mtype_hint=mtype_hint,
@@ -2235,7 +2236,7 @@ class Media:
             if state == Evidence.UNKNOWN:
                 return {}
             if not file_media_info:
-                log.warn("【Meta】LLM直出TMDBID无效或未命中，回退名称检索：%s" % llm_tmdb_id)
+                log.warn(llm_log_message("Meta", "LLM直出TMDBID无效或未命中，回退名称检索：%s" % llm_tmdb_id))
         main_query_name = meta_info.get_name()
         if not file_media_info:
             file_media_info, state = self.__confirm_search_result(

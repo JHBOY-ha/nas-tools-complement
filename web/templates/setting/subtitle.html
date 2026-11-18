@@ -78,6 +78,23 @@
             </div>
           </div>
         </div>
+        {# 只约束整理后自动下载；手动下载不受限，但与自动下载共用账户配额。用量由后端滚动 24 小时记录提供。 #}
+        {% set auto_download_limit = (subtitle_config.get('opensubtitles') or {}).get('auto_download_limit') %}
+        <div class="row">
+          <div class="col-lg-6">
+            <div class="mb-3">
+              <label class="form-label" for="subtitle.opensubtitles.auto_download_limit">自动下载上限（次 / 24 小时） <span class="form-help"
+                title="只限制媒体整理后自动下载字幕消耗的 OpenSubtitles 下载次数，按最近 24 小时滚动计算；达到上限后自动跳过，可在字幕库或文件管理中手动下载。手动下载不受此限制，但与自动下载共用账户每日配额。已有字幕、未找到高置信字幕或请求被明确拒绝不计数；超时或无法确认是否扣次时保留一次。"
+                data-bs-toggle="tooltip">?</span></label>
+              <input type="number" id="subtitle.opensubtitles.auto_download_limit" class="form-control"
+                     min="0" max="1000" step="1" inputmode="numeric"
+                     aria-describedby="opensubtitles-auto-limit-hint"
+                     value="{{ auto_download_limit if auto_download_limit is not none else 0 }}">
+              <div class="invalid-feedback">请输入 0–1000 的整数</div>
+              <div class="form-hint" id="opensubtitles-auto-limit-hint">0 表示不限制{% if AutoDownloadUsage %} · 最近 24 小时自动下载已占用 {{ AutoDownloadUsage.used }} 次额度{% if AutoDownloadUsage.resume_at %}，已达上限，约 {{ AutoDownloadUsage.resume_at }} 恢复{% endif %}{% endif %}</div>
+            </div>
+          </div>
+        </div>
         <div class="row">
           <div class="col-lg-6">
             <div class="mb-3">
@@ -245,13 +262,32 @@
     });
   }
 
-  //保存配置、关闭和刷新页面
+  // 留空按 0（不限制）保存；其余必须是 0–1000 的整数，与后端校验一致
+  function validate_opensubtitles_auto_limit() {
+    const input = document.getElementById('subtitle.opensubtitles.auto_download_limit');
+    const text = String(input.value || '').trim();
+    const valid = !input.validity.badInput && (text === '' || (/^\d{1,4}$/.test(text) && Number(text) <= 1000));
+    input.classList.toggle('is-invalid', !valid);
+    if (!valid) input.focus();
+    return valid;
+  }
+
+  //保存配置、关闭和刷新页面；后端拒绝时提示原因，不静默刷新
   function save_subtitle_config(type) {
+    if (type === 'opensubtitles' && !validate_opensubtitles_auto_limit()) return;
     $("#modal-" + type).modal('hide');
     save_config(type, function (ret) {
+      if (!ret || ret.code !== 0) {
+        show_fail_modal((ret && ret.msg) || '保存失败');
+        return;
+      }
       window_history_refresh();
     });
   }
+
+  $(document).on('input', '#modal-opensubtitles input[type=number]', function () {
+    this.classList.remove('is-invalid');
+  });
 
 
 </script>

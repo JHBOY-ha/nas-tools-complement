@@ -27,9 +27,18 @@ var library_fill_loading = false;
 var library_pending_page = null;
 var library_view_instance = null;
 var library_categories_cache = {};
+// Per-category counts under the current filters (category itself excluded); null until loaded.
+var library_category_counts = null;
+// Library sub-category to preselect when choosing an audit type in this dialog.
+var library_audit_prefill_subcategory = null;
 var library_subtitle_audit_task_id = "";
 var library_subtitle_upload_task_id = "";
 var library_subtitle_upload_request = null;
+// The last view is remembered per browser; history state still wins on back/forward.
+var library_view_storage_key = "nastool.media-library.view";
+var library_type_labels = {all: "全部类型", movie: "电影", tv: "电视剧", anime: "动漫"};
+var library_subtitle_labels = {missing: "缺字幕", unknown: "未检测", problem: "有问题", ok: "已完成"};
+var library_sort_labels = {internal: "是否有内嵌字幕", external: "是否有外挂字幕", audit: "字幕检测问题程度"};
 
 // popstate changes the history entry before the SPA replaces its DOM. Invalidate
 // immediately so a late response cannot write into that 150 ms transition window.
@@ -95,11 +104,13 @@ function library_filter_data(page) {
   };
 }
 
-// Counters ignore the subtitle filter itself, so tabs show what each tab would list.
+// Status counters ignore the subtitle filter, so each tab shows what it would list;
+// sub-category counters ignore the category but follow the subtitle state.
 function library_summary_data() {
   return {
     type: $("#library_filter_type").val() || "all",
     category: $("#library_filter_category").val() || "",
+    subtitle: $("#library_filter_subtitle").val() || "all",
     keyword: String($("#library_filter_keyword").val() || "").trim(),
     audio_language: $("#library_filter_audio").val() || "all"
   };
@@ -132,15 +143,20 @@ function load_library_summary() {
       if (ret && ret.code === 0) {
         library_summary_key = key;
         library_render_summary(ret.counts || {});
+        library_category_counts = ret.category_counts || null;
       } else {
         library_summary_key = "";
         library_render_summary(null);
+        library_category_counts = null;
       }
+      render_library_category_chips();
     },
     error: function () {
       if (!is_current()) { return; }
       library_summary_key = "";
       library_render_summary(null);
+      library_category_counts = null;
+      render_library_category_chips();
     }
   });
 }
@@ -156,6 +172,7 @@ function sync_library_tabs() {
     const active = $(this).attr("data-library-subtitle") === subtitle;
     $(this).toggleClass("active", active).attr("aria-pressed", active ? "true" : "false");
   });
+  update_library_fill_scope();
 }
 
 // Audio language comes from synced movie streams, so it only applies to movies.
@@ -171,10 +188,14 @@ function update_library_audio_control() {
 function set_library_type(type) {
   if (["all", "movie", "tv", "anime"].indexOf(type) === -1) { return; }
   $("#library_filter_type").val(type);
-  $("#library_filter_category").val("");
-  update_library_category_options();
+  // Keep a sub-category that still belongs to the new type; any other would list nothing.
+  const category = $("#library_filter_category").val() || "";
+  if (category && library_category_list(type).indexOf(category) === -1) {
+    $("#library_filter_category").val("");
+  }
   update_library_audio_control();
   sync_library_tabs();
+  render_library_category_chips();
   update_library_filter_badge();
   load_library_items(1);
 }
@@ -186,22 +207,98 @@ function set_library_subtitle(subtitle) {
   load_library_items(1);
 }
 
-function update_library_category_options(categories) {
+function set_library_category(category) {
+  category = String(category || "");
+  const current = $("#library_filter_category").val() || "";
+  // Clicking the selected chip again returns to every sub-category.
+  const next = category && category === current ? "" : category;
+  if (next === current) { return; }
+  $("#library_filter_category").val(next);
+  // A sub-category implies its type, so highlight that tab too; a name shared by
+  // TV and anime (such as 动漫) keeps "全部类型" so both stay listed.
+  const owners = next ? library_category_owners(next) : [];
+  if (($("#library_filter_type").val() || "all") === "all" && owners.length === 1) {
+    $("#library_filter_type").val(owners[0]);
+    update_library_audio_control();
+  }
+  sync_library_tabs();
+  render_library_category_chips();
+  update_library_filter_badge();
+  load_library_items(1);
+}
+
+function update_library_categories(categories) {
   if (categories) {
     library_categories_cache = categories;
   }
-  categories = library_categories_cache || {};
-  const type = $("#library_filter_type").val();
-  const selected = $("#library_filter_category").val();
-  const category_list = type === "all"
-      ? Array.from(new Set([].concat(categories.movie || [], categories.tv || [], categories.anime || []))).sort()
-      : (categories[type] || []);
-  let html = '<option value="">全部</option>';
-  category_list.forEach(function (category) {
-    const escaped = library_escape_html(category);
-    html += `<option value="${escaped}" ${category === selected ? "selected" : ""}>${escaped}</option>`;
+  render_library_category_chips();
+}
+
+// The server lists each type's sub-categories in the category YAML's order.
+// "全部类型" groups them by type and lists a name shared by two types once.
+function library_category_groups(type) {
+  const categories = library_categories_cache || {};
+  const types = type === "movie" || type === "tv" || type === "anime" ? [type] : ["movie", "tv", "anime"];
+  const seen = Object.create(null);
+  const groups = [];
+  types.forEach(function (media_type) {
+    const names = (categories[media_type] || []).filter(function (name) {
+      if (!name || seen[name]) { return false; }
+      seen[name] = true;
+      return true;
+    });
+    if (names.length) {
+      groups.push({type: media_type, names: names});
+    }
   });
-  $("#library_filter_category").html(html);
+  return groups;
+}
+
+function library_category_list(type) {
+  return library_category_groups(type).reduce(function (all, group) { return all.concat(group.names); }, []);
+}
+
+function library_category_owners(category) {
+  const categories = library_categories_cache || {};
+  return ["movie", "tv", "anime"].filter(function (type) {
+    return (categories[type] || []).indexOf(category) !== -1;
+  });
+}
+
+function render_library_category_chips() {
+  const type = $("#library_filter_type").val() || "all";
+  const selected = $("#library_filter_category").val() || "";
+  const groups = library_category_groups(type);
+  const counts = library_category_counts;
+  const container = document.getElementById("library_category_chips");
+  // Counts arrive after the list and re-render the row; keep keyboard focus on the same chip.
+  const focused = container && typeof container.contains === "function" && document.activeElement &&
+      container.contains(document.activeElement) ? $(document.activeElement).attr("data-library-category") : null;
+  const chip = function (value, count) {
+    const active = value === selected;
+    const known = count !== null && count !== undefined;
+    const badge = known ? ` <span class="badge">${Number(count).toLocaleString("zh-CN")}</span>` : "";
+    return `<button type="button" class="btn btn-sm lit-library-category-chip${active ? " active" : ""}` +
+        `${known && Number(count) === 0 ? " is-empty" : ""}" data-library-category="${library_escape_html(value)}"` +
+        ` aria-pressed="${active ? "true" : "false"}">${library_escape_html(value || "全部")}${badge}</button>`;
+  };
+  let html = chip("", null);
+  groups.forEach(function (group) {
+    if (groups.length > 1) {
+      html += `<span class="lit-library-category-group">${library_type_labels[group.type]}</span>`;
+    }
+    group.names.forEach(function (name) {
+      const count = counts ? (Object.prototype.hasOwnProperty.call(counts, name) ? counts[name] : 0) : null;
+      html += chip(name, count);
+    });
+  });
+  $("#library_category_chips").html(html);
+  $("#library_category_row").prop("hidden", !groups.length);
+  if (focused !== null && focused !== undefined) {
+    $("#library_category_chips [data-library-category]").filter(function () {
+      return ($(this).attr("data-library-category") || "") === focused;
+    }).first().trigger("focus");
+  }
 }
 
 function library_saved_view() {
@@ -209,14 +306,39 @@ function library_saved_view() {
   return (extra && extra.library_view) || null;
 }
 
-function library_save_history_state() {
-  // Record the current filter/sort/page onto the active history entry so
-  // SPA back/forward restores this view instead of the default one.
-  if (typeof window_history !== "function") {
-    return;
+function library_stored_view() {
+  try {
+    const view = JSON.parse(window.localStorage.getItem(library_view_storage_key) || "null");
+    return view && typeof view === "object" ? view : null;
+  } catch (error) {
+    return null;
   }
-  const extra = (window.history.state && window.history.state.extra) || {};
-  window_history(false, Object.assign({}, extra, {library_view: {
+}
+
+// Saved values come from history or browser storage; accept only known options.
+function library_normalize_view(view) {
+  view = view || {};
+  const pick = function (value, allowed, fallback) {
+    return allowed.indexOf(value) !== -1 ? value : fallback;
+  };
+  const text = function (value, limit) {
+    return typeof value === "string" ? value.trim().slice(0, limit) : "";
+  };
+  const audio_options = $("#library_filter_audio option").map(function () { return this.value; }).get();
+  return {
+    type: pick(view.type, ["all", "movie", "tv", "anime"], "all"),
+    category: text(view.category, 100),
+    subtitle: pick(view.subtitle, ["all", "missing", "unknown", "problem", "ok"], "all"),
+    sort_by: pick(view.sort_by, ["default", "internal", "external", "audit"], "default"),
+    sort_order: pick(view.sort_order, ["asc", "desc"], "desc"),
+    audio_language: pick(view.audio_language, audio_options, "all"),
+    keyword: text(view.keyword, 200),
+    page: Math.max(parseInt(view.page, 10) || 1, 1)
+  };
+}
+
+function library_current_view() {
+  return {
     type: $("#library_filter_type").val() || "all",
     category: $("#library_filter_category").val() || "",
     subtitle: $("#library_filter_subtitle").val() || "all",
@@ -225,7 +347,97 @@ function library_save_history_state() {
     keyword: String($("#library_filter_keyword").val() || "").trim(),
     audio_language: $("#library_filter_audio").val() || "all",
     page: library_page || 1
-  }}));
+  };
+}
+
+function library_view_is_customized() {
+  const view = library_current_view();
+  return view.type !== "all" || !!view.category || view.subtitle !== "all" || !!view.keyword ||
+      view.audio_language !== "all" || view.sort_by !== "default";
+}
+
+function library_save_history_state() {
+  // Record the current filter/sort/page onto the active history entry so
+  // SPA back/forward restores this view instead of the default one.
+  const view = library_current_view();
+  // The next visit reopens the same filters; a search word and page are one-off.
+  try {
+    window.localStorage.setItem(library_view_storage_key, JSON.stringify({
+      type: view.type, category: view.category, subtitle: view.subtitle, sort_by: view.sort_by,
+      sort_order: view.sort_order, audio_language: view.audio_language
+    }));
+  } catch (error) {
+    // Private browsing or blocked storage: remembering the view is optional.
+  }
+  if (typeof window_history !== "function") {
+    return;
+  }
+  const extra = (window.history.state && window.history.state.extra) || {};
+  window_history(false, Object.assign({}, extra, {library_view: view}));
+}
+
+// The fill queue walks movies only; a TV or anime scope must not fall back to every movie.
+function library_fill_scope() {
+  const type = $("#library_filter_type").val() || "all";
+  const category = $("#library_filter_category").val() || "";
+  if (type === "tv" || type === "anime") {
+    return {ok: false, label: library_type_labels[type]};
+  }
+  const owners = category ? library_category_owners(category) : [];
+  if (owners.length && owners.indexOf("movie") === -1) {
+    return {ok: false, label: category};
+  }
+  return {ok: true, label: category ? `电影 · ${category}` : "电影"};
+}
+
+function library_fill_status_label() {
+  return {unknown: "未检测", problem: "有问题"}[$("#library_filter_subtitle").val()] || "缺中文字幕";
+}
+
+function update_library_fill_scope() {
+  const scope = library_fill_scope();
+  $("#library_fill_btn").attr("title", scope.ok
+      ? `按当前筛选逐部补齐：${scope.label} · ${library_fill_status_label()}`
+      : `连续补齐只支持电影，当前筛选为“${scope.label}”`);
+}
+
+// Filters kept in the "筛选与排序" menu are otherwise invisible, notably after a remembered view.
+function render_library_active_filters() {
+  const parts = [];
+  const audio = $("#library_filter_audio").val() || "all";
+  if (audio !== "all") {
+    parts.push({key: "audio", label: `音轨：${library_audio_language_label(audio) || audio}`});
+  }
+  const sort_by = $("#library_sort_by").val() || "default";
+  if (sort_by !== "default") {
+    const order = $("#library_sort_order").val() === "asc" ? "升序" : "降序";
+    parts.push({key: "sort", label: `排序：${library_sort_labels[sort_by] || sort_by} · ${order}`});
+  }
+  let html = parts.map(function (part) {
+    const label = library_escape_html(part.label);
+    return `<button type="button" class="btn btn-sm" data-library-clear-filter="${part.key}" aria-label="移除${label}">` +
+        `${label}<span class="ms-1" aria-hidden="true">×</span></button>`;
+  }).join("");
+  if (library_view_is_customized()) {
+    html += '<button type="button" class="btn btn-sm" data-library-clear-filter="all">清除全部筛选</button>';
+  }
+  $("#library_active_filters").html(html);
+}
+
+function clear_library_filter(key) {
+  if (key === "all") {
+    reset_library_filters();
+    return;
+  }
+  if (key === "audio") {
+    $("#library_filter_audio").val("all");
+  } else if (key === "sort") {
+    $("#library_sort_by").val("default");
+    $("#library_sort_order").val("desc");
+    update_library_sort_order_labels();
+  }
+  update_library_filter_badge();
+  load_library_items(1);
 }
 
 function load_library_items(page) {
@@ -252,6 +464,8 @@ function load_library_items(page) {
   const previous_page = library_page;
   library_page = page;
   $("#library_prev_btn,#library_next_btn,#library_filter_btn,#library_filter_trigger,#library_refresh_btn").prop("disabled", true);
+  // Keep the previous cards, dimmed, until the new page arrives instead of blanking the grid.
+  $("#library_items_grid").addClass("is-loading").attr("aria-busy", "true");
   $("#library_items_summary").html(
       '<span class="d-inline-flex align-items-center gap-2"><span class="spinner-border spinner-border-sm" aria-hidden="true"></span><span>正在加载字幕状态...</span></span>'
   );
@@ -273,7 +487,20 @@ function load_library_items(page) {
         show_fail_modal(ret.msg || "字幕库列表加载失败");
         return;
       }
-      update_library_category_options(ret.categories || {});
+      update_library_categories(ret.categories || {});
+      // A remembered sub-category may have been renamed or emptied since; drop it
+      // and list everything instead of showing a puzzling empty result.
+      const stale_category = $("#library_filter_category").val() || "";
+      if (ret.categories && stale_category &&
+          library_category_list($("#library_filter_type").val() || "all").indexOf(stale_category) === -1) {
+        $("#library_filter_category").val("");
+        library_refresh_notice = `小分类“${stale_category}”已不存在，已显示全部`;
+        render_library_category_chips();
+        update_library_filter_badge();
+        library_pending_page = 1;
+        return;
+      }
+      render_library_active_filters();
       library_items_cache = {};
       const items = ret.items || [];
       const total = ret.total || 0;
@@ -317,6 +544,7 @@ function load_library_items(page) {
       if (!is_current_view()) { return; }
       NProgress.done();
       library_items_loading = false;
+      $("#library_items_grid").removeClass("is-loading").attr("aria-busy", "false");
       library_save_history_state();
       $("#library_filter_btn,#library_filter_trigger,#library_refresh_btn").prop("disabled", false);
       const pending_page = library_pending_page;
@@ -342,9 +570,23 @@ function update_library_pager(total_pages) {
 }
 
 function library_empty_state(library_total) {
-  const body = library_total
-      ? '<p class="empty-title">没有符合条件的媒体</p><p class="empty-subtitle text-muted">请调整或重置筛选条件。</p>'
-      : '<p class="empty-title">字幕库还没有媒体</p><p class="empty-subtitle text-muted">请先在首页执行“媒体库同步”，再回到这里查看。</p>';
+  let body;
+  const subtitle = $("#library_filter_subtitle").val() || "all";
+  if (!library_total) {
+    body = '<p class="empty-title">字幕库还没有媒体</p><p class="empty-subtitle text-muted">请先在首页执行“媒体库同步”，再回到这里查看。</p>';
+  } else if (library_subtitle_labels[subtitle]) {
+    // Name the empty combination and offer the same scope without the status filter.
+    const narrowed = !!String($("#library_filter_keyword").val() || "").trim() ||
+        ($("#library_filter_audio").val() || "all") !== "all";
+    const type = $("#library_filter_type").val() || "all";
+    const scope = library_escape_html(narrowed ? "当前筛选" :
+        ($("#library_filter_category").val() || (type === "all" ? "字幕库" : library_type_labels[type])));
+    body = `<p class="empty-title">${scope}中没有“${library_subtitle_labels[subtitle]}”的媒体</p>` +
+        `<div class="empty-action"><button class="btn" type="button" onclick="set_library_subtitle('all')">查看${scope}的全部媒体</button></div>`;
+  } else {
+    body = '<p class="empty-title">没有符合条件的媒体</p><p class="empty-subtitle text-muted">请调整或重置筛选条件。</p>' +
+        '<div class="empty-action"><button class="btn" type="button" onclick="reset_library_filters()">重置筛选</button></div>';
+  }
   return `<div class="empty" style="grid-column:1/-1;margin:3rem 0">${body}</div>`;
 }
 
@@ -409,7 +651,7 @@ function refresh_library_items() {
 
 function reset_library_filters() {
   $("#library_filter_type").val("all");
-  $("#library_filter_category").html('<option value="">全部</option>').val("");
+  $("#library_filter_category").val("");
   $("#library_filter_subtitle").val("all");
   $("#library_filter_audio").val("all");
   $("#library_sort_by").val("default");
@@ -417,6 +659,7 @@ function reset_library_filters() {
   $("#library_filter_keyword").val("");
   update_library_audio_control();
   sync_library_tabs();
+  render_library_category_chips();
   update_library_sort_order_labels();
   update_library_filter_badge();
   hide_library_filter_menu();
@@ -448,11 +691,8 @@ function hide_library_filter_menu() {
 }
 
 function update_library_filter_badge() {
-  // Type and subtitle state are visible as tabs, so only menu filters count here.
+  // Type, sub-category and subtitle state are visible as tabs, so they do not count here.
   let active_count = 0;
-  if ($("#library_filter_category").val()) {
-    active_count += 1;
-  }
   if (($("#library_filter_audio").val() || "all") !== "all") {
     active_count += 1;
   }
@@ -492,7 +732,21 @@ function run_library_subtitle_audit(retry) {
     $("#index_library_subtitle_audit_server").val(library_default_media_server);
     $("#index_library_subtitle_audit_mode").val("linked");
     $("#index_library_subtitle_audit_deep_confirm").prop("checked", false);
-    update_library_subtitle_audit_mode();
+    // Start from the library's current scope; the sub-category list loads below.
+    const view_type = $("#library_filter_type").val() || "all";
+    const view_category = $("#library_filter_category").val() || "";
+    const owners = view_category ? library_category_owners(view_category) : [];
+    const shared = view_type === "all" && owners.length > 1;
+    const type_select = $("#index_library_subtitle_audit_category");
+    // A shared chip has no single audit type. Offer only its owners until the dialog closes.
+    type_select.find("option").each(function () {
+      this.hidden = this.value ? shared && !owners.includes(this.value) : !shared;
+      this.disabled = !this.value || this.hidden;
+    });
+    type_select.val(shared ? "" : (view_type === "all" ? owners[0] || "movie" : view_type));
+    library_audit_prefill_subcategory = view_category;
+    library_subtitle_audit_categories = null;
+    update_library_subtitle_audit_subcategories();
     load_library_subtitle_task_limits();
     load_library_subtitle_audit_categories();
     load_library_subtitle_audit_history();
@@ -500,6 +754,7 @@ function run_library_subtitle_audit(retry) {
   }
   const category = $("#index_library_subtitle_audit_category").val();
   const subcategory = $("#index_library_subtitle_audit_subcategory").val();
+  if (!category || subcategory === null) { return; }
   const mode = $("#index_library_subtitle_audit_mode").val() || "linked";
   const server = $("#index_library_subtitle_audit_server").val() || library_default_media_server;
   if (mode === "deep" && !$("#index_library_subtitle_audit_deep_confirm").prop("checked")) {
@@ -557,6 +812,7 @@ function update_library_subtitle_audit_mode() {
   const category = $("#index_library_subtitle_audit_category option:selected").text() || "所选媒体分类";
   const categoryKey = $("#index_library_subtitle_audit_category").val();
   const subcategory = $("#index_library_subtitle_audit_subcategory").val();
+  $("#library_audit_start_scope").prop("disabled", !categoryKey || subcategory === null);
   const roots = library_subtitle_audit_roots[categoryKey] || [];
   const targetRoots = roots.map(function (root) {
     return subcategory ? String(root).replace(/[\\\/]$/, "") + "/" + subcategory : String(root);
@@ -809,15 +1065,24 @@ function load_library_subtitle_audit_categories() {
 function update_library_subtitle_audit_subcategories() {
   const category = $("#index_library_subtitle_audit_category").val();
   const category_name = $("#index_library_subtitle_audit_category option:selected").text();
-  const current = $("#index_library_subtitle_audit_subcategory").val();
+  const select = $("#index_library_subtitle_audit_subcategory");
+  if (!category || !library_subtitle_audit_categories) {
+    const message = category ? "正在读取小分类…" : "请先选择检测分类";
+    select.html(`<option disabled selected>${message}</option>`).prop("disabled", true);
+    update_library_subtitle_audit_mode();
+    return;
+  }
+  const current = library_audit_prefill_subcategory || "";
   const categories = library_subtitle_audit_categories[category] || [];
-  let html = `<option value="">全部${library_escape_html(category_name)}</option>`;
+  // A removed YAML entry or a failed lookup must never expand a preselected audit to all media.
+  const needs_choice = current && !categories.includes(current);
+  let html = needs_choice ? '<option disabled selected>原小分类不可用，请选择检测范围</option>' : "";
+  html += `<option value="">全部${library_escape_html(category_name)}</option>`;
   categories.forEach(function (name) {
     const escaped = library_escape_html(name);
     html += `<option value="${escaped}" ${name === current ? "selected" : ""}>${escaped}</option>`;
   });
-  $("#index_library_subtitle_audit_subcategory").html(html);
-  $("#index_library_subtitle_audit_subcategory").prop("disabled", categories.length === 0);
+  select.html(html).prop("disabled", !categories.length && !needs_choice);
   update_library_subtitle_audit_mode();
 }
 
@@ -1839,11 +2104,17 @@ function init_media_library_page(options) {
   $("#library_status_tabs").unbind("click").on("click", "[data-library-subtitle]", function () {
     set_library_subtitle($(this).attr("data-library-subtitle"));
   });
+  $("#library_category_chips").unbind("click").on("click", "[data-library-category]", function () {
+    set_library_category($(this).attr("data-library-category") || "");
+  });
+  $("#library_active_filters").unbind("click").on("click", "[data-library-clear-filter]", function () {
+    clear_library_filter($(this).attr("data-library-clear-filter"));
+  });
   $("#library_sort_by").unbind("change").change(function () {
     update_library_sort_order_labels();
     update_library_filter_badge();
   });
-  $("#library_filter_category,#library_filter_audio,#library_sort_order").unbind("change").change(function () {
+  $("#library_filter_audio,#library_sort_order").unbind("change").change(function () {
     update_library_filter_badge();
   });
   $("#library_filter_keyword").unbind("input").on("input", function () {
@@ -1859,28 +2130,32 @@ function init_media_library_page(options) {
     $("#library_filter_keyword").val("").trigger("input").trigger("focus");
   });
 
-  const saved_view = library_saved_view();
+  // Back/forward restores the exact entry (with search word and page); a fresh
+  // visit reopens the filters last used in this browser, starting from page 1.
+  const history_view = library_saved_view();
+  const stored_view = history_view ? null : library_stored_view();
+  const saved_view = history_view || stored_view;
+  const view = library_normalize_view(saved_view);
+  library_category_counts = null;
   if (saved_view) {
-    $("#library_filter_type").val(saved_view.type || "all");
-    $("#library_filter_subtitle").val(saved_view.subtitle || "all");
-    $("#library_filter_audio").val(saved_view.audio_language || "all");
-    $("#library_sort_by").val(saved_view.sort_by || "default");
-    $("#library_sort_order").val(saved_view.sort_order || "desc");
-    $("#library_filter_keyword").val(saved_view.keyword || "");
-    // Category options only exist after the first server response, so seed
-    // the select with the saved value; update_library_category_options
-    // preserves it through the selected check and rebuilds the real list.
-    const saved_category = String(saved_view.category || "");
-    if (saved_category) {
-      $("#library_filter_category").html(
-          `<option value="${library_escape_html(saved_category)}" selected></option>`);
-    }
+    $("#library_filter_type").val(view.type);
+    $("#library_filter_subtitle").val(view.subtitle);
+    $("#library_filter_audio").val(view.audio_language);
+    $("#library_sort_by").val(view.sort_by);
+    $("#library_sort_order").val(view.sort_order);
+    $("#library_filter_keyword").val(history_view ? view.keyword : "");
+    // Chips need the first response's category list; an unknown name is dropped then.
+    $("#library_filter_category").val(view.category);
   }
   update_library_audio_control();
   sync_library_tabs();
+  render_library_category_chips();
   update_library_sort_order_labels();
   update_library_filter_badge();
-  load_library_items(saved_view ? Math.max(parseInt(saved_view.page, 10) || 1, 1) : 1);
+  if (stored_view && library_view_is_customized()) {
+    library_refresh_notice = "已恢复上次的筛选";
+  }
+  load_library_items(history_view ? view.page : 1);
 }
 
 var library_online_path = "";
@@ -2101,6 +2376,11 @@ function start_library_fill() {
   if (!is_current_view() || library_fill || library_fill_loading || library_items_loading) {
     return;
   }
+  const scope = library_fill_scope();
+  if (!scope.ok) {
+    show_fail_modal(`连续补齐目前只支持电影。当前筛选是“${scope.label}”，请切换到“电影”或“全部类型”后再开始。`);
+    return;
+  }
   const data = Object.assign(library_filter_data(1), {
     type: "movie", page_size: 100, sort_by: "default", sort_order: "desc"
   });
@@ -2108,7 +2388,7 @@ function start_library_fill() {
   if (["all", "ok"].indexOf(data.subtitle) !== -1) {
     data.subtitle = "missing";
   }
-  const status_label = {missing: "缺中文字幕", unknown: "未检测", problem: "有问题"}[data.subtitle] || "缺中文字幕";
+  const status_label = library_fill_status_label();
   library_fill_loading = true;
   $("#library_fill_btn").prop("disabled", true);
   NProgress.start();
@@ -2136,7 +2416,7 @@ function start_library_fill() {
       const truncated = (ret.total || 0) > items.length ? `，仅取前 ${items.length} 部` : "";
       const skipped = items.length - queue.length;
       show_confirm_modal(
-          `将按当前筛选（电影、${status_label}）逐部检索字幕：共 ${queue.length} 部${truncated}` +
+          `将按当前筛选（${scope.label}、${status_label}）逐部检索字幕：共 ${queue.length} 部${truncated}` +
           `${skipped ? `，另有 ${skipped} 部无法上传已排除` : ""}。不会自动下载，每部都由你确认。是否开始？`,
           function () {
             if (!is_current_view()) { return; }

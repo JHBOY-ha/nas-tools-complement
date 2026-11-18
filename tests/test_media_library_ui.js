@@ -40,6 +40,9 @@ const episodes = [
   try {
     page = await browser.newPage({viewport: {width: 1280, height: 900}, reducedMotion: 'reduce'});
     const errors = [], requests = [];
+    const categories = {movie: ['外语电影'], tv: ['欧美剧', '动漫'], anime: ['动漫']};
+    let releaseCategories;
+    const categoriesReady = new Promise(resolve => { releaseCategories = resolve; });
     let refreshReply = {code: 0, updated: 1, unchanged: 4, failed: 0, requested: 5};
     page.on('pageerror', error => errors.push(error.message));
     await page.route('http://library.test/**', async route => {
@@ -59,7 +62,11 @@ const episodes = [
           function show_success_modal(message) { $('#feedback').text(message); }
           function show_fail_modal(message) { $('#feedback').text(message); }
           window.window_history = () => {};
-          window.SubtitleTasks = {init() {}, openCenter() {}, randomRequestId: () => 'request', formatBytes: v => v + ' B',
+          window.SubtitleTasks = {init() {}, openCenter() {}, request: async () => ({}), payloadOf: r => r,
+            requestTask: async (url, payload) => {
+              await $.post(url, JSON.stringify(payload));
+              return {legacy:true};
+            }, randomRequestId: () => 'request', formatBytes: v => v + ' B',
             validateFiles: files => ({ok: true, logicalCount: files.length, totalBytes: 0}), renderProgress() {}, watch() {}, refreshList: () => Promise.resolve()};
           </script>
           <script src="/static/js/media-library.js"></script>
@@ -68,17 +75,27 @@ const episodes = [
       if (url.pathname === '/library/items') {
         requests.push({path: url.pathname, body: route.request().postDataJSON()});
         return route.fulfill({json: {code: 0, items, total: items.length, page: 1, library_total: items.length,
-          synced_at: '2026-10-31 08:00:00', categories: {movie: ['外语电影'], tv: ['欧美剧'], anime: []}}});
+          synced_at: '2026-10-31 08:00:00', categories}});
       }
       if (url.pathname === '/library/summary') {
         requests.push({path: url.pathname, body: route.request().postDataJSON()});
-        return route.fulfill({json: {code: 0, counts: {all: 5, missing: 3, unknown: 2, problem: 0, ok: 0}}});
+        return route.fulfill({json: {code: 0, counts: {all: 5, missing: 3, unknown: 2, problem: 0, ok: 0},
+          category_counts: {'外语电影': 3}}});
       }
       if (url.pathname === '/library/refresh') {
         requests.push({path: url.pathname, body: route.request().postDataJSON()});
         return route.fulfill({json: refreshReply});
       }
       if (url.pathname.indexOf('sync') !== -1) { requests.push({path: url.pathname}); return route.fulfill({json: {code: 0}}); }
+      if (url.pathname === '/library/subtitle/audit/categories') {
+        await categoriesReady;
+        return route.fulfill({json: {code: 0, categories}});
+      }
+      if (url.pathname === '/library/subtitle/audit/history') return route.fulfill({json: {code: 0, history: []}});
+      if (url.pathname === '/library/subtitle/audit') {
+        requests.push({path: url.pathname, body: JSON.parse(route.request().postData())});
+        return route.fulfill({json: {code: 0}});
+      }
       if (url.pathname === '/library/episodes') return route.fulfill({json: {code: 0, items: episodes}});
       if (url.pathname === '/library/subtitle/preview') {
         requests.push({path: url.pathname, body: route.request().postDataJSON()});
@@ -133,33 +150,98 @@ const episodes = [
 
     // Status and type tabs apply immediately and carry the counters.
     assert.equal(await page.locator('[data-library-count="missing"]').innerText(), '3');
+    // Sub-categories sit in their own row of compact chips, grouped by type under "全部类型".
+    const chipRow = page.locator('#library_category_chips');
+    // The grid stays dimmed with aria-busy until the list (and its pending reloads) settle.
+    const settled = () => page.waitForFunction(() => {
+      const grid = document.getElementById('library_items_grid');
+      return !grid.classList.contains('is-loading') && grid.getAttribute('aria-busy') === 'false';
+    });
+    await chipRow.getByRole('button', {name: '外语电影 3'}).waitFor();
+    assert.deepEqual(await chipRow.locator('.lit-library-category-group').allInnerTexts(), ['电影', '电视剧']);
+    assert.deepEqual(await measure('.lit-library-category-chip'), {height: 28, radius: '4px', font: '12px'});
+    assert.equal(await chipRow.getByRole('button', {name: '欧美剧 0'}).evaluate(el => el.classList.contains('is-empty')), true);
+    await chipRow.getByRole('button', {name: /^动漫/}).click();
+    await settled();
+    await page.locator('#library_more_trigger').click();
+    await page.getByRole('button', {name: '检测外挂字幕'}).click();
+    const audit = page.locator('#index-library-subtitle-audit-modal');
+    const auditType = audit.locator('#index_library_subtitle_audit_category');
+    const startAudit = audit.getByRole('button', {name: '开始/重新检测'});
+    assert.equal(await startAudit.isDisabled(), true);
+    assert.deepEqual(await auditType.locator('option:enabled').evaluateAll(options => options.map(o => o.value)), ['tv', 'anime']);
+    await page.screenshot({path: path.join(evidenceDir, 'shared-category-audit.png')});
+    await auditType.selectOption('tv');
+    assert.equal(await startAudit.isDisabled(), true, 'wait for the configured subcategories');
+    releaseCategories();
+    await page.waitForFunction(() => document.getElementById('index_library_subtitle_audit_subcategory').value === '动漫');
+    await auditType.selectOption('anime');
+    assert.equal(await audit.locator('#index_library_subtitle_audit_subcategory').inputValue(), '动漫');
+    const submitted = page.waitForRequest(req => new URL(req.url()).pathname === '/library/subtitle/audit');
+    await startAudit.click();
+    const auditPayload = JSON.parse((await submitted).postData());
+    assert.deepEqual([auditPayload.category, auditPayload.subcategory], ['anime', '动漫']);
+    await audit.getByRole('button', {name: '关闭', exact:true}).last().click();
+    await audit.waitFor({state:'hidden'});
     await page.getByRole('button', {name: '电影', exact: true}).click();
     await page.waitForFunction(() => document.getElementById('library_filter_type').value === 'movie');
     assert.equal(lastList().type, 'movie');
+    assert.equal(await chipRow.locator('.lit-library-category-group').count(), 0, 'one type needs no group names');
+    // One click filters; the chip keeps focus when the counters re-render the row.
+    await chipRow.getByRole('button', {name: /^外语电影/}).click();
+    await page.waitForFunction(() => document.getElementById('library_filter_category').value === '外语电影');
+    await settled();
+    assert.equal(lastList().category, '外语电影');
+    assert.equal(await chipRow.getByRole('button', {name: /^外语电影/}).getAttribute('aria-pressed'), 'true');
+    await page.waitForFunction(() => document.activeElement && document.activeElement.dataset.libraryCategory === '外语电影');
+    assert.equal(requests.filter(r => r.path === '/library/summary').pop().body.subtitle, 'all');
     await page.locator('#library_filter_trigger').click();
-    // Filter fields form an even grid: same-row controls share a top edge, same-column controls a left edge.
+    // Audio spans the menu; the two sort fields share the next row and its left edge.
     const labelBox = async id => page.locator(id).evaluate(el => {
       const r = el.closest('[class*="col-"]').querySelector('label').getBoundingClientRect();
       return {x: Math.round(r.left), y: Math.round(r.top)};
     });
-    const [category, audio, sortBy, sortOrder] = [await labelBox('#library_filter_category'), await labelBox('#library_filter_audio'),
+    const [audio, sortBy, sortOrder] = [await labelBox('#library_filter_audio'),
       await labelBox('#library_sort_by'), await labelBox('#library_sort_order')];
-    assert.equal(category.y, audio.y, 'first row labels share a top edge');
-    assert.equal(sortBy.y, sortOrder.y, 'second row labels share a top edge');
-    assert.equal(category.x, sortBy.x, 'left column is aligned');
-    assert.equal(audio.x, sortOrder.x, 'right column is aligned');
+    assert.ok(audio.y < sortBy.y, 'audio language comes first');
+    assert.equal(sortBy.y, sortOrder.y, 'sort labels share a top edge');
+    assert.equal(audio.x, sortBy.x, 'left column is aligned');
     await page.locator('#library_filter_audio').selectOption('eng');
     await page.locator('#library_filter_btn').click();
     await page.getByRole('button', {name: /^缺字幕/}).click();
     await page.waitForFunction(() => document.getElementById('library_filter_subtitle').value === 'missing');
-    assert.deepEqual([lastList().type, lastList().subtitle, lastList().audio_language], ['movie', 'missing', 'eng']);
+    await settled();
+    assert.deepEqual([lastList().type, lastList().category, lastList().subtitle, lastList().audio_language],
+      ['movie', '外语电影', 'missing', 'eng']);
     assert.equal(await page.getByRole('button', {name: /^缺字幕/}).getAttribute('aria-pressed'), 'true');
+    // The menu's audio filter is otherwise hidden, so it shows as a removable tag.
+    await page.locator('#library_active_filters').getByRole('button', {name: '移除音轨：英语'}).waitFor();
+    // A fresh visit reopens the same filters (not the search word) and says so.
+    await page.reload();
+    await page.locator('.lit-library-card').first().waitFor();
+    await page.waitForFunction(() => /已恢复上次的筛选/.test(document.getElementById('library_items_summary').textContent));
+    await settled();
+    assert.deepEqual([lastList().type, lastList().category, lastList().subtitle, lastList().audio_language, lastList().page],
+      ['movie', '外语电影', 'missing', 'eng', 1]);
+    assert.equal(await page.getByRole('button', {name: '电影', exact: true}).getAttribute('aria-pressed'), 'true');
+    await page.locator('#library_active_filters').getByRole('button', {name: '移除音轨：英语'}).click();
+    await page.waitForFunction(() => document.getElementById('library_filter_audio').value === 'all');
+    await settled();
+    assert.equal(lastList().audio_language, 'all');
     await page.getByRole('button', {name: '电视剧', exact: true}).click();
     await page.waitForFunction(() => document.getElementById('library_filter_audio').disabled);
     assert.equal(await page.locator('#library_filter_audio').inputValue(), 'all');
-    await page.getByRole('button', {name: '全部类型', exact: true}).click();
-    await page.getByRole('button', {name: /^全部 /}).click();
+    await settled();
+    assert.equal(lastList().category, '', 'a movie sub-category is dropped for TV');
+    // TV has no fill queue; the button explains instead of queueing every movie.
+    await page.locator('#library_fill_btn').click();
+    await page.waitForFunction(() => /连续补齐目前只支持电影/.test(document.getElementById('feedback').textContent));
+    await page.locator('#library_active_filters').getByRole('button', {name: '清除全部筛选'}).click();
+    await page.waitForFunction(() => document.getElementById('library_filter_type').value === 'all' &&
+      document.getElementById('library_filter_subtitle').value === 'all');
+    await settled();
     await page.locator('.lit-library-card').first().waitFor();
+    assert.equal(await page.locator('#library_active_filters').innerHTML(), '');
 
     // The card menu is not clipped by the card and stays above neighbouring cards.
     const firstMenu = page.locator('.lit-library-card-menu [data-bs-toggle="dropdown"]').first();

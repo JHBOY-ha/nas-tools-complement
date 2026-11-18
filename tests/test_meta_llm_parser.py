@@ -82,6 +82,75 @@ class LLMMetaParserTest(TestCase):
                 sdk.chat.completions.create.assert_called_once()
                 self.assertEqual(max_tokens, sdk.chat.completions.create.call_args.kwargs["max_tokens"])
 
+    def test_spa_action_origin_survives_queued_recognition_and_empty_responses(self):
+        from flask import Flask, g
+        from app.utils.workload import BoundedExecutor
+        from web.action import WebAction
+        import log
+
+        app = Flask(__name__)
+        app.add_url_rule('/do', endpoint='do', methods=['POST'])
+        for page in ('douban_tv', 'ranking'):
+            app.add_url_rule('/' + page, endpoint=page)
+        pool = BoundedExecutor(1, 8)
+        self.addCleanup(pool.shutdown)
+        release = threading.Event()
+        pool.submit(release.wait, 5)
+        self.addCleanup(release.set)
+        action = WebAction.__new__(WebAction)
+        action._actions = {'get_recommend': lambda title: pool.submit(self.parser.parse, title)}
+        self.parser._search_context_enable = True
+        sdk = Mock()
+        sdk.chat.completions.create.return_value = {
+            "choices": [{"message": {"content": "", "reasoning_content": "reason"}, "finish_reason": "length"}]
+        }
+        cases = [('/douban_tv', '蓝色星球 第三季', '豆瓣电视剧'),
+                 ('/ranking', '万物生灵 第七季', '榜单推荐'),
+                 ('/ranking?key=private', 'Example', 'Web /do · get_recommend')]
+        tasks = []
+        with patch("app.utils.llm_client.OpenAI", return_value=sdk), \
+                patch.object(self.parser, "_LLMMetaParser__search_tmdb_candidates", return_value=[]), \
+                patch.object(self.parser, "_LLMMetaParser__search_bangumi_candidates", return_value=[]), \
+                patch.object(log, 'info', wraps=log.info) as info:
+            for page, title, _source in cases:
+                with app.test_request_context('/do', method='POST', headers={'X-NAStool-Page': page}):
+                    g.api_key_authenticated = True
+                    tasks.append(action.action('get_recommend', title))
+            release.set()
+            for task in tasks:
+                self.assertEqual(task.result(timeout=5), {})
+        messages = [call.args[0] for call in info.call_args_list]
+        for _, title, source in cases:
+            matching = [line for line in messages if line.endswith(f'来源：{source}')]
+            self.assertEqual(len(matching), 2)
+            self.assertIn('达到输出长度上限', matching[0])
+            self.assertIn(f'《{title}》未返回识别结果，继续按规则识别', matching[1])
+        self.assertNotIn('private', ''.join(messages))
+
+    def test_rss_recognition_shows_one_readable_result_and_keeps_diagnostics(self):
+        import log
+        from app.llm_source import llm_source
+
+        title = "某暗部的少女共栖 S01E07"
+        sdk = Mock()
+        response = {"cn_name": "某暗部的少女共栖", "type": "anime", "begin_season": 1, "begin_episode": 7,
+                    "tmdb_id": 284580, "tmdb_type": "tv", "tmdb_season": 1}
+        sdk.chat.completions.create.return_value = {"choices": [{"message": {"content": json.dumps(response)}}]}
+        self.parser._search_context_enable = True
+        candidates = [{"id": 284580, "type": "tv", "seasons": [{"n": 1}]}]
+        with patch("app.utils.llm_client.OpenAI", return_value=sdk), \
+                patch.object(self.parser, "_LLMMetaParser__search_tmdb_candidates", return_value=candidates), \
+                patch.object(self.parser, "_LLMMetaParser__search_bangumi_candidates", return_value=[]), \
+                patch.object(log, "info", wraps=log.info) as info, patch.object(log, "debug") as debug, \
+                llm_source("自定义订阅 #17（定时）"):
+            meta = MetaInfo(title, use_llm=False)
+            self.parser.merge_into(meta, title)
+            self.parser.merge_into(meta, title)
+        info.assert_called_once_with("【Meta】LLM 解析《某暗部的少女共栖》S01E07，匹配 TMDB 284580"
+                                     "  ·  来源：自定义订阅 #17（定时）")
+        self.assertTrue(any("LLM原始返回" in call.args[0] for call in debug.call_args_list))
+        self.assertTrue(any("LLM检索增强候选" in call.args[0] for call in debug.call_args_list))
+
     def test_stopped_parse_skips_providers_without_caching_a_negative_result(self):
         for stage in ('before', 'candidates', 'response'):
             with self.subTest(stage=stage):
