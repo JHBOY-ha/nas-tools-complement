@@ -19,16 +19,18 @@ from pathlib import Path
 from threading import Lock, Timer, Event
 from urllib import parse
 
-from flask import Flask, request, json, render_template, make_response, session, send_from_directory, send_file, g
+from flask import Flask, abort, request, json, render_template, make_response, session, send_from_directory, send_file, g
 from flask.wrappers import Request as FlaskRequest
 from flask_compress import Compress
 from flask_login import LoginManager, login_user, login_required, current_user
+from sqlalchemy.exc import OperationalError
 from werkzeug.exceptions import RequestEntityTooLarge, RequestTimeout
 from werkzeug.http import parse_options_header
 
 import log
 from app.brushtask import BrushTask
 from app.conf import ModuleConf, SystemConfig
+from app.db.transactions import is_database_contention
 from app.downloader import Downloader
 from app.filter import Filter
 from app.helper import SecurityHelper, MetaHelper, ChromeHelper, ThreadHelper, DbHelper
@@ -480,7 +482,14 @@ def add_header(r):
 # 定义获取登录用户的方法
 @LoginManager.user_loader
 def load_user(user_id):
-    return User().get(user_id)
+    try:
+        return User().get(user_id)
+    except OperationalError as error:
+        # 普通账号由 SQLite 加载。身份尚未核实时，不能接收取消请求。
+        if request.endpoint == "subtitle_task_cancel" and is_database_contention(error):
+            abort(make_response({"code": -1, "cancel_retryable": True,
+                                 "msg": "数据库繁忙，暂时无法核验账号"}, 503, {"Retry-After": "5"}))
+        raise
 
 
 # 页面不存在
@@ -2705,13 +2714,14 @@ def _request_bool(value):
     return str(value or "").strip().lower() in ["1", "true", "yes", "on", "y"]
 
 
-def _subtitle_tasks():
+def _subtitle_tasks(start=True):
     """Lazily register task processors after the application DB is available."""
     from app.helper.subtitle_tasks import get_subtitle_task_manager
     from app.helper.subtitle_task_processors import register_subtitle_task_processors
     manager = get_subtitle_task_manager()
     register_subtitle_task_processors(manager)
-    manager.start()
+    if start:
+        manager.start()
     return manager
 
 
@@ -3024,14 +3034,16 @@ def subtitle_task_detail(task_id):
 @login_required
 def subtitle_task_cancel(task_id):
     try:
-        task = _subtitle_tasks().cancel_task(
-            task_id,
-            owner=_subtitle_task_owner(),
-            admin=False
-        )
+        # 冷启动和 SQLite 等待也放在后台，HTTP 回执不会被同一把数据库锁挡住。
+        task = _subtitle_tasks(start=False).request_cancel(task_id, owner=_subtitle_task_owner())
         if not task:
             return {"code": -1, "msg": "字幕任务不存在"}, 404
+        if task.get("cancel_pending"):
+            return {"code": 0, "cancel_pending": True,
+                    "msg": "已收到取消请求，正在等待后台确认"}, 202
         return {"code": 0, "msg": "已请求取消字幕任务", "data": task}
+    except TaskQueueFull as e:
+        return {"code": -1, "msg": str(e)}, 503, {"Retry-After": "5"}
     except Exception as e:
         ExceptionUtils.exception_traceback(e)
         return _subtitle_task_error(e)

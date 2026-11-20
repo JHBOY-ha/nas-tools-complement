@@ -757,7 +757,7 @@ class SubtitleHealth:
             "issue_limit": max(int(issue_limit or 0), 0),
             "cancel_check": cancel_check,
             "progress_callback": progress_callback,
-            "last_progress_at": 0,
+            "last_progress": None,
             "cache_get": cache_get,
             "cache_put": cache_put,
             "heavy_operation": heavy_operation,
@@ -871,9 +871,13 @@ class SubtitleHealth:
         if not callback:
             return
         now = time.monotonic()
-        if not force and now - accumulator.get("last_progress_at", 0) < 0.5:
+        probing = accumulator["inspected"] > 0
+        last = accumulator["last_progress"]
+        # 与任务进度的 5 秒落库间隔一致，在申请写事务之前合并同阶段的路径变化。
+        # 首次进入探测阶段和扫描结束仍要及时通知。
+        if not force and last is not None and probing == last[1] and now - last[0] < 5:
             return
-        accumulator["last_progress_at"] = now
+        accumulator["last_progress"] = (now, probing)
         try:
             callback({
                 "directories": accumulator["directories"],

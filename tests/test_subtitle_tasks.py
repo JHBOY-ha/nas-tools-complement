@@ -1594,7 +1594,7 @@ class SubtitleTaskManagerTest(TestCase):
 
         self.assertEqual(failures["count"], 3)
         self.assertEqual(terminal["status"], "interrupted")
-        self.assertNotIn(task["task_id"], self.manager._executing_task_ids)
+        self.assertNotIn(task["task_id"], self.manager._executing_task_owners)
         replacement, reused = self.manager.submit_task(
             "audit", "user", {"category": "movie"},
             scope_key="movie", dedupe_key="movie"

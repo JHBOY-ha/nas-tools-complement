@@ -233,6 +233,27 @@ class SubtitleDatabasePerformanceTest(TestCase):
 
 
 class SubtitleFilePerformanceTest(TestCase):
+    def test_audit_progress_reports_phase_changes_and_limits_periodic_writes(self):
+        with tempfile.TemporaryDirectory() as root:
+            media = Path(root, 'Movie.mkv')
+            media.touch()
+            subtitle = media.with_suffix('.zh-CN.srt')
+            subtitle.write_bytes(SRT)
+            reports = []
+            with patch('app.helper.subtitle_health.time', wraps=time) as clock:
+                clock.monotonic.return_value = 10
+
+                def paths():
+                    yield str(media)
+                    clock.monotonic.return_value = 11
+                    yield os.path.join(root, 'second.mkv')
+                    clock.monotonic.return_value = 15
+                    yield os.path.join(root, 'third.mkv')
+
+                SubtitleHealth.audit_linked_media(paths(), 'emby', progress_callback=reports.append)
+            self.assertEqual([(os.path.basename(r['current_item']), r['inspected']) for r in reports],
+                             [('Movie.mkv', 0), ('third.mkv', 0), (subtitle.name, 1), ('', 1)])
+
     def test_opensubtitles_preflight_runs_outside_api_lock_and_rechecks_races(self):
         service = Subtitle()
         held = [False]

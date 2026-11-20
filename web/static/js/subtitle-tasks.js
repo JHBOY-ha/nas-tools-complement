@@ -14,6 +14,7 @@
   const STORAGE_KEY = "nastool.subtitle.tasks.v1";
   const taskCache = new Map();
   const watchers = new Map();
+  const cancelRequests = new Map();
   const detailLoaded = new Set();
   const detailLoading = new Set();
   let initialized = false;
@@ -162,6 +163,7 @@
           const response = (xhr && xhr.responseJSON) || parseJson(xhr && xhr.responseText);
           reject({
             status: xhr && xhr.status,
+            timedOut: textStatus === "timeout",
             response: response,
             message: responseMessage(response, textStatus === "timeout" ? "请求超时，请重试" : "连接中断，请稍后重试")
           });
@@ -411,15 +413,38 @@
     if (!taskId) {
       return Promise.reject({message: "缺少任务 ID"});
     }
-    return request("POST", "/subtitle/tasks/" + encodeURIComponent(taskId) + "/cancel", {})
-        .then(function (response) {
-          const task = taskOf(response) || payloadOf(response);
-          if (task && (task.task_id || task.id)) {
-            emitTask(task);
-          }
-          watch(taskId, {});
-          return task;
-        });
+    if (!cancelRequests.has(taskId)) {
+      cancelRequests.set(taskId, sendCancel(taskId).finally(() => cancelRequests.delete(taskId)));
+    }
+    return cancelRequests.get(taskId);
+  }
+
+  async function sendCancel(taskId) {
+    let delay = 5000;
+    while (true) {
+      let response;
+      try {
+        response = await request("POST", "/subtitle/tasks/" + encodeURIComponent(taskId) + "/cancel", {});
+      } catch (error) {
+        if (!error.timedOut && !(error.response && error.response.cancel_retryable)) throw error;
+        // 排他锁也可能挡住身份查询。服务端尚未确认接收时，由当前页面退避重试。
+        const message = "尚未收到取消回执，此页面将自动重试";
+        setConnectionState(message, true);
+        announce(message);
+        await new Promise(resolve => window.setTimeout(resolve, delay));
+        delay = Math.min(delay * 2, 30000);
+        continue;
+      }
+      if (!watchers.has(taskId)) watch(taskId, {});
+      if (response.cancel_pending) {
+        setConnectionState(response.msg, true);
+        announce(response.msg);
+        return response;
+      }
+      const task = taskOf(response) || payloadOf(response);
+      if (task && (task.task_id || task.id)) emitTask(task);
+      return task;
+    }
   }
 
   function confirmCancel(taskId) {
@@ -779,7 +804,8 @@
     const elapsed = data.elapsedSeconds !== undefined && data.elapsedSeconds !== null
         ? formatElapsed(data.elapsedSeconds) : "";
     const metrics = metricsText(data.metrics);
-    const canCancel = task.cancellable !== false && isActive(task) && task.status !== "canceling";
+    const canCancel = task.cancellable !== false && isActive(task)
+        && (task.status !== "canceling" || (task.progress && task.progress.phase === "cancel_reconciling"));
     const queue = task.status === "queued" && task.queue_position
         ? `<span class="text-muted small">队列第 ${escapeHtml(task.queue_position)} 位</span>` : "";
     const progressLabel = data.total !== null && data.total !== undefined
