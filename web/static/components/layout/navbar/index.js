@@ -703,14 +703,14 @@ export class LayoutNavbar extends CustomElement {
 
         .lit-navbar-search .input-group-flat {
           border: 1px solid #232323;
-          border-radius: 0.75rem;
+          border-radius: var(--nt-radius-md);
         }
         .lit-navbar-search .input-group-text {
           border: 0;
           background: transparent;
         }
         .lit-navbar-search .form-control {
-          border-radius: 0.75rem;
+          border-radius: var(--nt-radius-md);
           border: 0;
         }
 
@@ -735,7 +735,7 @@ export class LayoutNavbar extends CustomElement {
         }
 
         .lit-navbar-accordion-item, .lit-navbar-accordion-item-active {
-          border-radius:0.75rem;
+          border-radius: var(--nt-radius-md);
           transition: background-color 0.2s ease;
         }
 

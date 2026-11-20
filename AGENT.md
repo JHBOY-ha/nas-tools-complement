@@ -336,6 +336,18 @@ Chrome 入口通过；旧 SQLite 3.37.2 的 DELETE 回退 41 项通过。完整 
 
 验证：`tests.test_media_library` 新增分类顺序与分面计数用例，57 项中 6 项错误为既有的未隔离审计写库用例；`test_media_library_cards.js` 新增标签行、类型联动、补齐范围、视图校验、空状态、筛选标签断言；`test_media_library_history.js`、`test_media_library_online.js` 通过。Playwright UI 用例（`test_media_library_ui.js` 新增标签行尺寸/分组/焦点、菜单布局、筛选标签、刷新后恢复、补齐拒绝；`test_media_library_online_ui.js`）在本机以 playwright-core 驱动系统 Chrome 运行通过（仓库原用 Firefox，本机未安装）；在线字幕 UI 用例约 13 次运行中出现过 1 次关闭确认框后对话框未重新显示的超时，HEAD 与本改动各 5 次复跑均未复现。未在真实 NAS 数据上联调。
 
+## 全站圆角刻度、徽标统一与任务中心分组（2026-11-20）
+
+依据：用户看过本地设计稿后选定“建议档”（4/6/8/12/16），范围为全站，并要求同时实现任务中心的时间与分组。原先 Tabler 默认 4px、小按钮 2px、弹窗 8px，项目里又另写 8px、12px，同类元素圆角不一；徽标与小按钮同用一个圆角时，较矮的徽标显得更圆。
+
+- `style.css` 在 `:root` 定义 `--nt-radius-xs/sm/md/lg/xl`（4/6/8/12/16），并把 Tabler 的 `--tblr-border-radius-sm/默认/lg/xl` 指向 sm/md/lg/xl。卡片、弹窗（含 `.modal-status`）、徽标、`.btn-sm`、提示条、下拉菜单、toast 和复选框在 Tabler 中写死或沿用基础圆角，逐一映射到对应档；字幕库卡片、海报顶边和上传区改用变量；导航栏搜索框与菜单项由 12px 改为 md。规则：控件圆角约为高度的 1/5，里层不超过外层，抽屉贴边不加，类型角标保持胶囊形。
+- 补上全局 `.min-w-0`：模板里多处用到，但 Tabler beta16 没有这个类，flex 子项无法截断长文本。
+- 徽标：详情抽屉的字幕状态、剧集列表和状态说明弹窗由实心白字改为浅底同色字（`library_soft_badge` 把后端的 `bg-orange` 等转为 `bg-orange-lt text-orange`），后端返回值未改。实心只保留给数字提醒。
+- 任务中心（`subtitle-tasks.js`）：分“进行中 · N”（完整卡片）和“最近完成”（`renderTaskRow` 紧凑行）。紧凑行的状态徽标定宽对齐，媒体文件只显示文件名，完整路径放在 `title`；错误、指标、逐字幕结果仍保留。`formatTaskTime` 输出“今天/昨天 HH:MM”“M月D日 HH:MM”，跨年带年份；进行中显示开始时间（排队显示提交时间）和“已运行”，结束的任务显示结束时间（`finished_at`）。“取消”改为中性 `.btn-sm`，高度跟随 `.lit-library-modal` 的统一规则。说明从顶部蓝色提示条移到底部一行灰字，窄屏独占一行。信息行用“·”分隔，并用负外边距加裁剪，让换行后的行首不留分隔符。
+- 承接工作区里另一个进程未提交的改动：服务器名改为“Jellyfin”等普通文字、进度未知时不再写死 100% 宽度、减少动态效果时改为静止浅色整条、弹窗加 `lit-library-modal`。本次在其基础上把时间格式从“11-20 10:57”改为上面的友好格式。
+
+验证：`test_media_library_ui.js` 的按钮圆角断言由 4px 改为 8px/6px；新增 `tests/test_subtitle_task_center_ui.js`，在 1280px 与 390px 下用模拟接口打开真实任务中心，检查分组、友好时间、紧凑行只显示文件名且保留完整路径与错误、中性取消按钮、未知进度不填满、无服务器徽标和顶部提示条、圆角（弹窗 16、任务卡 12、徽标 4、取消 6）、行首分隔符被裁掉、无横向滚动。其余 JS 用例与 `tests.run_stability`（339 项，1 项为既有的 `PathUtils` 错误）通过；另截图检查了深色主题。`test_opensubtitles_settings_ui.js` 原为 WebKit 编写，换 Chrome 运行时“1e”输入的 `badInput` 判定不同而失败，该用例不加载 `style.css`，与本次改动无关。未在真实 NAS 上联调。
+
 ## OpenSubtitles 自动下载上限（2026-11-19）
 
 - 配置键 `subtitle.opensubtitles.auto_download_limit`：0–1000 的整数，0 表示不限制（默认，保持原行为）。`app.subtitle.parse_auto_download_limit` 同时用于保存校验（`set_config_value` 拒绝非法值，不改动配置）和启动读取（手改的非法值记警告后按不限制处理）。

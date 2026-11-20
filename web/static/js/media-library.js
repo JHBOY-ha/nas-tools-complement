@@ -1441,13 +1441,19 @@ function library_audio_language_label(code) {
   return {zho: "中文", eng: "英语", fra: "法语", rus: "俄语", jpn: "日语", kor: "韩语", other: "其他语言", unknown: "未知"}[code] || "";
 }
 
+// 文字状态统一用浅底同色字：后端给出的实心色（如 bg-orange）在这里换成对应的 -lt 配色。
+function library_soft_badge(cls) {
+  const match = /^bg-([a-z]+)$/.exec(String(cls || "").trim());
+  return match ? `bg-${match[1]}-lt text-${match[1]}` : String(cls || "bg-secondary-lt text-secondary");
+}
+
 function render_library_drawer_overview(item) {
   const is_movie = item.media_type === "movie";
-  const badge = function (cls, label, extra) {
-    return `<span class="badge ${library_escape_html(cls)} ${extra || ""}">${library_escape_html(label)}</span>`;
+  const badge = function (cls, label) {
+    return `<span class="badge ${library_escape_html(cls)}">${library_escape_html(label)}</span>`;
   };
   const rows = [];
-  rows.push(`<div class="d-flex flex-wrap gap-2 align-items-center">${badge(item.subtitle_badge || "bg-secondary", item.subtitle_label || "未检测", "text-white")}${
+  rows.push(`<div class="d-flex flex-wrap gap-2 align-items-center">${badge(library_soft_badge(item.subtitle_badge || "bg-secondary"), item.subtitle_label || "未检测")}${
       item.subtitle_status_checked_at ? `<span class="text-muted small">检查于 ${library_escape_html(item.subtitle_status_checked_at)}</span>` : ""}</div>`);
   if (is_movie && item.subtitle_audit_label) {
     rows.push(`<div class="d-flex flex-wrap gap-2 align-items-center">${badge(item.subtitle_audit_badge || "bg-secondary-lt", item.subtitle_audit_label)}${
@@ -1664,7 +1670,7 @@ function render_library_episodes(episodes) {
             <div class="text-muted small text-truncate" title="${path}">${path}</div>
           </div>
           <div class="col-auto">
-            <span class="badge ${library_escape_html(episode.subtitle_badge || "bg-secondary")}">${library_escape_html(episode.subtitle_label || "未检测")}</span>
+            <span class="badge ${library_escape_html(library_soft_badge(episode.subtitle_badge || "bg-secondary"))}">${library_escape_html(episode.subtitle_label || "未检测")}</span>
           </div>
           <div class="col-auto">${button}</div>
         </div>
