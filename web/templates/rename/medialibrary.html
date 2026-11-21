@@ -150,10 +150,15 @@
               </div>
               <div class="lit-library-result-bar">
                 <div id="library_items_summary" class="text-muted" aria-live="polite"></div>
+                <button class="btn btn-outline-warning d-none" id="library_repair_page_btn" type="button"
+                        onclick="repair_library_page()">
+                  {{ SVG.adjustments() }} <span>修复本页（<span id="library_repair_page_count">0</span> 部）</span>
+                </button>
                 <!-- 只列出收在“筛选与排序”里的条件，便于看清恢复的视图；类型、小分类和状态已在标签上可见。 -->
                 <div id="library_active_filters" class="lit-library-active-filters"></div>
               </div>
             </div>
+            <div id="library_repair_page_status" class="small text-break mt-2 d-none" role="status"></div>
           </div>
           <div class="lit-library-legend" aria-label="字幕状态图例">
             <span class="lit-library-legend-title">卡片状态</span>

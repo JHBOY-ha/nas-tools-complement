@@ -6,7 +6,7 @@
   }
 
   const TERMINAL_STATUSES = new Set([
-    "succeeded", "partial", "failed", "canceled", "interrupted"
+    "succeeded", "partial", "failed", "canceled", "interrupted", "unavailable"
   ]);
   const ACTIVE_STATUSES = new Set([
     "queued", "recovering", "running", "canceling"
@@ -39,7 +39,8 @@
     partial: ["部分完成", "bg-yellow-lt text-yellow"],
     failed: ["失败", "bg-red-lt text-red"],
     canceled: ["已取消", "bg-secondary-lt text-secondary"],
-    interrupted: ["已中断", "bg-orange-lt text-orange"]
+    interrupted: ["已中断", "bg-orange-lt text-orange"],
+    unavailable: ["结果已不可查询", "bg-secondary-lt text-secondary"]
   };
   const TYPE_LABELS = {
     upload: "手动上传",
@@ -258,6 +259,7 @@
   function pollWatcher(entry) {
     request("GET", "/subtitle/tasks/" + encodeURIComponent(entry.taskId))
         .then(function (response) {
+          if (watchers.get(entry.taskId) !== entry) return;
           const task = taskOf(response) || payloadOf(response);
           if (!task || !(task.task_id || task.id)) {
             throw {message: "任务状态响应不完整"};
@@ -281,6 +283,19 @@
           scheduleWatcher(entry, hiddenDelay);
         })
         .catch(function (error) {
+          if (watchers.get(entry.taskId) !== entry) return;
+          if (error.status === 404 && error.response && error.response.code === -1) {
+            // A task-detail 404 ends observation. Its actual outcome is unknown;
+            // never cache this local notification as a finished server task.
+            window.clearTimeout(entry.timer);
+            watchers.delete(entry.taskId);
+            taskCache.delete(entry.taskId);
+            detailLoaded.delete(entry.taskId);
+            renderCenter();
+            updateTaskButtons();
+            notifyWatcher(entry, "onDone", {task_id: entry.taskId, status: "unavailable", error: "任务结果已不可查询"});
+            return;
+          }
           entry.failures += 1;
           entry.connectionLost = true;
           entry.delay = Math.min(Math.round(entry.delay * 1.8), 30000);

@@ -194,4 +194,20 @@ grid = null;
 const requestCount = requests.length;
 $('#system-confirm-modal').hidden();
 assert.equal(requests.length, requestCount, 'leaving during modal close must not start subtitle search');
+
+// A confirmation belongs to the exact displayed page, even if its grid DOM is reused.
+grid = {};
+ctx.library_view_instance = {repairItems: [oldMovie]};
+ctx.repair_library_page();
+const oldRepair = confirmations.at(-1);
+assert.match(oldRepair.message, /修复本页 1 部电影/);
+ctx.library_view_instance.repairItems = [];
+oldRepair.confirm();
+assert.equal(requests.length, requestCount);
+ctx.library_view_instance.repairItems = [oldMovie];
+ctx.repair_library_page();
+const departedRepair = confirmations.at(-1);
+grid = null;
+departedRepair.confirm();
+assert.equal(requests.length, requestCount);
 console.log('Media library history lifecycle tests passed');

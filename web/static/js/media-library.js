@@ -82,9 +82,9 @@ function library_post_json(url, data, handler, on_error) {
       NProgress.done();
       handler(ret || {});
     },
-    error: function () {
+    error: function (xhr) {
       NProgress.done();
-      if (on_error) { on_error(); }
+      if (on_error) { on_error(xhr); }
       else { show_fail_modal("网络错误"); }
     }
   });
@@ -460,6 +460,10 @@ function load_library_items(page) {
   }
   library_items_loading = true;
   library_pending_page = null;
+  // 仅成功返回的“有问题”页可以批量修复。切换筛选或加载失败时，旧卡片不能成为批量目标。
+  view.repairItems = [];
+  $("#library_repair_page_btn").addClass("d-none");
+  const filters = library_filter_data(page);
   // A failed request must leave the pager on the page the user still sees.
   const previous_page = library_page;
   library_page = page;
@@ -475,7 +479,7 @@ function load_library_items(page) {
     url: "/library/items?random=" + Math.random(),
     dataType: "json",
     contentType: "application/json",
-    data: JSON.stringify(library_filter_data(page)),
+    data: JSON.stringify(filters),
     timeout: 0,
     success: function (ret) {
       if (!is_current_view()) { return; }
@@ -528,6 +532,13 @@ function load_library_items(page) {
         library_items_cache[item.id] = item;
         html += library_item_card(item, index);
       });
+      if (filters.subtitle === "problem" && library_pending_page === null) {
+        view.repairItems = items.filter(library_can_repair);
+        if (view.repairItems.length) {
+          $("#library_repair_page_count").text(view.repairItems.length);
+          $("#library_repair_page_btn").removeClass("d-none").prop("disabled", !!view.repairBusy);
+        }
+      }
       // The drawer reads this cache, so publish all new records before updating it.
       library_refresh_drawer_item();
       $("#library_items_grid").html(html);
@@ -1150,12 +1161,15 @@ function library_upload_block_label(item) {
 // Same glyph as the header's SVG.dots() macro, which is not available to rendered cards.
 var library_dots_icon = '<svg xmlns="http://www.w3.org/2000/svg" class="icon icon-tabler icon-tabler-dots" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path stroke="none" d="M0 0h24v24H0z" fill="none"></path><circle cx="5" cy="12" r="1"></circle><circle cx="12" cy="12" r="1"></circle><circle cx="19" cy="12" r="1"></circle></svg>';
 
+function library_can_repair(item) {
+  return item.media_type === "movie" && item.can_upload && !!item.target_path
+      && ["warning", "error"].indexOf(item.subtitle_audit_status) !== -1;
+}
+
 function library_card_primary(item) {
   const status = item.subtitle_status || "unknown";
   const is_movie = item.media_type === "movie";
-  const repairable = is_movie && item.can_upload
-      && ["warning", "error"].indexOf(item.subtitle_audit_status) !== -1;
-  if (repairable) {
+  if (library_can_repair(item)) {
     return {key: "repair", label: "修复", cls: "btn-outline-warning"};
   }
   if (status === "missing_chinese" || status === "unknown") {
@@ -1167,8 +1181,6 @@ function library_card_primary(item) {
 function library_card_actions(item, item_id, title) {
   const is_movie = item.media_type === "movie";
   const block_reason = library_upload_block_reason(item);
-  const repairable = is_movie && item.can_upload
-      && ["warning", "error"].indexOf(item.subtitle_audit_status) !== -1;
   const primary = library_card_primary(item);
   const call = function (name) { return `${name}(&quot;${item_id}&quot;)`; };
   const handlers = {
@@ -1191,7 +1203,7 @@ function library_card_actions(item, item_id, title) {
   } else {
     entries.push({key: "episodes", label: "选择剧集"});
   }
-  if (repairable) {
+  if (library_can_repair(item)) {
     entries.push({key: "repair", label: "二次处理"});
   }
   const menu_items = entries.filter(function (entry) { return entry.key !== primary.key; })
@@ -1291,6 +1303,128 @@ function library_item_card(item, index) {
     </div>`;
 }
 
+function library_repair_payload(item) {
+  const context = {
+    server_item_id: item.server_item_id || "",
+    parent_server_item_id: item.parent_server_item_id || "",
+    library_id: item.library_id || ""
+  };
+  return {
+    ...context,
+    media_path: item.target_path,
+    server: item.server || library_default_media_server,
+    refresh_context: context
+  };
+}
+
+function repair_library_page() {
+  const view = library_view_instance;
+  const items = view && view.repairItems;
+  const grid = document.getElementById("library_items_grid");
+  const current = () => view === library_view_instance && grid === document.getElementById("library_items_grid");
+  if (!grid || !items || !items.length || view.repairBusy || library_items_loading) return;
+  show_confirm_modal(
+      `修复本页 ${items.length} 部电影的已有外挂字幕？将按影视服务器规则处理命名和编码，保留不同来源的字幕轨道。`,
+      function () {
+        if (!current()) return;
+        hide_confirm_modal();
+        if (view.repairItems !== items || view.repairBusy) return;
+        view.repairBusy = true;
+        const button = $("#library_repair_page_btn").prop("disabled", true);
+        const status = $("#library_repair_page_status").removeClass("d-none").text("正在提交本页字幕修复任务…");
+        // 连接中断后重试同一目标时复用请求 ID，即使之前的任务已完成也不会重复修复。
+        if (!view.repairRequestIds) view.repairRequestIds = new Map();
+        const payloads = items.map(function (item) {
+          const payload = library_repair_payload(item);
+          const key = JSON.stringify(payload);
+          if (!view.repairRequestIds.has(key)) view.repairRequestIds.set(key, SubtitleTasks.randomRequestId());
+          return Object.assign(payload, {request_id: view.repairRequestIds.get(key)});
+        });
+        function submissionUnknown(xhr) {
+          if (!current()) return;
+          view.repairBusy = false;
+          button.prop("disabled", false);
+          status.text(xhr && xhr.status === 403 ? "需要媒体整理权限才能修复字幕。" :
+              "未能确认提交结果，请查看任务中心。可在本页重试。");
+        }
+        library_post_json("/library/subtitle/repair/batch", {items: payloads}, function (response) {
+          if (!current()) return;
+          if (response.code !== 0 || !Array.isArray(response.results) || response.results.length !== items.length) {
+            submissionUnknown();
+            return;
+          }
+          track_library_page_repairs(view, items, response.results, current);
+        }, submissionUnknown);
+      });
+}
+
+function track_library_page_repairs(view, items, results, current) {
+  const status = $("#library_repair_page_status");
+  const accepted = results.filter(result => result.task_id);
+  const rejected = [];
+  const retryable = [];
+  const unknown = [];
+  results.forEach((result, index) => {
+    if (result.retryable) {
+      retryable.push(`${items[index].title}（${result.error}）`);
+      return;
+    }
+    if (result.unconfirmed) {
+      unknown.push(items[index].title);
+      return;
+    }
+    view.repairRequestIds.delete(JSON.stringify(library_repair_payload(items[index])));
+    if (!result.task_id) rejected.push(`${items[index].title}（${result.error}）`);
+  });
+  const reused = accepted.filter(result => result.reused).length;
+  const disconnected = new Set();
+  function update() {
+    if (!current()) return;
+    const completed = accepted.filter(SubtitleTasks.isTerminal);
+    const pending = accepted.length - completed.length;
+    const counts = [
+      ["succeeded", "已完成"], ["partial", "部分完成"], ["failed", "失败"],
+      ["canceled", "已取消"], ["interrupted", "已中断"], ["unavailable", "结果已不可查询"]
+    ].map(([key, label]) => {
+      const count = completed.filter(task => task.status === key).length;
+      return count ? `${label} ${count} 部` : "";
+    }).filter(Boolean);
+    const parts = [`本次修复已受理 ${accepted.length} 部${reused ? `（复用 ${reused} 个任务）` : ""}`];
+    if (pending) parts.push(`待完成 ${pending} 部`);
+    parts.push(...counts);
+    if (completed.some(task => ["partial", "failed"].includes(task.status))) parts.push("处理明细见任务中心");
+    if (rejected.length) parts.push(`未受理 ${rejected.length} 部：${rejected.join("、")}`);
+    if (retryable.length) parts.push(`可重试 ${retryable.length} 部：${retryable.join("、")}`);
+    if (unknown.length) parts.push(`提交待核对：${unknown.join("、")}，请查看任务中心`);
+    if (disconnected.size) parts.push("任务状态暂时无法读取，正在重连");
+    status.text(parts.join(" · "));
+    if (!pending) {
+      view.repairBusy = false;
+      $("#library_repair_page_btn").prop("disabled", false);
+      if (accepted.length) load_library_items(library_page);
+    }
+  }
+  update();
+  accepted.filter(task => !SubtitleTasks.isTerminal(task)).forEach(result => {
+    SubtitleTasks.watch(result.task_id, {
+      onConnectionError: function () {
+        if (!disconnected.has(result.task_id)) {
+          disconnected.add(result.task_id);
+          update();
+        }
+      },
+      onUpdate: function () {
+        if (disconnected.delete(result.task_id)) update();
+      },
+      onDone: function (task) {
+        disconnected.delete(result.task_id);
+        result.status = task.status;
+        update();
+      }
+    });
+  });
+}
+
 function repair_library_subtitles(item_id, button) {
   const item = library_lookup_item(item_id);
   if (!item || !item.target_path) {
@@ -1307,18 +1441,7 @@ function repair_library_subtitles(item_id, button) {
             '<span class="spinner-border spinner-border-sm me-1" aria-hidden="true"></span>正在创建任务'
         );
         NProgress.start();
-        SubtitleTasks.requestTask("/library/subtitle/repair", {
-          media_path: item.target_path,
-          server: item.server || library_default_media_server,
-          server_item_id: item.server_item_id || "",
-          parent_server_item_id: item.parent_server_item_id || "",
-          library_id: item.library_id || "",
-          refresh_context: {
-            server_item_id: item.server_item_id || "",
-            parent_server_item_id: item.parent_server_item_id || "",
-            library_id: item.library_id || ""
-          }
-        }, {
+        SubtitleTasks.requestTask("/library/subtitle/repair", library_repair_payload(item), {
           onUpdate: function (task) {
             const progress = task.progress || {};
             repair_button.html(

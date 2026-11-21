@@ -79,6 +79,7 @@ _MULTIPART_OVERHEAD_BYTES = 1024 * 1024
 _STANDARD_STAGING_FACTOR = 3
 _ALIGN_STAGING_FACTOR = 6
 _QUEUE_POSITION_UNSET = object()
+_REPAIR_REQUEST_ALIASES = "_repair_request_ids"
 # SQLite 只允许一个写者。排队的取消请求占用独立的有界容量，避免阻塞 Webhook 等交互任务。
 _CANCEL_QUEUE_SIZE = 64
 _cancel_executor = BoundedExecutor(1, _CANCEL_QUEUE_SIZE, "subtitle-cancel")
@@ -510,6 +511,9 @@ class SubtitleTaskManager:
         self.start()
         owner = str(owner or "")
         payload = dict(payload or {})
+        if task_type == "repair":
+            # Only the manager may bind an additional request to an existing task.
+            payload.pop(_REPAIR_REQUEST_ALIASES, None)
         request_id = str(request_id or "").strip() or None
         server = str(server or payload.get("server") or "").strip().lower()
         scope_key = str(scope_key or "") or None
@@ -526,8 +530,20 @@ class SubtitleTaskManager:
                 self._interrupt_orphaned_audits_locked(
                     "检测执行线程已退出，任务已安全中断"
                 )
-            reusable = self._find_reusable(owner, task_type, request_id, dedupe_key)
+            if task_type == "repair" and request_id:
+                # Recheck under writer admission: another caller may have bound this ID
+                # after the HTTP path's read-only lookup and before its file checks finished.
+                receipt = self._repair_request_row(owner, request_id, payload, server)
+                if receipt is not None:
+                    return self._task_dict(receipt, include_result=True, include_items=True), True
+            reusable = self._find_reusable(owner, task_type, None if task_type == "repair" else request_id,
+                                           dedupe_key)
             if reusable:
+                if task_type == "repair" and request_id:
+                    stored = _loads(reusable.PAYLOAD, {})
+                    stored.setdefault(_REPAIR_REQUEST_ALIASES, []).append(request_id)
+                    reusable.PAYLOAD = _dumps(stored)
+                    self._db.commit()
                 return self._task_dict(reusable, include_result=True, include_items=True), True
             if task_type == "audit":
                 active = self._db.query(SUBTITLETASK).filter(
@@ -1030,6 +1046,33 @@ class SubtitleTaskManager:
                 except OSError:
                     continue
 
+    def get_repair_receipt(self, owner, request_id, target):
+        with read_snapshot(self._db), self._lock:
+            row = self._repair_request_row(owner, request_id, target, target["server"])
+            if row is not None:
+                return self._task_dict(row, include_result=True, include_items=True)
+        return None
+
+    def _repair_request_row(self, owner, request_id, target, server):
+        # The original ID stays in REQUEST_ID. instr narrows the owner's retained
+        # repairs without requiring SQLite JSON1; only exact array members are aliases.
+        candidates = self._db.query(SUBTITLETASK).filter(
+            SUBTITLETASK.OWNER == owner, SUBTITLETASK.TYPE == "repair",
+            or_(SUBTITLETASK.REQUEST_ID == request_id, func.instr(SUBTITLETASK.PAYLOAD, _dumps(request_id)) > 0)
+        ).order_by(SUBTITLETASK.CREATED_AT.desc())
+        for row in candidates:
+            stored = _loads(row.PAYLOAD, {})
+            if row.REQUEST_ID != request_id and request_id not in stored.get(_REPAIR_REQUEST_ALIASES, []):
+                continue
+            # The admission-time file identity can change after a move. Only the
+            # original target is needed for a replay, with no filesystem access.
+            fields = ("media_path", "media_file", "server_item_id", "parent_server_item_id", "library_id")
+            if (row.SERVER or "") != server or any(
+                    str(stored.get(field) or "") != str(target.get(field) or "") for field in fields):
+                raise SubtitleTaskError("此请求 ID 已用于其他修复目标", status_code=409)
+            return row
+        return None
+
     def _find_reusable(self, owner, task_type, request_id, dedupe_key):
         query = self._db.query(SUBTITLETASK).filter(
             SUBTITLETASK.OWNER == owner,
@@ -1118,6 +1161,8 @@ class SubtitleTaskManager:
                    queue_position=_QUEUE_POSITION_UNSET):
         now = time.time()
         payload = _loads(row.PAYLOAD, {})
+        if row.TYPE == "repair":
+            payload.pop(_REPAIR_REQUEST_ALIASES, None)
         active_seconds = float(row.ACTIVE_SECONDS or 0)
         if row.RUN_STARTED_AT and row.STATUS in ["running", "canceling"]:
             active_seconds += max(now - row.RUN_STARTED_AT, 0)

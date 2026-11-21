@@ -1,10 +1,15 @@
 # -*- coding: utf-8 -*-
 """Page-scoped library refresh, versioned posters and Plex poster routing."""
 
+from contextlib import closing
 import json
+from concurrent.futures import ThreadPoolExecutor
 import os
+from pathlib import Path
+import sqlite3
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from unittest.mock import MagicMock, Mock, patch
@@ -349,6 +354,191 @@ class LibraryImageRouteTest(unittest.TestCase):
         response = self.client.post("/library/refresh", json={"item_ids": ["1"]})
         self.assertEqual(response.get_json(), {"code": 0, "updated": 1})
         self.library.refresh_items.assert_called_once_with({"item_ids": ["1"]})
+
+
+class SubtitleBatchRepairTest(unittest.TestCase):
+    def setUp(self):
+        import web.main as web_main
+        from flask_login import UserMixin
+        from app.helper.subtitle_tasks import SubtitleTaskManager
+        from tests.test_database_governance import FileDatabase
+
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.library = self.root / 'movies'
+        self.library.mkdir()
+        self.db = FileDatabase(self.root / 'user.db')
+        self.addCleanup(self.db.close)
+        self.manager = SubtitleTaskManager(db=self.db, staging_root=str(self.root / 'staging'))
+        self.web = web_main
+        self.user = UserMixin()
+        self.user.id = 'owner'
+        self.user.pris = '媒体整理'
+        for change in (patch.dict(web_main.App.config, LOGIN_DISABLED=False),
+                       patch.object(web_main.LoginManager, '_user_callback',
+                                    side_effect=lambda uid: self.user if uid == self.user.id else None),
+                       patch.object(web_main, '_get_all_media_library_root_paths', return_value=[str(self.library)]),
+                       patch.object(web_main, '_subtitle_tasks', return_value=self.manager)):
+            change.start()
+            self.addCleanup(change.stop)
+        self.addCleanup(self.manager.shutdown)
+        self.client = web_main.App.test_client()
+        with self.client.session_transaction() as session:
+            session['_user_id'] = self.user.id
+        self.url = '/library/subtitle/repair'
+
+    def test_repair_requires_media_organizing_permission_before_admission(self):
+        from app.db.models import SUBTITLETASK
+        self.user.pris = '资源搜索'
+        with patch.object(self.web, '_enqueue_library_subtitle_repair') as enqueue:
+            for url, data in ((self.url, {'media_path': 'a.mkv'}),
+                              (self.url + '/batch', {'items': [{'media_path': 'a.mkv'}]})):
+                self.assertEqual(self.client.post(url, json=data).status_code, 403)
+            enqueue.assert_not_called()
+        self.assertEqual(self.db.query(SUBTITLETASK).count(), 0)
+
+    def test_batch_repairs_existing_track_and_reports_rejected_paths(self):
+        from app.helper.subtitle_task_processors import register_subtitle_task_processors
+        from tests.test_subtitle_tasks import SubtitleTaskManagerTest
+
+        register_subtitle_task_processors(self.manager)
+        movie = self.library / 'Movie.mkv'
+        second = self.library / 'Second.mkv'
+        for path in (movie, second):
+            path.touch()
+            path.with_suffix('.zh-CN.srt').write_text(
+                '1\n00:00:01,000 --> 00:00:02,000\n这是一段中文字幕。\n', encoding='utf-8')
+        outside = self.root / 'Outside.mkv'
+        outside.touch()
+        with patch('app.helper.subtitle_task_processors._localized_refresh', return_value={'status': 'skipped'}):
+            url = self.url + '/batch'
+            good = {'media_path': str(movie), 'server': 'jellyfin', 'request_id': 'batch-movie'}
+            self.assertEqual(self.client.post(url, json={'items': [good] * 19}).status_code, 400)
+            results = self.client.post(url, json={'items': [
+                {'media_path': str(outside)}, good, {'media_path': str(self.library / 'Missing.mkv')},
+                {'media_path': str(second), 'server': 'jellyfin', 'request_id': 'batch-second'}
+            ]}).get_json()['results']
+            self.assertIn('不在媒体库', results[0]['error'])
+            self.assertIn('不存在', results[2]['error'])
+            self.assertNotEqual(results[1]['task_id'], results[3]['task_id'])
+            for path, response in ((movie, results[1]), (second, results[3])):
+                task = SubtitleTaskManagerTest.wait_terminal(self.manager, response['task_id'], timeout=10)
+                self.assertEqual(task['owner'], 'owner')
+                self.assertEqual(task['status'], 'succeeded', task)
+                self.assertTrue(path.with_suffix('.chi.zh-cn.srt').is_file())
+            again = self.client.post(url, json={'items': [good]}).get_json()['results'][0]
+            self.assertEqual(again['task_id'], results[1]['task_id'])
+            self.assertTrue(again['reused'])
+
+    def test_aliases_replay_after_completion_and_move_and_reject_another_target(self):
+        from app.db.models import SUBTITLETASK
+        from app.helper.subtitle_tasks import SubtitleTaskManager
+        from tests.test_subtitle_tasks import SubtitleTaskManagerTest
+
+        release = threading.Event()
+        self.addCleanup(release.set)
+        self.manager.register_processor('repair', lambda manager, task_id: release.wait(5))
+        movie = self.library / 'Movie.mkv'
+        movie.touch()
+        original = {'media_path': str(movie), 'server': 'emby', 'request_id': 'single'}
+        created = self.client.post(self.url, json=original).get_json()
+        aliases = [dict(original, request_id=value) for value in ('batch-a', 'batch-b')]
+        receipts = self.client.post(self.url + '/batch', json={'items': aliases}).get_json()['results']
+        self.assertTrue(all(r['reused'] and r['task_id'] == created['task_id'] for r in receipts))
+        release.set()
+        SubtitleTaskManagerTest.wait_terminal(self.manager, created['task_id'])
+        moved = movie.rename(self.library / 'Moved.mkv')
+        # A fresh manager reads the durable receipt, with no worker or file checks.
+        reader = SubtitleTaskManager(db=self.db, staging_root=str(self.root / 'staging'))
+        with patch.object(self.web, '_subtitle_tasks', return_value=reader), \
+                patch.object(self.web, '_path_authorization_snapshot') as authorize:
+            replay = self.client.post(self.url + '/batch', json={'items': [original, *aliases]}).get_json()['results']
+            for r in replay:
+                self.assertEqual(r, {'task_id': created['task_id'], 'status': 'succeeded', 'reused': True})
+            for request in (dict(aliases[0], media_path=str(moved)), dict(original, server='plex')):
+                self.assertEqual(self.client.post(self.url, json=request).status_code, 409)
+            self.user.id = 'another-owner'
+            with self.client.session_transaction() as session:
+                session['_user_id'] = self.user.id
+            self.assertIn('不存在', self.client.post(self.url, json=aliases[0]).get_json()['msg'])
+            authorize.assert_not_called()
+        self.assertEqual(self.db.query(SUBTITLETASK).count(), 1)
+
+    def test_concurrent_repair_aliases_remain_exact_and_expire_with_task(self):
+        from app.db.models import SUBTITLETASK
+        from tests.test_subtitle_tasks import SubtitleTaskManagerTest
+
+        release = threading.Event()
+        self.addCleanup(release.set)
+        self.manager.register_processor('repair', lambda manager, task_id: release.wait(8))
+        target = {'media_path': str(self.library / 'Movie.mkv'), 'server': 'emby', 'server_item_id': 'metadata-id'}
+        original, _ = self.manager.submit_task('repair', 'owner', target, request_id='first')
+        aliases = ('batch-%_中文', 'batch-"quoted"')
+        ready = threading.Barrier(len(aliases))
+
+        def join_task(request_id):
+            ready.wait(timeout=4)
+            return self.manager.submit_task('repair', 'owner', target, request_id=request_id)
+
+        with ThreadPoolExecutor(max_workers=len(aliases)) as pool:
+            for receipt, reused in pool.map(join_task, aliases):
+                self.assertTrue(reused)
+                self.assertEqual(receipt['task_id'], original['task_id'])
+                self.assertEqual(receipt['payload'], target)
+        release.set()
+        SubtitleTaskManagerTest.wait_terminal(self.manager, original['task_id'])
+        for request_id in ('first', *aliases):
+            receipt = self.manager.get_repair_receipt('owner', request_id, target)
+            self.assertEqual(receipt['status'], 'succeeded')
+            self.assertEqual(receipt['task_id'], original['task_id'])
+        # An equal JSON string elsewhere in the payload must not be treated as an alias.
+        self.assertIsNone(self.manager.get_repair_receipt('owner', 'metadata-id', target))
+        with self.db.write_transaction():
+            self.db.query(SUBTITLETASK).filter_by(ID=original['task_id']).delete()
+        self.assertIsNone(self.manager.get_repair_receipt('owner', aliases[0], target))
+
+    def test_batch_returns_first_receipt_and_stops_after_one_database_lock(self):
+        from app.db.models import SUBTITLETASK
+        movie = self.library / 'Movie.mkv'
+        movie.touch()
+        self.manager.register_processor('repair', lambda manager, task_id: None)
+        self.manager.start()
+        items = [dict(media_path=str(movie), request_id=str(i), server_item_id=str(i)) for i in range(4)]
+        with self.db.managed.write_engine.connect() as writer:
+            writer.exec_driver_sql('PRAGMA busy_timeout=50')
+        with closing(sqlite3.connect(self.db.path)) as holder:
+            enqueue = self.web._enqueue_library_subtitle_repair
+
+            def lock_after_first(item, owner):
+                result = enqueue(item, owner)
+                if item == items[0]:
+                    holder.execute('BEGIN IMMEDIATE')
+                return result
+
+            with patch.object(self.web, '_enqueue_library_subtitle_repair', side_effect=lock_after_first) as attempts:
+                results = self.client.post(self.url + '/batch', json={'items': items}).get_json()['results']
+                self.assertEqual(attempts.call_count, 2)
+            self.assertTrue(results[0]['task_id'])
+            self.assertEqual(len(results), len(items))
+            self.assertTrue(all(r['retryable'] for r in results[1:]))
+            self.assertTrue(all('未尝试' in r['error'] for r in results[2:]))
+        self.assertEqual(self.db.query(SUBTITLETASK).count(), 1)
+
+    def test_locked_receipt_read_stops_batch_before_file_validation(self):
+        with self.db.engine.connect() as reader:
+            reader.connection.cursor().execute('PRAGMA busy_timeout=50').close()
+        items = [{'media_path': str(self.library / 'Movie.mkv'), 'request_id': str(i)} for i in range(3)]
+        with closing(sqlite3.connect(self.db.path)) as holder, \
+                patch.object(self.manager, 'get_repair_receipt', wraps=self.manager.get_repair_receipt) as receipts, \
+                patch.object(self.web, '_path_authorization_snapshot') as authorize:
+            holder.execute('BEGIN EXCLUSIVE')
+            results = self.client.post(self.url + '/batch', json={'items': items}).get_json()['results']
+            self.assertEqual(receipts.call_count, 1)
+            authorize.assert_not_called()
+        self.assertEqual(len(results), 3)
+        self.assertTrue(all(result['retryable'] for result in results))
+        self.assertTrue(all('未尝试' in result['error'] for result in results[1:]))
 
 
 class SubtitlePreviewTest(unittest.TestCase):

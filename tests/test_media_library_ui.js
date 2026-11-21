@@ -44,6 +44,12 @@ const episodes = [
     let releaseCategories;
     const categoriesReady = new Promise(resolve => { releaseCategories = resolve; });
     let refreshReply = {code: 0, updated: 1, unchanged: 4, failed: 0, requested: 5};
+    const problemItems = [movie(21, {subtitle_audit_status: 'error', subtitle_audit_label: '外挂字幕无法识别', subtitle_audit_badge: 'bg-red'}),
+      movie(22, {subtitle_audit_status: 'warning', subtitle_audit_label: '外挂字幕语言需规范', subtitle_audit_badge: 'bg-yellow'}),
+      movie(23, {subtitle_audit_status: 'warning', can_upload: false, target_path: ''}),
+      movie(24, {subtitle_audit_status: 'warning'}), movie(25, {subtitle_audit_status: 'error'})];
+    let loseBatchReceipt = true;
+    let repairStatus = 'running', gonePolls = 0;
     page.on('pageerror', error => errors.push(error.message));
     await page.route('http://library.test/**', async route => {
       const url = new URL(route.request().url());
@@ -53,6 +59,7 @@ const episodes = [
           <title>字幕库验证</title><link rel="stylesheet" href="/static/css/tabler.min.css"><link rel="stylesheet" href="/static/css/style.css">
           <body><div class="page"><div class="page-wrapper">${fixtures.body}</div></div>${fixtures.confirm}<div id="feedback" role="status"></div>
           <script src="/static/js/jquery-3.3.1.min.js"></script><script src="/static/js/tabler.min.js"></script>
+          <script src="/static/js/subtitle-tasks.js"></script>
           <script>
           window.NProgress = {start() {}, done() {}}; window.navmenu = () => {};
           function show_confirm_modal(title, func) {
@@ -62,24 +69,54 @@ const episodes = [
           function show_success_modal(message) { $('#feedback').text(message); }
           function show_fail_modal(message) { $('#feedback').text(message); }
           window.window_history = () => {};
+          let requestSequence = 0;
           window.SubtitleTasks = {init() {}, openCenter() {}, request: async () => ({}), payloadOf: r => r,
+            isTerminal: window.SubtitleTasks.isTerminal,
             requestTask: async (url, payload) => {
               await $.post(url, JSON.stringify(payload));
               return {legacy:true};
-            }, randomRequestId: () => 'request', formatBytes: v => v + ' B',
-            validateFiles: files => ({ok: true, logicalCount: files.length, totalBytes: 0}), renderProgress() {}, watch() {}, refreshList: () => Promise.resolve()};
+            }, randomRequestId: () => 'request-' + (++requestSequence), formatBytes: v => v + ' B',
+            validateFiles: files => ({ok: true, logicalCount: files.length, totalBytes: 0}), renderProgress() {},
+            watch: window.SubtitleTasks.watch, refreshList: () => Promise.resolve()};
           </script>
           <script src="/static/js/media-library.js"></script>
           <script>init_media_library_page({page_size: 18, default_server: 'emby'});</script></body></html>`});
       }
       if (url.pathname === '/library/items') {
         requests.push({path: url.pathname, body: route.request().postDataJSON()});
-        return route.fulfill({json: {code: 0, items, total: items.length, page: 1, library_total: items.length,
+        const rows = route.request().postDataJSON().subtitle === 'problem' ? problemItems : items;
+        return route.fulfill({json: {code: 0, items: rows, total: rows.length, page: 1, library_total: items.length,
           synced_at: '2026-10-31 08:00:00', categories}});
       }
+      if (url.pathname === '/library/subtitle/repair/batch') {
+        const body = route.request().postDataJSON();
+        requests.push({path: url.pathname, body});
+        if (loseBatchReceipt) {
+          loseBatchReceipt = false;
+          return route.abort('connectionfailed');
+        }
+        if (body.items.length === 1 && body.items[0].server_item_id === 'm25') {
+          return route.fulfill({json: {code: 0, results: [{task_id: 'retried', status: 'succeeded', reused: false}]}});
+        }
+        return route.fulfill({json: {code: 0, results: [
+          {task_id: 'repair-one', status: 'running', reused: true}, {error: '字幕上传/修复等待队列已满'},
+          {task_id: 'repair-gone', status: 'queued'}, {error: '数据库繁忙，本次未尝试提交', retryable: true}
+        ]}});
+      }
+      if (url.pathname === '/subtitle/tasks/repair-gone') {
+        gonePolls++;
+        // A temporary error must still retry; the task-detail 404 ends polling.
+        if (gonePolls === 1) return route.fulfill({status: 503, json: {code: -1, msg: '暂时不可用'}});
+        return route.fulfill({status: 404, json: {code: -1, msg: '字幕任务不存在'}});
+      }
+      if (url.pathname === '/subtitle/tasks/repair-one') {
+        return route.fulfill({json: {code: 0, data: {task_id: 'repair-one', type: 'repair', status: repairStatus}}});
+      }
+      if (url.pathname === '/subtitle/tasks') return route.fulfill({json: {code: 0, items: []}});
+      if (url.pathname === '/subtitle/tasks/settings') return route.fulfill({json: {code: 0, data: {}}});
       if (url.pathname === '/library/summary') {
         requests.push({path: url.pathname, body: route.request().postDataJSON()});
-        return route.fulfill({json: {code: 0, counts: {all: 5, missing: 3, unknown: 2, problem: 0, ok: 0},
+        return route.fulfill({json: {code: 0, counts: {all: 5, missing: 3, unknown: 2, problem: problemItems.length, ok: 0},
           category_counts: {'外语电影': 3}}});
       }
       if (url.pathname === '/library/refresh') {
@@ -157,6 +194,56 @@ const episodes = [
       const grid = document.getElementById('library_items_grid');
       return !grid.classList.contains('is-loading') && grid.getAttribute('aria-busy') === 'false';
     });
+    const batch = page.locator('#library_repair_page_btn');
+    assert.equal(await batch.isVisible(), false);
+    await page.locator('[data-library-subtitle="problem"]').click();
+    await batch.waitFor();
+    assert.match(await batch.innerText(), /修复本页.*4/);
+    await page.locator('.lit-library-panel').screenshot({path: path.join(evidenceDir, 'batch-repair-desktop.png')});
+    await batch.focus();
+    await page.keyboard.press('Enter');
+    const confirmation = page.locator('#system-confirm-modal');
+    await confirmation.waitFor();
+    assert.match(await confirmation.innerText(), /本页 4 部电影/);
+    await confirmation.locator('[data-bs-dismiss="modal"]').first().click();
+    await confirmation.waitFor({state: 'hidden'});
+    const batchCalls = () => requests.filter(r => r.path === '/library/subtitle/repair/batch');
+    assert.equal(batchCalls().length, 0);
+    await page.setViewportSize({width: 390, height: 800});
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true);
+    await batch.click();
+    await page.locator('#system_confirm_btn').click();
+    const batchStatus = page.locator('#library_repair_page_status');
+    await page.waitForFunction(() => document.querySelector('#library_repair_page_status').textContent.includes('未能确认'));
+    await batch.click();
+    await page.locator('#system_confirm_btn').click();
+    await page.waitForFunction(() => document.querySelector('#library_repair_page_status').textContent.includes('等待队列已满'));
+    assert.equal(batchCalls().length, 2);
+    assert.deepEqual(batchCalls()[0].body, batchCalls()[1].body);
+    assert.deepEqual(batchCalls()[0].body.items.map(i => i.server_item_id), ['m21', 'm22', 'm24', 'm25']);
+    assert.equal(new Set(batchCalls()[0].body.items.map(i => i.request_id)).size, 4);
+    await page.waitForFunction(() => document.querySelector('#library_repair_page_status').textContent.includes('结果已不可查询 1 部'));
+    assert.match(await batchStatus.innerText(), /已受理 2 部（复用 1 个任务）.*待完成 1 部.*未受理 1 部：电影22.*可重试 1 部：电影25/);
+    assert.equal(await batch.isDisabled(), true);
+    problemItems.shift();
+    repairStatus = 'partial';
+    await page.waitForFunction(() => document.querySelector('#library_repair_page_status').textContent.includes('部分完成 1 部'));
+    await settled();
+    assert.match(await batchStatus.innerText(), /部分完成 1 部/);
+    assert.equal(await batch.isEnabled(), true);
+    await page.locator('.lit-library-panel').screenshot({path: path.join(evidenceDir, 'batch-repair-mobile.png')});
+    // After a new list response, retry the previously unattempted movie with its original ID.
+    problemItems.splice(0, problemItems.length - 1);
+    await page.evaluate(() => load_library_items(library_page));
+    await settled();
+    await batch.click();
+    await page.locator('#system_confirm_btn').click();
+    await page.waitForFunction(() => document.querySelector('#library_repair_page_status').textContent.includes('已完成 1 部'));
+    assert.deepEqual(batchCalls()[2].body.items, [batchCalls()[0].body.items[3]]);
+    await page.setViewportSize({width: 1280, height: 900});
+    await page.locator('[data-library-subtitle="all"]').click();
+    await settled();
+    assert.equal(await batch.isVisible(), false);
     await chipRow.getByRole('button', {name: '外语电影 3'}).waitFor();
     assert.deepEqual(await chipRow.locator('.lit-library-category-group').allInnerTexts(), ['电影', '电视剧']);
     assert.deepEqual(await measure('.lit-library-category-chip'), {height: 28, radius: '6px', font: '12px'});
@@ -442,8 +529,9 @@ const episodes = [
     assert.equal(await page.locator('#system-confirm-modal').isVisible(), false);
     assert.equal(await page.evaluate(() => library_fill), null);
     await page.screenshot({path: path.join(evidenceDir, 'fill-after-navigation.png'), fullPage: true});
+    assert.equal(gonePolls, 2, 'confirmed 404s must not schedule further detail reads');
     assert.deepEqual(errors, []);
-    console.log('Media library UI checks passed: refresh, tabs, menu, drawer, drops, series retries, fill after re-search, 390px layout, drawer reload and stale preview/fill responses.');
+    console.log('Media library UI checks passed: batch repair, receipt retry, partial admission, refresh, tabs, menu, drawer, drops, series retries, fill after re-search, 390px layout, drawer reload and stale preview/fill responses.');
   } catch (error) {
     if (page) await page.screenshot({path: path.join(evidenceDir, 'failure.png'), fullPage: true});
     throw error;

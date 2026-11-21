@@ -1799,49 +1799,100 @@ def library_subtitle_audit_categories():
         return {"code": -1, "msg": str(e)}
 
 
+def _enqueue_library_subtitle_repair(data, owner):
+    """单片和批量入口共用同一套路径授权、任务去重和队列容量检查。"""
+    from app.helper.subtitle_tasks import SubtitleTaskError
+    media_file = os.path.normpath(str(data.get("media_path") or ""))
+    media_config = Config().get_config('media') or {}
+    server_type = str(data.get("server") or media_config.get('media_server') or "emby").lower()
+    payload = {
+        "media_path": media_file,
+        "server": server_type,
+        "server_item_id": data.get("server_item_id") or "",
+        "parent_server_item_id": data.get("parent_server_item_id") or "",
+        "library_id": data.get("library_id") or ""
+    }
+    request_id = str(data.get("request_id") or "").strip()
+    manager = _subtitle_tasks(start=False)
+    if request_id:
+        receipt = manager.get_repair_receipt(owner, request_id, payload)
+        if receipt is not None:
+            return receipt, True
+    if not media_file or not os.path.isfile(media_file):
+        raise SubtitleTaskError("媒体文件不存在")
+    if os.path.splitext(media_file)[-1].lower() not in RMT_MEDIAEXT:
+        raise SubtitleTaskError("请选择有效的媒体文件")
+    if not _is_within_media_library(media_file):
+        raise SubtitleTaskError("媒体文件不在媒体库目录范围内")
+    if server_type not in ["emby", "jellyfin", "plex"]:
+        raise SubtitleTaskError("影视服务器配置无效")
+    path_authorization = _path_authorization_snapshot(
+        media_file, _get_all_media_library_root_paths()
+    )
+    if not path_authorization:
+        raise SubtitleTaskError("媒体文件路径在入队前发生变化，请重试", status_code=409)
+    payload["path_authorization"] = {"repair": path_authorization}
+    dedupe_key = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return manager.submit_task(
+        "repair",
+        owner=owner,
+        payload=payload,
+        request_id=request_id,
+        server=server_type,
+        dedupe_key=dedupe_key
+    )
+
+
 @App.route('/library/subtitle/repair', methods=['POST'])
 @login_required
 def library_subtitle_repair():
     """创建单个媒体的外挂字幕二次处理任务。"""
+    from app.helper.subtitle_tasks import SubtitleTaskError
     try:
         data = request.get_json(silent=True) or request.form.to_dict() or {}
-        media_file = os.path.normpath(str(data.get("media_path") or ""))
-        media_config = Config().get_config('media') or {}
-        server_type = str(data.get("server") or media_config.get('media_server') or "emby").lower()
-        if not media_file or not os.path.isfile(media_file):
-            return {"code": -1, "msg": "媒体文件不存在"}, 400
-        if os.path.splitext(media_file)[-1].lower() not in RMT_MEDIAEXT:
-            return {"code": -1, "msg": "请选择有效的媒体文件"}, 400
-        if not _is_within_media_library(media_file):
-            return {"code": -1, "msg": "媒体文件不在媒体库目录范围内"}, 400
-        if server_type not in ["emby", "jellyfin", "plex"]:
-            return {"code": -1, "msg": "影视服务器配置无效"}, 400
-        path_authorization = _path_authorization_snapshot(
-            media_file, _get_all_media_library_root_paths()
-        )
-        if not path_authorization:
-            return {"code": -1, "msg": "媒体文件路径在入队前发生变化，请重试"}, 409
-        payload = {
-            "media_path": media_file,
-            "server": server_type,
-            "server_item_id": data.get("server_item_id") or "",
-            "parent_server_item_id": data.get("parent_server_item_id") or "",
-            "library_id": data.get("library_id") or "",
-            "path_authorization": {"repair": path_authorization}
-        }
-        dedupe_key = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-        task, reused = _subtitle_tasks().submit_task(
-            "repair",
-            owner=_subtitle_task_owner(),
-            payload=payload,
-            request_id=data.get("request_id"),
-            server=server_type,
-            dedupe_key=dedupe_key
-        )
+        task, reused = _enqueue_library_subtitle_repair(data, _subtitle_task_owner())
         return _subtitle_task_response(task, reused, "已加入字幕二次处理队列")
+    except SubtitleTaskError as error:
+        return _subtitle_task_error(error)
+    except OperationalError as error:
+        if is_database_contention(error):
+            return {"code": -1, "msg": "数据库繁忙，请稍后重试"}, 503
+        ExceptionUtils.exception_traceback(error)
+        return {"code": -1, "msg": "修复请求未能确认，请在任务中心核对"}, 500
     except Exception as e:
         ExceptionUtils.exception_traceback(e)
         return _subtitle_task_error(e)
+
+
+@App.route('/library/subtitle/repair/batch', methods=['POST'])
+@login_required
+def library_subtitle_repair_batch():
+    from app.helper.subtitle_tasks import SubtitleTaskError
+    from app.db.transactions import DatabaseBusy, DatabaseContention
+    data = request.get_json(silent=True)
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list) or not 1 <= len(items) <= 18 or not all(isinstance(item, dict) for item in items):
+        return {"code": -1, "msg": "请选择本页 1 至 18 部电影"}, 400
+
+    owner = _subtitle_task_owner()
+    results = []
+    # 每部电影独立入队；后续文件失效或队列满时，已受理的任务仍可在任务中心跟踪。
+    for index, item in enumerate(items):
+        try:
+            task, reused = _enqueue_library_subtitle_repair(item, owner)
+            results.append({"task_id": task["task_id"], "status": task["status"], "reused": reused})
+        except Exception as error:
+            if isinstance(error, DatabaseContention) or is_database_contention(error):
+                # 同一写库或回执查询被锁后，不对余下每部电影再等一次 SQLite 超时。
+                results.append({"error": "数据库繁忙，本次提交待重试", "retryable": True})
+                results.extend({"error": "数据库繁忙，本次未尝试提交", "retryable": True} for _ in items[index + 1:])
+                break
+            if isinstance(error, (SubtitleTaskError, DatabaseBusy)):
+                results.append({"error": str(error)})
+            else:
+                ExceptionUtils.exception_traceback(error)
+                results.append({"error": "提交结果未确认，请在任务中心核对", "unconfirmed": True})
+    return {"code": 0, "results": results}
 
 
 _LIBRARY_IMAGE_TYPES = ("Primary", "Backdrop", "Thumb", "Logo", "Banner", "Art")
