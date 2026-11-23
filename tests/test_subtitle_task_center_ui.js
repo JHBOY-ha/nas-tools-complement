@@ -70,7 +70,8 @@ const tasks = [
           rowTimes: [...document.querySelectorAll('.subtitle-task-row time')].filter(el => el.offsetParent).map(text),
           failText: text(document.querySelector('[data-subtitle-task-id="fail"]')),
           cancel: [...document.querySelectorAll('.subtitle-task-cancel')].map(el => ({
-            danger: el.classList.contains('btn-outline-danger'), height: Math.round(el.getBoundingClientRect().height), radius: radius(el)})),
+            danger: el.classList.contains('btn-outline-danger'), height: Math.round(el.getBoundingClientRect().height),
+            pill: getComputedStyle(el).borderRadius.split(' ').every(corner => parseFloat(corner) >= el.offsetHeight / 2)})),
           indeterminateWidth: Math.round(document.querySelector('.progress-bar-indeterminate').getBoundingClientRect().width),
           serverBadges: [...document.querySelectorAll('#subtitle-task-center-list .badge')].filter(el => /JELLYFIN|Jellyfin/.test(el.textContent)).length,
           alerts: document.querySelectorAll('#subtitle-task-center-modal .alert').length,
@@ -102,7 +103,7 @@ const tasks = [
       twoDaysAgo.setDate(twoDaysAgo.getDate() - 2);
       assert.deepEqual(view.rowTimes, ['昨天 23:10', `${twoDaysAgo.getMonth() + 1}月${twoDaysAgo.getDate()}日 00:11`]);
       assert.match(view.failText, /字幕编码无法识别/, 'compact rows keep the failure reason');
-      assert.ok(view.cancel.length === 2 && view.cancel.every(button => !button.danger && button.height === 28 && button.radius === '6px'));
+      assert.ok(view.cancel.length === 2 && view.cancel.every(button => !button.danger && button.height === 28 && button.pill));
       assert.equal(view.indeterminateWidth, 0, 'unknown progress must not fill the bar');
       assert.equal(view.serverBadges, 0, 'server names are plain text, not badges');
       assert.equal(view.alerts, 0);

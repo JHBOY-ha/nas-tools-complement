@@ -734,8 +734,8 @@ export class LayoutNavbar extends CustomElement {
           
         }
 
-        .lit-navbar-accordion-item, .lit-navbar-accordion-item-active {
-          border-radius: var(--nt-radius-md);
+        .lit-navbar-accordion-button, .lit-navbar-accordion-item, .lit-navbar-accordion-item-active {
+          border-radius: var(--tblr-border-radius-pill);
           transition: background-color 0.2s ease;
         }
 
@@ -805,7 +805,7 @@ export class LayoutNavbar extends CustomElement {
                 })}
               </div>
               <div class="d-flex align-items-end">
-                <span class="d-flex flex-grow-1 justify-content-center border rounded-3 m-3 p-2 ${this._is_update ? "bg-yellow" : ""}">
+                <span class="d-flex flex-grow-1 justify-content-center border rounded-pill m-3 p-2 ${this._is_update ? "bg-yellow" : ""}">
                   <a href=${this._update_url} class="${this._is_update ? "text-yellow-fg" : "text-muted"}" target="_blank" rel="noreferrer">
                     <strong>
                       <svg xmlns="http://www.w3.org/2000/svg" class="icon icon-tabler icon-tabler-brand-github" width="24" height="24"

@@ -151,18 +151,21 @@ const episodes = [
     await page.locator('.lit-library-card').first().waitFor();
     const lastList = () => requests.filter(r => r.path === '/library/items').pop().body;
 
-    // All library buttons come from one component: same height per size, same radius (36px→8px, 28px→6px), input level with buttons.
+    // Both button sizes have fully rounded ends; the search field keeps its form-control corners.
     const measure = selector => page.locator(selector).first().evaluate(el => {
       const style = getComputedStyle(el);
-      return {height: Math.round(el.getBoundingClientRect().height), radius: style.borderRadius, font: style.fontSize};
+      const rect = el.getBoundingClientRect();
+      const pill = style.borderRadius.split(' ').every(corner => parseFloat(corner) >= Math.min(rect.width, rect.height) / 2);
+      return {height: Math.round(rect.height), radius: pill ? 'pill' : style.borderRadius, font: style.fontSize};
     });
     for (const selector of ['#library_fill_btn', '[data-subtitle-task-center]', '#library_refresh_btn', '#library_more_trigger',
-      '.lit-library-status-tab', '#library_filter_keyword', '#library_filter_keyword_clear', '#library_filter_trigger',
+      '.lit-library-status-tab', '#library_filter_keyword_clear', '#library_filter_trigger',
       'form[role=search] button[type=submit]', '#library_prev_btn']) {
-      assert.deepEqual(await measure(selector), {height: 36, radius: '8px', font: '14px'}, selector);
+      assert.deepEqual(await measure(selector), {height: 36, radius: 'pill', font: '14px'}, selector);
     }
+    assert.deepEqual(await measure('#library_filter_keyword'), {height: 36, radius: '8px', font: '14px'});
     for (const selector of ['.lit-library-card-actions .btn-primary', '.lit-library-card-actions .btn-icon']) {
-      assert.deepEqual(await measure(selector), {height: 28, radius: '6px', font: '12px'}, selector);
+      assert.deepEqual(await measure(selector), {height: 28, radius: 'pill', font: '12px'}, selector);
     }
     assert.equal(await page.locator('.lit-library-panel .btn-primary:visible').count(), await page.locator('#library_fill_btn, .lit-library-card-actions .btn-primary').count(),
       'the header holds the only solid button outside the cards');
@@ -246,7 +249,7 @@ const episodes = [
     assert.equal(await batch.isVisible(), false);
     await chipRow.getByRole('button', {name: '外语电影 3'}).waitFor();
     assert.deepEqual(await chipRow.locator('.lit-library-category-group').allInnerTexts(), ['电影', '电视剧']);
-    assert.deepEqual(await measure('.lit-library-category-chip'), {height: 28, radius: '6px', font: '12px'});
+    assert.deepEqual(await measure('.lit-library-category-chip'), {height: 28, radius: 'pill', font: '12px'});
     assert.equal(await chipRow.getByRole('button', {name: '欧美剧 0'}).evaluate(el => el.classList.contains('is-empty')), true);
     await chipRow.getByRole('button', {name: /^动漫/}).click();
     await settled();
