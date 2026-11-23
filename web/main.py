@@ -19,7 +19,7 @@ from pathlib import Path
 from threading import Lock, Timer, Event
 from urllib import parse
 
-from flask import Flask, abort, request, json, render_template, make_response, session, send_from_directory, send_file, g
+from flask import Flask, abort, request, json, redirect, render_template, make_response, session, send_from_directory, send_file, g
 from flask.wrappers import Request as FlaskRequest
 from flask_compress import Compress
 from flask_login import LoginManager, login_user, login_required, current_user
@@ -36,6 +36,7 @@ from app.filter import Filter
 from app.helper import SecurityHelper, MetaHelper, ChromeHelper, ThreadHelper, DbHelper
 from app.indexer import Indexer
 from app.library import MediaLibrary
+from app.media.doubanapi import DoubanWeb
 from app.media.meta import MetaInfo
 from app.mediaserver import WebhookEvent, MediaServer
 from app.message import Message
@@ -865,6 +866,18 @@ def douban_tv():
                            Title="豆瓣电视剧",
                            Filter="douban_tv",
                            FilterConf=ModuleConf.DISCOVER_FILTER_CONF.get('douban_tv'))
+
+
+@App.route('/douban/subject/<int:subject_id>/preview')
+@login_required
+def douban_subject_preview(subject_id):
+    url = DoubanWeb().subject_preview(subject_id)
+    if not url:
+        return "", 404
+    response = redirect(url)
+    # 预览地址有时效，重新请求时需要取当时的签名。
+    response.cache_control.no_store = True
+    return response
 
 
 @App.route('/tmdb_movie', methods=['POST', 'GET'])

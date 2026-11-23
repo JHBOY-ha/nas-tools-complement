@@ -25,15 +25,20 @@ export class NormalCard extends observeState(CustomElement) {
     lazy: {},
     _placeholder: { state: true },
     _card_id: { state: true },
-    _card_image_error: { state: true },
+    _fallback_image: { state: true },
   };
 
   constructor() {
     super();
     this.lazy = "0";
     this._placeholder = true;
-    this._card_image_error = false;
     this._card_id = Symbol("normalCard_data_card_id");
+  }
+
+  willUpdate(changed) {
+    if (changed.has("image") || changed.has("tmdb_id")) {
+      this._fallback_image = undefined;
+    }
   }
 
   _render_left_up() {
@@ -114,6 +119,9 @@ export class NormalCard extends observeState(CustomElement) {
   }
 
   render() {
+    const doubanId = /^DB:([0-9]+)$/.exec(this.tmdb_id);
+    const preview = doubanId ? `/douban/subject/${doubanId[1]}/preview` : undefined;
+    const poster = this._fallback_image || this.image || preview || Golbal.noImage;
     return html`
       <div class="card card-sm lit-normal-card rounded-4 cursor-pointer ratio shadow-sm"
            @click=${() => { if (Golbal.is_touch_device()){ cardState.more_id = this._card_id } } }
@@ -123,13 +131,18 @@ export class NormalCard extends observeState(CustomElement) {
         <div ?hidden=${this._placeholder} class="rounded-4">
           <img class="card-img rounded-4" alt="" style="box-shadow:0 0 0 1px #888888; display: block; min-width: 100%; max-width: 100%; min-height: 100%; max-height: 100%; object-fit: cover;"
              referrerpolicy="no-referrer"
-             src=${this.lazy == "1" ? "" : Golbal.poster_image_url(this.image) ?? Golbal.noImage}
-             @error=${() => { if (this.lazy != "1") {this.image = Golbal.noImage; this._card_image_error = true} }}
+             src=${this.lazy == "1" ? nothing : poster}
+             @error=${() => {
+               if (this.lazy == "1") return;
+               // 原图失败后只试一次官方分享图，保留原始地址供卡片复用。
+               this._fallback_image = preview && poster !== preview && poster !== Golbal.noImage
+                 ? preview : Golbal.noImage;
+             }}
              @load=${() => { this._placeholder = false }}/>
           ${this._render_left_up()}
           ${this._render_right_up()}
         </div>
-        <div ?hidden=${cardState.more_id != this._card_id && this._card_image_error == false}
+        <div ?hidden=${cardState.more_id != this._card_id && poster !== Golbal.noImage}
              class="card-img-overlay rounded-4 ms-auto"
              style="background-color: rgba(0, 0, 0, 0.5); box-shadow:0 0 0 1px #dddddd;"
              @click=${() => { navmenu(`media_detail?type=${this.media_type}&id=${this.tmdb_id}`) }}>

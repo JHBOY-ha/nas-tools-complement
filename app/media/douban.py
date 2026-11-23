@@ -195,7 +195,7 @@ class DouBan:
             meta_info.tmdb_id = "DB:%s" % item.get("id")
             meta_info.douban_id = item.get("id")
             meta_info.overview = item.get("card_subtitle") or ""
-            meta_info.poster_path = item.get("cover_url").split('?')[0]
+            meta_info.poster_path = item.get("cover_url")
             rating = item.get("rating", {}) or {}
             meta_info.vote_average = rating.get("value")
             if meta_info not in ret_medias:
@@ -255,7 +255,7 @@ class DouBan:
             # 封面图
             cover_url = web_info.get("cover")
             if cover_url:
-                ret_media['cover_url'] = cover_url.replace("s_ratio_poster", "m_ratio_poster")
+                ret_media['cover_url'] = cover_url
             # 评分
             rating = web_info.get("rate")
             if rating:
@@ -405,28 +405,22 @@ class DouBan:
             else:
                 mtype = media_type
 
+            type_str = "MOV" if mtype == MediaType.MOVIE else "TV"
+            # 探索与榜单的海报字段不同。路径和查询参数可能参与签名。
+            pic = info.get('pic') or {}
+            pic_url = pic.get('large') or pic.get('normal')
+            cover = info.get('cover')
+            cover_url = (cover.get('url') if isinstance(cover, dict) else cover) or info.get('cover_url')
             if mtype == MediaType.MOVIE:
-                type_str = "MOV"
-                # 海报
-                poster_path = info.get('cover', {}).get("url")
-                if not poster_path:
-                    poster_path = info.get('cover_url')
-                if not poster_path:
-                    poster_path = info.get('pic', {}).get("large")
+                poster_path = cover_url or pic_url
             else:
-                type_str = "TV"
-                # 海报
-                poster_path = info.get('pic', {}).get("normal")
+                poster_path = pic_url or cover_url
 
             # 简介
             overview = info.get("card_subtitle") or ""
             if not year and overview:
                 if overview.split("/")[0].strip().isdigit():
                     year = overview.split("/")[0].strip()
-
-            # 高清海报
-            if poster_path:
-                poster_path = poster_path.replace("s_ratio_poster", "m_ratio_poster")
 
             ret_infos.append({
                 'id': "DB:%s" % rid,
