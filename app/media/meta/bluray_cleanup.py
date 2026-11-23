@@ -8,7 +8,7 @@ from app.utils.isolated_io import get_io_pool, isolated_stat
 from config import Config
 
 
-def _fingerprint(path):
+def disc_fingerprint(path):
     value = isolated_stat(path)
     return [value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns]
 
@@ -18,7 +18,7 @@ def save_cleanup(source, originals, targets):
     source = os.path.abspath(source)
     folder = os.path.join(Config().get_config_path(), 'bluray-cleanup')
     path = os.path.join(folder, hashlib.sha256(source.encode()).hexdigest() + '.json')
-    record = dict(source=source, source_identity=_fingerprint(source)[:2],
+    record = dict(source=source, source_identity=disc_fingerprint(source)[:2],
                   sources={os.path.relpath(file, source): fingerprint for file, fingerprint in originals.items()},
                   targets={})
     if os.path.exists(path):
@@ -29,7 +29,7 @@ def save_cleanup(source, originals, targets):
         # A previous attempt may have deleted some sources. Keep evidence for
         # their targets too, rather than shrinking the manifest on retry.
         record['targets'].update(previous['targets'])
-    record['targets'].update({os.path.abspath(target): _fingerprint(target) for target in targets})
+    record['targets'].update({os.path.abspath(target): disc_fingerprint(target) for target in targets})
     get_io_pool().execute('write_json_atomic', path=path, value=record)
     return path
 
@@ -70,10 +70,10 @@ def resume_cleanup(paths):
                    for path in paths):
             continue
         if os.path.lexists(source) and (os.path.islink(source)
-                or _fingerprint(source)[:2] != record['source_identity']):
+                or disc_fingerprint(source)[:2] != record['source_identity']):
             raise ValueError('原盘待清理源目录已变化，保留现场')
         for target, expected in record['targets'].items():
-            if os.path.islink(target) or not os.path.isfile(target) or _fingerprint(target) != expected:
+            if os.path.islink(target) or not os.path.isfile(target) or disc_fingerprint(target) != expected:
                 raise ValueError('原盘已发布目标发生变化，暂停源目录清理：%s' % target)
         if os.path.lexists(source):
             _clean_recorded_files(record)
@@ -104,7 +104,7 @@ def _clean_recorded_files(record):
     for relative in remaining:
         path = os.path.join(source, relative)
         if sources is not None:
-            verified = sources.get(relative) == _fingerprint(path)
+            verified = sources.get(relative) == disc_fingerprint(path)
         else:
             target = os.path.join(target_root, relative)
             verified = target in record['targets'] and (os.path.samefile(path, target)

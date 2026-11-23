@@ -170,14 +170,20 @@ class Subtitle:
         try:
             if path_guard_check:
                 path_guard_check()
-            if os.path.islink(source_subtitle) or not os.path.isfile(source_subtitle):
-                raise ValueError("源字幕不是有效的普通文件，未同步")
-            if os.path.getsize(source_subtitle) > self._opensubtitles_download_limit:
-                raise ValueError("源字幕超过 20 MiB，未同步")
+            source_stem, extension = os.path.splitext(source_subtitle)
+            extension = extension.lower()
+            components = {extension: source_subtitle}
+            index = source_stem + ".idx"
+            if extension == ".sub" and os.path.lexists(index):
+                components[".idx"] = index
+            for path in components.values():
+                if os.path.islink(path) or not os.path.isfile(path):
+                    raise ValueError("源字幕不是有效的普通文件，未同步")
+                if os.path.getsize(path) > self._opensubtitles_download_limit:
+                    raise ValueError("源字幕超过 20 MiB，未同步")
             validation = SubtitleHealth.validate_subtitle(source_subtitle)
             if not validation.get("valid"):
                 raise ValueError("源字幕无法解析，未同步：%s" % (validation.get("message") or "格式无效"))
-            source_hash = self.__file_sha256(source_subtitle)
             if os.path.abspath(media_file) == os.path.abspath(target_media_file):
                 result.update(target_subtitle=source_subtitle, synced=True)
                 return True, "字幕已保存在媒体库：%s" % source_subtitle, result
@@ -190,38 +196,55 @@ class Subtitle:
             suffix = re.sub(r"(?i)^\.(?:chi|zho)\.(?=zh-)", ".", suffix)
             language = self.__infer_subtitle_language(source_subtitle) or "zh-CN"
             profile = self.__guess_subtitle_profile(suffix, default_language=language)
-            extension = os.path.splitext(source_subtitle)[1].lower()
-            for attempt in range(3):
-                if path_guard_check:
-                    path_guard_check()
-                target = self.__build_subtitle_path(
-                    target_media_file, profile, extension, server_type, reuse_hash=source_hash)
-                # Naming may inspect existing files on a slow NAS. Revalidate
-                # the media placement again immediately before publication.
-                if path_guard_check:
-                    path_guard_check()
-                try:
-                    if rmt_mode == RmtMode.LINK:
-                        try:
-                            os.link(source_subtitle, target)
-                        except FileExistsError:
-                            # Another request may have just linked identical
-                            # bytes. Reuse them rather than adding another track.
-                            self.__publish_file_no_replace(source_subtitle, target, expected_hash=source_hash)
-                        except OSError:
-                            self.__publish_file_no_replace(source_subtitle, target, expected_hash=source_hash)
-                    else:
-                        # Keep a real subtitle beside softlinked videos too;
-                        # later source changes must not invalidate the library copy.
-                        self.__publish_file_no_replace(source_subtitle, target, expected_hash=source_hash)
-                    result.update(target_subtitle=target, synced=True)
-                    return True, "字幕已同步到媒体库：%s" % target, result
-                except FileExistsError:
-                    if attempt == 2:
-                        raise
-            raise OSError("字幕同步重试次数耗尽")
+            hashes = {ext: self.__file_sha256(path) for ext, path in components.items()}
+            # Pair selection, publication and rollback share the subtitle repair
+            # lock. A concurrent request must not reuse an index we may roll back.
+            with self._repair_lock if extension == ".sub" else nullcontext():
+                for attempt in range(3):
+                    if path_guard_check:
+                        path_guard_check()
+                    target = self.__build_subtitle_path(
+                        target_media_file, profile, extension, server_type,
+                        companion_exts=[".idx"] if extension == ".sub" else None, reuse_hashes=hashes)
+                    try:
+                        self.__sync_downloaded_files(components, hashes, target, rmt_mode, path_guard_check)
+                        result.update(target_subtitle=target, synced=True)
+                        return True, "字幕已同步到媒体库：%s" % target, result
+                    except FileExistsError:
+                        if attempt == 2:
+                            raise
         except (OSError, ValueError) as error:
             return False, "字幕已保存在原目录，同步失败：%s" % error, result
+
+    def __sync_downloaded_files(self, components, hashes, target, rmt_mode, path_guard_check):
+        def publish(ext, destination):
+            if path_guard_check:
+                path_guard_check()
+            if os.path.islink(destination):
+                raise FileExistsError("目标字幕文件已存在：%s" % destination)
+            if rmt_mode == RmtMode.LINK:
+                try:
+                    os.link(components[ext], destination)
+                    return True
+                except OSError:
+                    # The no-replace publisher handles identical existing files
+                    # and volumes that cannot hardlink to the download directory.
+                    pass
+            return self.__publish_file_no_replace(components[ext], destination, expected_hash=hashes[ext])
+
+        stem, extension = os.path.splitext(target)
+        index = stem + ".idx"
+        owned_index = None
+        if extension == ".sub" and ".idx" in components and publish(".idx", index):
+            owned_index = {"identity": self.__file_identity(index), "hash": hashes[".idx"]}
+        try:
+            publish(extension, target)
+        except (OSError, ValueError):
+            if owned_index and self.__owned_file_matches(index, owned_index):
+                if path_guard_check:
+                    path_guard_check()
+                os.unlink(index)
+            raise
 
     def upload_subtitle(self, upload_file, media_file, target_media_file=None, rmt_mode=None, server_type=None,
                         align_mode=None):
@@ -1701,7 +1724,7 @@ class Subtitle:
 
     @classmethod
     def __build_subtitle_path(cls, media_file, subtitle_profile, sub_ext, server_type=None,
-                              companion_exts=None, reuse_hash=None):
+                              companion_exts=None, reuse_hashes=None):
         """
         生成不覆盖已有文件的外挂字幕路径。
         命名格式：
@@ -1710,7 +1733,7 @@ class Subtitle:
           - Plex:          Movie.zh-CN.srt → Movie(1).zh-CN.srt → ...
                            (forced/sdh/cc 标记拼接在语言标签后: Movie.en.forced.sdh.srt)
         重名时最多尝试 100 个编号，超过则抛出 FileExistsError。
-        下载同步可传入 reuse_hash，复用相同语言/标记且内容相同的文件名。
+        下载同步只复用已有组件内容都匹配的文件名，缺少的配对组件可在重试时补齐。
         """
         media_base = os.path.splitext(media_file)[0]
         suffix_parts = [cls.__subtitle_language_tag(subtitle_profile.get("language"), server_type)]
@@ -1726,11 +1749,16 @@ class Subtitle:
         companion_exts = [str(ext).lower() for ext in (companion_exts or []) if ext]
 
         def available(path):
-            if os.path.lexists(path):
-                return bool(reuse_hash and not os.path.islink(path) and os.path.isfile(path)
-                            and cls.__file_sha256(path) == reuse_hash)
-            base = os.path.splitext(path)[0]
-            return not any(os.path.exists(base + ext) for ext in companion_exts)
+            stem = os.path.splitext(path)[0]
+            for ext in [sub_ext, *companion_exts]:
+                component = stem + ext
+                if os.path.lexists(component):
+                    expected = (reuse_hashes or {}).get(ext)
+                    if not expected or os.path.islink(component) or not os.path.isfile(component):
+                        return False
+                    if cls.__file_sha256(component) != expected:
+                        return False
+            return True
 
         if available(target):
             return target

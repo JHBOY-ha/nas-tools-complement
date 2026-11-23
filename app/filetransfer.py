@@ -348,6 +348,7 @@ class FileTransfer:
             # Remote commands have no locally verifiable destination. In particular,
             # a successful moveto/mc mv cannot authorize deleting the original disc.
             raise ValueError("原盘远程转移暂不支持完整性校验，请使用本地复制、移动或链接")
+        from app.media.meta.bluray_cleanup import disc_fingerprint
         source_root, target_root = os.path.realpath(file_path), os.path.realpath(new_path)
         if (PathUtils.is_path_in_path(source_root, target_root)
                 or PathUtils.is_path_in_path(target_root, source_root)):
@@ -366,8 +367,7 @@ class FileTransfer:
                     raise ValueError("原盘包含目录软链接，无法完整校验，保留源目录")
                 for name in names:
                     file = os.path.join(root, name)
-                    value = isolated_stat(file)
-                    files[file] = (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
+                    files[file] = disc_fingerprint(file)
             return files, directories
 
         def verify(source, target):
@@ -440,6 +440,10 @@ class FileTransfer:
                 # the receipt even if some indexes of a numbered set are gone.
                 for source in sorted(originals, key=lambda path: os.path.basename(path).lower()
                                      in ('index.bdmv', 'video_ts.ifo')):
+                    # Committing history and saving the receipt can wait on I/O.
+                    # The source path may now name a different file.
+                    if disc_fingerprint(source) != originals[source]:
+                        raise ValueError('原盘源文件在清理前发生变化，保留文件：%s' % source)
                     os.unlink(source)
                 # Remove only verified entries; a newly arrived file must survive.
                 for directory in sorted(directories - {os.curdir}, key=len, reverse=True):

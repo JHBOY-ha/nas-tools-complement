@@ -283,6 +283,30 @@ class BlurayTransferTest(unittest.TestCase):
         self.assertFalse(self.source.exists())
         self.assert_complete(self.destination)
 
+    def test_move_keeps_source_replaced_during_history_commit(self):
+        relative = 'BDMV/STREAM/00001.m2ts'
+        source = self.source / relative
+        replacement = self.root / 'replacement.m2ts'
+        replacement.write_bytes(b'other')
+        original = source.stat()
+        os.utime(replacement, ns=(original.st_atime_ns, original.st_mtime_ns))
+        save_history = self.transfer.dbhelper.insert_transfer_history
+
+        def replace_during_history(*args, **kwargs):
+            saved = save_history(*args, **kwargs)
+            os.replace(replacement, source)
+            return saved
+
+        downloader, client = self.downloader()
+        with patch.object(self.transfer.dbhelper, 'insert_transfer_history', side_effect=replace_during_history):
+            downloader.transfer()
+        client.delete_torrents.assert_not_called()
+        self.assertEqual(source.read_bytes(), b'other')
+        self.assertEqual((self.destination / relative).read_bytes(), self.contents[relative])
+        ok, _ = self.run_transfer(RmtMode.MOVE)
+        self.assertFalse(ok)
+        self.assertEqual(source.read_bytes(), b'other')
+
     def test_source_changes_during_publication_are_not_acknowledged(self):
         calls = []
         def change_source(*args, **kwargs):

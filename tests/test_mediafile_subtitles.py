@@ -138,6 +138,90 @@ class MediaFileSubtitlesTest(TestCase):
         self.assertEqual(self.target.with_suffix(".source-2.chi.zh-cn.srt").read_text(), SRT)
         self.subtitle.opensubtitles.download.assert_called_once_with(42)
 
+    def vobsub_files(self):
+        source = self.source_subtitle.with_suffix('.sub')
+        index = source.with_suffix('.idx')
+        source.write_bytes(b'\x00binary subtitle')
+        index.write_bytes(b'# VobSub index file, v7\nid: zh, index: 0')
+        # Isolate the external probe while exercising real discovery, naming,
+        # hashing, publication and refresh through the file-manager entry point.
+        for probe in (patch.object(self.health, '_SubtitleHealth__ffprobe_executable', return_value='ffprobe'),
+                      patch.object(self.health, '_SubtitleHealth__run_popen',
+                                   return_value=(0, '{"streams":[{"codec_type":"subtitle"}]}', '', None))):
+            probe.start()
+            self.addCleanup(probe.stop)
+        return source, index
+
+    def test_vobsub_sync_reuses_complete_pair_and_preserves_conflicting_index(self):
+        source, index = self.vobsub_files()
+        target = self.expected_subtitle().with_suffix('.sub')
+        target.write_bytes(source.read_bytes())
+        target.with_suffix('.idx').write_bytes(b'another subtitle index')
+        numbered = self.target.with_suffix('.source-2.chi.zh-cn.sub')
+        for _ in range(2):
+            success, message = self.run_download()
+            self.assertTrue(success, message)
+            self.assertEqual(numbered.read_bytes(), source.read_bytes())
+            self.assertEqual(numbered.with_suffix('.idx').read_bytes(), index.read_bytes())
+        self.assertEqual(target.with_suffix('.idx').read_bytes(), b'another subtitle index')
+        self.assertEqual(set(self.library.glob('*.sub')), {target, numbered})
+        self.assertEqual(self.refresh.call_count, 2)
+        self.subtitle.opensubtitles.download.assert_not_called()
+
+    def test_vobsub_primary_failure_only_rolls_back_new_index(self):
+        source, index = self.vobsub_files()
+        target = self.expected_subtitle().with_suffix('.sub')
+        target_index = target.with_suffix('.idx')
+        self.history.MODE = RmtMode.COPY.value
+        publish = self.subtitle._Subtitle__publish_file_no_replace
+
+        def fail_primary(path, destination, **kwargs):
+            if destination == str(target):
+                self.assertEqual(target_index.read_bytes(), index.read_bytes())
+                raise PermissionError('primary write failed')
+            return publish(path, destination, **kwargs)
+
+        for existing in (False, True):
+            with self.subTest(existing=existing):
+                if existing:
+                    target_index.write_bytes(index.read_bytes())
+                with patch.object(self.subtitle, '_Subtitle__publish_file_no_replace', side_effect=fail_primary):
+                    self.assertFalse(self.run_download()[0])
+                self.assertEqual(target_index.exists(), existing)
+                self.assertFalse(target.exists())
+                self.assertTrue(source.exists())
+                self.refresh.assert_not_called()
+
+    def test_standalone_microdvd_sub_remains_a_single_file(self):
+        source = self.source_subtitle.with_suffix('.sub')
+        source.write_bytes(b'{1}{25}Example subtitle\n')
+        success, message = self.run_download()
+        self.assertTrue(success, message)
+        self.assertEqual(self.expected_subtitle().with_suffix('.sub').read_bytes(), source.read_bytes())
+        self.assertFalse(list(self.library.glob('*.idx')))
+        self.refresh.assert_called_once()
+
+    def test_vobsub_index_failure_is_retryable_without_refreshing(self):
+        source, index = self.vobsub_files()
+        target = self.expected_subtitle().with_suffix('.sub')
+        # An earlier version may already have reported a SUB-only copy as complete.
+        target.write_bytes(source.read_bytes())
+        self.history.MODE = RmtMode.COPY.value
+        publish = self.subtitle._Subtitle__publish_file_no_replace
+        def fail_index(path, destination, **kwargs):
+            if destination.endswith('.idx'):
+                raise PermissionError('index write failed')
+            return publish(path, destination, **kwargs)
+        with patch.object(self.subtitle, '_Subtitle__publish_file_no_replace', side_effect=fail_index):
+            success, _ = self.run_download()
+        self.assertFalse(success)
+        self.refresh.assert_not_called()
+        self.assertEqual(target.read_bytes(), source.read_bytes())
+        self.assertTrue(self.run_download()[0])
+        self.assertEqual(target.with_suffix('.idx').read_bytes(), index.read_bytes())
+        self.assertEqual(list(self.library.glob('*.sub')), [target])
+        self.refresh.assert_called_once()
+
     def test_refresh_failure_preserves_both_files_and_retry_only_refreshes(self):
         self.refresh.return_value = {"status": "failed", "message": "连接失败"}
         success, message = self.run_download()
