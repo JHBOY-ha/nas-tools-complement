@@ -1667,7 +1667,7 @@ class WebAction:
         tmdbid = data.get("tmdbid")
         if not str(tmdbid).isdigit():
             tmdbid = None
-        if name:
+        if name and not rssid:
             name = MetaInfo(title=name).get_name()
         if mtype:
             if mtype in MovieTypes:
@@ -1708,6 +1708,7 @@ class WebAction:
         if isinstance(season, list):
             code = 0
             msg = ""
+            added_media = None
             for sea in season:
                 code, msg, media_info = _subscribe.add_rss_subscribe(mtype=mtype,
                                                                      name=name,
@@ -1726,8 +1727,13 @@ class WebAction:
                                                                      save_path=save_path,
                                                                      download_setting=download_setting,
                                                                      rssid=rssid)
-                if code != 0:
+                if code == 0:
+                    added_media = media_info
+                elif code != 9 or rssid:
                     break
+            # 榜单不会预查订阅。某一季已存在时，继续添加用户确认的其余季。
+            if not rssid and added_media and code == 9:
+                code, msg, media_info = 0, "添加订阅成功", added_media
         else:
             code, msg, media_info = _subscribe.add_rss_subscribe(mtype=mtype,
                                                                  name=name,
@@ -1754,7 +1760,8 @@ class WebAction:
                     title=name, tmdbid=media_info.tmdb_id)
             else:
                 rssid = self.dbhelper.get_rss_tv_id(
-                    title=name, tmdbid=media_info.tmdb_id)
+                    title=name, tmdbid=media_info.tmdb_id,
+                    season=media_info.get_season_string() if media_info.begin_season is not None else None)
         return {"code": code, "msg": msg, "page": page, "name": name, "rssid": rssid}
 
     def special_confirmation(self, data):
@@ -2934,14 +2941,16 @@ class WebAction:
                                                    tags=tags,
                                                    page=CurrentPage)
 
-        # 补充存在与订阅状态
+        # 榜单和发现页只展示来源数据。null 表示未查询；不能把浏览整页变成逐片识别。
+        if Type not in ("SEARCH", "DOWNLOADED"):
+            return {"code": 0, "Items": [dict(item, fav=None, rssid=None) for item in res_list]}
+
+        # 主动搜索与下载历史继续显示本地状态，列表类型本身不是影片的媒体类型。
         filetransfer = FileTransfer()
         for res in res_list:
-            fav, rssid = filetransfer.get_media_exists_flag(mtype=Type,
-                                                            title=res.get(
-                                                                "title"),
-                                                            year=res.get(
-                                                                "year"),
+            fav, rssid = filetransfer.get_media_exists_flag(mtype=res.get("type") or Type,
+                                                            title=res.get("title"),
+                                                            year=res.get("year"),
                                                             mediaid=res.get("id"))
             res.update({
                 'fav': fav,
@@ -3166,12 +3175,15 @@ class WebAction:
         tmdbid = data.get("tmdbid")
         title = data.get("title")
         if title:
-            title_season = MetaInfo(title=title).begin_season
+            # 用户仍可取消选季；仅用规则解析原始季标，正式提交再识别。
+            title_season = MetaInfo(title=title, use_llm=False).begin_season
         else:
             title_season = None
         if not str(tmdbid).isdigit():
             media_info = WebUtils.get_mediainfo_from_id(mtype=MediaType.TV,
-                                                        mediaid=tmdbid)
+                                                        mediaid=tmdbid, use_llm=False)
+            if not media_info or not media_info.tmdb_info:
+                return {"code": 1, "msg": "未查询到TMDB媒体信息", "seasons": []}
             season_infos = Media().get_tmdb_tv_seasons(media_info.tmdb_info)
         else:
             season_infos = Media().get_tmdb_tv_seasons_byid(tmdbid=tmdbid)
@@ -5118,18 +5130,18 @@ class WebAction:
         if not tmdbid:
             return {"code": 1, "msg": "未指定媒体ID"}
         media_info = WebUtils.get_mediainfo_from_id(
-            mtype=mtype, mediaid=tmdbid)
+            mtype=mtype, mediaid=tmdbid, use_llm=False)
         # 检查TMDB信息
         if not media_info or not media_info.tmdb_info:
             return {
                 "code": 1,
                 "msg": "无法查询到TMDB信息"
             }
-        # 查询存在及订阅状态
-        fav, rssid = FileTransfer().get_media_exists_flag(mtype=mtype,
-                                                          title=media_info.title,
-                                                          year=media_info.year,
-                                                          mediaid=media_info.tmdb_id)
+        # 网页详情只展示资料；已有详情 API 调用方仍可获取单项的本地状态。
+        fav, rssid = None, None
+        if data.get("include_status") is not False:
+            fav, rssid = FileTransfer().get_media_exists_flag(mtype=mtype, title=media_info.title,
+                                                              year=media_info.year, mediaid=media_info.tmdb_id)
         MediaHander = Media()
         return {
             "code": 0,

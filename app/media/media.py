@@ -2290,7 +2290,7 @@ class Media:
                        strict=None,
                        cache=True,
                        chinese=True,
-                       append_to_response=None):
+                       append_to_response=None, *, use_llm=True):
         """
         只有名称信息，判别是电影还是电视剧并搜刮TMDB信息，用于种子名称识别
         :param title: 种子名称
@@ -2300,6 +2300,7 @@ class Media:
         :param cache: 是否使用缓存，默认TRUE
         :param chinese: 原标题为英文时是否从别名中检索中文名称
         :param append_to_response: 额外查询的信息
+        :param use_llm: 只读详情使用规则解析；主动识别沿用 LLM 配置
         :return: 带有TMDB信息的MetaInfo对象
         """
         # 独立识别不应用转移忽略词；文件整理入口负责配置过滤。
@@ -2309,7 +2310,7 @@ class Media:
         if not title:
             return None
         # 识别
-        meta_info = MetaInfo(title, subtitle=subtitle, mtype=mtype)
+        meta_info = MetaInfo(title, subtitle=subtitle, mtype=mtype, use_llm=use_llm)
         if requires_confirmation(meta_info) and not (meta_info.note or {}).get("fractional_episode"):
             return self._finalize_recognition(
                 SpecialResolver(self).resolve(meta_info, mtype_hint=mtype), mtype_hint=mtype)

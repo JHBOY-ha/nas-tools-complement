@@ -27,7 +27,7 @@ export class PageMediainfo extends CustomElement {
 
   firstUpdated() {
     // 媒体信息、演员阵容
-    Golbal.get_cache_or_ajax("media_detail", "info", { "type": this.media_type, "tmdbid": this.tmdbid},
+    Golbal.get_cache_or_ajax("media_detail", "info", {type: this.media_type, tmdbid: this.tmdbid, include_status: false},
       (ret) => {
         if (ret.code === 0) {
           this.media_info = ret.data;
@@ -135,7 +135,7 @@ export class PageMediainfo extends CustomElement {
                         <span class="btn btn-pill btn-purple"
                           @click=${this._loveClick}>
                           <svg xmlns="http://www.w3.org/2000/svg" class="icon" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"/><path d="M19.5 12.572l-7.5 7.428l-7.5 -7.428m0 0a5 5 0 1 1 7.5 -6.566a5 5 0 1 1 7.5 6.572" /></svg>
-                          添加订阅
+                          订阅此作品
                         </span>`
                       }`
                     : html`
@@ -228,7 +228,7 @@ export class PageMediainfo extends CustomElement {
               <normal-card
                 @fav_change=${(e) => {
                   Golbal.update_fav_data("get_recommend", "sim", (extra) => (
-                    extra.Items[index].fav = e.detail.fav, extra
+                    Object.assign(extra.Items[index], e.detail), extra
                   ));
                 }}
                 lazy=1
@@ -237,6 +237,7 @@ export class PageMediainfo extends CustomElement {
                 card-showsub=1
                 card-image=${item.image}
                 card-fav=${item.fav}
+                card-rssid=${item.rssid}
                 card-vote=${item.vote}
                 card-year=${item.year}
                 card-title=${item.title}
@@ -257,7 +258,7 @@ export class PageMediainfo extends CustomElement {
               <normal-card
                 @fav_change=${(e) => {
                   Golbal.update_fav_data("get_recommend", "more", (extra) => (
-                    extra.Items[index].fav = e.detail.fav, extra
+                    Object.assign(extra.Items[index], e.detail), extra
                   ));
                 }}
                 lazy=1
@@ -266,6 +267,7 @@ export class PageMediainfo extends CustomElement {
                 card-showsub=1
                 card-image=${item.image}
                 card-fav=${item.fav}
+                card-rssid=${item.rssid}
                 card-vote=${item.vote}
                 card-year=${item.year}
                 card-title=${item.title}
@@ -281,7 +283,7 @@ export class PageMediainfo extends CustomElement {
 
   _update_fav_data() {
     Golbal.update_fav_data("media_detail", "info", (extra) => (
-      extra.data.fav = this.fav, extra
+      Object.assign(extra.data, {fav: this.fav, rssid: this.media_info.rssid}), extra
     ));
   }
 
@@ -290,12 +292,14 @@ export class PageMediainfo extends CustomElement {
     Golbal.lit_love_click(this.media_info.title, this.media_info.year, this.media_type, this.tmdbid, this.fav,
       () => {
         this.fav = "0";
+        this.media_info.rssid = "";
         this._update_fav_data();
       },
-      () => {
+      (rssid) => {
         this.fav = "1";
+        this.media_info.rssid = rssid;
         this._update_fav_data();
-      });
+      }, this.media_info.rssid);
   }
 
 

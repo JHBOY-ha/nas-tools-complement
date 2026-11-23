@@ -110,7 +110,7 @@ export class PageDiscovery extends CustomElement {
     for (const item of this._media_type_list[this.discovery_type]) {
       Golbal.get_cache_or_ajax(
           "get_recommend",
-          self.discovery_type + item.title,
+          this.discovery_type + item.title,
           { "type": item.type, "subtype": item.subtype, "page": 1, "week": item.week},
           (ret) => {
             this._slide_card_list = {...this._slide_card_list, [item.title]: ret.Items};
@@ -131,8 +131,8 @@ export class PageDiscovery extends CustomElement {
               ? this._slide_card_list[item.title].map((card, index) => ( html`
                 <normal-card
                   @fav_change=${(e) => {
-                    Golbal.update_fav_data("get_recommend", item.subtype, (extra) => (
-                      extra.Items[index].fav = e.detail.fav, extra
+                    Golbal.update_fav_data("get_recommend", this.discovery_type + item.title, (extra) => (
+                      Object.assign(extra.Items[index], e.detail), extra
                     ));
                   }}
                   lazy=1
@@ -141,6 +141,7 @@ export class PageDiscovery extends CustomElement {
                   card-showsub=1
                   card-image=${card.image}
                   card-fav=${card.fav}
+                  card-rssid=${card.rssid}
                   card-vote=${card.vote}
                   card-year=${card.year}
                   card-title=${card.title}

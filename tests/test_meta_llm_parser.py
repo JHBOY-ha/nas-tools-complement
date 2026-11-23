@@ -82,6 +82,110 @@ class LLMMetaParserTest(TestCase):
                 sdk.chat.completions.create.assert_called_once()
                 self.assertEqual(max_tokens, sdk.chat.completions.create.call_args.kwargs["max_tokens"])
 
+    def test_discovery_lists_return_display_data_without_checking_subscriptions(self):
+        from app.media.bangumi import Bangumi
+        from app.media.douban import DouBan
+        from web.action import WebAction
+
+        action = WebAction.__new__(WebAction)
+        calendar = [{"weekday": {"id": day, "cn": str(day)},
+                     "items": [{"id": day * 100 + i, "name_cn": f"番剧{day}-{i}"} for i in range(15)]}
+                    for day in range(1, 8)]
+        item = {"type": "movie", "title": "电影", "id": "42"}
+        with patch.object(Bangumi, "calendar", return_value=calendar), \
+                patch.object(DouBan(), "doubanapi") as douban, \
+                patch("web.action.Media") as tmdb, patch("web.action.FileTransfer") as transfer, \
+                patch.object(self.parser, "_LLMMetaParser__get_client") as llm:
+            douban.movie_recommend.return_value = {"items": [item]}
+            douban.tv_recommend.return_value = {"items": [dict(item, type="tv")]}
+            douban.movie_hot_gaia.return_value = {"subject_collection_items": [item]}
+            tmdb.return_value.get_tmdb_trending_all_week.return_value = [{"id": 42, "title": "电影"}]
+            for day in range(1, 8):
+                rows = action.get_recommend({"type": "TV", "subtype": "bangumi", "week": day})["Items"]
+                self.assertEqual(len(rows), 15)
+                self.assertTrue(all(row["fav"] is None and row["rssid"] is None for row in rows))
+            for kind, subtype in (("DOUBANTAG", "MOV"), ("DOUBANTAG", "TV"), ("MOV", "dbhm"), ("TRENDING", "tmdb")):
+                row, = action.get_recommend({"type": kind, "subtype": subtype})["Items"]
+                self.assertEqual(row["title"], "电影")
+                self.assertIsNone(row["fav"])
+            transfer.assert_not_called()
+            llm.assert_not_called()
+
+    def test_download_history_uses_actual_kind_and_rules_for_status(self):
+        from app.filetransfer import FileTransfer
+        from web.action import WebAction
+
+        action = WebAction.__new__(WebAction)
+        transfer = FileTransfer.__new__(FileTransfer)
+        transfer.dbhelper = Mock()
+        transfer.dbhelper.get_rss_movie_id.return_value = 3
+        transfer.dbhelper.get_rss_tv_id.return_value = 7
+        items = [{"id": "DB:10", "type": "MOV", "title": "Movie", "year": "2020"},
+                 {"id": "BG:20", "type": "TV", "title": "Boundary Show S03", "year": "2026"}]
+        with patch.object(action, "get_downloaded", return_value={"Items": items}), \
+                patch("web.action.FileTransfer", return_value=transfer), \
+                patch.object(self.parser, "_LLMMetaParser__get_client") as llm:
+            rows = action.get_recommend({"type": "DOWNLOADED"})["Items"]
+            self.assertEqual([(r["fav"], r["rssid"]) for r in rows], [("1", 3), ("1", 7)])
+            self.assertEqual(transfer.dbhelper.get_rss_tv_id.call_args.kwargs["season"], "S03")
+            llm.assert_not_called()
+
+    def test_detail_is_rule_only_and_confirmed_subscription_can_use_llm(self):
+        from types import SimpleNamespace
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import Session
+        from tests.recognition_fixture import FakeTmdb
+        from app.db.models import RSSTVS
+        from app.helper import DbHelper
+        from app.subscribe import Subscribe
+        from web.action import WebAction
+
+        fixture = FakeTmdb(self)
+        fixture.tv(42, "Boundary Show", year="2020", genres=(), seasons={1: 2, 2: 3})
+        action = WebAction.__new__(WebAction)
+        action.dbhelper = DbHelper()
+        engine = create_engine("sqlite://")
+        self.addCleanup(engine.dispose)
+        RSSTVS.__table__.create(engine)
+        session = Session(engine)
+        self.addCleanup(session.close)
+        action.dbhelper._db = SimpleNamespace(session=session, query=session.query, insert=session.add,
+                                              commit=session.commit, rollback=session.rollback)
+        subscribe = Subscribe.__new__(Subscribe)
+        subscribe.media, subscribe.dbhelper = fixture.media, action.dbhelper
+        client = Mock()
+        client.complete_text.return_value = '{"en_name":"Boundary Show","type":"tv"}'
+        with patch("web.backend.web_utils.Media", return_value=fixture.media), \
+                patch("web.backend.web_utils.DouBan") as douban, patch("web.backend.web_utils.Bangumi") as bangumi, \
+                patch("web.action.Media", return_value=fixture.media), patch("web.action.FileTransfer") as transfer, \
+                patch("web.action.Subscribe", return_value=subscribe), \
+                patch.object(self.parser, "_LLMMetaParser__get_client", return_value=client):
+            transfer.return_value.get_media_exists_flag.return_value = ("0", "")
+            douban.return_value.get_douban_detail.return_value = {
+                "original_title": "Other title", "title": "Boundary Show", "year": "2020"}
+            bangumi.return_value.detail.return_value = {
+                "name": "Other title", "name_cn": "Boundary Show", "date": "2020-01-01"}
+            for mediaid in ("DB:10", "BG:20", "42"):
+                detail = action.media_detail({"tmdbid": mediaid, "type": "TV", "include_status": False})
+                self.assertEqual(detail["code"], 0, detail)
+                self.assertEqual(str(detail["data"]["tmdbid"]), "42")
+                self.assertIsNone(detail["data"]["fav"])
+            transfer.assert_not_called()
+            self.assertEqual(action.media_detail({"tmdbid": "42", "type": "TV"})["data"]["fav"], "0")
+            options = action._WebAction__get_tvseason_list({"tmdbid": "BG:20", "title": "Boundary Show"})
+            self.assertEqual({s["num"] for s in options["seasons"]}, {1, 2})
+            client.complete_text.assert_not_called()
+
+            data = {"name": "Boundary Show", "year": "2020", "type": "TV", "mediaid": "42"}
+            add = action._WebAction__add_rss_media
+            self.assertEqual(add(dict(data, season=1))["code"], 0)
+            self.assertTrue(client.complete_text.called)
+            mixed = add(dict(data, season=[1, 2, 1]))
+            self.assertEqual(mixed["code"], 0)
+            self.assertEqual(mixed["rssid"], action.dbhelper.get_rss_tv_id("Boundary Show", tmdbid=42, season="S02"))
+            self.assertEqual(add(dict(data, season=[1, 2]))["code"], 9)
+            self.assertEqual([r.SEASON for r in session.query(RSSTVS).order_by(RSSTVS.SEASON)], ["S01", "S02"])
+
     def test_spa_action_origin_survives_queued_recognition_and_empty_responses(self):
         from flask import Flask, g
         from app.utils.workload import BoundedExecutor

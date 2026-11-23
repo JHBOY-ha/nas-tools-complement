@@ -14,6 +14,7 @@ export class NormalCard extends observeState(CustomElement) {
     show_sub: { attribute: "card-showsub"},
     title: { attribute: "card-title" },
     fav: { attribute: "card-fav" , reflect: true},
+    rssid: { attribute: "card-rssid" },
     date: { attribute: "card-date" },
     vote: { attribute: "card-vote" },
     image: { attribute: "card-image" },
@@ -94,7 +95,8 @@ export class NormalCard extends observeState(CustomElement) {
             </span>
           </a>
           <div class="ms-auto">
-            <div class="text-muted" title="加入/取消订阅" style="cursor: pointer" @click=${this._loveClick}>
+            <button type="button" class="text-muted border-0 bg-transparent p-0"
+                    title=${this.fav == "1" ? "取消订阅" : "订阅此作品"} @click=${this._loveClick}>
               <span class="icon-pulse text-white">
                 <svg xmlns="http://www.w3.org/2000/svg" class="icon icon-tabler icon-tabler-heart ${this.fav == "1" ? "icon-filled text-red" : ""}" width="24" height="24"
                     viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round"
@@ -103,7 +105,7 @@ export class NormalCard extends observeState(CustomElement) {
                   <path d="M19.5 12.572l-7.5 7.428l-7.5 -7.428m0 0a5 5 0 1 1 7.5 -6.566a5 5 0 1 1 7.5 6.572"></path>
                 </svg>
               </span>
-            </div>
+            </button>
           </div>
         </div>`;
     } else {
@@ -164,7 +166,7 @@ export class NormalCard extends observeState(CustomElement) {
   _fav_change() {
     const options = {
       detail: {
-        fav: this.fav
+        fav: this.fav, rssid: this.rssid
       },
       bubbles: true,
       composed: true,
@@ -177,12 +179,14 @@ export class NormalCard extends observeState(CustomElement) {
     Golbal.lit_love_click(this.title, this.year, this.media_type, this.tmdb_id, this.fav,
       () => {
         this.fav = "0";
+        this.rssid = "";
         this._fav_change();
       },
-      () => {
+      (rssid) => {
         this.fav = "1";
+        this.rssid = rssid;
         this._fav_change();
-      });
+      }, this.rssid);
   }
   
 }

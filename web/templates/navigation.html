@@ -1133,10 +1133,14 @@
           navmenu(ret.page);
         } else {
           if (func) {
-            func();
+            func(ret.rssid);
           }
           show_rss_success_modal(ret.rssid, type, name + " 添加订阅成功！")
         }
+      } else if (ret.code === 9) {
+        // 只读榜单没有预先查询状态；以用户确认后服务端的查重结果更新卡片。
+        if (func && ret.rssid) func(ret.rssid);
+        show_success_modal(name + " 已在订阅中");
       } else {
         show_fail_modal(`${ret.name} 添加订阅失败：${ret.msg}！`);
       }
@@ -1148,6 +1152,10 @@
     hide_mediainfo_modal();
     let data = {"name": name, "type": type, "year": year, "rssid": rssid, "page": page, "tmdbid": tmdbid};
     ajax_post("remove_rss_media", data, function (ret) {
+      if (ret.code !== 0) {
+        show_fail_modal(ret.msg || "取消订阅失败");
+        return;
+      }
       if (func) {
         func();
       } else if (ret.page) {
