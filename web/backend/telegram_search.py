@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, urlparse
 import log
 from app.downloader import Downloader
 from app.helper import ThreadHelper
-from app.helper.search_sessions import ACTIVE_SEARCH_STATES, SearchSessions, pack_media, unpack_media
+from app.helper.search_sessions import ACTIVE_SEARCH_STATES, PENDING_DOWNLOAD_STATES, SearchSessions, pack_media, unpack_media
 from app.indexer import Indexer
 from app.media import Media
 from app.message import Message
@@ -364,12 +364,15 @@ class TelegramSearch:
     def _search(self, sid, epoch, cancel):
         record = self.store.get(sid)
         media = unpack_media(record['selected'])
-        if not media.tmdb_id:
-            # Douban candidates must resolve to a concrete TMDB work before any
-            # resource request; preserve the user-selected title/year constraint.
-            media = Media().get_media_info(title=media.get_title_string(), mtype=media.type, strict=True)
-            if not media or not media.tmdb_id:
-                raise ValueError('无法匹配 TMDB 电影')
+        if not media.tmdb_info or not str(media.tmdb_id).isdigit():
+            # Douban puts a DB: subject ID in tmdb_id. Resolve the selected
+            # title/year/type, retaining the candidate's requested season/episode.
+            resolved = Media().get_media_info(title=media.get_title_string(), mtype=media.type, strict=True)
+            if not resolved or resolved.skip_reason or not resolved.tmdb_info:
+                raise ValueError('无法匹配 TMDB 作品')
+            media.set_tmdb_info(resolved.tmdb_info)
+            if not str(media.tmdb_id).isdigit() or not media.tmdb_info:
+                raise ValueError('无法匹配 TMDB 作品')
         if cancel.is_set():
             return
         downloader = Downloader()
@@ -468,31 +471,27 @@ class TelegramSearch:
     def download(self, sid, epoch, rid, automatic=False, no_exists=None, source_index=None):
         # The durable claim precedes downloader I/O. A timeout stays unknown;
         # neither a second click nor a restart is allowed to resubmit it.
-        with self.store.edit(sid) as record:
-            if record['epoch'] != epoch or record['state'] in ('canceled', 'failed', 'interrupted'):
-                return
-            if rid in record['downloads'] and record['downloads'][rid]['state'] != 'not_submitted':
-                return
-            media = unpack_media(record['results'][rid])
-            sources = record['results'][rid].get('sources', [])
-            if source_index is not None:
-                media.__dict__.update(sources[source_index])
-            elif record['preferences']['sites'] and media.site not in record['preferences']['sites']:
-                source = next((value for value in sources if value['site'] in record['preferences']['sites']), None)
-                if source:
-                    media.__dict__.update(source)
-            setting = record['preferences']['setting'] or media.download_setting
-            tag = 'nts-' + hashlib.sha256((record['owner'] + rid + str(setting)).encode()).hexdigest()[:24]
-            prior = self.store.find_download(tag)
-            record['downloads'][rid] = prior if prior else {
-                'tag': tag, 'state': 'submitting', 'message': '正在提交下载', 'setting': setting,
-                'site': media.site, 'task_id': None}
-            if prior:
-                return
-            media.user_name = record['user_name']
+        record = self.store.get(sid)
+        if record['epoch'] != epoch or record['state'] in ('canceled', 'failed', 'interrupted'):
+            return
+        media = unpack_media(record['results'][rid])
+        sources = record['results'][rid].get('sources', [])
+        if source_index is not None:
+            media.__dict__.update(sources[source_index])
+        elif record['preferences']['sites'] and media.site not in record['preferences']['sites']:
+            source = next((value for value in sources if value['site'] in record['preferences']['sites']), None)
+            if source:
+                media.__dict__.update(source)
+        setting = record['preferences']['setting'] or media.download_setting
+        tag = 'nts-' + hashlib.sha256((record['owner'] + rid + str(setting)).encode()).hexdigest()[:24]
+        operation = dict(tag=tag, state='submitting', message='正在提交下载', setting=setting,
+                         site=media.site, task_id=None)
+        if not self.store.claim_download(sid, epoch, rid, operation):
+            self.publish(sid)
+            return
+        media.user_name = record['user_name']
         self.publish(sid)
         downloader = Downloader()
-        operation = self.store.get(sid)['downloads'][rid]
         attempted = False
         def before_submit():
             nonlocal attempted
@@ -540,25 +539,25 @@ class TelegramSearch:
             operation.update(state='unknown' if attempted else 'not_submitted',
                              message='提交状态待确认，请查询下载器；不会自动重复提交' if attempted
                              else '下载前检查失败，尚未提交；可稍后重试下载')
-        with self.store.edit(sid) as record:
-            record['downloads'][rid] = operation
-        self.publish(sid)
+        for related_sid in self.store.update_download(sid, rid, **operation):
+            self.publish(related_sid)
 
     def refresh_downloads(self, sid, background=False):
         record = self.store.get(sid)
-        changed = False
+        changed = set()
         operations = sorted(((rid, op) for rid, op in record['downloads'].items()
-                             if op['state'] not in ('organized', 'exists', 'not_submitted')),
+                             if op['state'] in PENDING_DOWNLOAD_STATES),
                             key=lambda item: item[1].get('checked_at', 0))
         for rid, operation in operations[:4 if background else 20]:
             status = Downloader().get_search_task_status(operation['tag'], operation['setting'], operation['site'])
-            with self.store.edit(sid) as current:
-                current['downloads'][rid]['checked_at'] = time.time()
-                if status.get('task_id'):
-                    current['downloads'][rid].update(status)
-                    changed = changed or operation['state'] != status['state']
-        if changed or not background:
-            self.publish(sid)
+            changes = status if status.get('task_id') else {}
+            related = self.store.update_download(sid, rid, checked_at=time.time(), **changes)
+            if changes and operation['state'] != changes['state']:
+                changed.update(related)
+        if not background:
+            changed.add(sid)
+        for related_sid in changed:
+            self.publish(related_sid)
 
     def refresh_pending(self):
         """Use the existing scheduler budget; notify only task state changes."""

@@ -401,6 +401,22 @@ class DvdTransferTest(unittest.TestCase):
         self.assert_movie_nfo()
         self.assertFalse(self.source.exists())
 
+    def test_move_preserves_unrecognized_dvd_in_collection_on_every_retry(self):
+        collection = self.root / 'Collection'
+        collection.mkdir()
+        self.source = self.source.rename(collection / self.source.name)
+        unrecognized = collection / 'Another.Movie' / 'VIDEO_TS' / 'VTS_01_1.VOB'
+        unrecognized.parent.mkdir(parents=True)
+        unrecognized.write_bytes(b'untransferred movie')
+        downloader, client = self.downloader()
+        client.get_transfer_task.return_value = [dict(path=str(collection), id='collection', tags=[])]
+        for _ in range(2):
+            downloader.transfer()
+            self.assert_complete(self.destination)
+            self.assertEqual(unrecognized.read_bytes(), b'untransferred movie')
+            client.delete_torrents.assert_not_called()
+            client.set_torrents_status.assert_not_called()
+
     def test_collection_mixes_dvd_bluray_and_preserves_numbered_dvd_set(self):
         second = self.root / 'Interstellar.2014.BluRay'
         (second / 'BDMV/STREAM').mkdir(parents=True)

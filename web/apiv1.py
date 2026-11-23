@@ -474,7 +474,8 @@ class SearchKeyword(ClientResource):
 @search.route('/result')
 class SearchResult(ClientResource):
     parser = reqparse.RequestParser()
-    parser.add_argument('search_id', type=str, location=('form', 'args'))
+    parser.add_argument('search_id', type=str, location=('form', 'args'),
+                        help='可选。无 Cookie 且省略时查询当前调用方最近的有效搜索。')
 
     @search.doc(parser=parser)
     def post(self):

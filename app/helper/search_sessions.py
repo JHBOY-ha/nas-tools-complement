@@ -70,15 +70,22 @@ class SearchSessions:
         self.root = root or os.path.join(Config().get_config_path(), 'search-sessions')
         self._lock = threading.RLock()
         self._records = {}
+        self._receipts = {}
         self.ttl = max(60, int((Config().get_config('pt') or {}).get('search_session_ttl_minutes', 30)) * 60)
         os.makedirs(self.root, mode=0o700, exist_ok=True)
         # Interrupted searches can be restarted; uncertain downloads must never
         # be submitted again automatically after process restart.
         for name in os.listdir(self.root):
-            if not re.fullmatch(r'[0-9a-f]{16}\.json', name):
+            receipt = re.fullmatch(r'download-[0-9a-f]{64}\.json', name)
+            if not receipt and not re.fullmatch(r'[0-9a-f]{16}\.json', name):
                 continue
             with open(os.path.join(self.root, name), encoding='utf-8') as stream:
                 record = json.load(stream, object_hook=_decode)
+            if receipt:
+                if record['state'] == 'submitting':
+                    record.update(state='unknown', message='提交状态待确认，请查询下载器')
+                self._receipts[record['tag']] = record
+                continue
             if record['state'] in ACTIVE_SEARCH_STATES:
                 record.update(state='interrupted', message='服务已重启，请重新搜索')
             for operation in record['downloads'].values():
@@ -86,6 +93,21 @@ class SearchSessions:
                     operation.update(state='unknown', message='提交状态待确认，请查询下载器')
             self._records[record['id']] = record
         self._prune()
+        # Previous versions copied in-flight receipts between searches. On
+        # upgrade, confirmed downloader evidence outranks a stale copy. An
+        # interrupted submission stays unknown if nothing confirms its outcome.
+        legacy = {}
+        for record in self._records.values():
+            if record['channel'] == 'telegram':
+                for op in record['downloads'].values():
+                    tag = op.get('tag')
+                    if tag and tag not in self._receipts:
+                        legacy.setdefault(tag, []).append(op)
+        states = ('not_submitted', 'unknown', 'exists', 'accepted', 'downloading', 'complete', 'organized')
+        for operations in legacy.values():
+            if len(operations) > 1:
+                self._save_download(max(operations, key=lambda op: (
+                    states.index(op['state']), op.get('checked_at', 0))))
 
     def _save(self, name, value):
         path = os.path.join(self.root, name + '.json')
@@ -113,13 +135,17 @@ class SearchSessions:
                 del self._records[sid]
             elif (record['expires_at'] < now and record['state'] not in ACTIVE_SEARCH_STATES
                   and record['downloads'] and not record.get('archived')
-                  and all(operation['state'] != 'submitting' for operation in record['downloads'].values())):
+                  and all(self._receipt(op)['state'] != 'submitting' for op in record['downloads'].values())):
                 # Receipts outlive the search quota for status checks and dedupe.
                 # Drop the heavy snapshot while preserving owner, callback IDs and
                 # download tags; expiry already prevents new download actions.
                 archived = dict(record, archived=True, results={}, candidates=[], selected=None, report={})
                 self._save(sid, archived)
                 self._records[sid] = archived
+        referenced = {op.get('tag') for record in self._records.values() for op in record['downloads'].values()}
+        for tag in self._receipts.keys() - referenced:
+            os.unlink(os.path.join(self.root, self._receipt_name(tag) + '.json'))
+            del self._receipts[tag]
 
     def create(self, owner, chat, query, channel='telegram', request_id=None):
         with self._lock:
@@ -155,7 +181,19 @@ class SearchSessions:
 
     def get(self, sid):
         with self._lock:
-            return copy.deepcopy(self._records.get(sid))
+            record = self._records.get(sid)
+            if record is not None:
+                return copy.deepcopy(dict(record, downloads={
+                    rid: self._receipt(op) for rid, op in record['downloads'].items()}))
+
+    def latest_web_search(self, owner):
+        with self._lock:
+            now = time.time()
+            latest = max((record for record in self._records.values()
+                          if record['channel'] == 'web' and record['owner'] == str(owner)
+                          and record['expires_at'] >= now),
+                         key=lambda record: record['created_at'], default=None)
+            return latest['id'] if latest else None
 
     @contextmanager
     def edit(self, sid):
@@ -175,11 +213,56 @@ class SearchSessions:
             return sid in self._records
 
     def find_download(self, tag):
-        """Return a detached receipt; call inside edit() for an atomic claim."""
+        """Older snapshots embedded their receipt in the search record."""
         with self._lock:
+            if tag in self._receipts:
+                receipt = self._receipts[tag]
+                return copy.deepcopy(receipt) if receipt['state'] != 'not_submitted' else None
             return next((copy.deepcopy(operation) for record in self._records.values()
                          for operation in record['downloads'].values()
                          if operation.get('tag') == tag and operation['state'] != 'not_submitted'), None)
+
+    def _receipt(self, operation):
+        return self._receipts.get(operation.get('tag'), operation)
+
+    def claim_download(self, sid, epoch, rid, operation):
+        """Attach the session before persisting the single claim that permits submission."""
+        tag = operation['tag']
+        with self._lock:
+            with self.edit(sid) as record:
+                if record['epoch'] != epoch or record['state'] in ('canceled', 'failed', 'interrupted'):
+                    return False
+                existing = record['downloads'].get(rid)
+                if existing and self._receipt(existing)['state'] != 'not_submitted':
+                    return False
+                prior = self.find_download(tag)
+                # If saving the claim fails, no downloader call was made. A
+                # reference left on disk can safely retry after a restart.
+                record['downloads'][rid] = prior or dict(operation, state='not_submitted', message='尚未提交下载')
+            if prior:
+                if tag not in self._receipts:
+                    self._save_download(prior)
+                return False
+            self._save_download(operation)
+            return True
+
+    @staticmethod
+    def _receipt_name(tag):
+        return 'download-' + hashlib.sha256(tag.encode()).hexdigest()
+
+    def _save_download(self, operation):
+        tag = operation['tag']
+        self._save(self._receipt_name(tag), operation)
+        self._receipts[tag] = operation.copy()
+
+    def update_download(self, sid, rid, **changes):
+        """A result or status poll updates the same receipt for every search sharing the tag."""
+        with self._lock:
+            op = self._receipt(self._records[sid]['downloads'][rid])
+            updated = dict(op, **changes)
+            self._save_download(updated)
+            return [item['id'] for item in self._records.values()
+                    if item['downloads'].get(rid, {}).get('tag') == op['tag']]
 
     def pending_download_sessions(self, channel, limit):
         """Select least-recently checked sessions without exposing live records."""
@@ -189,7 +272,8 @@ class SearchSessions:
             for record in self._records.values():
                 if record['channel'] != channel:
                     continue
-                checked = [operation.get('checked_at', 0) for operation in record['downloads'].values()
+                operations = map(self._receipt, record['downloads'].values())
+                checked = [operation.get('checked_at', 0) for operation in operations
                            if operation['state'] in PENDING_DOWNLOAD_STATES]
                 if checked:
                     pending.append((min(checked), record['id']))

@@ -3,7 +3,7 @@ import hashlib
 import json
 import os
 
-from app.utils import PathUtils
+from app.utils import PathUtils, SystemUtils
 from app.utils.isolated_io import get_io_pool, isolated_stat
 from config import Config
 
@@ -13,12 +13,14 @@ def _fingerprint(path):
     return [value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns]
 
 
-def save_cleanup(source, targets):
+def save_cleanup(source, originals, targets):
     """Called after the complete disc and its history commit, before any unlink."""
     source = os.path.abspath(source)
     folder = os.path.join(Config().get_config_path(), 'bluray-cleanup')
     path = os.path.join(folder, hashlib.sha256(source.encode()).hexdigest() + '.json')
-    record = dict(source=source, source_identity=_fingerprint(source)[:2], targets={})
+    record = dict(source=source, source_identity=_fingerprint(source)[:2],
+                  sources={os.path.relpath(file, source): fingerprint for file, fingerprint in originals.items()},
+                  targets={})
     if os.path.exists(path):
         with open(path, encoding='utf-8') as stream:
             previous = json.load(stream)
@@ -73,10 +75,56 @@ def resume_cleanup(paths):
         for target, expected in record['targets'].items():
             if os.path.islink(target) or not os.path.isfile(target) or _fingerprint(target) != expected:
                 raise ValueError('原盘已发布目标发生变化，暂停源目录清理：%s' % target)
-        if remove_empty_tree(source):
-            # The caller retains these until its enclosing collection finishes
-            # too; a failed parent rmdir must not lose all recovery evidence.
-            cleaned[source] = receipt
-        # If source files remain, normal disc recognition/publication resumes;
-        # its index is still present and the manifest above has been verified.
+        if os.path.lexists(source):
+            _clean_recorded_files(record)
+            if not remove_empty_tree(source):
+                raise ValueError('原盘源目录仍有未转移文件，已保留')
+        # The enclosing collection must also finish before discarding its receipts.
+        cleaned[source] = receipt
     return cleaned
+
+
+def _clean_recorded_files(record):
+    """Resume from the original disc root, even after individual indexes disappeared."""
+    source = record['source']
+    sources = record.get('sources')
+    remaining = []
+
+    def scan_error(error):
+        raise error
+    for root, dirs, names in os.walk(source, onerror=scan_error):
+        if any(os.path.islink(os.path.join(root, name)) for name in dirs):
+            raise ValueError('原盘源目录包含软链接，暂停清理')
+        remaining.extend(os.path.relpath(os.path.join(root, name), source) for name in names)
+    if not remaining:
+        return
+    target_root = None if sources is not None else _legacy_target_root(remaining, record['targets'])
+    # Keep any remaining indexes until last, including during a second interruption.
+    remaining.sort(key=lambda relative: os.path.basename(relative).lower() in ('index.bdmv', 'video_ts.ifo'))
+    for relative in remaining:
+        path = os.path.join(source, relative)
+        if sources is not None:
+            verified = sources.get(relative) == _fingerprint(path)
+        else:
+            target = os.path.join(target_root, relative)
+            verified = target in record['targets'] and (os.path.samefile(path, target)
+                or get_io_pool('bulk').execute('compare', source=path, target=target,
+                                               timeout=SystemUtils.get_external_transfer_timeout()))
+        if not verified:
+            raise ValueError('原盘源文件未记录或已变化，暂停清理：%s' % path)
+        os.unlink(path)
+
+
+def _legacy_target_root(remaining, targets):
+    # Old receipts have no source fingerprints. Indexes were unlinked last:
+    # match their full relative paths, including DiscN, to the verified targets.
+    roots = []
+    for relative in remaining:
+        marker = relative.lower().split(os.sep)[-2:]
+        if marker in (['bdmv', 'index.bdmv'], ['video_ts', 'video_ts.ifo']):
+            suffix = os.sep + relative
+            roots.append({path[:-len(relative)] for path in targets if path.endswith(suffix)})
+    candidates = set.intersection(*roots) if roots else set()
+    if len(candidates) != 1:
+        raise ValueError('无法从旧清理回执确认原盘目标目录，保留源文件')
+    return candidates.pop()

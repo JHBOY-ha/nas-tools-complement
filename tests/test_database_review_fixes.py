@@ -420,6 +420,8 @@ class DatabaseReviewFixTest(DatabaseCase):
 
                 def remote_item(_server_type, item_id):
                     self.assertFalse(server.is_syncing(), 'remote reads must not hold the sync lock')
+                    self.assertEqual(self.db.managed.read_engine.pool.checkedout(), 0,
+                                     'remote reads must return the SQLite read connection')
                     self.assertEqual(self.db.managed.coordinator.snapshot()['active'], 0)
                     if item_id == 'second':
                         self.assertTrue(sync(receiver))

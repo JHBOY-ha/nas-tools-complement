@@ -38,9 +38,10 @@ def web_functions(app, namespace):
 
 class ReviewTransferTest(TestCase):
     def test_invalid_ignore_configuration_never_authorizes_download_deletion(self):
+        from app.utils.path_utils import PathUtils
         from app.utils.types import RmtMode
         ns = env()
-        ns['RmtMode'] = RmtMode
+        ns.update(RmtMode=RmtMode, PathUtils=PathUtils)
         transfer = load_class('app/filetransfer.py', 'FileTransfer',
                               ['transfer_media', 'check_ignore', 'link_sync_file'], ns)()
         transfer.progress = Mock()

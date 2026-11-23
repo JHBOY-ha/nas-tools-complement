@@ -182,7 +182,9 @@ const episodes = [
     refreshReply = {code: 0, updated: 0, unchanged: 0, failed: 5, requested: 5};
     await page.getByRole('button', {name: '刷新'}).click();
     await page.waitForFunction(() => /无法从媒体服务器读取最新信息/.test(document.getElementById('feedback').textContent));
-    assert.match(await page.locator('#library_items_summary').innerText(), /当前显示上次同步的数据/);
+    // The failure dialog appears before the cached list has finished reloading.
+    await page.waitForFunction(() => /当前显示上次同步的数据/.test(document.getElementById('library_items_summary').textContent)
+      && document.getElementById('library_items_grid').getAttribute('aria-busy') === 'false');
     assert.equal(await page.getByRole('button', {name: '刷新'}).isEnabled(), true);
     assert.equal(refreshCalls().length, 3);
     assert.equal(requests.filter(r => /sync/.test(r.path)).length, 0, 'refresh must not start a full sync');

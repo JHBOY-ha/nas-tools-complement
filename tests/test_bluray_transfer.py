@@ -1,4 +1,5 @@
 """Disc publication/retry contracts; run through python3 -m tests.run_recognition."""
+import json
 import os
 import shutil
 from contextlib import ExitStack
@@ -540,6 +541,42 @@ class BlurayNormalizationTest(unittest.TestCase):
         self.assert_complete(self.destination / 'Disc2')
         self.assertTrue((self.destination / 'notes.nfo').exists())
         self.transfer.threadhelper.start_thread.assert_called_once()
+
+    def test_interrupted_multidisc_cleanup_keeps_original_destination_layout(self):
+        self.check_multidisc_cleanup(legacy=False)
+
+    def test_legacy_multidisc_cleanup_keeps_original_destination_layout(self):
+        self.check_multidisc_cleanup(legacy=True)
+
+    def check_multidisc_cleanup(self, legacy):
+        from config import Config
+        pack = self.disc_set()
+        real_unlink = os.unlink
+        indexes = []
+        def interrupt(path, *args, **kwargs):
+            if str(path).startswith(str(pack) + os.sep) and os.path.basename(path) == 'index.bdmv':
+                indexes.append(path)
+                if len(indexes) == 2:
+                    raise PermissionError('second index busy')
+            return real_unlink(path, *args, **kwargs)
+
+        with patch('app.filetransfer.os.unlink', side_effect=interrupt):
+            self.assertFalse(self.run_transfer(RmtMode.MOVE)[0])
+        self.assertEqual(len(indexes), 2)
+        self.assertFalse(os.path.exists(indexes[0]))
+        self.assertTrue(os.path.exists(indexes[1]))
+        if legacy:
+            receipts = Path(Config().get_config_path()) / 'bluray-cleanup'
+            receipt = next(path for path in receipts.glob('*.json')
+                           if json.loads(path.read_text())['source'] == str(pack))
+            record = json.loads(receipt.read_text())
+            del record['sources']
+            receipt.write_text(json.dumps(record))
+        self.assertTrue(self.run_transfer(RmtMode.MOVE)[0])
+        self.assertFalse(pack.exists())
+        self.assert_complete(self.destination / 'Disc1')
+        self.assert_complete(self.destination / 'Disc2')
+        self.assertFalse((self.destination / 'BDMV').exists())
 
     def test_numbered_discs_do_not_absorb_named_movies_or_separate_video_files(self):
         pack = self.disc_set()

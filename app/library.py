@@ -350,8 +350,14 @@ class MediaLibrary:
         if self.media_server.is_syncing():
             return {"code": -1, "msg": "媒体库正在同步，请同步完成后再刷新"}
 
-        rows = {str(row.ITEM_ID): row for row in
-                self.mediadb.find_items(server_type=server_type, item_ids=item_ids)}
+        # Keep only scalar values across the remote calls. End the read snapshot
+        # here so a slow server cannot pin a pooled SQLite connection.
+        with self.mediadb.read_snapshot():
+            rows = {str(row.ITEM_ID): (row.SERVER, {
+                "library": row.LIBRARY, "type": row.ITEM_TYPE, "title": row.TITLE,
+                "originalTitle": row.ORGIN_TITLE, "year": row.YEAR, "tmdbid": row.TMDBID,
+                "imdbid": row.IMDBID, "path": row.PATH, "json": row.JSON
+            }) for row in self.mediadb.find_items(server_type=server_type, item_ids=item_ids)}
         changes = []
         unchanged = failed = 0
         # Network reads happen one at a time and outside any lock or transaction.
@@ -369,10 +375,11 @@ class MediaLibrary:
             if not isinstance(fresh, dict) or str(fresh.get("id") or "") != item_id:
                 failed += 1
                 continue
-            if self.__sync_record_matches(row, fresh):
+            stored_server, stored = row
+            if self.__sync_record_matches(stored, fresh):
                 unchanged += 1
             else:
-                changes.append((row.SERVER, fresh))
+                changes.append((stored_server, fresh))
 
         if changes:
             if not self.media_server.begin_incremental_write(sync_generation):
@@ -394,14 +401,11 @@ class MediaLibrary:
                 "failed": failed, "requested": len(item_ids)}
 
     @staticmethod
-    def __sync_record_matches(row, fresh):
+    def __sync_record_matches(stored, fresh):
         def text(value):
             return "" if value is None else str(value)
 
-        return all(text(getattr(row, column)) == text(fresh.get(key)) for column, key in (
-            ("LIBRARY", "library"), ("ITEM_TYPE", "type"), ("TITLE", "title"),
-            ("ORGIN_TITLE", "originalTitle"), ("YEAR", "year"), ("TMDBID", "tmdbid"),
-            ("IMDBID", "imdbid"), ("PATH", "path"), ("JSON", "json")))
+        return all(text(value) == text(fresh.get(key)) for key, value in stored.items())
 
     @classmethod
     def __poster_tag(cls, item_json):

@@ -2,7 +2,6 @@ import argparse
 import os
 import random
 import re
-import shutil
 import traceback
 import uuid
 from contextlib import contextmanager
@@ -435,10 +434,10 @@ class FileTransfer:
                 # did not contain them; metadata failure must never authorize cleanup.
                 metadata_paths = [path for path in nfo_paths
                                   if os.path.dirname(path) == new_path and os.path.isfile(path)]
-                receipt = save_cleanup(file_path, list(targets.values()) + metadata_paths)
+                receipt = save_cleanup(file_path, originals, list(targets.values()) + metadata_paths)
                 cleanup_receipts[os.path.abspath(file_path)] = receipt
-                # Keep the disc entry point until the last byte-bearing file is
-                # cleaned up, so a failed cleanup can still enter disc retry logic.
+                # Leave the disc recognizable as long as possible. Recovery uses
+                # the receipt even if some indexes of a numbered set are gone.
                 for source in sorted(originals, key=lambda path: os.path.basename(path).lower()
                                      in ('index.bdmv', 'video_ts.ifo')):
                     os.unlink(source)
@@ -743,6 +742,7 @@ class FileTransfer:
                             try:
                                 if remove_empty_tree(in_path):
                                     return __finish_transfer(True, '已完成原盘源目录清理')
+                                return __finish_transfer(False, '源目录仍有未转移文件，已保留，请核对后重试')
                             except OSError as error:
                                 return __finish_transfer(False, str(error))
                         # Explain actual rejections, rather than implying that
@@ -1305,17 +1305,15 @@ class FileTransfer:
         log.info("【Rmt】%s 处理完成，总数：%s，失败：%s" % (in_path, total_count, failed_count))
         if alert_count > 0:
             self.message.send_transfer_fail_message(in_path, alert_count, "、".join(alert_messages))
-        elif failed_count == 0 and success_flag:
-            # 删除空目录
-            if rmt_mode == RmtMode.MOVE \
-                    and not (files and disc_paths) \
-                    and os.path.exists(in_path) \
-                    and os.path.isdir(in_path) \
-                    and not root_path \
-                    and not PathUtils.get_dir_files(in_path=in_path, exts=RMT_MEDIAEXT) \
-                    and not PathUtils.get_dir_files(in_path=in_path, exts=['.!qb', '.part']):
-                log.info("【Rmt】目录下已无媒体文件及正在下载的文件，移动模式下删除目录：%s" % in_path)
-                shutil.rmtree(in_path)
+        elif (failed_count == 0 and success_flag and rmt_mode == RmtMode.MOVE
+              and not files and not root_path and os.path.isdir(in_path)):
+            # A downloader may delete the entire source on success. An unrecognized
+            # DVD or sidecar still belongs to the user even if no video suffix matches.
+            try:
+                if not remove_empty_tree(in_path):
+                    return __finish_transfer(False, '源目录仍有未转移文件，已保留，请核对后重试')
+            except OSError as error:
+                return __finish_transfer(False, str(error))
         return __finish_transfer(success_flag, error_message)
 
     def transfer_manually(self, s_path, t_path, mode):

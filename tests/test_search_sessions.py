@@ -225,6 +225,17 @@ class SearchSessionsTest(SearchSessionFixture):
         self.assertEqual(restored.find_download('task-99')['state'], 'accepted')
         self.assertIn(record['id'], restored.pending_download_sessions('web', limit=100))
 
+    def test_upgrade_shares_confirmed_receipt_with_older_inflight_copy(self):
+        ids = []
+        for state in ('submitting', 'accepted'):
+            item, _ = self.store.create(1, 1, '沙丘')
+            with self.store.edit(item['id']) as record:
+                record['downloads']['r1'] = dict(tag='nts-old', state=state, message=state)
+            ids.append(item['id'])
+        restored = self.store_type(self.directory.name)
+        for sid in ids:
+            self.assertEqual(restored.get(sid)['downloads']['r1']['state'], 'accepted')
+
 
 
 class TelegramSearchTest(SearchSessionFixture):
@@ -253,6 +264,30 @@ class TelegramSearchTest(SearchSessionFixture):
         self.assertNotEqual(record['id'], self.sid)
         self.assertEqual(record['state'], 'identifying')
         self.helper.start_thread.assert_called_once()
+
+    def test_douban_subject_resolves_before_library_lookup(self):
+        from app.media.douban import DouBan
+        candidate_data = {'type_name': MediaType.MOVIE.value, 'target': {
+            'title': '沙丘', 'year': '2021', 'id': '12345'}}
+        douban_type = DouBan.__closure__[0].cell_contents
+        douban = douban_type.__new__(douban_type)
+        douban.doubanapi = Mock()
+        douban.doubanapi.search.return_value = {'items': [candidate_data]}
+        candidate = douban.search_douban_medias('沙丘')[0]
+        with self.store.edit(self.sid) as record:
+            record.update(state='queued', selected=pack_media(candidate), view='results')
+        with patch('web.backend.telegram_search.Media') as resolver, patch('web.backend.telegram_search.Downloader') as dl:
+            resolver.return_value.get_media_info.return_value = None
+            with self.assertRaisesRegex(ValueError, 'TMDB'):
+                self.service.search(self.sid, 0)
+            dl.assert_not_called()
+            resolver.return_value.get_media_info.return_value = movie()
+            dl.return_value.check_exists_medias.return_value = (True, {}, [])
+            self.service.search(self.sid, 0)
+            resolved = dl.return_value.check_exists_medias.call_args.kwargs['meta_info']
+            self.assertEqual((resolved.douban_id, resolved.tmdb_id, resolved.tmdb_info['id']),
+                             ('12345', 438631, 438631))
+            resolver.return_value.get_media_info.assert_called_with(title='沙丘 (2021)', mtype=MediaType.MOVIE, strict=True)
 
     def test_identify_persists_real_sdk_candidates_with_and_without_year(self):
         from app.media import Media
@@ -586,6 +621,40 @@ class TelegramSearchTest(SearchSessionFixture):
         status = next(button for row in rows for button in row if button['text'] == '1 查看状态')
         self.assertEqual(_parse_callback(status['callback_data']), (self.sid, 0, 'status', None))
 
+    def test_concurrent_sessions_share_failure_retry_and_persisted_result(self):
+        rid = self.ready()
+        other, _ = self.store.create(1, 1, '沙丘 again')
+        with self.store.edit(other['id']) as record:
+            record.update(state='results', results={rid: pack_media(torrent())})
+        started, release = threading.Event(), threading.Event()
+        def busy(*args):
+            started.set()
+            self.assertTrue(release.wait(3))
+            return {'lookup_failed': True}
+        with patch('web.backend.telegram_search.Downloader') as factory, ThreadPoolExecutor(1) as pool:
+            downloader = factory.return_value
+            downloader.get_search_task_status.side_effect = busy
+            first = pool.submit(self.service.download, self.sid, 0, rid)
+            try:
+                self.assertTrue(started.wait(2))
+                self.service.download(other['id'], 0, rid)
+                self.assertEqual(self.store.get(other['id'])['downloads'][rid]['state'], 'submitting')
+            finally:
+                release.set()
+            first.result(2)
+            for sid in (self.sid, other['id']):
+                self.assertEqual(self.store.get(sid)['downloads'][rid]['state'], 'not_submitted')
+            downloader.get_search_task_status.side_effect = None
+            downloader.get_search_task_status.return_value = {}
+            downloader.check_exists_medias.return_value = (False, {}, [])
+            downloader.download.return_value = (True, '')
+            self.service.download(other['id'], 0, rid)
+            self.service.download(self.sid, 0, rid)
+            downloader.download.assert_called_once()
+            restored = self.store_type(self.directory.name)
+            for sid in (self.sid, other['id']):
+                self.assertEqual(restored.get(sid)['downloads'][rid]['state'], 'accepted')
+
     def test_uncertain_submission_is_not_retried_after_restart(self):
         rid = self.ready()
         downloader, client = self.make_submission_downloader()
@@ -889,11 +958,20 @@ class WebSearchReviewTest(SearchSessionFixture):
                                    data={'search_word': 'Dune', 'unident': '1'})
             self.assertEqual(response.status_code, 200)
             sid = response.get_json()['data']['search_id']
+            response = client.post('/api/v1/search/result', headers=headers)
+            self.assertEqual(response.get_json()['data']['total'], 1)
             response = client.post('/api/v1/search/result', headers=headers, json={'search_id': sid})
             self.assertEqual(response.get_json()['data']['total'], 1)
             response = client.post('/api/v1/download/search', headers=headers, data={'id': sid + ':0'})
             self.assertTrue(response.get_json()['success'])
+            searcher.return_value.search_medias.return_value = []
+            client.post('/api/v1/search/keyword', headers=headers, data={'search_word': 'Other', 'unident': '1'})
+            self.assertEqual(client.post('/api/v1/search/result', headers=headers).get_json()['data']['total'], 0)
+            self.assertEqual(client.post('/api/v1/search/result', headers=headers,
+                                         data={'search_id': sid}).get_json()['data']['total'], 1)
             user.username = 'bob'
+            response = client.post('/api/v1/search/result', headers=headers)
+            self.assertEqual(response.get_json()['data']['total'], 0)
             response = client.post('/api/v1/search/result', headers=headers, data={'search_id': sid})
             self.assertEqual(response.get_json()['data']['total'], 0)
             response = client.post('/api/v1/download/search', headers=headers, data={'id': sid + ':0'})

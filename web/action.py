@@ -3998,7 +3998,12 @@ class WebAction:
             res = []
             # Older message channels still link to the legacy table explicitly;
             # native web/Telegram sessions never write to that shared table.
-            if request.args.get('legacy') == '1' or not sid:
+            legacy = request.args.get('legacy') == '1'
+            if not sid and not legacy and (getattr(g, 'api_user', None) or getattr(g, 'api_key_authenticated', False)):
+                # Stateless API clients used to ask for the latest result without
+                # a search_id or cookie. Keep that lookup within the caller's namespace.
+                sid = SearchSessions().latest_web_search(self._search_owner())
+            elif legacy or not sid:
                 res = self.dbhelper.get_search_results()
                 sid = None
             if sid:
