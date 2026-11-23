@@ -245,7 +245,7 @@ class Downloader:
                     # The adapter's progress property rounds to two decimals;
                     # 100.00% can still have bytes left to write.
                     complete = torrent.left_until_done == 0 and not torrent.error and torrent.status not in {
-                        'checking', 'check_pending'}
+                        'checking', 'check pending'}
                 if complete:
                     continue
                 save_path = torrent.get('save_path') if kind == DownloaderType.QB else torrent.download_dir
@@ -598,7 +598,7 @@ class Downloader:
         if kind == DownloaderType.QB:
             task_id, progress = task.hash, float(task.progress)
         else:
-            task_id, progress = str(task.id), float(task.percent_done)
+            task_id, progress = str(task.id), float(task.percentDone)
         tags = str(task.tags or '').split(',') if kind == DownloaderType.QB else (task.labels or [])
         if '已整理' in [value.strip() for value in tags]:
             return {'task_id': task_id, 'state': 'organized', 'message': '下载与整理完成', 'progress': progress}

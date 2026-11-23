@@ -160,6 +160,10 @@ def search_medias_for_web(content, ident_flag=True, filters=None, tmdbid=None, m
                                               match_media=media_info,
                                               in_from=SearchType.WEB,
                                               search_context=search_context)
+    # Rank the complete result set before assigning snapshot IDs and applying its limit.
+    media_list = sorted(media_list, key=lambda item: (str(item.res_order).rjust(3, '0'),
+                                                       str(item.site_order).rjust(3, '0'),
+                                                       str(item.seeders).rjust(10, '0')), reverse=True)
     # Authenticated web searches own immutable resource IDs just like Telegram;
     # legacy callers keep their existing database contract.
     dbhepler = DbHelper()
@@ -179,9 +183,6 @@ def search_medias_for_web(content, ident_flag=True, filters=None, tmdbid=None, m
     else:
         log.info("【Web】共检索到 %s 个有效资源" % len(media_list))
         # 插入数据库
-        media_list = sorted(media_list, key=lambda x: "%s%s%s" % (str(x.res_order).rjust(3, '0'),
-                                                                  str(x.site_order).rjust(3, '0'),
-                                                                  str(x.seeders).rjust(10, '0')), reverse=True)
         if not search_id:
             dbhepler.insert_search_results(media_items=media_list,
                                            ident_flag=ident_flag,

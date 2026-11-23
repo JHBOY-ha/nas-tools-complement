@@ -1,7 +1,8 @@
 /* Subtitle task center: running/finished groups, friendly times, compact finished rows and the radius scale. */
-const {chromium} = require('playwright');
+const {firefox} = require('playwright');
 const fs = require('fs'), path = require('path'), assert = require('assert');
 const root = path.resolve(__dirname, '..');
+const evidenceDir = process.env.TEST_ARTIFACT_DIR || '/tmp/nas-tools-subtitle-task-center';
 
 const minutesAgo = minutes => new Date(Date.now() - minutes * 60000).toISOString();
 const daysAgoAt = (days, hours, minutes) => {
@@ -30,7 +31,7 @@ const tasks = [
 ];
 
 (async () => {
-  const browser = await chromium.launch({headless: true, ...(process.env.CHROME_PATH ? {executablePath: process.env.CHROME_PATH} : {})});
+  const browser = await firefox.launch({headless: true, ...(process.env.FIREFOX_PATH ? {executablePath: process.env.FIREFOX_PATH} : {})});
   try {
     for (const width of [1280, 390]) {
       const page = await browser.newPage({viewport: {width, height: 900}});
@@ -111,6 +112,8 @@ const tasks = [
       assert.ok(view.metaFirstOffset.every(offset => offset < 0), 'the leading separator of each line is clipped');
       assert.equal(view.overflow, false);
       assert.deepEqual(errors, []);
+      fs.mkdirSync(evidenceDir, {recursive: true});
+      await page.screenshot({path: path.join(evidenceDir, `task-center-${width}.png`)});
       await page.close();
     }
     console.log('Task center groups running and finished tasks with friendly times and the shared radius scale.');

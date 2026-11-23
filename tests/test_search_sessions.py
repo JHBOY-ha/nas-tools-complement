@@ -588,15 +588,13 @@ class TelegramSearchTest(SearchSessionFixture):
 
     def test_uncertain_submission_is_not_retried_after_restart(self):
         rid = self.ready()
-        downloader = Mock()
-        downloader.get_search_task_status.return_value = {}
-        downloader.check_exists_medias.return_value = (False, {}, [])
-        downloader.download.return_value = (None, 'timeout')
+        downloader, client = self.make_submission_downloader()
+        client.add_torrent.side_effect = TimeoutError('timeout')
         with patch('web.backend.telegram_search.Downloader', return_value=downloader):
             self.service.download(self.sid, 0, rid)
             self.service.store = self.store_type(self.directory.name)
             self.service.download(self.sid, 0, rid)
-        self.assertEqual(downloader.download.call_count, 1)
+        client.add_torrent.assert_called_once()
         self.assertEqual(self.service.store.get(self.sid)['downloads'][rid]['state'], 'unknown')
 
     def test_preferences_persist_per_user_and_do_not_mutate_other_search(self):
@@ -712,6 +710,36 @@ class TelegramSearchTest(SearchSessionFixture):
         self.assertEqual(downloader.batch_download.call_args.kwargs['need_tvs'], {})
         downloader.download.assert_not_called()
 
+    def test_retry_after_fetch_failure_stops_after_uncertain_submission(self):
+        for automatic in (False, True):
+            with self.subTest(automatic=automatic):
+                rid = self.ready([torrent(url=f'https://example.invalid/{automatic}.torrent')])
+                downloader, client = self.make_submission_downloader()
+                client.add_torrent.return_value = False
+                with patch('web.backend.telegram_search.Downloader', return_value=downloader), \
+                        patch('app.downloader.downloader.Torrent') as transport:
+                    transport.return_value.get_torrent_info.side_effect = [
+                        (None, None, '', [], '未下载到种子数据'), ('', b'torrent', '', [], '')]
+                    self.service.download(self.sid, 0, rid, automatic=automatic)
+                    self.assertEqual(self.store.get(self.sid)['downloads'][rid]['state'], 'not_submitted')
+                    client.add_torrent.assert_not_called()
+                    self.service.download(self.sid, 0, rid, automatic=automatic)
+                    self.assertEqual(self.store.get(self.sid)['downloads'][rid]['state'], 'unknown')
+                    self.service.download(self.sid, 0, rid, automatic=automatic)
+                    client.add_torrent.assert_called_once()
+
+    def test_transmission_tag_lookup_reports_unrounded_progress(self):
+        from transmission_rpc import Torrent
+        downloader = Downloader()
+        client = Mock()
+        with patch.object(downloader, 'get_download_setting', return_value={'downloader': 'TR'}), \
+                patch.object(downloader, '_Downloader__get_client', return_value=client):
+            for progress, state in ((0.99999, 'downloading'), (1.0, 'complete')):
+                task = Torrent(None, dict(id=7, percentDone=progress, labels=['nts-test']))
+                client.get_torrents.return_value = ([task], False)
+                result = downloader.get_search_task_status('nts-test', setting=1)
+                self.assertEqual((result['task_id'], result['progress'], result['state']), ('7', progress, state))
+
     def test_downloader_lookup_failure_never_triggers_submission(self):
         rid = self.ready()
         downloader = Mock()
@@ -780,16 +808,26 @@ class WebSearchIsolationTest(SearchSessionFixture):
 
     def test_web_search_persists_isolated_snapshot_without_deleting_legacy_results(self):
         from web.backend import search_torrents
+        from copy import copy
         item = torrent()
+        items = []
+        for index in range(501):
+            release = copy(item)
+            release.seeders = 501 - index
+            release.site_order = int(index == 499)
+            release.res_order = int(index == 500)
+            items.append(release)
         record, _ = self.store.create('alice', 'alice', '沙丘', channel='web')
         with patch('app.helper.search_sessions.SearchSessions', return_value=self.store), \
                 patch.object(search_torrents, 'Searcher') as searcher, \
                 patch.object(search_torrents, 'DbHelper') as db, \
                 patch.object(search_torrents, 'ProgressHelper'):
-            searcher.return_value.search_medias.return_value = [item]
+            searcher.return_value.search_medias.return_value = items
             code, _ = search_torrents.search_medias_for_web('沙丘', ident_flag=False, search_id=record['id'])
         self.assertEqual(code, 0)
-        self.assertEqual(len(self.store.get(record['id'])['results']), 1)
+        results = self.store.get(record['id'])['results']
+        self.assertEqual(len(results), 500)
+        self.assertEqual([results[str(i)]['seeders'] for i in (0, 1, 2, 499)], [1, 2, 501, 4])
         db.return_value.delete_all_search_torrents.assert_not_called()
         db.return_value.insert_search_results.assert_not_called()
 

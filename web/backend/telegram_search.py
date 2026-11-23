@@ -522,11 +522,13 @@ class TelegramSearch:
                     else:
                         result, _ = downloader.download(media, download_setting=setting, task_tag=tag,
                                                          before_submit=before_submit)
-                    operation.update(state='accepted' if result else 'unknown',
-                        message='已提交到下载器' if result else '提交状态待确认，请查询下载器后处理')
-                    # Confirmation is durable independently of later status
-                    # lookups. The existing poller (or status button) resolves
-                    # the task ID; a query failure must not undo acceptance.
+                    if result:
+                        operation.update(state='accepted', message='已提交到下载器')
+                    elif attempted:
+                        operation.update(state='unknown', message='提交状态待确认，请查询下载器后处理')
+                    else:
+                        # Downloader errors can include private tracker URLs. Keep the retry hint safe for chat.
+                        operation.update(state='not_submitted', message='尚未提交下载，请检查资源链接和下载设置后重试')
         except SearchCancelled:
             # A batch may already have submitted an earlier item. Keep that
             # receipt uncertain rather than allowing a duplicate submission.

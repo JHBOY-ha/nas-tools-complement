@@ -121,14 +121,19 @@ class EpisodeTransferGuardsTest(unittest.TestCase):
                     self.assertEqual(sync._need_sync_paths, {})
                     self.assertEqual(next(library.rglob('*.mkv')).read_bytes(), b'complete bytes')
             config.return_value.get_config.side_effect = lambda key: {'trhost': 'offline'} if key == 'transmission' else {}
-            task = SimpleNamespace(id=1, download_dir=str(self.root), progress=100,
-                                   left_until_done=1, status='stopped', error=0)
-            client.get_torrents.return_value = ([task], False)
+            from transmission_rpc import Torrent
             client.get_files.return_value = [SimpleNamespace(name=source.name)]
-            with self.assertRaises(DownloadNotReady):
-                downloader.check_monitored_files_complete([str(source)])
-            task.left_until_done = 0
-            downloader.check_monitored_files_complete([str(source)])
+            # RPC v14+ encodes queued verification as 1 and active verification as 2.
+            for status, remaining in ((0, 1), (1, 0), (2, 0), (6, 0)):
+                with self.subTest(status=status, remaining=remaining):
+                    task = Torrent(SimpleNamespace(rpc_version=17), dict(id=1, downloadDir=str(self.root),
+                                   percentDone=1, leftUntilDone=remaining, status=status, error=0))
+                    client.get_torrents.return_value = ([task], False)
+                    if status == 6:
+                        downloader.check_monitored_files_complete([str(source)])
+                    else:
+                        with self.assertRaises(DownloadNotReady):
+                            downloader.check_monitored_files_complete([str(source)])
 
             # Windows drive boundaries are normal non-membership, while a
             # same-drive member still has to wait for its torrent to finish.
