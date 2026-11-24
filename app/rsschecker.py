@@ -1,7 +1,9 @@
 import json
 import traceback
+from copy import deepcopy
 
 import jsonpath
+from cacheout import LRUCache
 from app.utils.scheduled_executor import SharedScheduledExecutor
 from apscheduler.schedulers.background import BackgroundScheduler
 from lxml import etree
@@ -46,6 +48,8 @@ class RssChecker(object):
         self.init_config()
 
     def init_config(self):
+        # 只复用本任务已确认在库的条目身份；重新加载订阅配置时一起失效。
+        self._library_matches = LRUCache(maxsize=256, ttl=24 * 3600)
         self.dbhelper = DbHelper()
         self.message = Message()
         self.searcher = Searcher()
@@ -209,38 +213,37 @@ class RssChecker(object):
                     continue
 
                 if taskinfo.get("uses") == "D":
-                    # 识别种子名称，开始检索TMDB
-                    media_info = MetaInfo(title=meta_name,
-                                          mtype=mediatype)
                     if taskinfo.get("recognization") == "Y":
-                        media_info = self.media.get_media_info(title=meta_name, mtype=mediatype)
+                        key = (taskinfo["id"], meta_name, mediatype, enclosure)
+                        cached = self._library_matches.get(key)
+                        # 下载路径会修改媒体对象；每轮独立检查当前库存，删集后仍可补下。
+                        media_info = (deepcopy(cached) if cached is not None else
+                                      self.media.get_media_info(title=meta_name, mtype=mediatype))
                         if not media_info or not media_info.tmdb_info:
                             log.warn("【RssChecker】%s 未匹配到有效媒体信息，保留待重试" % title)
                             continue
                         # 检查是否已存在
-                        if media_info.type == MediaType.MOVIE:
-                            exist_flag, no_exists, _ = self.downloader.check_exists_medias(meta_info=media_info,
-                                                                                           no_exists=no_exists)
-                            if exist_flag:
+                        exist_flag, no_exists, _ = self.downloader.check_exists_medias(meta_info=media_info,
+                                                                                       no_exists=no_exists)
+                        if exist_flag:
+                            if cached is None:
+                                self._library_matches.set(key, media_info)
+                            if media_info.type == MediaType.MOVIE:
                                 log.info("【RssChecker】电影 %s 已存在" % media_info.get_title_string())
-                                continue
-                        else:
-                            exist_flag, no_exists, _ = self.downloader.check_exists_medias(meta_info=media_info,
-                                                                                           no_exists=no_exists)
-                            if exist_flag is None:
-                                log.warn("【RssChecker】%s 季集信息未能确认，保留待重试" % title)
-                                continue
-                            # 当前剧集已存在，跳过
-                            if exist_flag:
-                                # 已全部存在
-                                if not no_exists or not no_exists.get(
-                                        media_info.tmdb_id):
-                                    log.info("【RssChecker】电视剧 %s %s 已存在" % (
-                                        media_info.get_title_string(), media_info.get_season_episode_string()))
-                                continue
-                            if no_exists.get(media_info.tmdb_id):
-                                log.info("【RssChecker】%s 缺失季集：%s"
-                                         % (media_info.get_title_string(), no_exists.get(media_info.tmdb_id)))
+                            elif not no_exists.get(media_info.tmdb_id):
+                                log.info("【RssChecker】电视剧 %s %s 已存在" % (
+                                    media_info.get_title_string(), media_info.get_season_episode_string()))
+                            continue
+                        if cached is not None:
+                            self._library_matches.delete(key)
+                        if exist_flag is None:
+                            log.warn("【RssChecker】%s 媒体库状态未能确认，保留待重试" % title)
+                            continue
+                        if no_exists.get(media_info.tmdb_id):
+                            log.info("【RssChecker】%s 缺失季集：%s"
+                                     % (media_info.get_title_string(), no_exists.get(media_info.tmdb_id)))
+                    else:
+                        media_info = MetaInfo(title=meta_name, mtype=mediatype)
                     # 大小及种子页面
                     media_info.set_torrent_info(size=size,
                                                 page_url=page_url,

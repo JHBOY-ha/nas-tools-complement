@@ -47,6 +47,7 @@ RECOGNITION_MODULES = (
     "tests.test_sync_reliability",
     "tests.test_download_dedupe",
     "tests.test_rss_prefilter",
+    "tests.test_custom_rss_recognition",
     "tests.test_media_cache_numbering",
     "tests.test_media_recognition_integrity",
     "tests.test_meta_parser_boundaries",
