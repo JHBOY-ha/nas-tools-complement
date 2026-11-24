@@ -398,6 +398,16 @@ class SubtitleBatchRepairTest(unittest.TestCase):
             enqueue.assert_not_called()
         self.assertEqual(self.db.query(SUBTITLETASK).count(), 0)
 
+    def test_page_refresh_requires_the_media_sync_permission(self):
+        with patch.object(self.web, 'MediaLibrary') as library:
+            self.user.pris = '资源搜索'
+            self.assertEqual(self.client.post('/library/refresh', json={'item_ids': ['1']}).status_code, 403)
+            library.assert_not_called()
+            self.user.pris = '媒体整理'
+            library.return_value.refresh_items.return_value = {'code': 0}
+            self.assertEqual(self.client.post('/library/refresh', json={'item_ids': ['1']}).get_json(), {'code': 0})
+            library.return_value.refresh_items.assert_called_once_with({'item_ids': ['1']})
+
     def test_batch_repairs_existing_track_and_reports_rejected_paths(self):
         from app.helper.subtitle_task_processors import register_subtitle_task_processors
         from tests.test_subtitle_tasks import SubtitleTaskManagerTest

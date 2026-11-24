@@ -89,12 +89,15 @@ const fixtures = JSON.parse(rendered.stdout);
     await confirmation.waitFor({state: 'visible'});
     assert.equal(await online.isVisible(), false);
     assert.match(await confirmation.innerText(), /一次账户下载配额/);
+    // Bootstrap activates its focus trap after the visible fade transition.
+    await page.waitForFunction(() => document.querySelector('#system-confirm-modal').contains(document.activeElement));
     await page.keyboard.press('Escape');
     await online.waitFor({state: 'visible'});
     assert.equal(downloads.length, 0);
     await page.waitForFunction(() => document.activeElement.classList.contains('library-online-download'));
     await page.getByRole('button', {name: '下载并保存', exact: true}).click();
     await confirmation.waitFor({state: 'visible'});
+    await page.waitForFunction(() => document.querySelector('#system-confirm-modal').contains(document.activeElement));
     await page.locator('#system_confirm_btn').click();
     await page.getByRole('button', {name: '已保存', exact: true}).waitFor();
     assert.equal(downloads.length, 1);

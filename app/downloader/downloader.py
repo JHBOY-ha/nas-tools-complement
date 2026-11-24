@@ -19,7 +19,7 @@ from app.utils.commons import singleton
 from app.utils.search_cancellation import SearchCancelled
 from app.utils.types import MediaType, DownloaderType, SearchType, RmtMode
 from app.utils.workload import TaskQueueFull
-from config import Config, PT_TAG, RMT_MEDIAEXT
+from config import Config, PT_TAG, RMT_MEDIAEXT, RMT_SUBEXT
 
 lock = Lock()
 client_lock = Lock()
@@ -581,7 +581,7 @@ class Downloader:
             tag = None
         return self.default_client.get_downloading_progress(tag=tag)
 
-    def get_search_task_status(self, tag, setting=None, site=None):
+    def get_search_task_status(self, tag, setting=None, site=None, *, coverage_media=None):
         """Resolve a search submission by its durable downloader tag, not title."""
         setting = setting or (self.sites.get_site_download_setting(site) if site else None)
         attributes = self.get_download_setting(setting or self.get_default_download_setting()) or {}
@@ -589,6 +589,8 @@ class Downloader:
         if kind not in (DownloaderType.QB, DownloaderType.TR):
             return {'message': '此下载器暂不支持按搜索标签查询，请在下载器核对'}
         client = self.__get_client(kind)
+        if not client:
+            return {'lookup_failed': True}
         tasks, failed = client.get_torrents(tag=tag)
         if failed:
             return {'lookup_failed': True}
@@ -601,11 +603,35 @@ class Downloader:
             task_id, progress = str(task.id), float(task.percentDone)
         tags = str(task.tags or '').split(',') if kind == DownloaderType.QB else (task.labels or [])
         if '已整理' in [value.strip() for value in tags]:
-            return {'task_id': task_id, 'state': 'organized', 'message': '下载与整理完成', 'progress': progress}
-        complete = progress >= 1
-        return {'task_id': task_id, 'state': 'complete' if complete else 'downloading',
-                'message': '下载完成，整理状态以整理通知为准' if complete else f'下载中 {progress * 100:.1f}%',
-                'progress': progress}
+            state, message = 'organized', '下载与整理完成'
+        elif progress >= 1:
+            state, message = 'complete', '下载完成，整理状态以整理通知为准'
+        else:
+            state, message = 'downloading', f'下载中 {progress * 100:.1f}%'
+        result = {'task_id': task_id, 'state': state, 'message': message, 'progress': progress}
+        if coverage_media is not None and len(tasks) == 1:
+            result['selected_episodes'] = self._selected_task_episodes(client, kind, task_id, coverage_media)
+        return result
+
+    def _selected_task_episodes(self, client, kind, task_id, media):
+        files = client.get_files(task_id)
+        if not files:
+            return None
+        if kind == DownloaderType.QB:
+            if any(item.get('priority') is None for item in files):
+                return None
+            names = [item['name'] for item in files if item['priority'] > 0]
+        else:
+            names = [item.name for item in files if item.selected]
+        videos = [name for name in names if os.path.splitext(name)[1].lower() in RMT_MEDIAEXT]
+        if names and not videos:
+            return None
+        recognized = self._get_torrent_file_episodes(videos, media)
+        # An unrecognized selected video can still cover part of the request.
+        # Report unknown rather than treating the readable subset as the whole task.
+        if len(recognized) != len(set(videos)):
+            return None
+        return sorted({number for values in recognized.values() for number in values})
 
     def get_torrents(self, torrent_ids):
         """
@@ -1105,46 +1131,35 @@ class Downloader:
         :param media_info: 已确认的种子作品及季集，用于将文件发布编号映射为正式编号
         :return: 返回选中的集的列表
         """
-        sucess_epidised = []
         seasons = media_info.get_season_list()
-        if len(seasons) != 1:
+        if len(seasons) != 1 or downloader not in (DownloaderType.TR, DownloaderType.QB):
             return []
         wanted = {(seasons[0], episode) for episode in need_episodes}
-        _client = self.__get_client(downloader)
+        client = self.__get_client(downloader)
+        files = client.get_files(tid)
+        if not files:
+            return []
+        names = [item.name if downloader == DownloaderType.TR else item.get("name") for item in files]
+        episode_map = self._get_torrent_file_episodes(names, media_info, include_subtitles=True)
+        # Only verified video contributes coverage. A matching subtitle (including
+        # both VobSub members) follows the selected episodes but cannot fill a gap.
+        selected = {name for name, episodes in episode_map.items()
+                    if os.path.splitext(name)[1].lower() in RMT_MEDIAEXT and set(episodes).issubset(wanted)}
+        covered = {number for name in selected for number in episode_map[name]}
+        if not covered:
+            return []
+        selected.update(name for name, episodes in episode_map.items() if set(episodes).issubset(covered))
+
         if downloader == DownloaderType.TR:
-            files_info = {}
-            torrent_files = _client.get_files(tid)
-            if not torrent_files:
+            selection = {index: {'priority': 'normal', 'selected': name in selected}
+                         for index, name in enumerate(names)}
+            if client.set_files(file_info={tid: selection}) is False:
                 return []
-            episode_map = self._get_torrent_file_episodes([item.name for item in torrent_files], media_info)
-            for file_id, torrent_file in enumerate(torrent_files):
-                episodes = episode_map.get(torrent_file.name, [])
-                selected = bool(episodes) and set(episodes).issubset(wanted)
-                if selected:
-                    sucess_epidised = list(set(sucess_epidised).union(episode for _, episode in episodes))
-                if not files_info.get(tid):
-                    files_info[tid] = {file_id: {'priority': 'normal', 'selected': selected}}
-                else:
-                    files_info[tid][file_id] = {'priority': 'normal', 'selected': selected}
-            if sucess_epidised and files_info:
-                if _client.set_files(file_info=files_info) is False:
-                    return []
-        elif downloader == DownloaderType.QB:
-            file_ids = []
-            torrent_files = _client.get_files(tid)
-            if not torrent_files:
+        else:
+            excluded = [item.get("index") for item in files if item.get("name") not in selected]
+            if excluded and client.set_files(torrent_hash=tid, file_ids=excluded, priority=0) is False:
                 return []
-            episode_map = self._get_torrent_file_episodes([item.get("name") for item in torrent_files], media_info)
-            for torrent_file in torrent_files:
-                episodes = episode_map.get(torrent_file.get("name"), [])
-                if not episodes or not set(episodes).issubset(wanted):
-                    file_ids.append(torrent_file.get("index"))
-                else:
-                    sucess_epidised = list(set(sucess_epidised).union(episode for _, episode in episodes))
-            if sucess_epidised and file_ids:
-                if _client.set_files(torrent_hash=tid, file_ids=file_ids, priority=0) is False:
-                    return []
-        return sucess_epidised
+        return sorted(episode for _, episode in covered)
 
     def get_download_list(self, media_list):
         """
@@ -1312,14 +1327,15 @@ class Downloader:
             if dict_type.name == type_name or dict_type.value == type_name:
                 return dict_type
 
-    def _get_torrent_file_episodes(self, file_names, media_info):
+    def _get_torrent_file_episodes(self, file_names, media_info, include_subtitles=False):
         """返回已核验的 (季, 集) 坐标；整季包里的番外不能补位正片。"""
         context = self._build_download_context(media_info)
         if not context or download_block_reason(media_info):
             return {}
         # 清单中的缺集号不能借单文件下载任务补齐，否则可能选错附件。
         context["allow_episode_fallback"] = False
-        names = [name for name in file_names if name and os.path.splitext(name)[1].lower() in RMT_MEDIAEXT]
+        extensions = RMT_MEDIAEXT + RMT_SUBEXT + ['.idx', '.sup'] if include_subtitles else RMT_MEDIAEXT
+        names = [name for name in file_names if name and os.path.splitext(name)[1].lower() in extensions]
         recognized = self.media.get_media_info_on_files(
             names, download_context=context, check_files=False)
         return {name: [(meta.begin_season, episode) for episode in meta.get_episode_list()]

@@ -606,6 +606,7 @@ class DbHelper:
         """
         self._db.query(TRANSFERBLACKLIST).delete()
         self._db.query(SYNCHISTORY).delete()
+        self._db.query(SYSTEMDICT).filter(SYSTEMDICT.TYPE == 'verified_disc').delete()
 
     @DbPersist(_db)
     def truncate_rss_history(self, ):

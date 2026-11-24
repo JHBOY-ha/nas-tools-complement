@@ -90,6 +90,11 @@ class MediaFileSubtitles:
                     or os.path.splitext(target)[1].lower() not in RMT_MEDIAEXT:
                 raise ValueError("整理历史中的媒体库目标不存在或不在已配置媒体库/同步目标目录内，未下载字幕")
             paths = {path: self._identity(path) for path in (media_file, target)}
+            mode = ModuleConf.get_enum_item(RmtMode, history.MODE) if history and history.MODE else None
+            # An upgraded cut can reuse the destination name. A link transfer
+            # still identifies this source only while both paths resolve to the same inode.
+            if mode in (RmtMode.LINK, RmtMode.SOFTLINK) and not os.path.samefile(media_file, target):
+                raise ValueError("整理历史中的媒体链接已被替换，请重新选择媒体文件")
 
             def guard():
                 if not self._inside_library(target, roots) \
@@ -112,7 +117,6 @@ class MediaFileSubtitles:
                 raise ValueError("下载已返回，但未找到对应字幕，未同步或刷新")
             guard()
             server = str(media_config.get("media_server") or "emby").lower()
-            mode = ModuleConf.get_enum_item(RmtMode, history.MODE) if history and history.MODE else None
             success, message, _result = subtitle.sync_downloaded_subtitle(
                 source, media_file, target, rmt_mode=mode, server_type=server,
                 path_guard_check=guard

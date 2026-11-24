@@ -10,7 +10,13 @@ def promote_bracket_title(title, release_group=None):
     # still use the legacy group-name markers.
     known_group = match and (re.search(r"字幕组|字幕組|TSDM", match[1], re.I)
         or (release_group and match[1][1:-1].strip().casefold() == str(release_group).strip().casefold()))
-    if (known_group and "[" not in match[2] and re.search(r"[\u4e00-\u9fffA-Za-z]", match.group(2))
+    # A bare number needs independent episode evidence. An ascending pair
+    # such as [12][13] can be two episode labels rather than a numeric title.
+    numeric_title = False
+    if known_group and re.fullmatch(r"[1-9]\d{0,2}", match[2]):
+        episode = re.match(r"\s*\[(EP?)?(\d{1,4})(?:v\d+)?\]", title[match.end():], re.I)
+        numeric_title = bool(episode and (episode[1] or int(episode[2]) < int(match[2])))
+    if (known_group and "[" not in match[2] and (numeric_title or re.search(r"[\u4e00-\u9fffA-Za-z]", match[2]))
             and not re.fullmatch(r"国漫|日漫|美漫|动漫|动画|电影|电视剧|综艺|国剧|韩剧|日剧|美剧|简体|繁体", match[2])
             # Completion blocks describe episodes, even though END contains letters.
             and not re.fullmatch(r"\s*\d{1,4}[\s_]*(?:END|FIN(?:AL|ALE)?|COMPLETE)\s*", match[2], re.I)

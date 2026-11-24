@@ -441,6 +441,32 @@ class DatabaseReviewFixTest(DatabaseCase):
                 server.get_sync_item = lambda _server, item_id: dict(id=item_id, type='Movie', title='Latest')
                 self.assertEqual(library.refresh_items({'item_ids': ['second']})['updated'], 1)
 
+    def test_overlapping_page_refresh_cannot_overwrite_the_newer_commit(self):
+        from app.library import MediaLibrary
+        with self.sync_context() as (_, _, store):
+            store.insert('emby', dict(id='second', type='Movie', title='Original'))
+            library = MediaLibrary.__new__(MediaLibrary)
+            server = Mock()
+            library.media_server, library.mediadb = server, store
+            server.get_type.return_value = NS(value='emby')
+            server.is_syncing.return_value = False
+            server.get_sync_generation.return_value = 0
+            server.begin_incremental_write.return_value = True
+
+            def first_page(_server, item_id):
+                if item_id == 'second':
+                    # Another page commits its newer version of the first item
+                    # while the original request is still reading the second.
+                    with patch.object(server, 'get_sync_item', return_value=dict(id='old', type='Movie', title='Latest')):
+                        self.assertEqual(library.refresh_items({'item_ids': ['old']})['updated'], 1)
+                return dict(id=item_id, type='Movie', title='Earlier')
+
+            server.get_sync_item.side_effect = first_page
+            self.assertEqual(library.refresh_items({'item_ids': ['old', 'second']})['code'], -1)
+            with sqlite3.connect(self.db.path) as connection:
+                self.assertEqual(dict(connection.execute('SELECT ITEM_ID, TITLE FROM MEDIASYNC_ITEMS')),
+                                 {'old': 'Latest', 'second': 'Original'})
+
     def test_sync_capacity_or_statistics_failure_preserves_rows_and_progress(self):
         with self.sync_context() as (sync, receiver, store):
             for failure in (patch.object(self.db.managed, '_check_capacity', side_effect=DatabaseBusy('full')),

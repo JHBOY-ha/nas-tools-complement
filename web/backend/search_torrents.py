@@ -13,7 +13,7 @@ from app.searcher import Searcher
 from app.sites import Sites
 from app.subscribe import Subscribe
 from app.utils import StringUtils, Torrent
-from app.utils.types import SearchType, IndexerType
+from app.utils.types import SearchType
 from config import Config
 from web.backend.web_utils import WebUtils
 
@@ -190,6 +190,18 @@ def search_medias_for_web(content, ident_flag=True, filters=None, tmdbid=None, m
         return 0, ""
 
 
+def parse_message_search_options(query):
+    """从标题中移除独立的站点和下载设置词；同一站点可同时用于检索和订阅。"""
+    words = query.split()
+    rss_sites = [site["name"] for site in Sites().get_sites(rss=True) if site.get("name") in words]
+    search_sites = [name for name in Indexer().get_indexer_names() if name in words]
+    profiles = [profile for profile in Downloader().get_download_setting().values()
+                if profile.get("name") in words]
+    options = set(rss_sites + search_sites + [profile["name"] for profile in profiles])
+    title = " ".join(word for word in words if word not in options)
+    return title, rss_sites, search_sites, profiles[0]["id"] if profiles else None
+
+
 def search_media_by_message(input_str, in_from: SearchType, user_id, user_name=None):
     """
     输入字符串，解析要求并进行资源检索
@@ -330,37 +342,7 @@ def search_media_by_message(input_str, in_from: SearchType, user_id, user_name=N
 
         # 搜索或订阅
         else:
-            # 获取字符串中可能的RSS站点列表
-            rss_sites, content = StringUtils.get_idlist_from_string(input_str,
-                                                                    [{
-                                                                        "id": site.get("name"),
-                                                                        "name": site.get("name")
-                                                                    } for site in Sites().get_sites(rss=True)])
-
-            # 索引器类型
-            indexer_type = Indexer().get_client_type()
-            indexers = Indexer().get_indexers()
-
-            # 获取字符串中可能的搜索站点列表
-            if indexer_type == IndexerType.BUILTIN:
-                content = input_str
-                search_sites, _ = StringUtils.get_idlist_from_string(input_str, [{
-                    "id": indexer.name,
-                    "name": indexer.name
-                } for indexer in indexers])
-            else:
-                search_sites, content = StringUtils.get_idlist_from_string(content, [{
-                    "id": indexer.name,
-                    "name": indexer.name
-                } for indexer in indexers])
-
-            # 获取字符串中可能的下载设置
-            download_setting, content = StringUtils.get_idlist_from_string(content, [{
-                "id": dl.get("id"),
-                "name": dl.get("name")
-            } for dl in Downloader().get_download_setting().values()])
-            if download_setting:
-                download_setting = download_setting[0]
+            content, rss_sites, search_sites, download_setting = parse_message_search_options(input_str)
 
             # 识别媒体信息，列出匹配到的所有媒体
             log.info("【Web】正在识别 %s 的媒体信息..." % content)

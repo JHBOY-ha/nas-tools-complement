@@ -645,10 +645,10 @@ function refresh_library_items() {
             : `已更新 ${ret.updated || 0} 项，${ret.unchanged || 0} 项无变化`;
       }
     },
-    error: function () {
+    error: function (xhr) {
       if (!is_current_view()) { return; }
       library_refresh_notice = "服务器信息未更新，当前显示上次同步的数据";
-      show_fail_modal("网络错误");
+      show_fail_modal(xhr.status === 403 ? "需要媒体整理权限才能刷新服务器信息。" : "网络错误");
     },
     complete: function () {
       library_refreshing = false;
@@ -1344,8 +1344,12 @@ function repair_library_page() {
           if (!current()) return;
           view.repairBusy = false;
           button.prop("disabled", false);
-          status.text(xhr && xhr.status === 403 ? "需要媒体整理权限才能修复字幕。" :
-              "未能确认提交结果，请查看任务中心。可在本页重试。");
+          if (xhr && xhr.status === 503 && xhr.responseJSON && xhr.responseJSON.retryable) {
+            status.text(xhr.responseJSON.msg);
+          } else {
+            status.text(xhr && xhr.status === 403 ? "需要媒体整理权限才能修复字幕。" :
+                "未能确认提交结果，请查看任务中心。可在本页重试。");
+          }
         }
         library_post_json("/library/subtitle/repair/batch", {items: payloads}, function (response) {
           if (!current()) return;

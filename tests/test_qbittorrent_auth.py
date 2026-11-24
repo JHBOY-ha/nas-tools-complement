@@ -188,6 +188,15 @@ class ConnectionTests(unittest.TestCase):
         self.assertIs(wrapper.qbc, self.client)
         self.assertEqual(wrapper.ver, "v5.2.3.10")
 
+    def test_tag_lookup_reconnects_after_failed_initial_login(self):
+        self.client.auth_log_in.side_effect = [qbittorrentapi.LoginFailed(), None]
+        wrapper = self.module.Qbittorrent(self.config)
+        self.assertIsNone(wrapper.qbc)
+        self.client.torrents_info.return_value = [{'hash': 'existing'}]
+        self.assertEqual(wrapper.get_torrents(tag='nts-test'), ([{'hash': 'existing'}], False))
+        self.client.torrents_info.assert_called_once_with(torrent_hashes=None, status_filter=None, tag='nts-test')
+        self.client.torrents_add.assert_not_called()
+
     def test_login_failure(self):
         self.client.auth_log_in.side_effect = qbittorrentapi.LoginFailed()
         wrapper = self.module.Qbittorrent(self.config)

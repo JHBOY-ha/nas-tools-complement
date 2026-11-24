@@ -51,7 +51,7 @@ python3 -m tests.run_recognition tests.test_media_identity_matrix
 
 手动集数的格式、范围顺序和偏移后非负性在识别/转移前检查；合法负偏移和第 0 集继续可用，不因普通人工集号未被 TMDB 收录而强制拒绝。目录空筛选结果按实际首个排除原因汇总路径、后缀、定位或区间、大小；监控空目录继续正常跳过，下载整理及扫描故障继续失败。字幕回归区分有待恢复凭据的失败任务与完整历史且无凭据的已完成任务，后者不重复字幕或历史写入。
 
-已知片名解析缺口（未知发布组作片名、纯数字括号片名、中文季范围、中英文连写目录名）保留在 `tests/test_recognition_naming_gaps.py`，不在默认入口中，需单独运行：`python3 -m tests.run_recognition tests.test_recognition_naming_gaps`。
+常规识别测试还覆盖带发布组后缀的括号命名、带独立集号的纯数字括号片名、中文季范围和中英文连写目录名。可用 `python3 -m tests.run_recognition tests.test_recognition_naming_gaps` 单独运行这些样例。
 
 原始 `tests/cases/meta_cases.py` 有 61 条非空命名样例，期望类型为电影 17 条、电视剧 44 条。新增矩阵的同义格式变体用于检验规则一致性；它们和 unittest 方法数都不是独立真实作品数量。第三方 anitopy 的已知失败样例不计入本项目通过率。
 

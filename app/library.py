@@ -352,12 +352,15 @@ class MediaLibrary:
 
         # Keep only scalar values across the remote calls. End the read snapshot
         # here so a slow server cannot pin a pooled SQLite connection.
-        with self.mediadb.read_snapshot():
-            rows = {str(row.ITEM_ID): (row.SERVER, {
+        def read_rows(ids):
+            return {str(row.ITEM_ID): (row.SERVER, {
                 "library": row.LIBRARY, "type": row.ITEM_TYPE, "title": row.TITLE,
                 "originalTitle": row.ORGIN_TITLE, "year": row.YEAR, "tmdbid": row.TMDBID,
                 "imdbid": row.IMDBID, "path": row.PATH, "json": row.JSON
-            }) for row in self.mediadb.find_items(server_type=server_type, item_ids=item_ids)}
+            }) for row in self.mediadb.find_items(server_type=server_type, item_ids=ids)}
+
+        with self.mediadb.read_snapshot():
+            rows = read_rows(item_ids)
         changes = []
         unchanged = failed = 0
         # Network reads happen one at a time and outside any lock or transaction.
@@ -387,6 +390,12 @@ class MediaLibrary:
             try:
                 staged = sum(len(str(fresh.get("json") or "")) for _, fresh in changes)
                 with self.mediadb.write_transaction(required_bytes=staged * 4):
+                    # Two page refreshes may read concurrently within one full-sync
+                    # generation. Check only the rows we will replace, under the writer lock.
+                    changed_ids = [str(fresh['id']) for _, fresh in changes]
+                    current_rows = read_rows(changed_ids)
+                    if any(current_rows.get(item_id) != rows[item_id] for item_id in changed_ids):
+                        raise DatabaseWriteError("其他刷新已更新本页项目，请重试")
                     for stored_server, fresh in changes:
                         if self.mediadb.insert(stored_server, fresh) is False:
                             raise DatabaseWriteError("媒体项目刷新写入失败")

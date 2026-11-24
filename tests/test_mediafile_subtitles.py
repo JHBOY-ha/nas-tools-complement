@@ -127,6 +127,21 @@ class MediaFileSubtitlesTest(TestCase):
         self.assertEqual(list(self.library.glob("*.srt")), [self.expected_subtitle()])
         self.assertEqual(self.refresh.call_count, 2)
 
+    def test_jellyfin_source_label_is_reused_without_taking_a_sibling_movies_subtitle(self):
+        sibling = self.source.with_suffix('.OtherRelease.mkv')
+        sibling.touch()
+        sibling.with_suffix('.chi.zh-cn.srt').write_text(SRT.replace('测试', '其他版本'))
+        language_edition = self.source.with_name(self.source.stem.lower() + '.EN.mkv')
+        language_edition.touch()
+        self.source.with_suffix('.EN.zh-cn.srt').write_text(SRT.replace('测试', '其他语言版本'))
+        self.assertIsNone(self.subtitle.find_downloaded_subtitle(self.item))
+        named = self.source.with_suffix('.YYeTs.chi.zh-cn.srt')
+        named.write_text(SRT)
+        success, message = self.run_download()
+        self.assertTrue(success, message)
+        self.assertEqual(self.expected_subtitle().read_text(), SRT)
+        self.subtitle.opensubtitles.download.assert_not_called()
+
     def test_preserves_different_subtitle_and_reuses_numbered_output(self):
         existing = self.expected_subtitle()
         existing.write_text(SRT.replace("测试", "已有"))
@@ -294,6 +309,17 @@ class MediaFileSubtitlesTest(TestCase):
         self.assertIn("发生变化", message)
         self.assertTrue(self.source_subtitle.is_file())
         self.assertFalse(list(self.library.glob("*.srt")))
+        self.refresh.assert_not_called()
+
+    def test_replaced_historical_media_link_is_rejected_before_download(self):
+        self.target.unlink()
+        self.target.write_bytes(b'new cut')
+        for mode in (RmtMode.LINK, RmtMode.SOFTLINK):
+            self.history.MODE = mode.value
+            with self.subTest(mode=mode):
+                self.assertFalse(self.run_download()[0])
+        self.subtitle.opensubtitles.download.assert_not_called()
+        self.assertFalse(self.expected_subtitle().exists())
         self.refresh.assert_not_called()
 
     def test_candidates_are_preserved_until_user_selects_one(self):

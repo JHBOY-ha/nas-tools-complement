@@ -53,7 +53,7 @@ class MetaAnime(MetaBase):
             grouped = re.match(r"^(\[[^\]]+\])\s*\[([^\]]+)\]", title)
             promoted = promote_bracket_title(title, release_group=group_for_title) != title
             title = self.__prepare_title(title, release_group=group_for_title)
-            if grouped and promoted and re.search(r"\s+\d{1,3}$", grouped[2].strip()):
+            if grouped and promoted and re.search(r"(?:^|\s)\d{1,3}$", grouped[2].strip()):
                 # A numeric suffix inside a title block is not the separate EP
                 # block. Mask only that title while anitopy reads the other fields.
                 parse_title = title.replace(grouped[1] + " " + grouped[2], grouped[1] + " NASTOOL_TITLE", 1)

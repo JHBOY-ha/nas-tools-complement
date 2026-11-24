@@ -97,6 +97,10 @@ class Qbittorrent(_IDownloadClient):
         获取种子列表
         return: 种子列表, 是否发生异常
         """
+        # Search checks the durable task tag before submitting. A failed initial
+        # login must recover on this read before a download can reach add_torrent.
+        if not self.qbc:
+            self.connect()
         if not self.qbc:
             return [], True
         try:

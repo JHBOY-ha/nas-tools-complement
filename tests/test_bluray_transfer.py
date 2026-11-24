@@ -223,6 +223,42 @@ class BlurayTransferTest(unittest.TestCase):
         self.assertTrue(ok, message)
         self.assert_complete(self.destination)
 
+    def test_unchanged_monitored_disc_skips_bytes_and_followups_but_detects_changes(self):
+        self.assertTrue(self.run_transfer(in_from=SyncType.MON)[0])
+        stream = self.destination / 'BDMV/STREAM/00001.m2ts'
+        with patch.object(get_io_pool('bulk'), 'execute', side_effect=AssertionError('unexpected byte comparison')):
+            self.assertTrue(self.run_transfer(in_from=SyncType.MON)[0])
+        self.transfer.message.send_transfer_movie_message.assert_called_once()
+        self.transfer.threadhelper.start_thread.assert_called_once()
+        (self.source / 'new-sidecar.txt').write_text('new')
+        self.assertTrue(self.run_transfer(in_from=SyncType.MON)[0])
+        self.assertEqual((self.destination / 'new-sidecar.txt').read_text(), 'new')
+        stamp = stream.stat()
+        stream.write_bytes(b'other')
+        os.utime(stream, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+        self.assertFalse(self.run_transfer(in_from=SyncType.MON)[0])
+        self.assertEqual(self.transfer.message.send_transfer_movie_message.call_count, 2)
+
+    def test_clearing_transfer_cache_discards_monitor_fingerprint(self):
+        from app.helper import DictHelper
+        self.assertTrue(self.run_transfer(in_from=SyncType.MON)[0])
+        self.assertTrue(DictHelper().get('verified_disc', str(self.source)))
+        self.transfer.dbhelper.truncate_transfer_blacklist()
+        self.assertFalse(DictHelper().get('verified_disc', str(self.source)))
+        self.assertTrue(self.run_transfer(in_from=SyncType.MON)[0])
+        self.assertEqual(self.transfer.message.send_transfer_movie_message.call_count, 2)
+
+    def test_flat_batch_checks_each_disc_parent_once(self):
+        directory = self.root / 'movies'
+        directory.mkdir()
+        files = [directory / ('Arrival.2016.1080p.%s.mkv' % i) for i in range(30)]
+        for file in files:
+            file.touch()
+        with patch('app.utils.path_utils.os.listdir', wraps=os.listdir) as listdir:
+            result = self.catalog.media.get_media_info_on_files([str(file) for file in files])
+        self.assertEqual(len(result), len(files))
+        self.assertEqual([call.args for call in listdir.call_args_list].count((str(directory),)), 1)
+
     def test_hardlink_and_softlink_keep_sources(self):
         for mode in (RmtMode.LINK, RmtMode.SOFTLINK):
             with self.subTest(mode=mode):
@@ -306,6 +342,93 @@ class BlurayTransferTest(unittest.TestCase):
         ok, _ = self.run_transfer(RmtMode.MOVE)
         self.assertFalse(ok)
         self.assertEqual(source.read_bytes(), b'other')
+
+    def test_move_keeps_sources_if_target_replaced_during_commit(self):
+        stream = 'BDMV/STREAM/00001.m2ts'
+        replacement = self.root / 'replacement'
+        replacement.write_bytes(b'other')
+        save = self.transfer.dbhelper.insert_transfer_history
+
+        def replace(*args, **kwargs):
+            result = save(*args, **kwargs)
+            os.replace(replacement, self.destination / stream)
+            return result
+
+        with patch.object(self.transfer.dbhelper, 'insert_transfer_history', side_effect=replace):
+            self.assertFalse(self.run_transfer(RmtMode.MOVE)[0])
+        self.assert_complete(self.source)
+        self.assertFalse(self.run_transfer(RmtMode.MOVE)[0])
+        self.assertEqual((self.source / stream).read_bytes(), self.contents[stream])
+
+    def test_old_receipt_rechecks_surviving_bytes_without_remaining_disc_index(self):
+        from app.media.meta.bluray_cleanup import disc_fingerprint
+        from config import Config
+        with patch('app.media.meta.bluray_cleanup.finish_cleanup', side_effect=PermissionError('interrupted')):
+            self.assertFalse(self.run_transfer(RmtMode.MOVE)[0])
+        folder = Path(Config().get_config_path()) / 'bluray-cleanup'
+        receipt = next(p for p in folder.glob('*.json') if json.loads(p.read_text())['source'] == str(self.source))
+        record = json.loads(receipt.read_text())
+        del record['target_root']
+        (self.source / 'BDMV/index.bdmv').unlink()
+        relative = 'BDMV/STREAM/00001.m2ts'
+        target = self.destination / relative
+        target.unlink()
+        target.write_bytes(b'other')
+        wrong = target.stat()
+        # Previous versions sampled target fingerprints after the history commit.
+        record['targets'][str(target)] = disc_fingerprint(target)
+        receipt.write_text(json.dumps(record))
+        self.assertFalse(self.run_transfer(RmtMode.MOVE)[0])
+        self.assertEqual((self.source / relative).read_bytes(), self.contents[relative])
+        target.write_bytes(self.contents[relative])
+        os.utime(target, ns=(wrong.st_atime_ns, wrong.st_mtime_ns))
+        self.assertTrue(self.run_transfer(RmtMode.MOVE)[0])
+        self.assertFalse(self.source.exists())
+
+    def test_recovery_rejects_target_parent_redirected_to_same_source_inode(self):
+        with patch('app.media.meta.bluray_cleanup.finish_cleanup', side_effect=PermissionError('interrupted')):
+            self.assertFalse(self.run_transfer(RmtMode.MOVE)[0])
+        stream_dir = self.destination / 'BDMV/STREAM'
+        shutil.rmtree(stream_dir)
+        stream_dir.symlink_to(self.source / 'BDMV/STREAM', target_is_directory=True)
+        self.assertTrue(os.path.samefile(stream_dir / '00001.m2ts', self.source / 'BDMV/STREAM/00001.m2ts'))
+        self.assertFalse(self.run_transfer(RmtMode.MOVE)[0])
+        self.assert_complete(self.source)
+
+    def test_legacy_compare_rechecks_both_pathnames_before_unlink(self):
+        from config import Config
+        relative = 'BDMV/STREAM/00001.m2ts'
+        source, target = self.source / relative, self.destination / relative
+        with move_copy_fallback(source), patch('app.media.meta.bluray_cleanup.finish_cleanup',
+                                               side_effect=PermissionError('interrupted')):
+            self.assertFalse(self.run_transfer(RmtMode.MOVE)[0])
+        receipts = Path(Config().get_config_path()) / 'bluray-cleanup'
+        receipt = next(p for p in receipts.glob('*.json') if json.loads(p.read_text())['source'] == str(self.source))
+        record = json.loads(receipt.read_text())
+        del record['target_root'], record['sources']
+        receipt.write_text(json.dumps(record))
+        (self.source / 'BDMV/index.bdmv').unlink()
+        bulk = get_io_pool('bulk')
+        compare = bulk.execute
+        for victim in (source, target):
+            with self.subTest(victim=victim):
+                backup = self.root / 'original'
+                os.link(victim, backup)
+                replacement = self.root / 'replacement'
+                replacement.write_bytes(b'other')
+
+                def swap_after_read(operation, **kwargs):
+                    result = compare(operation, **kwargs)
+                    if operation == 'compare' and kwargs['source'] == str(source):
+                        os.replace(replacement, victim)
+                    return result
+
+                with patch.object(bulk, 'execute', side_effect=swap_after_read):
+                    self.assertFalse(self.run_transfer(RmtMode.MOVE)[0])
+                self.assertTrue(source.is_file())
+                self.assertEqual(victim.read_bytes(), b'other')
+                os.replace(backup, victim)
+        self.assertTrue(self.run_transfer(RmtMode.MOVE)[0])
 
     def test_source_changes_during_publication_are_not_acknowledged(self):
         calls = []
@@ -595,6 +718,7 @@ class BlurayNormalizationTest(unittest.TestCase):
                            if json.loads(path.read_text())['source'] == str(pack))
             record = json.loads(receipt.read_text())
             del record['sources']
+            del record['target_root']
             receipt.write_text(json.dumps(record))
         self.assertTrue(self.run_transfer(RmtMode.MOVE)[0])
         self.assertFalse(pack.exists())

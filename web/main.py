@@ -486,10 +486,13 @@ def load_user(user_id):
     try:
         return User().get(user_id)
     except OperationalError as error:
-        # 普通账号由 SQLite 加载。身份尚未核实时，不能接收取消请求。
-        if request.endpoint == "subtitle_task_cancel" and is_database_contention(error):
-            abort(make_response({"code": -1, "cancel_retryable": True,
-                                 "msg": "数据库繁忙，暂时无法核验账号"}, 503, {"Retry-After": "5"}))
+        # 身份查询先于取消和修复入队；此处遇锁时，整个请求仍可安全重试。
+        if request.endpoint in ("subtitle_task_cancel", "library_subtitle_repair", "library_subtitle_repair_batch") \
+                and is_database_contention(error):
+            body = {"code": -1, "retryable": True, "msg": "数据库繁忙，暂时无法核验账号，请稍后重试"}
+            if request.endpoint == "subtitle_task_cancel":
+                body["cancel_retryable"] = True
+            abort(make_response(body, 503, {"Retry-After": "5"}))
         raise
 
 

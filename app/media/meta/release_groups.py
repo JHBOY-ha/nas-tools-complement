@@ -93,7 +93,8 @@ class ReleaseGroupsMatcher(object):
         if not label:
             return False
         text = str(label).strip()
-        if re.search(r"字幕组|字幕組|(?:^|[ &_-])(?:group|subs?|raws|studio|team)(?:$|[ &_-])", text, re.I):
+        if (re.search(r"字幕组|字幕組|(?:^|[ &_-])(?:group|subs?|raws|studio|team)(?:$|[ &_-])", text, re.I)
+                or re.search(r"[a-z0-9](?:Subs?|Raws)$", text)):
             return True
         try:
             return bool(self.match(title="[%s]" % text))

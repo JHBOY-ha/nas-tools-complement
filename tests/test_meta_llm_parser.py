@@ -457,6 +457,21 @@ class LLMMetaParserTest(TestCase):
         self.assertIn("external_candidates", user_prompt)
         self.assertTrue(result.get("candidate_verified"))
 
+    def test_bangumi_outage_preserves_tmdb_context_and_llm_result(self):
+        self.parser._search_context_enable = True
+        candidate = {"id": 11, "name": "Dune", "type": "movie"}
+        client = Mock()
+        client.complete_text.return_value = '{"type":"movie","en_name":"Dune","tmdb_id":11,"tmdb_type":"movie"}'
+        with patch.object(self.parser, "_LLMMetaParser__get_client", return_value=client), \
+                patch.object(self.parser, "_LLMMetaParser__search_tmdb_candidates", return_value=[candidate]), \
+                patch("app.media.meta.llm_parser.RequestUtils") as http:
+            http.return_value.get_res.return_value = None
+            result = self.parser.parse("Dune 2021", mtype_hint=MediaType.MOVIE)
+        self.assertTrue(result.get("candidate_verified"))
+        self.assertEqual(11, result["tmdb_id"])
+        self.assertIn("Dune", client.complete_text.call_args.kwargs["user_prompt"])
+        http.return_value.get_res.assert_called_once()
+
     def test_parse_should_extract_tmdb_id(self):
         result = self.parser._LLMMetaParser__normalize_result({
             "type": "anime",

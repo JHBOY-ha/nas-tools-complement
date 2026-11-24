@@ -49,6 +49,7 @@ const episodes = [
       movie(23, {subtitle_audit_status: 'warning', can_upload: false, target_path: ''}),
       movie(24, {subtitle_audit_status: 'warning'}), movie(25, {subtitle_audit_status: 'error'})];
     let loseBatchReceipt = true;
+    let authBusy = true;
     let repairStatus = 'running', gonePolls = 0;
     page.on('pageerror', error => errors.push(error.message));
     await page.route('http://library.test/**', async route => {
@@ -91,6 +92,10 @@ const episodes = [
       if (url.pathname === '/library/subtitle/repair/batch') {
         const body = route.request().postDataJSON();
         requests.push({path: url.pathname, body});
+        if (authBusy) {
+          authBusy = false;
+          return route.fulfill({status: 503, json: {code: -1, retryable: true, msg: '数据库繁忙，暂时无法核验账号，请稍后重试'}});
+        }
         if (loseBatchReceipt) {
           loseBatchReceipt = false;
           return route.abort('connectionfailed');
@@ -219,12 +224,16 @@ const episodes = [
     await batch.click();
     await page.locator('#system_confirm_btn').click();
     const batchStatus = page.locator('#library_repair_page_status');
+    await page.waitForFunction(() => document.querySelector('#library_repair_page_status').textContent.includes('无法核验账号'));
+    await batch.click();
+    await page.locator('#system_confirm_btn').click();
     await page.waitForFunction(() => document.querySelector('#library_repair_page_status').textContent.includes('未能确认'));
     await batch.click();
     await page.locator('#system_confirm_btn').click();
     await page.waitForFunction(() => document.querySelector('#library_repair_page_status').textContent.includes('等待队列已满'));
-    assert.equal(batchCalls().length, 2);
+    assert.equal(batchCalls().length, 3);
     assert.deepEqual(batchCalls()[0].body, batchCalls()[1].body);
+    assert.deepEqual(batchCalls()[0].body, batchCalls()[2].body);
     assert.deepEqual(batchCalls()[0].body.items.map(i => i.server_item_id), ['m21', 'm22', 'm24', 'm25']);
     assert.equal(new Set(batchCalls()[0].body.items.map(i => i.request_id)).size, 4);
     await page.waitForFunction(() => document.querySelector('#library_repair_page_status').textContent.includes('结果已不可查询 1 部'));
@@ -244,7 +253,7 @@ const episodes = [
     await batch.click();
     await page.locator('#system_confirm_btn').click();
     await page.waitForFunction(() => document.querySelector('#library_repair_page_status').textContent.includes('已完成 1 部'));
-    assert.deepEqual(batchCalls()[2].body.items, [batchCalls()[0].body.items[3]]);
+    assert.deepEqual(batchCalls()[3].body.items, [batchCalls()[0].body.items[3]]);
     await page.setViewportSize({width: 1280, height: 900});
     await page.locator('[data-library-subtitle="all"]').click();
     await settled();

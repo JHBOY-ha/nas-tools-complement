@@ -1,6 +1,7 @@
 """Offline regressions for title boundaries and episode evidence precedence."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from app.downloader.downloader import Downloader
@@ -106,6 +107,27 @@ class MetaParserBoundaryTest(unittest.TestCase):
         client.get_files.return_value = [{'name': name, 'index': index} for index, name in enumerate(names)]
         with patch.object(downloader, '_Downloader__get_client', return_value=client):
             self.assertEqual(downloader.set_files_status('torrent', [2], DownloaderType.QB, media), [])
+
+    def test_selected_video_carries_its_subtitles_without_counting_subtitle_only_episodes(self):
+        downloader = object.__new__(type(Downloader()))
+        fixture = FakeTmdb(self)
+        fixture.tv(42, "Show", seasons={0: 3, 1: 12})
+        downloader.media = fixture.media
+        media = fixture.media.get_media_info("Show S01")
+        names = ["Show.S01E03.mkv", "Show.S01E03.zh.srt", "Show.S01E03.sub", "Show.S01E03.idx",
+                 "Show.S01E04.en.srt", "Show.S00E03.ass", "Show.S01E05.mkv", "Show.S01E03.txt"]
+        for kind in (DownloaderType.QB, DownloaderType.TR):
+            with self.subTest(kind=kind):
+                client = MagicMock()
+                client.get_files.return_value = ([dict(index=i, name=name) for i, name in enumerate(names)]
+                    if kind == DownloaderType.QB else [SimpleNamespace(name=name) for name in names])
+                with patch.object(downloader, "_Downloader__get_client", return_value=client):
+                    self.assertEqual(downloader.set_files_status("torrent", [3, 4], kind, media), [3])
+                if kind == DownloaderType.QB:
+                    self.assertEqual(client.set_files.call_args.kwargs['file_ids'], [4, 5, 6, 7])
+                else:
+                    selected = client.set_files.call_args.kwargs['file_info']['torrent']
+                    self.assertEqual([i for i, item in selected.items() if item['selected']], [0, 1, 2, 3])
 
     def test_latin_title_digits_are_not_season_or_episode_markers(self):
         for name, year in (("Case39", "2009"), ("Cars24", "2020"), ("Sense80", "2021")):

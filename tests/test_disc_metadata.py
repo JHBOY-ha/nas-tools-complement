@@ -342,6 +342,22 @@ class DvdTransferTest(unittest.TestCase):
                     self.assert_complete(self.source)
         self.assertFalse(self.source.exists())
 
+    def test_dvd_move_keeps_real_tree_when_source_root_is_symlink(self):
+        actual = self.source.rename(self.root / 'real-source')
+        self.source.symlink_to(actual, target_is_directory=True)
+        self.assertFalse(self.run_transfer(RmtMode.MOVE)[0])
+        self.assertTrue(self.source.is_symlink())
+        self.assert_complete(actual)
+        self.assert_unrecorded()
+
+    def test_unrecognized_dvd_move_keeps_disc_together_for_manual_retry(self):
+        self.source = self.source.rename(self.root / 'Unidentified.Movie.2017.DVD')
+        unknown = self.root / 'unknown'
+        unknown.mkdir()
+        self.assertFalse(self.run_transfer(RmtMode.MOVE, unknown_dir=str(unknown))[0])
+        self.assert_complete(self.source)
+        self.assertEqual(list(unknown.iterdir()), [])
+
     def test_numbered_dvd_and_mixed_sets_do_not_enqueue_bluray_subtitles(self):
         for prefix, mixed in (('DVD', False), ('Disc', True)):
             for mode in (RmtMode.COPY, RmtMode.MOVE):

@@ -9,6 +9,15 @@ from app.helper import ProgressHelper
 from app.utils.types import SearchType
 
 
+def media_search_filters(media_info, sites):
+    """各片名轮次必须使用同一作品、季集和站点约束。"""
+    seasons = media_info.get_season_list() if media_info.begin_season is not None else None
+    episodes = media_info.get_episode_list()
+    return {"season": [1] if episodes and not seasons else seasons,
+            "episode": episodes, "year": media_info.year, "type": media_info.type,
+            "site": sites, "seeders": True}
+
+
 class Searcher:
     downloader = None
     media = None
@@ -81,22 +90,7 @@ class Searcher:
         # 进度计数重置
         if not search_only:
             self.progress.start('search')
-        # 查找的季
-        if media_info.begin_season is None:
-            search_season = None
-        else:
-            search_season = media_info.get_season_list()
-        # 查找的集
-        search_episode = media_info.get_episode_list()
-        if search_episode and not search_season:
-            search_season = [1]
-        # 过滤条件
-        filter_args = {"season": search_season,
-                       "episode": search_episode,
-                       "year": media_info.year,
-                       "type": media_info.type,
-                       "site": sites,
-                       "seeders": True}
+        filter_args = media_search_filters(media_info, sites)
         if filters:
             filter_args.update(filters)
         # 两轮共用局部上下文，复用片名并跳过已搜索的站点/关键词组合。

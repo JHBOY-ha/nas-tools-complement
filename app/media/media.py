@@ -2539,6 +2539,7 @@ class Media:
         # FileTransfer, so do not rely solely on its optional hint.
         disc_paths = {path for path in file_list
                       if check_files and os.path.isdir(path) and PathUtils.get_disc_dir(path)}
+        disc_parents = {}
         file_list = sorted(file_list, key=lambda path: (bool(fractions[path] or specials[path]), bool(fractions[path])))
         fractional_cache = {}
         task_identities = {}
@@ -2625,10 +2626,15 @@ class Media:
                 parent_name = os.path.basename(os.path.dirname(file_path))
                 parent_parent_name = os.path.basename(PathUtils.get_parent_paths(file_path, 2))
                 # 过滤掉 BDMV / VIDEO_TS 原盘内部文件，整理入口应先归一化为根目录。
-                if check_files and not os.path.isdir(file_path) \
-                        and PathUtils.get_disc_dir(file_path):
-                    log.info("【Meta】%s 跳过原盘内部文件：" % file_path)
-                    continue
+                if check_files and not os.path.isdir(file_path) and os.path.exists(file_path):
+                    # Disc-set detection lists the directory. Sibling episodes
+                    # share this result for one recognition batch.
+                    directory = os.path.dirname(file_path) or os.curdir
+                    if directory not in disc_parents:
+                        disc_parents[directory] = PathUtils.get_disc_dir(directory)
+                    if disc_parents[directory]:
+                        log.info("【Meta】%s 跳过原盘内部文件：" % file_path)
+                        continue
                 # 没有自带TMDB信息
                 if not tmdb_info:
                     # 识别名称

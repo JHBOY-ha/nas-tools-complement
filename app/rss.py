@@ -153,9 +153,6 @@ class Rss:
                             continue
                         elif not media_info.tmdb_info:
                             log.info(f"【Rss】{title} 识别为 {media_info.get_name()} 未匹配到TMDB媒体信息")
-                        # 缺集清单使用 TMDB 编号，必须先完成与转移相同的季集映射。
-                        if self.__should_skip_identified_rss_article(media_info, site_name, rss_tvs):
-                            continue
                         # 大小及种子页面
                         media_info.set_torrent_info(size=size,
                                                     page_url=page_url,
@@ -482,6 +479,11 @@ class Rss:
                     # 匹配季，季可以为空
                     if season and season != media_info.get_season_string():
                         continue
+                    # 缺集清单只约束本条订阅；同一作品的其他精确或模糊规则仍可匹配。
+                    if self.__should_skip_identified_rss_article(media_info, rss_info):
+                        match_msg.append("%s %s 不在订阅 %s 的缺失集" % (
+                            media_info.org_string, media_info.get_season_episode_string(), rid))
+                        continue
                 # 模糊匹配
                 else:
                     # 匹配季，季可以为空
@@ -649,54 +651,15 @@ class Rss:
         except Exception:
             return []
 
-    def __should_skip_identified_rss_article(self, media_info, site_name, rss_tvs):
-        """只用已确认的作品身份和正式季集与订阅缺集比较。"""
-        if (not rss_tvs or not media_info.tmdb_id or media_info.type == MediaType.MOVIE
+    def __should_skip_identified_rss_article(self, media_info, rss_info):
+        """比较已匹配订阅的缺集清单和本条资源经映射的正式集号。"""
+        if (rss_info.get("fuzzy_match") or rss_info.get("over_edition")
+                or media_info.type == MediaType.MOVIE or not media_info.tmdb_id
+                or str(rss_info.get("tmdbid")) != str(media_info.tmdb_id)
                 or download_block_reason(media_info)):
             return False
-
-        matched_rss_infos = [
-            rss_info for _, rss_info in rss_tvs.items()
-            if not rss_info.get("fuzzy_match")
-            and str(rss_info.get("tmdbid")) == str(media_info.tmdb_id)
-            and (not rss_info.get("rss_sites") or site_name in rss_info["rss_sites"])
-        ]
-        if not matched_rss_infos:
+        episodes = media_info.get_episode_list()
+        if not episodes:
             return False
-
-        title_episodes = media_info.get_episode_list()
-        if not title_episodes:
-            return False
-        title_episode_set = set(title_episodes)
-        title_seasons = media_info.get_season_list()
-        title_season_set = set(title_seasons)
-
-        comparable = False
-        for rss_info in matched_rss_infos:
-            if rss_info.get("over_edition"):
-                return False
-
-            rss_season = rss_info.get("season")
-            if rss_season not in (None, ""):
-                try:
-                    rss_season = int(str(rss_season).replace("S", ""))
-                except Exception:
-                    rss_season = None
-                if rss_season is not None and rss_season not in title_season_set:
-                    continue
-
-            need_episodes = self.__get_subscribe_tv_episode_list(rss_info)
-            if not need_episodes:
-                return False
-            comparable = True
-            if title_episode_set.intersection(set(need_episodes)):
-                return False
-
-        if comparable:
-            log.info("【Rss】%s %s 不在订阅缺失集，跳过下载匹配" % (
-                media_info.org_string,
-                media_info.get_season_episode_string()
-            ))
-            return True
-
-        return False
+        missing = self.__get_subscribe_tv_episode_list(rss_info)
+        return bool(missing) and set(episodes).isdisjoint(missing)

@@ -1,4 +1,6 @@
 import argparse
+import hashlib
+import json
 import os
 import random
 import re
@@ -334,7 +336,7 @@ class FileTransfer:
         return 0
 
     def __transfer_disc_dir(self, file_path, new_path, rmt_mode, record_callback, cleanup_receipts,
-                            media, file_name):
+                            media, file_name, monitor):
         """
         转移 BDMV / VIDEO_TS 原盘；元数据和整盘校验成功后才能确认完成
         :param file_path: 原路径
@@ -343,12 +345,17 @@ class FileTransfer:
         :param record_callback: 整盘校验后提交历史及去重记录；成功才允许清理源目录
         :param cleanup_receipts: 由整批转移确认完成后清除的目录清理回执
         :param file_name: 旧版 NFO 的模板文件名，不含媒体文件扩展名
+        :param monitor: 为保留源文件的目录同步识别重复扫描
+        :return: 此次完成了发布或验证；已确认未变化的监控原盘返回 False，免发后续通知
         """
         if rmt_mode not in (RmtMode.COPY, RmtMode.MOVE, RmtMode.LINK, RmtMode.SOFTLINK):
             # Remote commands have no locally verifiable destination. In particular,
             # a successful moveto/mc mv cannot authorize deleting the original disc.
             raise ValueError("原盘远程转移暂不支持完整性校验，请使用本地复制、移动或链接")
         from app.media.meta.bluray_cleanup import disc_fingerprint
+        if rmt_mode == RmtMode.MOVE and os.path.islink(file_path):
+            # os.walk follows its starting directory even with followlinks=False.
+            raise ValueError("原盘源目录是软链接，保留真实目录")
         source_root, target_root = os.path.realpath(file_path), os.path.realpath(new_path)
         if (PathUtils.is_path_in_path(source_root, target_root)
                 or PathUtils.is_path_in_path(target_root, source_root)):
@@ -399,10 +406,28 @@ class FileTransfer:
             originals, directories = snapshot()
             if not originals:
                 raise ValueError("原盘目录为空，保留源目录")
-            for directory in directories:
-                os.makedirs(os.path.join(new_path, directory), exist_ok=True)
             targets = {source: os.path.join(new_path, os.path.relpath(source, file_path))
                        for source in originals}
+
+            def monitor_signature():
+                # Persist only a digest. A replaced target, new disc member,
+                # changed destination or scraper setting requires normal verification.
+                paths = set(originals) | set(targets.values()) | nfo_paths
+                identities = {path: (os.path.islink(path), disc_fingerprint(path, include_ctime=True))
+                              for path in paths if os.path.isfile(path)}
+                existing_dirs = sorted(d for d in directories if os.path.isdir(os.path.join(new_path, d)))
+                evidence = [sorted(directories), identities, existing_dirs, new_path,
+                            rmt_mode.name, media.tmdb_id, self._scraper_flag, self._scraper_nfo, self._scraper_pic]
+                return hashlib.sha256(json.dumps(evidence, sort_keys=True).encode()).hexdigest()
+
+            if monitor:
+                from app.helper import DictHelper
+                monitor_key = os.path.abspath(file_path)
+                if (self.dbhelper.is_transfer_in_blacklist(file_path)
+                        and DictHelper().get('verified_disc', monitor_key) == monitor_signature()):
+                    return False
+            for directory in directories:
+                os.makedirs(os.path.join(new_path, directory), exist_ok=True)
             for source, target in targets.items():
                 if os.path.lexists(target):
                     verify(source, target)
@@ -414,43 +439,37 @@ class FileTransfer:
                 # index.bdmv / VIDEO_TS.IFO) until the whole disc is verified.
                 publish_exclusive(source, target, rmt_mode, self.__transfer_command,
                                   lambda: True, retain_source=True)
-            for source, target in targets.items():
-                verify(source, target)
+            if movie_disc and self._scraper_flag:
+                self.scraper.ensure_disc_movie_nfo(
+                    media, (self._scraper_nfo or {}).get('movie') or {}, new_path)
+            # Capture the source and destination state being verified, before
+            # any record commit. A later replacement must invalidate this evidence.
+            signature = monitor_signature() if monitor else None
+            verified_targets = {}
             if movie_disc:
                 for path in nfo_paths:
+                    if rmt_mode == RmtMode.MOVE and os.path.dirname(path) == new_path and os.path.isfile(path):
+                        verified_targets[path] = disc_fingerprint(path)
                     validate_movie_nfo(path, media.tmdb_id)
-                if self._scraper_flag:
-                    self.scraper.ensure_disc_movie_nfo(
-                        media, (self._scraper_nfo or {}).get('movie') or {}, new_path)
+            for source, target in targets.items():
+                if rmt_mode == RmtMode.MOVE and target not in verified_targets:
+                    verified_targets[target] = disc_fingerprint(target)
+                verify(source, target)
             if snapshot() != (originals, directories):
                 raise ValueError("原盘源文件在转移期间变化，保留源目录等待重试")
             from app.db.main_db import MainDb
             with MainDb().write_transaction():
                 if record_callback() is not True:
                     raise ValueError("原盘转移记录未确认，保留源目录等待重试")
+                if monitor and DictHelper().set('verified_disc', monitor_key, signature) is False:
+                    raise ValueError("原盘同步记录未确认")
             if rmt_mode == RmtMode.MOVE:
-                from app.media.meta.bluray_cleanup import save_cleanup
-                # Include generated NFOs in restart evidence even when the source
-                # did not contain them; metadata failure must never authorize cleanup.
-                metadata_paths = [path for path in nfo_paths
-                                  if os.path.dirname(path) == new_path and os.path.isfile(path)]
-                receipt = save_cleanup(file_path, originals, list(targets.values()) + metadata_paths)
+                from app.media.meta.bluray_cleanup import finish_cleanup, save_cleanup
+                receipt, record = save_cleanup(file_path, originals, new_path, verified_targets)
                 cleanup_receipts[os.path.abspath(file_path)] = receipt
-                # Leave the disc recognizable as long as possible. Recovery uses
-                # the receipt even if some indexes of a numbered set are gone.
-                for source in sorted(originals, key=lambda path: os.path.basename(path).lower()
-                                     in ('index.bdmv', 'video_ts.ifo')):
-                    # Committing history and saving the receipt can wait on I/O.
-                    # The source path may now name a different file.
-                    if disc_fingerprint(source) != originals[source]:
-                        raise ValueError('原盘源文件在清理前发生变化，保留文件：%s' % source)
-                    os.unlink(source)
-                # Remove only verified entries; a newly arrived file must survive.
-                for directory in sorted(directories - {os.curdir}, key=len, reverse=True):
-                    os.rmdir(os.path.join(file_path, directory))
-                os.rmdir(file_path)
+                finish_cleanup(record)
         log.info("【Rmt】文件 %s %s完成" % (file_path, rmt_mode.value))
-        return 0
+        return True
 
     def is_target_dir_path(self, path):
         """
@@ -937,6 +956,10 @@ class FileTransfer:
                     failed_count += 1
                     if error_message not in alert_messages and is_need_insert_unknown:
                         alert_messages.append(error_message)
+                    if disc_root:
+                        # The generic unknown-folder publisher handles individual
+                        # files. A disc must remain intact for manual identification.
+                        continue
                     # 原样转移过去
                     if unknown_dir:
                         log.warn("【Rmt】%s 按原文件名转移到未识别目录：%s" % (file_name, unknown_dir))
@@ -1147,18 +1170,9 @@ class FileTransfer:
                     disc_file_name = os.path.basename(ret_file_path or 'movie')
                     if file_exist_flag:
                         disc_file_name = os.path.splitext(disc_file_name)[0]
-                    ret = self.__transfer_disc_dir(file_item, ret_dir_path, rmt_mode, record_disc, cleaned,
-                                                   media, disc_file_name)
-                    if ret != 0:
-                        success_flag = False
-                        error_message = "原盘目录转移失败，错误码：%s" % ret
-                        self.progress.update(ptype="filetransfer", text=error_message)
-                        if udf_flag:
-                            return __finish_transfer(success_flag, error_message)
-                        failed_count += 1
-                        alert_count += 1
-                        if error_message not in alert_messages:
-                            alert_messages.append(error_message)
+                    if not self.__transfer_disc_dir(file_item, ret_dir_path, rmt_mode, record_disc, cleaned,
+                                                    media, disc_file_name,
+                                                    monitor=in_from == SyncType.MON and rmt_mode != RmtMode.MOVE):
                         continue
                 else:
                     # 开始转移文件

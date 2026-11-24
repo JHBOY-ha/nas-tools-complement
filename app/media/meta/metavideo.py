@@ -85,6 +85,12 @@ class MetaVideo(MetaBase):
         title = re.sub(r'[0-9.]+\s*[MGT]i?B(?![A-Z]+)', "", title, flags=re.IGNORECASE)
         # 把年月日去掉
         title = re.sub(r'\d{4}[\s._-]\d{1,2}[\s._-]\d{1,2}', "", title)
+        # Keep a Chinese range intact for init_subtitle(original_title); splitting
+        # on its hyphen would otherwise turn the first endpoint into a title.
+        title = re.sub(r"第\s*[0-9一二三四五六七八九十]+\s*-\s*[0-9一二三四五六七八九十]+\s*季", " ", title)
+        # Bilingual release folders sometimes join a numbered Chinese title to
+        # the first word of a multi-word English title without any separator.
+        title = re.sub(r"([\u4e00-\u9fff]\d+)(?=[A-Z][a-z]+[. _-]+[A-Za-z]{2,}\b)", r"\1 ", title)
         # 拆分tokens
         # Tokens 会拆掉 +；以可识别 token 保护 HDR10+，解析后恢复标记。
         title = re.sub(r"(?i)(?<![A-Z0-9])HDR10\+(?![A-Z0-9])", "HDR10PLUS", title)
@@ -200,7 +206,7 @@ class MetaVideo(MetaBase):
                 name = None
             elif self.is_in_episode(int(name)) and not self.begin_season:
                 name = None
-        return self.normalize_release_version_suffix(name)
+        return self.normalize_release_version_suffix(name) or None
 
     @staticmethod
     def __valid_written_number(token, following):

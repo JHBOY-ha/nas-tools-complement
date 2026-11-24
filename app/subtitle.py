@@ -2427,20 +2427,34 @@ class Subtitle:
         media_dir = os.path.dirname(media_base) or "."
         media_name = os.path.basename(media_base)
         wanted = set(self.opensubtitles.languages if languages is None else languages)
+        # Jellyfin writes e.g. "fre" for an OpenSubtitles preference of "fr".
+        wanted.update({self._jellyfin_iso639_2[code] for code in wanted if code in self._jellyfin_iso639_2})
         if "ze" in wanted:
             wanted.add("zh-cn")
         try:
-            # Stream directory entries so a matching subtitle can stop the
-            # traversal immediately without materializing every media filename.
+            # Track only possible siblings and subtitles of this movie in a single scan.
             with os.scandir(media_dir) as entries:
                 return self.__find_opensubtitles_target(entries, media_name, wanted, language_evidence)
         except OSError:
             return None
 
     def __find_opensubtitles_target(self, entries, media_name, wanted, language_evidence):
+        candidates = []
+        sibling_stems = set()
+        media_prefix = media_name.casefold() + "."
+        aliases = {"eng": "en", "english": "en",
+                   "zh-hans": "zh-cn", "chs": "zh-cn", "cn": "zh-cn",
+                   "zh-hant": "zh-tw", "cht": "zh-tw", "tw": "zh-tw",
+                   "ze": "zh-cn"}
+        # Bilingual tracks may carry language tags outside the user's preference.
+        tags = (set(aliases) | set(aliases.values()) | wanted | set(self._jellyfin_iso639_2)
+                | set(self._jellyfin_iso639_2.values()) | {
+                    'zh', 'chi', 'zho', 'chinese', 'forced', 'default', 'sdh', 'cc', 'hi', 'full'})
         for entry in entries:
             file_name = entry.name
             stem, extension = os.path.splitext(file_name)
+            if extension.lower() in RMT_MEDIAEXT and stem.casefold().startswith(media_prefix) and entry.is_file():
+                sibling_stems.add(stem.casefold())
             if extension.lower() not in RMT_SUBEXT or not (
                     stem == media_name or stem.startswith("%s." % media_name)):
                 continue
@@ -2450,24 +2464,18 @@ class Subtitle:
             # Inspect language tags after the media name, never the title itself.
             suffix = stem[len(media_name):].lower().replace("_", "-")
             # Emby appends collision numbers to the language tag (zh-CN(1)).
-            tokens = {re.sub(r"\([0-9]+\)$", "", token)
-                      for token in suffix.strip(".").split(".")}
-            aliases = {"eng": "en", "english": "en",
-                       "zh-hans": "zh-cn", "chs": "zh-cn", "cn": "zh-cn",
-                       "zh-hant": "zh-tw", "cht": "zh-tw", "tw": "zh-tw",
-                       "ze": "zh-cn"}
-            # Only language/accessibility/collision tags may follow the exact
-            # video stem. A release suffix such as Extended belongs to another cut.
-            # A bilingual subtitle can include languages outside the user's
-            # download preference. Reuse the supported ISO code table for tags.
-            tags = (set(aliases) | set(aliases.values()) | wanted | set(self._jellyfin_iso639_2)
-                    | set(self._jellyfin_iso639_2.values()) | {
-                        'zh', 'chi', 'zho', 'chinese', 'forced', 'default', 'sdh', 'cc', 'hi', 'full'})
-            if stem != media_name and any(
-                    token not in tags and not re.fullmatch(r'source-\d+', token) for token in tokens):
+            tokens = [re.sub(r"\([0-9]+\)$", "", token) for token in suffix.strip(".").split(".")]
+            # Jellyfin permits one source label before the language. Editorial
+            # cuts remain distinct even if their video has since been moved.
+            if stem != media_name and tokens[0] not in tags:
+                from app.media.meta.release_version import clean_cut_tokens
+                source = tokens.pop(0)
+                if not re.fullmatch(r'[\w-]{1,32}(?:-\d{1,3})?', source) or clean_cut_tokens(source) != source:
+                    continue
+            if stem != media_name and any(token not in tags for token in tokens):
                 continue
             languages = {aliases.get(token, token) for token in tokens}
-            if not languages.intersection({"zh-cn", "zh-tw"}) and tokens.intersection(
+            if not languages.intersection({"zh-cn", "zh-tw"}) and languages.intersection(
                     {"zh", "chi", "zho", "chinese"}):
                 languages.update({"zh-cn", "zh-tw"})
             if stem == media_name:
@@ -2476,6 +2484,13 @@ class Subtitle:
                 inferred = self.__infer_subtitle_language(target).lower()
                 languages = {aliases.get(inferred, inferred)}
             if languages.intersection(wanted):
+                if stem == media_name:
+                    return target
+                candidates.append((stem.casefold(), target))
+        # A sibling's stem can end in a language (Movie.EN.mkv) or a group name.
+        # It takes precedence even when its directory entry comes after the subtitle.
+        for stem, target in candidates:
+            if not any(stem == video or stem.startswith(video + ".") for video in sibling_stems):
                 return target
         return None
 

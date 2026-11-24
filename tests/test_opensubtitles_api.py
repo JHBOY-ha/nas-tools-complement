@@ -583,6 +583,15 @@ class OpenSubtitlesApiTest(TestCase):
             Path(str(base) + ".chi.zh-tw.srt").write_text("字幕", encoding="utf-8")
             self.assertIsNone(subtitle._Subtitle__existing_opensubtitles_target({"file": str(base)}))
 
+    def test_numbered_jellyfin_source_track_uses_the_configured_language(self):
+        subtitle = self._subtitle()
+        subtitle.opensubtitles.languages = ["fr"]
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory) / "Movie"
+            existing = base.with_suffix(".Equipe-2.fre.srt")
+            existing.touch()
+            self.assertEqual(subtitle.find_downloaded_subtitle({"file": str(base)}), str(existing))
+
     def test_non_chinese_download_keeps_language_suffix(self):
         subtitle = self._subtitle()
         self.assertEqual("Movie.en.srt", subtitle._Subtitle__subtitle_target({"file": "Movie"}, "en"))

@@ -16,13 +16,14 @@ from app.helper.search_sessions import ACTIVE_SEARCH_STATES, PENDING_DOWNLOAD_ST
 from app.indexer import Indexer
 from app.media import Media
 from app.message import Message
-from app.searcher import Searcher
+from app.searcher import Searcher, media_search_filters
 from app.subscribe import Subscribe
 from app.utils.commons import singleton
 from app.utils.search_cancellation import SearchCancelled, search_cancellation
 from app.utils.types import MediaType, SearchType
 from app.utils.workload import TaskQueueFull
 from config import Config
+from web.backend.search_torrents import parse_message_search_options
 from web.backend.web_utils import WebUtils
 from web.backend.telegram_search_view import PAGE_SIZE, render_search_message, visible_results
 
@@ -191,7 +192,21 @@ class TelegramSearch:
         self.publish(sid)
         if cancel.is_set():
             return
-        candidates = WebUtils.search_media_infos(record['query'], page=page)
+        if 'lookup_query' in record:
+            title, rss_sites = record['lookup_query'], record['rss_sites']
+        else:
+            title, rss_sites, sites, setting = parse_message_search_options(record['query'])
+            with self.store.edit(sid) as current:
+                if cancel.is_set() or current['epoch'] != epoch or current['state'] != 'identifying':
+                    return
+                # Text options override saved defaults for this session only. Store the
+                # cleaned title once so later candidate pages use the same query.
+                current.update(lookup_query=title, rss_sites=rss_sites)
+                if sites:
+                    current['preferences']['sites'] = sites
+                if setting is not None:
+                    current['preferences']['setting'] = setting
+        candidates = WebUtils.search_media_infos(title, page=page) if title and not cancel.is_set() else []
         with self.store.edit(sid) as current:
             if cancel.is_set() or current['epoch'] != epoch or current['state'] != 'identifying':
                 return
@@ -202,6 +217,7 @@ class TelegramSearch:
                 key = (media.type, media.tmdb_id, media.douban_id, media.title, media.year)
                 if key not in known:
                     known.add(key)
+                    media.rss_sites = rss_sites
                     incoming.append(pack_media(media))
             incoming = incoming[:max(0, 100 - len(current['candidates']))]
             current['candidates'].extend(incoming)
@@ -419,9 +435,9 @@ class TelegramSearch:
             self.publish(sid)
         context = {'cancel_event': cancel, 'on_progress': progress}
         searcher = Searcher()
-        searcher.search_one_media(media, SearchType.TG, no_exists,
-                                   sites=record['preferences']['sites'] or media.search_sites,
-                                   search_context=context, search_only=True)
+        sites = record['preferences']['sites'] or media.search_sites
+        searcher.search_one_media(media, SearchType.TG, no_exists, sites=sites,
+                                  search_context=context, search_only=True)
         # Use only provider-backed alternative names, only after no valid
         # result, and retain the same dispatch context to avoid repeat calls.
         if not context.get('results') and not cancel.is_set():
@@ -445,9 +461,8 @@ class TelegramSearch:
             for alias in names[:2]:
                 if cancel.is_set():
                     break
-                found = searcher.search_medias(alias, {'year': media.year, 'type': media.type,
-                    'site': record['preferences']['sites'], 'seeders': True}, media, SearchType.TG,
-                    search_context=context)
+                found = searcher.search_medias(alias, media_search_filters(media, sites), media, SearchType.TG,
+                                              search_context=context)
                 if found or cancel.is_set():
                     break
         progress([], context.get('report', {}), flush=True)
@@ -459,14 +474,65 @@ class TelegramSearch:
         if cancel.is_set():
             return
         settings = Config().get_config('pt')
-        if settings.get('search_no_result_rss') and not self.store.get(sid)['results']:
-            self.subscribe(sid)
-        if settings.get('search_auto', True):
-            items = [unpack_media(value) for _, value in visible_results(self.store.get(sid))]
-            # Reuse the existing ranking and select only after all rounds.
+        results = self.store.get(sid)
+        incomplete = not results['results']
+        if settings.get('search_auto', True) and results['results']:
+            items = [unpack_media(value) for _, value in visible_results(results)]
+            # batch_download removes accepted episode coverage from this same missing list.
+            accepted = False
+            pending = []
             for item in downloader.get_download_list(items):
-                self.download(sid, epoch, resource_key(item), automatic=True, no_exists=no_exists)
+                if cancel.is_set():
+                    return
+                outcome = self.download(sid, epoch, resource_key(item), automatic=True, no_exists=no_exists)
+                if outcome == 'accepted':
+                    accepted = True
+                elif outcome != 'not_submitted':
+                    pending.append(item)
+            incomplete = not accepted or bool(no_exists)
+            if pending and settings.get('search_no_result_rss') and not cancel.is_set():
+                incomplete = self._check_pending_coverage(sid, media, no_exists, pending, downloader, cancel)
+        if incomplete and settings.get('search_no_result_rss') and not cancel.is_set():
+            self.subscribe(sid)
 
+    def _check_pending_coverage(self, sid, media, remaining, pending, downloader, cancel):
+        # These receipts predate this batch or have an uncertain outcome. A pack
+        # can have just one video selected, even after the downloader reports 100%.
+        missing = {(entry['season'] if entry['season'] is not None else 1, episode)
+                   for entry in remaining.get(media.tmdb_id, [])
+                   for episode in (entry['episodes'] or range(1, entry['total_episodes'] + 1))}
+        receipts = self.store.get(sid)['downloads']
+        possible = set()
+        for item in pending:
+            if not missing or cancel.is_set():
+                return False
+            receipt = receipts.get(resource_key(item))
+            seasons, episodes = set(item.get_season_list()), set(item.get_episode_list())
+            scope = {(s, e) for s, e in missing if s in seasons and (not episodes or e in episodes)}
+            if not scope:
+                continue
+            if receipt and receipt['state'] == 'exists':
+                missing.difference_update(scope)
+                continue
+            coverage = None
+            if receipt and receipt['state'] != 'submitting':
+                try:
+                    status = downloader.get_search_task_status(receipt['tag'], receipt['setting'], receipt['site'],
+                                                               coverage_media=item)
+                    coverage = status.get('selected_episodes')
+                except Exception as error:
+                    # A failed read must leave the submitted download and its receipt intact.
+                    log.warn(f'【Telegram Search】无法核实下载选集：{type(error).__name__}')
+            if coverage is None:
+                possible.update(scope)
+            else:
+                missing.difference_update(tuple(number) for number in coverage)
+        if missing and not missing.difference(possible) and not cancel.is_set():
+            with self.store.edit(sid) as record:
+                if record['state'] == 'results':
+                    record['message'] = '已有下载的选集暂时无法核实，已暂缓自动订阅，请核对下载器'
+            self.publish(sid)
+        return bool(missing.difference(possible))
 
     def download(self, sid, epoch, rid, automatic=False, no_exists=None, source_index=None):
         # The durable claim precedes downloader I/O. A timeout stays unknown;
@@ -488,10 +554,12 @@ class TelegramSearch:
                          site=media.site, task_id=None)
         if not self.store.claim_download(sid, epoch, rid, operation):
             self.publish(sid)
+            # The prior receipt has no exact manifest of selected episodes.
             return
         media.user_name = record['user_name']
         self.publish(sid)
         downloader = Downloader()
+        tag_lookup_complete = False
         attempted = False
         def before_submit():
             nonlocal attempted
@@ -499,7 +567,8 @@ class TelegramSearch:
             attempted = True
         try:
             status = downloader.get_search_task_status(operation['tag'], setting, media.site)
-            if status.get('lookup_failed'):
+            tag_lookup_complete = not status.get('lookup_failed')
+            if not tag_lookup_complete:
                 operation.update(state='not_submitted', message='下载器查询失败，尚未提交；可稍后重试下载')
             elif status.get('task_id'):
                 operation.update(status)
@@ -541,6 +610,9 @@ class TelegramSearch:
                              else '下载前检查失败，尚未提交；可稍后重试下载')
         for related_sid in self.store.update_download(sid, rid, **operation):
             self.publish(related_sid)
+        # A failed tag lookup leaves this click safely retryable, but cannot
+        # establish that automatic RSS would not repeat an earlier download.
+        return operation['state'] if tag_lookup_complete else 'unknown'
 
     def refresh_downloads(self, sid, background=False):
         record = self.store.get(sid)

@@ -527,10 +527,14 @@ class LLMMetaParser(object):
             search_func=lambda q: self.__search_tmdb_candidates(query=q, mtype_hint=mtype_hint, year=year_hint),
             query_list=query_list
         )
-        bangumi_candidates = self.__search_candidates_by_queries(
-            search_func=self.__search_bangumi_candidates,
-            query_list=query_list
-        )
+        try:
+            bangumi_candidates = self.__search_candidates_by_queries(
+                search_func=self.__search_bangumi_candidates, query_list=query_list)
+        except RecognitionPending as error:
+            # Bangumi names enrich the prompt; only the separate alias lookup
+            # requires this provider to decide whether a work was found.
+            log.debug(llm_log_message("Meta", str(error)))
+            bangumi_candidates = []
 
         if tmdb_candidates:
             payload["tmdb"] = tmdb_candidates

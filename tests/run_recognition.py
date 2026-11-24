@@ -29,6 +29,7 @@ RECOGNITION_MODULES = (
     "tests.test_disc_metadata",
     # Preserve title roles through provider lookup and cache reuse.
     "tests.test_series_name_integrity",
+    "tests.test_recognition_naming_gaps",
     "tests.test_special_episodes",
     "tests.test_special_confirmation",
     "tests.test_review_regressions",

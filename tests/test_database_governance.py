@@ -125,6 +125,12 @@ class DatabaseGovernanceTest(DatabaseCase):
                 response = client.post('/subtitle/tasks/test/cancel')
                 self.assertEqual(response.status_code, 503)
                 self.assertTrue(response.get_json()['cancel_retryable'])
+                for url in ('/library/subtitle/repair', '/library/subtitle/repair/batch'):
+                    with self.subTest(url=url):
+                        response = client.post(url, json={})
+                        self.assertEqual(response.status_code, 503)
+                        self.assertTrue(response.get_json()['retryable'])
+                        self.assertEqual(response.headers['Retry-After'], '5')
                 tasks.assert_not_called()
             response = client.post('/subtitle/tasks/test/cancel')
             self.assertEqual(response.status_code, 202)

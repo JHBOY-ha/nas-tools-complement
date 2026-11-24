@@ -318,6 +318,31 @@ class TelegramSearchTest(SearchSessionFixture):
                     reloaded = self.store_type(self.directory.name).get(record['id'])
                     self.assertEqual(reloaded['selected'], saved['selected'])
 
+    def test_text_search_uses_one_shot_sites_and_download_profile_across_candidate_pages(self):
+        self.store.preferences(1, value={'quality': '', 'max_gb': 0, 'sites': ['Default'], 'setting': 2})
+        record, _ = self.store.create(1, 1, '沙丘 2021 Tracker 快速盘')
+        with patch('web.backend.search_torrents.Sites') as sites, \
+                patch('web.backend.search_torrents.Indexer') as indexer, \
+                patch('web.backend.search_torrents.Downloader') as downloader, \
+                patch('web.backend.telegram_search.WebUtils.search_media_infos') as lookup:
+            sites.return_value.get_sites.return_value = [{'name': 'Tracker'}]
+            indexer.return_value.get_indexer_names.return_value = ['Tracker']
+            downloader.return_value.get_download_setting.return_value = {'7': {'name': '快速盘', 'id': 7}}
+            lookup.return_value = [movie(), movie(year='1984', tmdbid=841)]
+            self.service.identify(record['id'], 0)
+            saved = self.store.get(record['id'])
+            lookup.assert_called_once_with('沙丘 2021', page=1)
+            self.assertEqual((saved['preferences']['sites'], saved['preferences']['setting']), (['Tracker'], 7))
+            self.assertEqual(saved['candidates'][0]['rss_sites'], ['Tracker'])
+            self.assertEqual(self.store.preferences(1)['sites'], ['Default'])
+            with self.store.edit(record['id']) as current:
+                current['state'] = 'identifying'
+                current['preferences']['sites'] = ['New']
+            self.service.identify(record['id'], 0, page=2)
+            lookup.assert_called_with('沙丘 2021', page=2)
+            self.assertEqual(self.store.get(record['id'])['preferences']['sites'], ['New'])
+            indexer.return_value.get_indexer_names.assert_called_once()
+
     def test_old_candidate_button_cannot_select_from_new_search(self):
         with self.store.edit(self.sid) as record:
             record.update(state='candidates', candidates=[pack_media(movie(year='1984', tmdbid=841)), pack_media(movie())])
@@ -765,6 +790,123 @@ class TelegramSearchTest(SearchSessionFixture):
         searcher.search_medias.assert_called_once()
         self.assertEqual(searcher.search_medias.call_args.args[0], 'Dune: Part One')
         self.assertEqual(len(self.store.get(self.sid)['results']), 1)
+
+    def test_alias_query_keeps_requested_season_episode_and_sites(self):
+        from tests.recognition_fixture import FakeTmdb
+        from app.searcher import Searcher
+        fixture = FakeTmdb(self)
+        fixture.tv(42, 'Show', seasons={1: 12, 2: 12})
+        series = fixture.media.get_media_info('Show.S02E03.mkv')
+        series.tmdb_info['alternative_titles'] = {'results': [{'iso_3166_1': 'US', 'title': 'Other Title'}]}
+        series.search_sites = ['Selected']
+        with self.store.edit(self.sid) as record:
+            record.update(selected=pack_media(series), state='queued')
+        searcher = Searcher.__new__(Searcher)
+        searcher.media = fixture.media
+        searcher.indexer = Mock()
+        searcher.indexer.search_by_keyword.return_value = []
+        with patch('web.backend.telegram_search.Downloader') as downloader, \
+                patch('web.backend.telegram_search.Searcher', return_value=searcher), \
+                patch('app.searcher.Config') as config:
+            config.return_value.get_config.return_value = {}
+            downloader.return_value.check_exists_medias.return_value = (False, {}, [])
+            self.service.search(self.sid, 0)
+        calls = searcher.indexer.search_by_keyword.call_args_list
+        self.assertEqual(calls[-1].kwargs['key_word'], 'Other Title')
+        self.assertEqual(calls[-1].kwargs['filter_args'], calls[0].kwargs['filter_args'])
+        self.assertEqual(calls[-1].kwargs['filter_args']['season'], [2])
+        self.assertEqual(calls[-1].kwargs['filter_args']['episode'], [3])
+        self.assertEqual(calls[-1].kwargs['filter_args']['site'], ['Selected'])
+
+    def test_auto_subscribe_uses_remaining_episode_coverage_after_download(self):
+        from tests.recognition_fixture import FakeTmdb
+        fixture = FakeTmdb(self)
+        fixture.tv(42, 'Show', seasons={1: 2})
+        series = fixture.media.get_media_info('Show S01')
+        release = fixture.media.get_media_info('Show.S01E01.mkv')
+        release.set_torrent_info(site='Example', enclosure='magnet:?xt=urn:btih:abc', size=1024, seeders=2)
+        for owner, (resource, missing, status, should_subscribe) in enumerate((
+                (release, [1, 2], {}, True),
+                (release, [1], {}, False),
+                (series, [1, 2], {'task_id': 'old', 'state': 'downloading'}, False),
+                (release, [1, 2], {'task_id': 'old', 'state': 'downloading'}, True))):
+            with self.subTest(missing=missing, resource=resource.org_string, status=status):
+                sid = self.store.create(owner, owner, 'Show')[0]['id']
+                with self.store.edit(sid) as record:
+                    record.update(selected=pack_media(series), state='queued')
+                remaining = {42: [{'season': 1, 'episodes': missing.copy(), 'total_episodes': 2}]}
+                downloader = object.__new__(type(Downloader()))
+                downloader._download_order = 'seeder'
+                downloader.check_exists_medias = Mock(return_value=(False, remaining, []))
+                downloader.get_search_task_status = Mock(return_value=status)
+                downloader.message = Mock()
+                downloader.download = Mock(return_value=(True, ''))
+                def search(*args, search_context, **kwargs):
+                    search_context['on_progress']([resource], {})
+                    search_context['results'] = [resource]
+                with patch('web.backend.telegram_search.Downloader', return_value=downloader), \
+                        patch('web.backend.telegram_search.Searcher') as searcher, \
+                        patch('web.backend.telegram_search.Config') as config, \
+                        patch.object(self.service, 'subscribe') as subscribe:
+                    config.return_value.get_config.return_value = {'search_auto': True, 'search_no_result_rss': True}
+                    searcher.return_value.search_one_media.side_effect = search
+                    self.service.search(sid, 0)
+                self.assertEqual(downloader.download.called, not status)
+                self.assertEqual(subscribe.called, should_subscribe)
+
+    def test_existing_season_task_only_covers_selected_video_files(self):
+        from types import SimpleNamespace
+        from tests.recognition_fixture import FakeTmdb
+        fixture = FakeTmdb(self)
+        fixture.tv(42, 'Show', seasons={1: 2})
+        series = fixture.media.get_media_info('Show S01')
+        series.set_torrent_info(site='Example', enclosure='magnet:?xt=urn:btih:abc', size=1024, seeders=2)
+        for kind in (DownloaderType.QB, DownloaderType.TR):
+            for prior, selected_count in ((False, 1), (True, 2), (True, None)):
+                with self.subTest(kind=kind, prior=prior, selected_count=selected_count):
+                    owner = f'{kind.name}-{selected_count}'
+                    sid = self.store.create(owner, owner, 'Show')[0]['id']
+                    with self.store.edit(sid) as record:
+                        record.update(selected=pack_media(series), state='queued')
+                        if prior:
+                            record['downloads'][resource_key(series)] = dict(state='accepted', tag='old-tag',
+                                setting=7, site='Example', message='已提交下载')
+                    downloader = object.__new__(type(Downloader()))
+                    downloader.media = fixture.media
+                    downloader._download_order = 'seeder'
+                    downloader.sites = Mock()
+                    downloader.sites.get_site_download_setting.return_value = 7
+                    downloader.get_download_setting = Mock(return_value={'downloader': kind.name})
+                    downloader.check_exists_medias = Mock(return_value=(False,
+                        {42: [{'season': 1, 'episodes': [], 'total_episodes': 2}]}, []))
+                    client = Mock()
+                    downloader._Downloader__get_client = Mock(return_value=client)
+                    downloader.download = Mock()
+                    task = SimpleNamespace(hash='hash', id=8, percentDone=1.0, progress=1.0, tags='', labels=[])
+                    client.get_torrents.return_value = ([task], False)
+                    files = [('Show.S01E01.mkv', True), ('Show.S01E02.mkv', selected_count == 2),
+                             ('Show.S01E02.zh.srt', True)]
+                    if selected_count is None:
+                        client.get_files.return_value = []
+                    elif kind == DownloaderType.QB:
+                        client.get_files.return_value = [dict(name=name, priority=int(on)) for name, on in files]
+                    else:
+                        client.get_files.return_value = [SimpleNamespace(name=name, selected=on) for name, on in files]
+                    def search(*args, search_context, **kwargs):
+                        search_context['on_progress']([series], {})
+                        search_context['results'] = [series]
+                    with patch('web.backend.telegram_search.Downloader', return_value=downloader), \
+                            patch('web.backend.telegram_search.Searcher') as searcher, \
+                            patch('web.backend.telegram_search.Config') as config, \
+                            patch.object(self.service, 'subscribe') as subscribe:
+                        config.return_value.get_config.return_value = {'search_auto': True, 'search_no_result_rss': True}
+                        searcher.return_value.search_one_media.side_effect = search
+                        self.service.search(sid, 0)
+                    downloader.download.assert_not_called()
+                    client.get_files.assert_called_once()
+                    self.assertEqual(subscribe.called, selected_count == 1)
+                    if selected_count is None:
+                        self.assertIn('暂缓自动订阅', self.store.get(sid)['message'])
 
     def test_automatic_download_uses_existing_batch_rules_and_task_tag(self):
         rid = self.ready()
