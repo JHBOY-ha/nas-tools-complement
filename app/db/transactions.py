@@ -3,6 +3,7 @@ from collections import deque
 from contextlib import contextmanager
 import logging
 import re
+import sqlite3
 import threading
 import time
 
@@ -15,11 +16,26 @@ from .settings import DatabaseSettings
 
 
 class DatabaseBusy(TaskQueueFull):
-    """No SQL was started; callers must not acknowledge a rejected write."""
+    """The operation was rejected or rolled back and cannot be acknowledged."""
+
+
+class DatabaseContention(DatabaseBusy):
+    """A competing connection or queued writer prevented this transaction."""
 
 
 class DatabaseWriteError(TaskQueueFull):
     """A sanitized failure, without SQL parameters or credentials."""
+
+
+def is_database_contention(error):
+    if not isinstance(error, DBAPIError) or not isinstance(error.orig, sqlite3.OperationalError):
+        return False
+    code = getattr(error.orig, 'sqlite_errorcode', None)
+    if code is not None:
+        return (code & 0xff) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+    # Python 3.9 没有 sqlite_errorcode；匹配驱动的锁错误，避免把含 locked 的列名当成可重试错误。
+    return str(error.orig).lower().partition(':')[0] in (
+        'database is locked', 'database is busy', 'database table is locked', 'database schema is locked')
 
 
 class WriteCoordinator:
@@ -50,7 +66,7 @@ class WriteCoordinator:
         with self._condition:
             if self._usage() >= self.settings.writer_queue_size:
                 self._rejected += 1
-                raise DatabaseBusy('数据库写入队列已满，操作未准入')
+                raise DatabaseContention('数据库写入队列已满，操作未准入')
             self._reservations.add(token)
         self._local.reservation = token
         try:
@@ -81,7 +97,7 @@ class WriteCoordinator:
                 pass
             elif self._usage() >= self.settings.writer_queue_size:
                 self._rejected += 1
-                raise DatabaseBusy('数据库写入队列已满，操作未准入')
+                raise DatabaseContention('数据库写入队列已满，操作未准入')
             self._pending.append(ticket)
             if reservation in self._reservations:
                 self._reserved_pending[ticket] = reservation
@@ -90,7 +106,7 @@ class WriteCoordinator:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         self._rejected += 1
-                        raise DatabaseBusy('数据库写入等待超时，操作未准入')
+                        raise DatabaseContention('数据库写入等待超时，操作未准入')
                     self._condition.wait(remaining)
             except BaseException:
                 self._pending.remove(ticket)
@@ -235,9 +251,8 @@ class ManagedDatabase:
                 session.rollback()
                 # SQLAlchemy exception strings include bound values. Do not
                 # chain or echo them into UI responses/application logs.
-                if isinstance(error, DBAPIError) and ('locked' in str(error.orig).lower()
-                                                      or 'busy' in str(error.orig).lower()):
-                    raise DatabaseBusy('数据库锁竞争，操作未完成，请核对后重试') from None
+                if is_database_contention(error):
+                    raise DatabaseContention('数据库锁竞争，操作未完成，请核对后重试') from None
                 raise DatabaseWriteError('数据库事务失败，结果未确认，请先核对，勿重复执行') from None
             except BaseException:
                 session.rollback()

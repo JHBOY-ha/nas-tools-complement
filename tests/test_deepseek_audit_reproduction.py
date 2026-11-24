@@ -174,7 +174,7 @@ class DeepSeekReproduction(unittest.TestCase):
         # Only the remote library is fake. The loop, decorators and media SQL
         # are production code, backed by independent real SQLite transactions.
         sync = extracted_function((ROOT / 'app/mediaserver/media_server.py').read_text(),
-                                  'sync_mediaserver', {'lock': threading.Lock(), 'log': Mock()})
+                                  'sync_mediaserver', {'lock': threading.Lock(), 'sync_generation': 0, 'log': Mock()})
         with self.db.managed.maintenance() as connection:
             BaseMedia.metadata.create_all(connection)
         outcomes = []

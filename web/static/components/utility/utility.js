@@ -26,29 +26,6 @@ export class Golbal {
   static noImage = "../static/img/no-image.png";
   static noImage_person = "../static/img/person.png";
 
-  static poster_image_url(value) {
-    try {
-      const url = new URL(value);
-      if (!/^https?:$/.test(url.protocol) || url.username || url.password
-          || (url.port && url.port !== "80" && url.port !== "443")
-          || !/^(?:img\d*|qnmob3)\.doubanio\.com$/.test(url.hostname)
-          || !/^\/view\/photo\/[^/]+\/public\/p\d+\.(?:jpe?g|png|webp)$/.test(url.pathname)) {
-        return value;
-      }
-      // Douban's mobile CDN needs image processing; its bare URL can return an invalid PNG.
-      url.protocol = "https:";
-      url.hostname = "qnmob3.doubanio.com";
-      url.port = "";
-      const resize = "imageView2/2/q/80/w/500/h/750/format/webp";
-      if (!url.searchParams.has(resize)) {
-        url.search += (url.search ? "&" : "?") + resize;
-      }
-      return url.href;
-    } catch (e) {
-      return value;
-    }
-  }
-
   // 转换传值的空字符情况
   static repNull(value) {
     if (!value || value == "None" || value == "null" || value == "undefined") {
@@ -71,11 +48,11 @@ export class Golbal {
   }
 
   // 订阅按钮被点击时
-  static lit_love_click(title, year, media_type, tmdb_id, fav, remove_func, add_func) {
+  static lit_love_click(title, year, media_type, tmdb_id, fav, remove_func, add_func, rssid) {
     if (fav == "1"){
       show_ask_modal("是否确定将 " + title + " 从订阅中移除？", function () {
         hide_ask_modal();
-        remove_rss_media(title, year, media_type, "", "", tmdb_id, remove_func);
+        remove_rss_media(title, year, media_type, rssid || "", "", tmdb_id, remove_func);
       });
     } else {
       show_ask_modal("是否确定订阅： " + title + "？", function () {
@@ -85,7 +62,9 @@ export class Golbal {
           add_rss_media(title, year, media_type, mediaid, "", "", add_func);
         } else {
           ajax_post("get_tvseason_list", {tmdbid: mediaid, title: title}, function (ret) {
-            if (ret.seasons.length === 1) {
+            if (ret.code !== 0 || !Array.isArray(ret.seasons)) {
+              show_fail_modal(ret.msg || "未查询到季信息");
+            } else if (ret.seasons.length === 1) {
               add_rss_media(title, year, "TV", mediaid, "", ret.seasons[0].num, add_func);
             } else if (ret.seasons.length > 1) {
               show_rss_seasons_modal(title, year, "TV", mediaid, ret.seasons, add_func);

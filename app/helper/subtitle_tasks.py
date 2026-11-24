@@ -9,13 +9,17 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
+from concurrent.futures import wait
 from contextlib import contextmanager
 
 from sqlalchemy import and_, func, or_, text as sql_text
+from sqlalchemy.exc import OperationalError
 
 import log
+from app.llm_source import llm_source
 from app.db.main_db import MainDb
-from app.db.transactions import write_transaction, read_snapshot, DatabaseBusy, DatabaseWriteError
+from app.db.transactions import (write_transaction, read_snapshot, DatabaseBusy,
+                                 DatabaseContention, DatabaseWriteError, is_database_contention)
 from app.db import publication as state_publication
 from app.db.settings import DatabaseSettings
 from app.db.session_scope import release_db_connections
@@ -31,6 +35,7 @@ from app.db.models import (
     SUBTITLETASKSETTING,
 )
 from app.utils import ExceptionUtils
+from app.utils.workload import BoundedExecutor
 from config import Config
 
 
@@ -74,6 +79,10 @@ _MULTIPART_OVERHEAD_BYTES = 1024 * 1024
 _STANDARD_STAGING_FACTOR = 3
 _ALIGN_STAGING_FACTOR = 6
 _QUEUE_POSITION_UNSET = object()
+_REPAIR_REQUEST_ALIASES = "_repair_request_ids"
+# SQLite 只允许一个写者。排队的取消请求占用独立的有界容量，避免阻塞 Webhook 等交互任务。
+_CANCEL_QUEUE_SIZE = 64
+_cancel_executor = BoundedExecutor(1, _CANCEL_QUEUE_SIZE, "subtitle-cancel")
 
 _POLICY_RANGES = {
     "max_upload_queue": (1, 32),
@@ -193,7 +202,11 @@ class SubtitleTaskManager:
         # Heartbeats are emitted only for claims that still have a live worker.
         # A row left active after a failed DB write therefore cannot be kept
         # alive forever merely by the manager heartbeat.
-        self._executing_task_ids = set()
+        self._executing_task_owners = {}
+        # HTTP 请求与数据库重试分开。只用任务 ID 加已登录用户的组合匹配停止信号。
+        self._cancel_requests = {}
+        self._cancel_errors = OrderedDict()
+        self._cancel_lock = threading.RLock()
         self._processors = {}
         self._progress_last = {}
         self._spooling_ids = set()
@@ -331,22 +344,25 @@ class SubtitleTaskManager:
         # Persist the last known active interval before signaling workers.  A
         # hard crash cannot provide an exact stop timestamp, but graceful NAS
         # shutdowns must not lose the cumulative task budget checkpoint.
-        if self._started:
-            with self._write_lock():
-                now = time.time()
-                rows = self._db.query(SUBTITLETASK).filter(
-                    SUBTITLETASK.STATUS.in_(["running", "canceling"])
-                ).all()
-                for row in rows:
-                    self._checkpoint_active(row, now, keep_running=False)
-                    row.UPDATED_AT = now
-                if rows:
-                    self._db.commit()
-        self._stop.set()
-        self._wake.set()
-        self._audit_wake.set()
-        with self._heavy_condition:
-            self._heavy_condition.notify_all()
+        try:
+            if self._started:
+                with self._write_lock():
+                    now = time.time()
+                    rows = self._db.query(SUBTITLETASK).filter(
+                        SUBTITLETASK.STATUS.in_(["running", "canceling"])
+                    ).all()
+                    for row in rows:
+                        self._checkpoint_active(row, now, keep_running=False)
+                        row.UPDATED_AT = now
+                    if rows:
+                        self._db.commit()
+        finally:
+            # 即使最后一次心跳被锁拒绝，也要让后台取消重试和任务线程退出。
+            self._stop.set()
+            self._wake.set()
+            self._audit_wake.set()
+            with self._heavy_condition:
+                self._heavy_condition.notify_all()
         worker = self._worker
         if wait and worker and worker.is_alive():
             worker.join(timeout=5)
@@ -495,6 +511,9 @@ class SubtitleTaskManager:
         self.start()
         owner = str(owner or "")
         payload = dict(payload or {})
+        if task_type == "repair":
+            # Only the manager may bind an additional request to an existing task.
+            payload.pop(_REPAIR_REQUEST_ALIASES, None)
         request_id = str(request_id or "").strip() or None
         server = str(server or payload.get("server") or "").strip().lower()
         scope_key = str(scope_key or "") or None
@@ -511,8 +530,20 @@ class SubtitleTaskManager:
                 self._interrupt_orphaned_audits_locked(
                     "检测执行线程已退出，任务已安全中断"
                 )
-            reusable = self._find_reusable(owner, task_type, request_id, dedupe_key)
+            if task_type == "repair" and request_id:
+                # Recheck under writer admission: another caller may have bound this ID
+                # after the HTTP path's read-only lookup and before its file checks finished.
+                receipt = self._repair_request_row(owner, request_id, payload, server)
+                if receipt is not None:
+                    return self._task_dict(receipt, include_result=True, include_items=True), True
+            reusable = self._find_reusable(owner, task_type, None if task_type == "repair" else request_id,
+                                           dedupe_key)
             if reusable:
+                if task_type == "repair" and request_id:
+                    stored = _loads(reusable.PAYLOAD, {})
+                    stored.setdefault(_REPAIR_REQUEST_ALIASES, []).append(request_id)
+                    reusable.PAYLOAD = _dumps(stored)
+                    self._db.commit()
                 return self._task_dict(reusable, include_result=True, include_items=True), True
             if task_type == "audit":
                 active = self._db.query(SUBTITLETASK).filter(
@@ -1015,6 +1046,33 @@ class SubtitleTaskManager:
                 except OSError:
                     continue
 
+    def get_repair_receipt(self, owner, request_id, target):
+        with read_snapshot(self._db), self._lock:
+            row = self._repair_request_row(owner, request_id, target, target["server"])
+            if row is not None:
+                return self._task_dict(row, include_result=True, include_items=True)
+        return None
+
+    def _repair_request_row(self, owner, request_id, target, server):
+        # The original ID stays in REQUEST_ID. instr narrows the owner's retained
+        # repairs without requiring SQLite JSON1; only exact array members are aliases.
+        candidates = self._db.query(SUBTITLETASK).filter(
+            SUBTITLETASK.OWNER == owner, SUBTITLETASK.TYPE == "repair",
+            or_(SUBTITLETASK.REQUEST_ID == request_id, func.instr(SUBTITLETASK.PAYLOAD, _dumps(request_id)) > 0)
+        ).order_by(SUBTITLETASK.CREATED_AT.desc())
+        for row in candidates:
+            stored = _loads(row.PAYLOAD, {})
+            if row.REQUEST_ID != request_id and request_id not in stored.get(_REPAIR_REQUEST_ALIASES, []):
+                continue
+            # The admission-time file identity can change after a move. Only the
+            # original target is needed for a replay, with no filesystem access.
+            fields = ("media_path", "media_file", "server_item_id", "parent_server_item_id", "library_id")
+            if (row.SERVER or "") != server or any(
+                    str(stored.get(field) or "") != str(target.get(field) or "") for field in fields):
+                raise SubtitleTaskError("此请求 ID 已用于其他修复目标", status_code=409)
+            return row
+        return None
+
     def _find_reusable(self, owner, task_type, request_id, dedupe_key):
         query = self._db.query(SUBTITLETASK).filter(
             SUBTITLETASK.OWNER == owner,
@@ -1103,6 +1161,8 @@ class SubtitleTaskManager:
                    queue_position=_QUEUE_POSITION_UNSET):
         now = time.time()
         payload = _loads(row.PAYLOAD, {})
+        if row.TYPE == "repair":
+            payload.pop(_REPAIR_REQUEST_ALIASES, None)
         active_seconds = float(row.ACTIVE_SECONDS or 0)
         if row.RUN_STARTED_AT and row.STATUS in ["running", "canceling"]:
             active_seconds += max(now - row.RUN_STARTED_AT, 0)
@@ -1142,6 +1202,15 @@ class SubtitleTaskManager:
             result["result"] = _loads(row.RESULT, {}) if row.RESULT else None
         if include_items:
             result["items"] = self.list_items(row.ID)
+        if row.STATUS in ACTIVE_STATES:
+            with self._cancel_lock:
+                key = (str(row.ID), row.OWNER)
+                if key in self._cancel_requests:
+                    result["cancellable"] = False
+                    if not row.CANCEL_REQUESTED:
+                        progress["message"] = "取消请求已收到，正在等待数据库确认"
+                elif key in self._cancel_errors:
+                    progress["message"] = "取消请求处理失败，请查看服务日志后重试"
         return result
 
     def _queue_position(self, row):
@@ -1592,14 +1661,15 @@ class SubtitleTaskManager:
                 SUBTITLETASK.ID,
                 SUBTITLETASK.TYPE,
                 SUBTITLETASK.CANCEL_REQUESTED,
-                SUBTITLETASK.PAYLOAD
+                SUBTITLETASK.PAYLOAD,
+                SUBTITLETASK.OWNER
             ).filter(
                 SUBTITLETASK.STATUS.in_(list(ACTIVE_STATES))
             ).all()
             snapshots = [{
                 "id": str(row[0]),
                 "type": row[1],
-                "cancel_requested": bool(row[2]),
+                "cancel_requested": bool(row[2]) or self._cancel_pending(row[0], row[4]),
                 "payload": _loads(row[3], {}) or {},
             } for row in rows]
         if not snapshots:
@@ -1668,6 +1738,7 @@ class SubtitleTaskManager:
                 action = outcome["action"]
                 if action == "canceled":
                     succeeded = outcome["succeeded"]
+                    row.CANCEL_REQUESTED = 1
                     row.STATUS = "partial" if succeeded else "canceled"
                     row.PHASE = "complete"
                     row.MESSAGE = (
@@ -2084,8 +2155,8 @@ class SubtitleTaskManager:
                     try:
                         self._execute_task(task_id)
                     finally:
-                        with self._lock:
-                            self._executing_task_ids.discard(str(task_id))
+                        with self._lock, self._cancel_lock:
+                            self._executing_task_owners.pop(str(task_id), None)
                     task_id = None
                 except Exception as error:
                     # SQLite lock/commit failures must not permanently kill the
@@ -2117,7 +2188,7 @@ class SubtitleTaskManager:
                         "检测后台线程不可用，任务已安全中断",
                         include_unclaimed=not audit_worker_available
                     )
-                    live_task_ids = list(self._executing_task_ids)
+                    live_task_ids = list(self._executing_task_owners)
                     if not live_task_ids:
                         continue
                     now = time.time()
@@ -2148,9 +2219,10 @@ class SubtitleTaskManager:
         changed = False
         now = time.time()
         for row in rows:
-            if str(row.ID) in self._executing_task_ids:
+            if str(row.ID) in self._executing_task_owners:
                 continue
             self._checkpoint_active(row, now, keep_running=False)
+            self._record_pending_cancel(row)
             row.STATUS = "canceled" if row.CANCEL_REQUESTED else "interrupted"
             row.PHASE = "complete"
             row.MESSAGE = "任务已取消" if row.CANCEL_REQUESTED else str(reason)
@@ -2175,6 +2247,9 @@ class SubtitleTaskManager:
             )).first()
             if not row:
                 return None
+            if self._cancel_pending(row.ID, row.OWNER):
+                # 让取消入口核对排队上传可能已有的发布记录，再清理暂存。
+                return None
             if row.CANCEL_REQUESTED:
                 row.STATUS = "canceled"
                 row.FINISHED_AT = time.time()
@@ -2191,7 +2266,8 @@ class SubtitleTaskManager:
                 row.RUN_STARTED_AT = now
                 row.UPDATED_AT = now
                 self._db.commit()
-                self._executing_task_ids.add(str(row.ID))
+                with self._cancel_lock:
+                    self._executing_task_owners[str(row.ID)] = row.OWNER
                 return row.ID
         if cleanup_id:
             self._cleanup_task_staging(cleanup_id)
@@ -2214,7 +2290,7 @@ class SubtitleTaskManager:
             if not row:
                 return None
             now = time.time()
-            if row.CANCEL_REQUESTED:
+            if self._record_pending_cancel(row):
                 row.STATUS = "canceled"
                 row.PHASE = "complete"
                 row.MESSAGE = "任务已在队列中取消"
@@ -2229,7 +2305,8 @@ class SubtitleTaskManager:
             row.RUN_STARTED_AT = now
             row.UPDATED_AT = now
             self._db.commit()
-            self._executing_task_ids.add(str(row.ID))
+            with self._cancel_lock:
+                self._executing_task_owners[str(row.ID)] = row.OWNER
             return str(row.ID)
 
     def _audit_worker_loop(self):
@@ -2258,8 +2335,8 @@ class SubtitleTaskManager:
                     try:
                         self._execute_task(task_id)
                     finally:
-                        with self._lock:
-                            self._executing_task_ids.discard(str(task_id))
+                        with self._lock, self._cancel_lock:
+                            self._executing_task_owners.pop(str(task_id), None)
                     task_id = None
                 except Exception as error:
                     self._db.rollback()
@@ -2289,7 +2366,8 @@ class SubtitleTaskManager:
             self.finish_task(task_id, "failed", error="字幕任务处理器未注册", message="任务无法执行")
             return
         try:
-            processor(self, task_id)
+            with llm_source(f"字幕任务 {task['type']} #{task_id}"):
+                processor(self, task_id)
             current = self.get_task(task_id, owner=None, admin=True)
             if current and current.get("status") not in TERMINAL_STATES:
                 if self.is_cancel_requested(task_id):
@@ -2383,7 +2461,6 @@ class SubtitleTaskManager:
         if not row or row.STATUS in TERMINAL_STATES:
             return
         task_type = row.TYPE
-        cancel_requested = bool(row.CANCEL_REQUESTED)
         recovered_outputs = 0
         if task_type == "upload":
             try:
@@ -2405,6 +2482,7 @@ class SubtitleTaskManager:
                 return
             now = time.time()
             self._checkpoint_active(row, now, keep_running=False)
+            cancel_requested = self._record_pending_cancel(row)
             if task_type == "upload" and not cancel_requested and not self._stop.is_set():
                 row.STATUS = "recovering"
                 row.PHASE = "recovering"
@@ -2414,6 +2492,10 @@ class SubtitleTaskManager:
                 row.PHASE = row.STATUS
                 row.MESSAGE = "任务已取消，已发布字幕予以保留" if recovered_outputs else "任务已取消"
                 row.RESULT = _dumps({"recovered_publish_count": recovered_outputs})
+                row.FINISHED_AT = now
+            elif task_type == "audit" and cancel_requested:
+                row.STATUS, row.PHASE = "canceled", "complete"
+                row.MESSAGE = "字幕检测已取消"
                 row.FINISHED_AT = now
             else:
                 # Audit and repair are not replayed after an unknown
@@ -2484,7 +2566,7 @@ class SubtitleTaskManager:
             if row.STATUS in TERMINAL_STATES:
                 return self._task_dict(row, include_result=True, include_items=True)
             task_type = row.TYPE
-            if row.CANCEL_REQUESTED and status != "canceled":
+            if self._record_pending_cancel(row) and status != "canceled":
                 effect_persisted = False
                 result_value = result if isinstance(result, dict) else {}
                 if task_type == "upload":
@@ -2515,10 +2597,62 @@ class SubtitleTaskManager:
         self._wake.set()
         return value
 
+    def _cancel_pending(self, task_id, owner):
+        with self._cancel_lock:
+            return (str(task_id), owner) in self._cancel_requests
+
+    def _record_pending_cancel(self, row):
+        """Only called in a write transaction, before a claim or final decision."""
+        if not row.CANCEL_REQUESTED and self._cancel_pending(row.ID, row.OWNER):
+            row.CANCEL_REQUESTED = 1
+        return bool(row.CANCEL_REQUESTED)
+
+    def request_cancel(self, task_id, owner):
+        """Return a confirmed task when ready, or an HTTP receipt while SQLite is busy."""
+        key = (str(task_id), str(owner))
+        with self._cancel_lock:
+            live_owner = self._executing_task_owners.get(key[0])
+            if live_owner is not None and live_owner != key[1]:
+                return None
+            future = self._cancel_requests.get(key)
+            if future is None:
+                future = _cancel_executor.submit(self._retry_cancel, *key)
+                self._cancel_requests[key] = future
+                self._cancel_errors.pop(key, None)
+
+                def completed(finished):
+                    with self._cancel_lock:
+                        self._cancel_requests.pop(key, None)
+                        if not finished.cancelled() and finished.exception() is not None:
+                            self._cancel_errors[key] = True
+                            if len(self._cancel_errors) > _CANCEL_QUEUE_SIZE:
+                                self._cancel_errors.popitem(last=False)
+                            log.error("【字幕任务】取消请求处理失败：%s" % type(finished.exception()).__name__)
+
+                future.add_done_callback(completed)
+        # HTTP 能及时返回，关闭页面不影响同一服务进程继续处理。排队回执不宣称已落库。
+        done, _ = wait([future], timeout=0.25)
+        return future.result() if done else {"cancel_pending": True}
+
+    def _retry_cancel(self, task_id, owner):
+        while not self._stop.is_set():
+            try:
+                self.start()
+                return self.cancel_task(task_id, owner=owner)
+            except DatabaseContention:
+                pass
+            except OperationalError as error:
+                # 上传对账等只读步骤也可能被排他锁挡住，重试仍需重新核验任务归属。
+                if not is_database_contention(error):
+                    raise
+            finally:
+                release_db_connections(self._db)
+            self._stop.wait(1)
+        raise SubtitleTaskError("服务正在停止，请在重启后核对任务状态", status_code=503)
+
     def cancel_task(self, task_id, owner=None, admin=False):
         # 三段式：先持久化取消意图（原子性锚点）→ 锁外做发布结果对账 →
         # 锁内重读后写终态。对账涉及全文件哈希与删除，不能在锁内执行。
-        cleanup = False
         needs_reconcile = False
         with self._write_lock():
             row = self._db.query(SUBTITLETASK).filter(SUBTITLETASK.ID == str(task_id)).first()
@@ -2550,12 +2684,12 @@ class SubtitleTaskManager:
                 row.MESSAGE = "正在等待当前安全步骤停止"
             row.UPDATED_AT = now
             self._db.commit()
+            if not needs_reconcile:
+                # 运行中的任务只需一次事务。不要为了返回状态再次竞争写锁。
+                self._wake.set()
+                return self._task_dict(row, include_result=True, include_items=True)
 
-        reconciliation = {"succeeded": 0}
-        if needs_reconcile:
-            reconciliation = self._reconcile_upload_outputs(
-                str(task_id), rollback_incomplete=True
-            )
+        reconciliation = self._reconcile_upload_outputs(str(task_id), rollback_incomplete=True)
 
         with self._write_lock():
             row = self._db.query(SUBTITLETASK).filter(SUBTITLETASK.ID == str(task_id)).first()
@@ -2564,34 +2698,36 @@ class SubtitleTaskManager:
             # 对账期间 worker 可能已把任务置为终态，此时以已落库的结果为准。
             if row.STATUS in TERMINAL_STATES:
                 return self._task_dict(row, include_result=True, include_items=True)
-            if needs_reconcile:
-                now = time.time()
-                row.STATUS = "partial" if reconciliation["succeeded"] else "canceled"
-                row.PHASE = "complete"
-                row.MESSAGE = (
-                    "任务已取消，恢复时确认已发布的字幕予以保留"
-                    if reconciliation["succeeded"] else "任务已在队列中取消"
-                )
-                row.RESULT = _dumps({
-                    "success_count": reconciliation["succeeded"],
-                    "failure_count": 0,
-                    "stop_reason": "canceled",
-                    "refresh": {
-                        "status": "skipped", "scope": "none",
-                        "message": "任务已取消，未执行局部刷新"
-                    }
-                } if reconciliation["succeeded"] else {})
-                row.FINISHED_AT = now
-                row.UPDATED_AT = now
-                cleanup = row.TYPE == "upload"
-                self._db.commit()
+            now = time.time()
+            row.STATUS = "partial" if reconciliation["succeeded"] else "canceled"
+            row.PHASE = "complete"
+            row.MESSAGE = (
+                "任务已取消，恢复时确认已发布的字幕予以保留"
+                if reconciliation["succeeded"] else "任务已在队列中取消"
+            )
+            row.RESULT = _dumps({
+                "success_count": reconciliation["succeeded"],
+                "failure_count": 0,
+                "stop_reason": "canceled",
+                "refresh": {
+                    "status": "skipped", "scope": "none",
+                    "message": "任务已取消，未执行局部刷新"
+                }
+            } if reconciliation["succeeded"] else {})
+            row.FINISHED_AT = now
+            row.UPDATED_AT = now
+            self._db.commit()
             value = self._task_dict(row, include_result=True, include_items=True)
-        if cleanup:
-            self._cleanup_task_staging(task_id)
+        self._cleanup_task_staging(task_id)
         self._wake.set()
         return value
 
     def is_cancel_requested(self, task_id):
+        # 轮询详情时可能持有管理器锁等待 SQLite。已认领任务的归属可在内存中核实。
+        with self._cancel_lock:
+            task_owner = self._executing_task_owners.get(str(task_id))
+            if (str(task_id), task_owner) in self._cancel_requests:
+                return True
         with self._lock:
             row = self._db.query(SUBTITLETASK.CANCEL_REQUESTED, SUBTITLETASK.STATUS).filter(
                 SUBTITLETASK.ID == str(task_id)
@@ -2870,7 +3006,7 @@ class SubtitleTaskManager:
                 raise TaskNotFound('字幕检测任务不存在')
             if row.STATUS in TERMINAL_STATES:
                 return self._task_dict(row, include_result=True, include_items=True)
-            if row.CANCEL_REQUESTED:
+            if self._record_pending_cancel(row):
                 self._checkpoint_active(row, now, keep_running=False)
                 row.STATUS, row.PHASE = 'canceled', 'complete'
                 row.RESULT, row.ERROR = serialized_result, None
@@ -2891,7 +3027,7 @@ class SubtitleTaskManager:
                     # writer lock, preserving the configured free-space margin.
                     with self._write_lock(required_bytes=state_publication.batch_bytes(batch)):
                         row = self._db.query(SUBTITLETASK).filter(SUBTITLETASK.ID == str(task_id)).first()
-                        if not row or row.CANCEL_REQUESTED or row.STATUS in TERMINAL_STATES:
+                        if not row or row.STATUS in TERMINAL_STATES or self._record_pending_cancel(row):
                             raise TaskCancelled('审计暂存期间取消或中断')
                         state_publication.stage(self._db, publication_id, model,
                                                 batch)
@@ -2906,7 +3042,7 @@ class SubtitleTaskManager:
             self._publication_checkpoint('before_publish', publication_id)
             with self._write_lock():
                 row = self._db.query(SUBTITLETASK).filter(SUBTITLETASK.ID == str(task_id)).first()
-                if not row or row.CANCEL_REQUESTED or row.STATUS in TERMINAL_STATES:
+                if not row or row.STATUS in TERMINAL_STATES or self._record_pending_cancel(row):
                     raise TaskCancelled('审计发布前取消或中断')
                 state_publication.publish(self._db, publication_id)
                 finished = time.time()
@@ -2928,6 +3064,7 @@ class SubtitleTaskManager:
                 if not row:
                     raise TaskNotFound('字幕检测任务不存在')
                 if row.STATUS not in TERMINAL_STATES:
+                    row.CANCEL_REQUESTED = 1
                     finished = time.time()
                     self._checkpoint_active(row, finished, keep_running=False)
                     row.STATUS, row.PHASE = 'canceled', 'complete'

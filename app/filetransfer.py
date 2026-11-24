@@ -1,8 +1,9 @@
 import argparse
+import hashlib
+import json
 import os
 import random
 import re
-import shutil
 import traceback
 import uuid
 from contextlib import contextmanager
@@ -26,7 +27,7 @@ from app.utils import EpisodeFormat, PathUtils, StringUtils, SystemUtils, Except
 from app.utils.types import MediaType, SyncType, RmtMode
 from app.utils.security_utils import compile_ignore_pattern
 from app.utils.workload import get_transfer_gate, TaskQueueFull
-from app.utils.isolated_io import isolated_stat
+from app.utils.isolated_io import get_io_pool, isolated_stat
 from config import RMT_SUBEXT, RMT_MEDIAEXT, RMT_FAVTYPE, RMT_MIN_FILESIZE, DEFAULT_MOVIE_FORMAT, \
     DEFAULT_TV_FORMAT, Config
 
@@ -334,24 +335,141 @@ class FileTransfer:
                             log.info("【Rmt】字幕 %s 出错了,原因: %s" % (new_file, str(reason)))
         return 0
 
-    def __transfer_bluray_dir(self, file_path, new_path, rmt_mode):
+    def __transfer_disc_dir(self, file_path, new_path, rmt_mode, record_callback, cleanup_receipts,
+                            media, file_name, monitor):
         """
-        转移蓝光文件夹
+        转移 BDMV / VIDEO_TS 原盘；元数据和整盘校验成功后才能确认完成
         :param file_path: 原路径
         :param new_path: 新路径
         :param rmt_mode: RmtMode转移方式
+        :param record_callback: 整盘校验后提交历史及去重记录；成功才允许清理源目录
+        :param cleanup_receipts: 由整批转移确认完成后清除的目录清理回执
+        :param file_name: 旧版 NFO 的模板文件名，不含媒体文件扩展名
+        :param monitor: 为保留源文件的目录同步识别重复扫描
+        :return: 此次完成了发布或验证；已确认未变化的监控原盘返回 False，免发后续通知
         """
+        if rmt_mode not in (RmtMode.COPY, RmtMode.MOVE, RmtMode.LINK, RmtMode.SOFTLINK):
+            # Remote commands have no locally verifiable destination. In particular,
+            # a successful moveto/mc mv cannot authorize deleting the original disc.
+            raise ValueError("原盘远程转移暂不支持完整性校验，请使用本地复制、移动或链接")
+        from app.media.meta.bluray_cleanup import disc_fingerprint
+        if rmt_mode == RmtMode.MOVE and os.path.islink(file_path):
+            # os.walk follows its starting directory even with followlinks=False.
+            raise ValueError("原盘源目录是软链接，保留真实目录")
+        source_root, target_root = os.path.realpath(file_path), os.path.realpath(new_path)
+        if (PathUtils.is_path_in_path(source_root, target_root)
+                or PathUtils.is_path_in_path(target_root, source_root)):
+            raise ValueError("原盘源目录和目标目录不能相同或互相包含")
+
+        def snapshot():
+            # A NAS scan error must not become a shorter, apparently complete disc.
+            # Include hidden/sidecar files too: successful MOVE removes this tree.
+            def scan_error(error):
+                raise error
+            files = {}
+            directories = set()
+            for root, dirs, names in os.walk(file_path, onerror=scan_error):
+                directories.add(os.path.relpath(root, file_path))
+                if any(os.path.islink(os.path.join(root, name)) for name in dirs):
+                    raise ValueError("原盘包含目录软链接，无法完整校验，保留源目录")
+                for name in names:
+                    file = os.path.join(root, name)
+                    files[file] = disc_fingerprint(file)
+            return files, directories
+
+        def verify(source, target):
+            # Size alone cannot distinguish two editions or a damaged same-size copy.
+            # MOVE must never accept a target symlink into the source being deleted.
+            if (not os.path.isfile(target)
+                    or (rmt_mode != RmtMode.SOFTLINK and (
+                        os.path.islink(target) or PathUtils.is_path_in_path(source_root, os.path.realpath(target))))
+                    or not (os.path.samefile(source, target) or get_io_pool('bulk').execute(
+                        'compare', source=source, target=target,
+                        timeout=SystemUtils.get_external_transfer_timeout()))):
+                raise ValueError("原盘目标文件不完整或内容冲突，保留源文件：%s" % target)
+
         log.info("【Rmt】正在%s目录：%s 到 %s" % (rmt_mode.value, file_path, new_path))
-        # 复制
-        retcode = self.__transfer_dir_files(src_dir=file_path,
-                                            target_dir=new_path,
-                                            rmt_mode=rmt_mode,
-                                            bludir=True)
-        if retcode == 0:
-            log.info("【Rmt】文件 %s %s完成" % (file_path, rmt_mode.value))
-        else:
-            log.error("【Rmt】文件%s %s失败，错误码 %s" % (file_path, rmt_mode.value, str(retcode)))
-        return retcode
+        from app.media.meta.extra_transfer import has_pending_publication
+        with _transfer_lock(new_path), get_transfer_gate().slot():
+            disc_type = PathUtils.get_disc_type(file_path)
+            movie_disc = media.type == MediaType.MOVIE and disc_type is not None
+            nfo_paths = set()
+            if movie_disc:
+                from app.media.meta.disc_metadata import validate_movie_nfo
+                names = ['movie.nfo'] + (['VIDEO_TS.nfo'] if disc_type == 'dvd' else [])
+                nfo_paths = {os.path.join(root, name) for root in (file_path, new_path) for name in names}
+                # Prior versions emitted a synthetic video-stem NFO for discs.
+                # Validate that metadata too, but do not overwrite or rename it.
+                nfo_paths.add(os.path.join(new_path, file_name + '.nfo'))
+                for path in nfo_paths:
+                    validate_movie_nfo(path, media.tmdb_id)
+            originals, directories = snapshot()
+            if not originals:
+                raise ValueError("原盘目录为空，保留源目录")
+            targets = {source: os.path.join(new_path, os.path.relpath(source, file_path))
+                       for source in originals}
+
+            def monitor_signature():
+                # Persist only a digest. A replaced target, new disc member,
+                # changed destination or scraper setting requires normal verification.
+                paths = set(originals) | set(targets.values()) | nfo_paths
+                identities = {path: (os.path.islink(path), disc_fingerprint(path, include_ctime=True))
+                              for path in paths if os.path.isfile(path)}
+                existing_dirs = sorted(d for d in directories if os.path.isdir(os.path.join(new_path, d)))
+                evidence = [sorted(directories), identities, existing_dirs, new_path,
+                            rmt_mode.name, media.tmdb_id, self._scraper_flag, self._scraper_nfo, self._scraper_pic]
+                return hashlib.sha256(json.dumps(evidence, sort_keys=True).encode()).hexdigest()
+
+            if monitor:
+                from app.helper import DictHelper
+                monitor_key = os.path.abspath(file_path)
+                if (self.dbhelper.is_transfer_in_blacklist(file_path)
+                        and DictHelper().get('verified_disc', monitor_key) == monitor_signature()):
+                    return False
+            for directory in directories:
+                os.makedirs(os.path.join(new_path, directory), exist_ok=True)
+            for source, target in targets.items():
+                if os.path.lexists(target):
+                    verify(source, target)
+                    # A crash after atomic publication can leave an owned staging
+                    # inode/receipt; let the publisher finish its cleanup on retry.
+                    if not has_pending_publication(source, target):
+                        continue
+                # Publish each file atomically, but retain ALL MOVE sources (including
+                # index.bdmv / VIDEO_TS.IFO) until the whole disc is verified.
+                publish_exclusive(source, target, rmt_mode, self.__transfer_command,
+                                  lambda: True, retain_source=True)
+            if movie_disc and self._scraper_flag:
+                self.scraper.ensure_disc_movie_nfo(
+                    media, (self._scraper_nfo or {}).get('movie') or {}, new_path)
+            # Capture the source and destination state being verified, before
+            # any record commit. A later replacement must invalidate this evidence.
+            signature = monitor_signature() if monitor else None
+            verified_targets = {}
+            if movie_disc:
+                for path in nfo_paths:
+                    if rmt_mode == RmtMode.MOVE and os.path.dirname(path) == new_path and os.path.isfile(path):
+                        verified_targets[path] = disc_fingerprint(path)
+                    validate_movie_nfo(path, media.tmdb_id)
+            for source, target in targets.items():
+                if rmt_mode == RmtMode.MOVE and target not in verified_targets:
+                    verified_targets[target] = disc_fingerprint(target)
+                verify(source, target)
+            if snapshot() != (originals, directories):
+                raise ValueError("原盘源文件在转移期间变化，保留源目录等待重试")
+            from app.db.main_db import MainDb
+            with MainDb().write_transaction():
+                if record_callback() is not True:
+                    raise ValueError("原盘转移记录未确认，保留源目录等待重试")
+                if monitor and DictHelper().set('verified_disc', monitor_key, signature) is False:
+                    raise ValueError("原盘同步记录未确认")
+            if rmt_mode == RmtMode.MOVE:
+                from app.media.meta.bluray_cleanup import finish_cleanup, save_cleanup
+                receipt, record = save_cleanup(file_path, originals, new_path, verified_targets)
+                cleanup_receipts[os.path.abspath(file_path)] = receipt
+                finish_cleanup(record)
+        log.info("【Rmt】文件 %s %s完成" % (file_path, rmt_mode.value))
+        return True
 
     def is_target_dir_path(self, path):
         """
@@ -375,13 +493,12 @@ class FileTransfer:
                 return True
         return False
 
-    def __transfer_dir_files(self, src_dir, target_dir, rmt_mode, bludir=False, mark_processed=True):
+    def __transfer_dir_files(self, src_dir, target_dir, rmt_mode, mark_processed=True):
         """
         按目录结构转移所有文件
         :param src_dir: 原路径
         :param target_dir: 新路径
         :param rmt_mode: RmtMode转移方式
-        :param bludir: 是否蓝光目录
         """
         file_list = PathUtils.get_dir_files(src_dir)
         retcode = 0
@@ -399,10 +516,8 @@ class FileTransfer:
             if retcode != 0:
                 break
             else:
-                if not bludir and mark_processed:
+                if mark_processed:
                     self.dbhelper.insert_transfer_blacklist(file)
-        if retcode == 0 and bludir:
-            self.dbhelper.insert_transfer_blacklist(src_dir)
         return retcode
 
     def __transfer_origin_file(self, file_item, target_dir, rmt_mode):
@@ -520,7 +635,7 @@ class FileTransfer:
         识别并转移一个文件、多个文件或者目录
         :param in_from: 来源，即调用该功能的渠道
         :param in_path: 转移的路径，可能是一个文件也可以是一个目录
-        :param files: 文件清单，非空时以该文件清单为准，为空时从in_path中按后缀和大小限制检索需要处理的文件清单
+        :param files: 文件清单，非空时仅处理选中条目；原盘内部条目会归一化为整盘并去重
         :param target_dir: 目的文件夹，非空的转移到该文件夹，为空时则按类型转移到配置文件中的媒体库文件夹
         :param unknown_dir: 未识别文件夹，非空时未识别的媒体文件转移到该文件夹，为空时则使用配置文件中的未识别文件夹
         :param rmt_mode: 文件转移方式
@@ -534,7 +649,14 @@ class FileTransfer:
         :return: 处理状态，错误信息
         """
 
+        cleaned = {}
         def __finish_transfer(status, message):
+            if status:
+                try:
+                    for receipt in cleaned.values():
+                        os.unlink(receipt)
+                except OSError as error:
+                    status, message = False, '原盘清理回执尚未确认：%s' % error
             if status:
                 self.progress.update(ptype="filetransfer",
                                      value=100,
@@ -567,11 +689,25 @@ class FileTransfer:
         if not rmt_mode:
             rmt_mode = self._default_rmt_mode
 
+        if rmt_mode == RmtMode.MOVE:
+            from app.media.meta.bluray_cleanup import resume_cleanup, remove_empty_tree
+            try:
+                cleaned = resume_cleanup(files or [in_path])
+                if os.path.abspath(in_path) in cleaned or (cleaned and not os.path.lexists(in_path)):
+                    return __finish_transfer(True, '已完成原盘源目录清理')
+                if files and cleaned:
+                    files = [path for path in files if not any(
+                        PathUtils.is_path_in_path(root, os.path.abspath(path)) for root in cleaned)]
+                    if not files:
+                        return __finish_transfer(True, '已完成原盘源目录清理')
+            except (OSError, ValueError) as error:
+                return __finish_transfer(False, str(error))
+
         log.info("【Rmt】开始处理：%s，转移方式：%s" % (in_path, rmt_mode.value))
 
         success_flag = True
         error_message = ""
-        bluray_disk_dir = None
+        disc_root = None
         if not files:
             # 如果传入的是个目录
             if os.path.isdir(in_path):
@@ -582,10 +718,13 @@ class FileTransfer:
                 if PathUtils.is_invalid_path(in_path):
                     return __finish_transfer(False, "回收站或者隐藏文件夹")
                 # 判断是不是原盘文件夹
-                bluray_disk_dir = PathUtils.get_bluray_dir(in_path)
-                if bluray_disk_dir:
-                    file_list = [bluray_disk_dir]
-                    log.info("【Rmt】当前为蓝光原盘文件夹：%s" % str(in_path))
+                try:
+                    disc_root = PathUtils.get_disc_dir(in_path)
+                except OSError as error:
+                    return __finish_transfer(False, "目录扫描失败：%s" % error)
+                if disc_root:
+                    file_list = [disc_root]
+                    log.info("【Rmt】当前为原盘文件夹：%s" % str(in_path))
                 else:
                     if str(min_filesize) == "0":
                         # 不限制大小
@@ -597,74 +736,132 @@ class FileTransfer:
                     # Explicit special clips can be smaller than the ordinary media limit.
                     extras_enabled = ((Config().get_config("media") or {}).get("extras") or {}).get("enabled") is True
                     # 查找目录下的文件
+                    diagnostics = {}
                     try:
                         file_list = PathUtils.get_dir_files(in_path=in_path,
                                                             episode_format=episode[0],
                                                             exts=RMT_MEDIAEXT,
-                                                            filesize=0, raise_errors=True)
+                                                            filesize=0, raise_errors=True,
+                                                            diagnostics=diagnostics, include_discs=True)
+                    except ValueError as error:
+                        return __finish_transfer(False, "集数参数无效：%s" % error)
                     except OSError as error:
                         # os.walk 默认吞掉子目录访问错误；不能把扫描失败当成空目录成功。
                         return __finish_transfer(False, "目录扫描失败：%s" % error)
                     def eligible(path):
                         try:
-                            return (os.path.getsize(path) >= now_filesize
-                                    or bool(extract_special(os.path.basename(path), extras_enabled)[1]))
+                            if (os.path.isdir(path) or os.path.getsize(path) >= now_filesize
+                                    or bool(extract_special(os.path.basename(path), extras_enabled)[1])):
+                                return True
+                            diagnostics["below_min_size"] = diagnostics.get("below_min_size", 0) + 1
+                            return False
                         except OSError:
                             # Let per-file recognition report a disappearing special.
                             return True
                     file_list = [path for path in file_list if eligible(path)]
                     log.debug("【Rmt】文件清单：" + str(file_list))
                     if len(file_list) == 0:
-                        log.warn("【Rmt】%s 目录下未找到媒体文件，当前最小文件大小限制为 %s"
-                                 % (in_path, StringUtils.str_filesize(now_filesize)))
+                        if cleaned:
+                            try:
+                                if remove_empty_tree(in_path):
+                                    return __finish_transfer(True, '已完成原盘源目录清理')
+                                return __finish_transfer(False, '源目录仍有未转移文件，已保留，请核对后重试')
+                            except OSError as error:
+                                return __finish_transfer(False, str(error))
+                        # Explain actual rejections, rather than implying that
+                        # an unrelated configured size limit caused every empty scan.
+                        reasons = ["%s %s 个" % (label, diagnostics[key]) for key, label in (
+                            ("invalid_path", "隐藏、回收站等无效路径"),
+                            ("unsupported_extension", "不支持的文件后缀"),
+                            ("episode_mismatch", "集数定位或筛选范围不匹配")) if diagnostics.get(key)]
+                        if diagnostics.get("below_min_size"):
+                            reasons.append("小于最小文件大小 %s 个（限制 %s）" % (
+                                diagnostics["below_min_size"], StringUtils.str_filesize(now_filesize)))
+                        message = "目录下未找到媒体文件：%s" % "；".join(reasons or ["未发现文件"])
+                        log.warn("【Rmt】%s %s" % (in_path, message))
                         # 监控目录没有合格媒体是正常跳过；下载整理仍需失败，
                         # 不能据此授权下载器删除尚未处理的源数据。
-                        return __finish_transfer(in_from == SyncType.MON,
-                                                 "目录下未找到媒体文件，当前最小文件大小限制为 %s"
-                                                 % StringUtils.str_filesize(now_filesize))
+                        return __finish_transfer(in_from == SyncType.MON, message)
             # 传入的是个文件
             else:
                 if not os.path.exists(in_path):
                     log.error("【Rmt】文件转移失败，文件不存在：%s" % in_path)
                     return __finish_transfer(False, "文件不存在")
-                if os.path.splitext(in_path)[-1].lower() not in RMT_MEDIAEXT:
-                    log.warn("【Rmt】不支持的媒体文件格式，不处理：%s" % in_path)
-                    return __finish_transfer(False, "不支持的媒体文件格式")
                 # 判断是不是原盘文件夹
-                bluray_disk_dir = PathUtils.get_bluray_dir(in_path)
-                if bluray_disk_dir:
-                    file_list = [bluray_disk_dir]
-                    log.info("【Rmt】当前为蓝光原盘文件夹：%s" % bluray_disk_dir)
+                try:
+                    disc_root = PathUtils.get_disc_dir(in_path)
+                except OSError as error:
+                    return __finish_transfer(False, "目录扫描失败：%s" % error)
+                if disc_root:
+                    file_list = [disc_root]
+                    log.info("【Rmt】当前为原盘文件夹：%s" % disc_root)
                 else:
+                    if os.path.splitext(in_path)[-1].lower() not in RMT_MEDIAEXT:
+                        log.warn("【Rmt】不支持的媒体文件格式，不处理：%s" % in_path)
+                        return __finish_transfer(False, "不支持的媒体文件格式")
                     file_list = [in_path]
         else:
-            # 传入的是个文件列表，这些文失件是in_path下面的文件
+            # 显式清单和目录扫描共用下面的原盘归一化；不扩展到未选择的兄弟电影。
             file_list = files
 
+        normalized = []
+        disc_paths = set()
+        roots = {}
+        try:
+            for path in file_list:
+                path = os.path.normpath(path)
+                # Many selected clips share one STREAM directory; avoid rescanning
+                # its ancestry for every clip while preserving each regular file.
+                directory = path if os.path.isdir(path) else os.path.dirname(path)
+                if directory not in roots:
+                    roots[directory] = PathUtils.get_disc_dir(directory)
+                bluray_root = roots[directory]
+                if bluray_root:
+                    path = bluray_root
+                    disc_paths.add(path)
+                if path not in normalized:
+                    normalized.append(path)
+        except OSError as error:
+            return __finish_transfer(False, "目录扫描失败：%s" % error)
+        file_list = normalized
         #  过滤掉文件列表
         file_list, msg = self.check_ignore(file_list=file_list)
         if not file_list:
-            return __finish_transfer(True, msg)
+            return __finish_transfer(not disc_paths, msg)
+        ignored_discs = disc_paths.difference(file_list)
+        if ignored_discs:
+            # A partially selected batch cannot authorize deletion of ignored discs.
+            success_flag = False
+            error_message = "部分原盘被忽略，保留未转移的源目录"
 
-        # Resolve downloader identity before consulting the transfer blacklist.
-        # Older tasks may have been blacklisted after a wrong filename match; an
-        # exact RSS/hash association must be allowed to repair those files.
-        contexts = {}
-        if in_from == SyncType.MON and not tmdb_info and not download_context:
-            from app.downloader import Downloader
+        # Validate every selected target before publishing the first file. This
+        # checks numeric results only, not whether TMDB has recorded the episode.
+        if (episode[0] and media_type != MediaType.MOVIE
+                and (tmdb_info or {}).get("media_type") != MediaType.MOVIE):
+            for file_path in file_list:
+                try:
+                    episode[0].split_episode(os.path.basename(file_path))
+                except ValueError as error:
+                    return __finish_transfer(False, "%s：%s" % (os.path.basename(file_path), error))
+
+        # Older deployments may write unfinished .mkv files directly into a
+        # watched directory. Check exact task membership before any publication
+        # or blacklist write; filename recognition still uses the local file.
+        if in_from == SyncType.MON:
+            from app.downloader import Downloader, DownloadNotReady
             try:
-                contexts = Downloader().get_monitored_download_contexts(file_list)
-            except Exception as err:
-                log.warn("【Rmt】%s" % err)
-                return __finish_transfer(False, str(err))
-
-        # 目录同步模式下，过滤掉文件列表中已处理过的
+                Downloader().check_monitored_files_complete(file_list)
+            except DownloadNotReady:
+                self.progress.end('filetransfer')
+                raise
+        # Old disc attempts could have recorded a blacklist before history completed.
+        # Always verify directory contents instead of trusting that marker on retries.
         if in_from == SyncType.MON:
             file_list = [file_path for file_path in file_list
-                         if file_path in contexts or self.dbhelper.is_transfer_notin_blacklist(file_path)]
+                         if file_path in disc_paths or self.dbhelper.is_transfer_notin_blacklist(file_path)]
             if not file_list:
                 log.info("【Rmt】所有文件均已成功转移过，没有需要处理的文件！如需重新处理，请清理缓存（服务->清理转移缓存）")
-                return __finish_transfer(True, "没有新文件需要处理")
+                return __finish_transfer(success_flag, error_message or "没有新文件需要处理")
         # API检索出媒体信息，传入一个文件列表，得出每一个文件的名称，这里是当前目录下所有的文件了
         if download_context:
             tmdb_info = download_context["tmdb_info"]
@@ -673,7 +870,8 @@ class FileTransfer:
                 download_context.get("source_title"), media_type.value, tmdb_info.get("id")))
         Medias = self.media.get_media_info_on_files(
             file_list, tmdb_info, media_type, season, episode[0],
-            download_context=download_context, download_contexts=contexts)
+            download_context=download_context,
+            bluray=bool(disc_paths))
         if len(Medias or {}) != len(file_list):
             return __finish_transfer(False, "部分文件未能识别或与下载任务季集冲突，请核对")
         if not Medias:
@@ -684,7 +882,7 @@ class FileTransfer:
         self.progress.update(ptype="filetransfer", text=f"共 {len(Medias)} 个文件需要处理...")
 
         # 统计总的文件数、失败文件数、需要提醒的失败数
-        failed_count = 0
+        failed_count = len(ignored_discs)
         alert_count = 0
         alert_messages = []
         total_count = 0
@@ -699,6 +897,16 @@ class FileTransfer:
         # 处理识别后的每一个文件或单个文件夹
         for file_item, media in Medias.items():
             try:
+                # Disc state belongs to this item, not the entire mixed batch.
+                disc_root = file_item if file_item in disc_paths else None
+                disc_type = PathUtils.get_disc_type(file_item) if disc_root else None
+                contains_dvd = disc_type == 'dvd'
+                if disc_root and disc_type is None:
+                    # Numbered sets retain their parent root. Inspect member types
+                    # before MOVE removes the source, including mixed BDMV/DVD sets.
+                    contains_dvd = any(PathUtils.get_disc_type(os.path.join(disc_root, name)) == 'dvd'
+                                       for name in os.listdir(disc_root)
+                                       if not PathUtils.is_invalid_path(os.path.join(disc_root, name)))
                 # 跳过结果不得落入未识别目录，也不能执行重命名或转移。
                 if getattr(media, "skip_reason", None):
                     log.info("【Rmt】%s 跳过：%s" % (file_item, media.skip_reason))
@@ -716,6 +924,8 @@ class FileTransfer:
                 if not udf_flag:
                     if re.search(r'[./\s\[]+Sample[/.\s\]]+', file_item, re.IGNORECASE):
                         log.warn("【Rmt】%s 可能是预告片，跳过..." % file_item)
+                        if disc_root:
+                            return __finish_transfer(False, "原盘被预告片规则跳过，保留源目录")
                         continue
 
                 # 文件名
@@ -726,8 +936,8 @@ class FileTransfer:
                                      text="正在处理：%s ..." % file_name)
 
                 # 数据库记录的路径
-                if bluray_disk_dir:
-                    reg_path = bluray_disk_dir
+                if disc_root:
+                    reg_path = disc_root
                 else:
                     reg_path = file_item
                 # 未识别
@@ -746,6 +956,10 @@ class FileTransfer:
                     failed_count += 1
                     if error_message not in alert_messages and is_need_insert_unknown:
                         alert_messages.append(error_message)
+                    if disc_root:
+                        # The generic unknown-folder publisher handles individual
+                        # files. A disc must remain intact for manual identification.
+                        continue
                     # 原样转移过去
                     if unknown_dir:
                         log.warn("【Rmt】%s 按原文件名转移到未识别目录：%s" % (file_name, unknown_dir))
@@ -801,11 +1015,11 @@ class FileTransfer:
                 dir_exist_flag, ret_dir_path, file_exist_flag, ret_file_path = self.__is_media_exists(dist_path, media)
                 from app.media.meta.extra_transfer import has_pending_publication
                 # 凭据跨进程/重启保留直到字幕完成；完整历史且无凭据才能去重。
-                pending_publication = (not bluray_disk_dir and file_exist_flag
+                pending_publication = (not disc_root and file_exist_flag
                                        and has_pending_publication(file_item, ret_file_path))
                 # 先解析本次目标，再判断是否允许补重试；其他目录中的同 inode
                 # 只证明已入库，不能让字幕重试绕过去重并重新发布到另一个目录。
-                if rmt_mode == RmtMode.LINK and not udf_flag and not self._filesize_cover:
+                if not disc_root and rmt_mode == RmtMode.LINK and not udf_flag and not self._filesize_cover:
                     existing = self._existing_media_files(media)
                     already_exists = bool(existing) if media.type == MediaType.MOVIE else False
                     if media.type != MediaType.MOVIE and media.get_episode_list():
@@ -833,9 +1047,9 @@ class FileTransfer:
                                 for key in ("fractional_episode", "special_episode"))
                 # Presence only selects recovery; publish_exclusive validates the
                 # source/target evidence under its lock before acknowledging history.
-                local_publication = (not bluray_disk_dir and (not file_exist_flag or pending_publication) and
+                local_publication = (not disc_root and (not file_exist_flag or pending_publication) and
                                      rmt_mode in (RmtMode.LINK, RmtMode.COPY, RmtMode.MOVE, RmtMode.SOFTLINK))
-                record_during_publication = protected or local_publication
+                record_during_publication = bool(disc_root) or protected or local_publication
                 publication_recorded = False
                 from app.db.main_db import MainDb
                 from app.db.transactions import DatabaseBusy, DatabaseWriteError
@@ -849,7 +1063,7 @@ class FileTransfer:
                     with MainDb().write_transaction():
                         saved = self.dbhelper.insert_transfer_history(
                             in_from=in_from, rmt_mode=rmt_mode, in_path=reg_path,
-                            out_path=new_file if not bluray_disk_dir else None,
+                            out_path=new_file if not disc_root else None,
                             dest=dist_path, media_info=media)
                         # This acknowledges media bytes only. Subtitles have not
                         # run yet, so the monitor must still be allowed to retry.
@@ -857,6 +1071,11 @@ class FileTransfer:
                             raise DatabaseWriteError('文件已落盘，记录未确认；请先核对，勿重复执行')
                     publication_recorded = True
                     return True
+                def record_disc():
+                    # The directory publisher holds one transaction around both
+                    # records, and keeps MOVE sources if either write fails.
+                    record_transfer()
+                    return self.dbhelper.insert_transfer_blacklist(file_item) is not False
                 if protected and file_exist_flag and not pending_publication and not os.path.samefile(file_item, ret_file_path):
                     raise ValueError("特殊集目标已存在不同文件，保留源文件")
                 if pending_publication and record_during_publication:
@@ -868,14 +1087,7 @@ class FileTransfer:
                 exist_filenum = 0
                 handler_flag = False
                 # 路径存在
-                if dir_exist_flag:
-                    # 蓝光原盘
-                    if bluray_disk_dir:
-                        log.warn("【Rmt】蓝光原盘目录已存在：%s" % ret_dir_path)
-                        if udf_flag:
-                            return __finish_transfer(False, "蓝光原盘目录已存在：%s" % ret_dir_path)
-                        failed_count += 1
-                        continue
+                if dir_exist_flag and not disc_root:
                     # 文件存在
                     if (file_exist_flag and rmt_mode == RmtMode.LINK
                             and os.path.samefile(file_item, ret_file_path)):
@@ -930,7 +1142,7 @@ class FileTransfer:
                             failed_count += 1
                             continue
                 # 路径不存在
-                else:
+                elif not dir_exist_flag:
                     if not ret_dir_path:
                         log.error("【Rmt】拼装目录路径错误，无法从文件名中识别出季集信息：%s" % file_item)
                         success_flag = False
@@ -951,19 +1163,16 @@ class FileTransfer:
                         # 创建电录
                         log.debug("【Rmt】正在创建目录：%s" % ret_dir_path)
                         os.makedirs(ret_dir_path)
-                # 转移蓝光原盘
-                if bluray_disk_dir:
-                    ret = self.__transfer_bluray_dir(file_item, ret_dir_path, rmt_mode)
-                    if ret != 0:
-                        success_flag = False
-                        error_message = "蓝光目录转移失败，错误码：%s" % ret
-                        self.progress.update(ptype="filetransfer", text=error_message)
-                        if udf_flag:
-                            return __finish_transfer(success_flag, error_message)
-                        failed_count += 1
-                        alert_count += 1
-                        if error_message not in alert_messages:
-                            alert_messages.append(error_message)
+                # 转移原盘
+                if disc_root:
+                    # Only an existing video adds an extension to ret_file_path;
+                    # unmatched template stems may contain meaningful dots.
+                    disc_file_name = os.path.basename(ret_file_path or 'movie')
+                    if file_exist_flag:
+                        disc_file_name = os.path.splitext(disc_file_name)[0]
+                    if not self.__transfer_disc_dir(file_item, ret_dir_path, rmt_mode, record_disc, cleaned,
+                                                    media, disc_file_name,
+                                                    monitor=in_from == SyncType.MON and rmt_mode != RmtMode.MOVE):
                         continue
                 else:
                     # 开始转移文件
@@ -1021,7 +1230,7 @@ class FileTransfer:
                                  "year": media.year,
                                  "season": media.begin_season,
                                  "episode": media.begin_episode,
-                                 "bluray": True if bluray_disk_dir else False,
+                                 "bluray": True if disc_root else False,
                                  "imdbid": media.imdb_id}
                 # 转移历史记录
                 try:
@@ -1029,7 +1238,7 @@ class FileTransfer:
                     # stages succeed. Legacy paths still commit history with it.
                     with MainDb().write_transaction():
                         recorded = True if publication_recorded else record_transfer()
-                        if recorded is not False:
+                        if recorded is not False and not disc_root:
                             recorded = self.dbhelper.insert_transfer_blacklist(file_item)
                         if recorded is False:
                             raise DatabaseWriteError('转移成功标记未确认，请核对后重试')
@@ -1047,7 +1256,9 @@ class FileTransfer:
                         return __finish_transfer(False, error_message)
                     continue
                 # Only enqueue follow-up work once the transfer is recorded.
-                if subtitle_item not in download_subtitle_items:
+                # DVDs, including numbered/mixed sets, have no standalone target
+                # for the legacy Blu-ray/MP4 subtitle-provider adapter.
+                if not contains_dvd and subtitle_item not in download_subtitle_items:
                     download_subtitle_items.append(subtitle_item)
                 # 未识别手动识别或历史记录重新识别的批处理模式
                 if isinstance(episode[1], bool) and episode[1]:
@@ -1076,7 +1287,8 @@ class FileTransfer:
                                                    scraper_nfo=self._scraper_nfo,
                                                    scraper_pic=self._scraper_pic,
                                                    dir_path=ret_dir_path,
-                                                   file_name=os.path.basename(ret_file_path),
+                                                   file_name='movie' if disc_type and media.type == MediaType.MOVIE
+                                                   else os.path.basename(ret_file_path),
                                                    file_ext=file_ext)
                 # 更新进度
                 self.progress.update(ptype="filetransfer",
@@ -1102,7 +1314,7 @@ class FileTransfer:
         # 启新进程下载字幕
         if download_subtitle_items:
             try:
-                self.threadhelper.start_thread(Subtitle().download_subtitle, (download_subtitle_items,))
+                self.threadhelper.start_thread(Subtitle().download_subtitle_automatically, (download_subtitle_items,))
             except TaskQueueFull:
                 # Media has already been published. Optional subtitle admission
                 # must not turn that successful transfer into a failed retry.
@@ -1111,16 +1323,15 @@ class FileTransfer:
         log.info("【Rmt】%s 处理完成，总数：%s，失败：%s" % (in_path, total_count, failed_count))
         if alert_count > 0:
             self.message.send_transfer_fail_message(in_path, alert_count, "、".join(alert_messages))
-        elif failed_count == 0:
-            # 删除空目录
-            if rmt_mode == RmtMode.MOVE \
-                    and os.path.exists(in_path) \
-                    and os.path.isdir(in_path) \
-                    and not root_path \
-                    and not PathUtils.get_dir_files(in_path=in_path, exts=RMT_MEDIAEXT) \
-                    and not PathUtils.get_dir_files(in_path=in_path, exts=['.!qb', '.part']):
-                log.info("【Rmt】目录下已无媒体文件及正在下载的文件，移动模式下删除目录：%s" % in_path)
-                shutil.rmtree(in_path)
+        elif (failed_count == 0 and success_flag and rmt_mode == RmtMode.MOVE
+              and not files and not root_path and os.path.isdir(in_path)):
+            # A downloader may delete the entire source on success. An unrecognized
+            # DVD or sidecar still belongs to the user even if no video suffix matches.
+            try:
+                if not remove_empty_tree(in_path):
+                    return __finish_transfer(False, '源目录仍有未转移文件，已保留，请核对后重试')
+            except OSError as error:
+                return __finish_transfer(False, str(error))
         return __finish_transfer(success_flag, error_message)
 
     def transfer_manually(self, s_path, t_path, mode):
@@ -1334,7 +1545,7 @@ class FileTransfer:
         # 电视剧
         else:
             dir_name, season_name, _ = self.get_tv_dest_path(meta_info)
-            if not season or not total_num:
+            if season is None or not total_num:
                 return []
             if meta_info.type == MediaType.ANIME:
                 dest_paths = self._anime_path
@@ -1447,6 +1658,8 @@ class FileTransfer:
         # 纯链接同步同样不能把无效过滤配置记为成功的同步历史。
         if getattr(self, '_ignore_config_error', ''):
             return -1, "忽略词配置无效，暂停整理直到配置修正"
+        from app.downloader import Downloader
+        Downloader().check_monitored_files_complete([in_file])
         new_file_list, msg = self.check_ignore(file_list=[new_file])
         if not new_file_list:
             return 0, msg
@@ -1689,7 +1902,8 @@ class FileTransfer:
             rssid = self.dbhelper.get_rss_movie_id(title=title, year=year, tmdbid=tmdbid)
         else:
             if not tmdbid:
-                meta_info = MetaInfo(title=title)
+                # 状态查询只需从片名提取本地订阅使用的名称和季号。
+                meta_info = MetaInfo(title=title, use_llm=False)
                 title = meta_info.get_name()
                 season = meta_info.get_season_string()
                 if season:

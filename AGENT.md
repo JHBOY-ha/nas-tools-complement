@@ -308,7 +308,7 @@ Chrome 入口通过；旧 SQLite 3.37.2 的 DELETE 回退 41 项通过。完整 
 - 在线字幕（迅雷 / Assrt）卡片使用迅雷官网 https://www.xunlei.com/about/ 引用的 https://www.xunlei.com/icons/logo.svg，保存为 `web/static/img/xunlei.svg`；复用相邻服务的封面布局，按原始比例完整显示，点击仍打开在线字幕配置弹窗，不依赖外站图片请求。
 - `web/templates/setting/subtitle.html` 只负责字幕服务配置；配置弹窗内仅保留并突出 OpenSubtitles API Consumers 快捷按钮，不另设重复的官网入口，首页卡片只打开配置。
 - `web/templates/setting/subtitle_task_settings.html` 为独立任务设置页，经登录保护的 `/subtitle_task_settings` 路由加载，兼容现有 `navmenu` 的 POST 加载及浏览器历史恢复。
-- `web/templates/rename/medialibrary.html` 在字幕库工具栏提供任务设置入口；“任务设置”与“任务中心”共用尺寸规则。
+- `web/templates/rename/medialibrary.html` 的“任务设置”现位于页头“更多”菜单（见“字幕库交互改版”）；“任务中心”保留在页头。
 - 文件管理页“字幕任务”通过 `mediafile-task-action` 沿用默认 Tabler 按钮尺寸，与“转移目录”一致；局部覆盖任务中心动态注入的最小高度，保留任务计数与点击行为。
 - 子页面保留导航栏“媒体整理 → 字幕库”选中状态，提供返回字幕库和共享任务中心入口。
 - 资源限制按上传队列与空间、进程与任务预算、检测与记录分组；每个字段旁以基础设置同款 `form-help` 问号和 Bootstrap tooltip 悬停/聚焦展示说明，保留隐藏的输入框辅助说明；字幕库状态说明只统一问号外观，仍打开原有弹窗，默认隐藏已读取状态，保留保存和错误反馈。配置键、安全范围和后端执行语义保持不变。
@@ -320,6 +320,45 @@ Chrome 入口通过；旧 SQLite 3.37.2 的 DELETE 回退 41 项通过。完整 
 
 模板渲染与字段迁移完整性检查、JS 语法检查、相关字幕任务回归测试；浏览器检查页面跳转、配置和官网入口独立响应、窄屏布局、读取/保存失败与校验。预览使用模拟接口时不宣称真实后台联调通过。
 
+## 字幕库筛选交互：小分类标签行与记住视图（2026-11-19）
+
+依据：用户最常用小分类，但它藏在“筛选与排序”菜单里（打开、展开、选择、应用共四步），而不常用的类型标签一步可达。用户选定方案 A（小分类平铺成标签行）+ E（记住上次视图）及其细化项。
+
+- 小分类从菜单移到类型标签下方的紧凑标签行（`#library_category_chips`），点击立即生效、再点取消；`#library_filter_category` 改为隐藏域。“全部类型”下按电影/电视剧/动漫分组，两类共有的名称（如“动漫”）只出现一次；点电影或剧集专属的小分类会同时选中对应类型，共有名称保持“全部类型”。切换类型时保留仍属于新类型的小分类，否则清空。
+- 顺序：`list_items` 的 `categories` 按分类 YAML 排列（原为字母序），YAML 已删除但仍有媒体的名称排在后面，空名称不出现。
+- 计数：`/library/summary` 新增 `category_counts`，与状态计数一次遍历得出——应用除小分类外的全部筛选（含字幕状态）；状态计数仍应用小分类、不应用字幕状态。前端摘要请求因此带上 `subtitle`，切换状态会重新读取计数。列表筛选和计数共用 `MediaLibrary.__matches_subtitle`。
+- “有问题”与前三种互斥状态交叉（缺字幕+未检测+已完成=全部），移到最后并加分隔线。
+- 记住视图：每次列表加载后把类型、小分类、状态、音轨、排序写入 `localStorage`（`nastool.media-library.view`），不记搜索词和页码；读写失败静默忽略。恢复顺序为历史记录（前进/后退，含搜索词和页码）> localStorage > 默认值，所有值经 `library_normalize_view` 白名单校验。恢复时结果栏提示“已恢复上次的筛选”；已不存在的小分类自动清空并提示后重新加载。
+- 结果栏只为收在菜单里的条件（音轨、排序）显示可移除标签；任一筛选非默认时显示“清除全部筛选”。菜单内只剩音轨与排序，宽度收窄。
+- 联动：开始补齐在电视剧/动漫类型或剧集小分类下拒绝并说明（原先会静默退回补齐全部电影），确认文案带上小分类；按钮 `title` 说明当前补齐范围。外挂字幕检测弹窗按当前类型和小分类预选。空结果按“范围 + 状态”说明并提供“查看该范围全部媒体”或“重置筛选”。
+- 加载时保留旧卡片并调淡（`is-loading` + `aria-busy`），计数返回重绘标签行时保持键盘焦点。
+- 未做：多选小分类、固定常用视图、补齐按来源两轮/额度展示（另行讨论）。
+
+验证：`tests.test_media_library` 新增分类顺序与分面计数用例，57 项中 6 项错误为既有的未隔离审计写库用例；`test_media_library_cards.js` 新增标签行、类型联动、补齐范围、视图校验、空状态、筛选标签断言；`test_media_library_history.js`、`test_media_library_online.js` 通过。Playwright UI 用例（`test_media_library_ui.js` 新增标签行尺寸/分组/焦点、菜单布局、筛选标签、刷新后恢复、补齐拒绝；`test_media_library_online_ui.js`）在本机以 playwright-core 驱动系统 Chrome 运行通过（仓库原用 Firefox，本机未安装）；在线字幕 UI 用例约 13 次运行中出现过 1 次关闭确认框后对话框未重新显示的超时，HEAD 与本改动各 5 次复跑均未复现。未在真实 NAS 数据上联调。
+
+## 全站圆角刻度、徽标统一与任务中心分组（2026-11-20）
+
+依据：用户看过本地设计稿后选定“建议档”（4/6/8/12/16），范围为全站，并要求同时实现任务中心的时间与分组。原先 Tabler 默认 4px、小按钮 2px、弹窗 8px，项目里又另写 8px、12px，同类元素圆角不一；徽标与小按钮同用一个圆角时，较矮的徽标显得更圆。
+
+- `style.css` 在 `:root` 定义 `--nt-radius-xs/sm/md/lg/xl`（4/6/8/12/16），并把 Tabler 的 `--tblr-border-radius-sm/默认/lg/xl` 指向 sm/md/lg/xl。卡片、弹窗（含 `.modal-status`）、徽标、`.btn-sm`、提示条、下拉菜单、toast 和复选框在 Tabler 中写死或沿用基础圆角，逐一映射到对应档；字幕库卡片、海报顶边和上传区改用变量；导航栏搜索框与菜单项由 12px 改为 md。规则：控件圆角约为高度的 1/5，里层不超过外层，抽屉贴边不加，类型角标保持胶囊形。
+- 补上全局 `.min-w-0`：模板里多处用到，但 Tabler beta16 没有这个类，flex 子项无法截断长文本。
+- 徽标：详情抽屉的字幕状态、剧集列表和状态说明弹窗由实心白字改为浅底同色字（`library_soft_badge` 把后端的 `bg-orange` 等转为 `bg-orange-lt text-orange`），后端返回值未改。实心只保留给数字提醒。
+- 任务中心（`subtitle-tasks.js`）：分“进行中 · N”（完整卡片）和“最近完成”（`renderTaskRow` 紧凑行）。紧凑行的状态徽标定宽对齐，媒体文件只显示文件名，完整路径放在 `title`；错误、指标、逐字幕结果仍保留。`formatTaskTime` 输出“今天/昨天 HH:MM”“M月D日 HH:MM”，跨年带年份；进行中显示开始时间（排队显示提交时间）和“已运行”，结束的任务显示结束时间（`finished_at`）。“取消”改为中性 `.btn-sm`，高度跟随 `.lit-library-modal` 的统一规则。说明从顶部蓝色提示条移到底部一行灰字，窄屏独占一行。信息行用“·”分隔，并用负外边距加裁剪，让换行后的行首不留分隔符。
+- 承接工作区里另一个进程未提交的改动：服务器名改为“Jellyfin”等普通文字、进度未知时不再写死 100% 宽度、减少动态效果时改为静止浅色整条、弹窗加 `lit-library-modal`。本次在其基础上把时间格式从“11-20 10:57”改为上面的友好格式。
+
+验证：`test_media_library_ui.js` 的按钮圆角断言由 4px 改为 8px/6px；新增 `tests/test_subtitle_task_center_ui.js`，在 1280px 与 390px 下用模拟接口打开真实任务中心，检查分组、友好时间、紧凑行只显示文件名且保留完整路径与错误、中性取消按钮、未知进度不填满、无服务器徽标和顶部提示条、圆角（弹窗 16、任务卡 12、徽标 4、取消 6）、行首分隔符被裁掉、无横向滚动。其余 JS 用例与 `tests.run_stability`（339 项，1 项为既有的 `PathUtils` 错误）通过；另截图检查了深色主题。`test_opensubtitles_settings_ui.js` 原为 WebKit 编写，换 Chrome 运行时“1e”输入的 `badInput` 判定不同而失败，该用例不加载 `style.css`，与本次改动无关。未在真实 NAS 上联调。
+
+## OpenSubtitles 自动下载上限（2026-11-19）
+
+- 配置键 `subtitle.opensubtitles.auto_download_limit`：0–1000 的整数，0 表示不限制（默认，保持原行为）。`app.subtitle.parse_auto_download_limit` 同时用于保存校验（`set_config_value` 拒绝非法值，不改动配置）和启动读取（手改的非法值记警告后按不限制处理）。
+- 只约束整理后自动下载：`filetransfer` 改调 `Subtitle.download_subtitle_automatically`。字幕库在线下载（`OnlineSubtitles` 直接调客户端）和文件管理“下载字幕”不计数、不受限。
+- 窗口为最近 24 小时滚动：无论 OpenSubtitles 按自然日还是首次下载后 24 小时重置，都不会超出上限。用量记录在 `SYSTEM_DICT`（`OpenSubtitles/AutoDownloadLedger`，JSON 时间戳列表），重启后保留，无需迁移。不限制时也记录，便于中途开启上限时按实际用量计算。
+- 计数口径：检索前先粗查，达上限直接跳过且不检索；申请下载链接前在进程锁内预占一次，保证并发自动下载不超额。请求未发出或被明确拒绝（如 HTTP 406）时回退预占；链接已签发、响应丢失或无法确认是否扣次时保留预占。已有字幕、无高置信结果不计数。
+- 有上限时记录写入失败会跳过本次自动下载，避免超额；无上限时记录失败不阻止下载。
+- 设置弹窗显示最近 24 小时自动下载次数和达上限时的预计恢复时间；读取失败只隐藏这行，不影响设置页。保存失败现在会弹出原因，而不是静默刷新。
+
+验证：`tests/test_opensubtitles_api.py` 新增 10 项（上限内外、手动不计、24 小时过期、链接失败回退、签发后失败仍计、已有字幕、记录失败、并发、恢复时间、取值校验），全文件 53 项通过；`tests.run_recognition` 通过；`tests.run_stability` 332 项中 1 项错误为既有问题（`test_opus_review_fixes` 抽取 `transfer_media` 的命名空间缺 `PathUtils`，由 `30e2969` 引入，与本改动无关）。未在真实 OpenSubtitles 账户或 NAS 上联调。
+
 ## OpenSubtitles 安全与字幕状态定向查询
 
 - OpenSubtitles API 登录、搜索、用户信息和下载授权只允许 HTTPS，启用证书校验且禁止自动重定向；登录返回的 `base_url` 必须规范化且包含有效主机，否则清除令牌并恢复官方 API 根地址。
@@ -330,7 +369,7 @@ Chrome 入口通过；旧 SQLite 3.37.2 的 DELETE 回退 41 项通过。完整 
 
 ## 字幕库低 I/O 与文本对齐方案
 
-- 字幕库列表、翻页、筛选、排序和普通刷新只读取媒体同步表、转移历史和 `SUBTITLE_MEDIA_STATUS`，不得访问媒体路径、枚举 NAS 目录或启动 ffprobe。没有快照且媒体服务器流信息不明确时必须显示“未检测”。
+- 字幕库列表、翻页、筛选、排序和状态计数只读取媒体同步表、转移历史和 `SUBTITLE_MEDIA_STATUS`，不得访问媒体路径、枚举 NAS 目录或启动 ffprobe。没有快照且媒体服务器流信息不明确时必须显示“未检测”。用户手动点击的“刷新”例外：它只对当前页最多 18 个项目向媒体服务器读取最新信息，仍不访问 NAS 文件，也不做全量同步。
 - 外挂字幕检测负责写入已覆盖媒体的正/负快照；上传和二次处理仅复检目标媒体，且复检继承取消、超时与重操作并发限制。已发布后取消或超时时，仅根据发布事实写 SQLite 快照，不继续访问 NAS。服务启动、升级和页面刷新不触发全库扫描。
 - 封面服务失败时按项目 ID 定向查询同步记录与转移历史，并缓存成功和失败回退，禁止为单张封面加载全量媒体数据。
 - 文本对齐只使用视频内嵌文本字幕：n-gram 候选索引、单调锚点链、MAD 异常值剔除、稳健偏移/轻微线性漂移/确认分段模型及写入前时间轴校验。分段控制点使用连续窗口中位值，模型应用后再校验锚点 P95 残差；低置信度或校验失败保留原字幕。
@@ -479,3 +518,29 @@ Chrome 入口通过；旧 SQLite 3.37.2 的 DELETE 回退 41 项通过。完整 
 - 保留 `MetaAnime` 路由及其 END/FINAL、范围、制作组、编码行为；公共入口仅合并序数季的名称/季号证据，完整结构或裸写歧义的集号采用共享候选。特殊集/小数集仍走原有专用处理。
 - 查询、作品详情、季详情及映射目标证据只在同一文件批次复用；下一批重试失败项。模拟服务调用计数与实际 HTTP 分开验证，未访问真实 TMDB/NAS。正式回归覆盖缓存污染、三态、手动恢复、RSS/IMDb、配置与外部别名、动漫路由、批次重试及两位数兼容；审查中的错误输出不再作为预期。
 - 本轮验证：60 项聚焦测试、完整 `tests.run_recognition` 的 341 项测试、额外 5 项动漫身份测试通过，`git diff --check` 通过。四次两位数识别共 1 次普通名称检索、4 次作品详情、0 次消歧搜索/季详情；同批三个个位数文件共 2 次搜索、2 次作品详情、1 次季详情。以上为模拟接口调用；HTTP 调用为 0，不代表真实服务延迟或请求缓存命中率。
+
+## 字幕库交互改版（2026-10-31）
+
+用户确认的约束：“更新服务器信息”只是把媒体服务器的最新数据拉回 NAStool，不让服务器重新刮削；刷新只由用户手动触发且只处理当前页，不做全量同步；拖拽上传不放在卡片上，只在点击海报后的详情抽屉里。
+
+- **当前页刷新**：`POST /library/refresh` → `MediaLibrary.refresh_items`。最多 18 个 ID，逐项串行向服务器读取，全部读取完成后才在短事务内写库；读取失败、服务器未返回或返回 ID 不一致的项目保留原记录。全量同步进行中拒绝刷新，读取前记录全量同步代次，写库前以 `MediaServer.begin_incremental_write(expected_generation)` 非阻塞抢占同步锁并核验代次；读取期间只要启动过全量同步，即使已完成也丢弃本次刷新结果，提示重试。网络读取期间不持锁。全量同步与单项刷新共用各客户端的 `sync_item_from_info` / Plex `__sync_item`，保证字段一致。不调用任何服务器刷新或刮削接口。
+- **海报版本**：`poster_url` 带 `?tag=`，值来自 `ImageTags.Primary`（Emby/Jellyfin）或 Plex 海报路径末段。服务器成功返回且带有效版本时使用 `max-age=31536000, immutable`；无版本为 1 小时；本地海报回退为 `private, no-cache`；404 为 5 分钟。图片类型和 ID 经白名单校验后才请求服务器，缩略图固定 `maxWidth=320&quality=85`。路由改为 `<path:itemid>` 以容纳 Plex 的 `/library/metadata/N`，非 Plex 服务器拒绝含斜杠的 ID。Plex 令牌只在服务端 URL 中使用，日志不记录异常正文。
+- **Plex**：新增 `get_sync_item`、`get_item_image`，同步记录增加 `Thumb`。未给 Plex 添加 `get_iteminfo`：唯一调用方是 Emby/Jellyfin 的 webhook，行为不变。
+- **剧集状态**：`__summary_series_status` 只聚合整理历史中已关联的剧集，只有这些已知集全部有中文字幕时才显示“已有”，不代表媒体服务器中的全部剧集已覆盖；部分覆盖为 `unknown` 并显示“已覆盖 X/Y 集”。列表项新增 `episode_total`、`episode_covered`、`audio_language`、响应新增 `library_total`、`synced_at`。页码越界由服务端钳制，前端跟随返回页。
+- **按钮**：`style.css` 的“字幕库：按钮统一规则”用 `--lit-library-btn-height` / `--lit-library-btn-sm-height` 控制 `.lit-library-panel`、`.lit-library-drawer`、`.lit-library-modal` 内的高度，会覆盖 `subtitle-tasks.js` 注入的 `[data-subtitle-task-center]{min-height:2.75rem}`。新增弹窗要带 `lit-library-modal`；不要给单个按钮写高度或圆角。
+- **筛选与计数**：`subtitle` 增加 `unknown`、`problem`；新增 `audio_language`（zho/eng/fra/rus/jpn/kor/other/unknown，其中 zho/eng/fra/rus 对应联合国常任理事国使用的中、英、法、俄语，西班牙语、阿拉伯语归入 other；按默认音轨，仅电影，具体语言排除剧集）。`POST /library/summary` 与列表共用 `__candidate_items`，状态计数不应用字幕状态筛选。单纯翻页不重取计数。
+- **抽屉与上传**：被取代的“选择剧集”和“上传字幕”弹窗已移除，控件 ID 保留并移入抽屉；在线检索与整季字幕包仍是对话框，打开时 `library_drawer_hide_for_modal()` 收起抽屉，关闭时恢复（OpenSubtitles 配额确认期间由 `library_online_serialized` 区分，不视为退出）。有浏览器上传在途时拒绝切换到其他媒体。拖放只绑定在上传区，window 级 `dragover/drop` 监听全局只装一次，且仅在字幕库页面存在拖放区时才拦截文件拖入，避免浏览器跳转。`POST /library/subtitle/preview` 只接收文件名，复用 `Subtitle.preview_upload_names` 与真实上传同一套命名函数，不读取字幕内容、不写文件，但目标路径校验和重名检查会读取文件系统元数据；无语言标记时提示将按正文识别。列表重载先填充新缓存，再更新抽屉概览；预览回调同时核验页面实例、原 DOM、请求代次与目标媒体。
+- **连续补齐**：队列在点击时固定（最多 100 部，电影，需 `can_upload`），不依赖实时分页；保存后由用户点击“下一部”，不自动下载。关闭在线对话框即退出并刷新当前页。队列请求的成功、错误、完成回调及确认/关闭弹窗后的继续操作均核验页面实例与原列表 DOM，离页后不再弹出确认或启动检索。
+- **未实现**：抽屉内的字幕删除/管理、批量安全补齐（需要新的持久任务类型和路径安全校验）、下载后自动对齐；本次未做。
+
+验证入口与范围：
+
+- `python3 -m tests.run_stability` 使用临时配置和数据库，默认套件包含 `tests.test_database_review_fixes` 中真实 SQLite 的同步/刷新交错回归；不包含 `tests.test_media_library` 或 `tests.test_library_refresh_poster`。
+- 字幕库专项需显式运行：`python3 -m tests.run_stability tests.test_media_library tests.test_library_refresh_poster tests.test_online_subtitles`。不要直接运行读取真实 `config/` 的媒体库审计测试。
+- `node tests/test_media_library_history.js` 覆盖页面/DOM 失效、预览计数器重用、抽屉刷新、补齐晚响应及确认后的延迟继续；卡片、在线字幕和整季字幕包回归分别为 `tests/test_media_library_cards.js`、`tests/test_media_library_online.js`、`tests/test_subtitle_season_pack.js`。
+- 浏览器回归为 `node tests/test_media_library_ui.js` 和 `node tests/test_media_library_online_ui.js`，均使用 Playwright 的 headless Firefox 与独立临时浏览器目录。需要环境提供 `playwright` 模块及 Firefox；可用 `NODE_PATH` 指定模块目录、`FIREFOX_PATH` 指定 Playwright Firefox 可执行文件。字幕库 UI 截图默认保存在 `/tmp/nas-tools-library-ui`，可用 `TEST_ARTIFACT_DIR` 改变位置，在线字幕窄屏截图为 `/tmp/nas-tools-opensubtitles-online-mobile.png`。
+- UI 回归覆盖标签、菜单裁剪、抽屉、拖放、阻止上传、剧集目标、连续补齐、390px 布局，以及抽屉状态更新、SPA 重建后的旧预览、离页后的旧补齐响应。
+
+本次四项评审修复已通过：默认稳定性 332 项、显式字幕库专项 122 项、上述四组 Node 回归，以及两组 headless Firefox UI 回归；Python/JavaScript 语法检查和 `git diff --check` 通过。测试配置、数据库、浏览器配置及截图/日志均使用临时目录。
+
+未在真实 NAS、真实 Emby/Jellyfin/Plex 上验证 `ImageTags`、`maxWidth`、Plex 转码接口和音轨语言覆盖率。

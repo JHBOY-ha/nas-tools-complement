@@ -19,21 +19,24 @@ from pathlib import Path
 from threading import Lock, Timer, Event
 from urllib import parse
 
-from flask import Flask, request, json, render_template, make_response, session, send_from_directory, send_file, g
+from flask import Flask, abort, request, json, redirect, render_template, make_response, session, send_from_directory, send_file, g
 from flask.wrappers import Request as FlaskRequest
 from flask_compress import Compress
 from flask_login import LoginManager, login_user, login_required, current_user
+from sqlalchemy.exc import OperationalError
 from werkzeug.exceptions import RequestEntityTooLarge, RequestTimeout
 from werkzeug.http import parse_options_header
 
 import log
 from app.brushtask import BrushTask
 from app.conf import ModuleConf, SystemConfig
+from app.db.transactions import is_database_contention
 from app.downloader import Downloader
 from app.filter import Filter
 from app.helper import SecurityHelper, MetaHelper, ChromeHelper, ThreadHelper, DbHelper
 from app.indexer import Indexer
 from app.library import MediaLibrary
+from app.media.doubanapi import DoubanWeb
 from app.media.meta import MetaInfo
 from app.mediaserver import WebhookEvent, MediaServer
 from app.message import Message
@@ -480,7 +483,17 @@ def add_header(r):
 # 定义获取登录用户的方法
 @LoginManager.user_loader
 def load_user(user_id):
-    return User().get(user_id)
+    try:
+        return User().get(user_id)
+    except OperationalError as error:
+        # 身份查询先于取消和修复入队；此处遇锁时，整个请求仍可安全重试。
+        if request.endpoint in ("subtitle_task_cancel", "library_subtitle_repair", "library_subtitle_repair_batch") \
+                and is_database_contention(error):
+            body = {"code": -1, "retryable": True, "msg": "数据库繁忙，暂时无法核验账号，请稍后重试"}
+            if request.endpoint == "subtitle_task_cancel":
+                body["cancel_retryable"] = True
+            abort(make_response(body, 503, {"Retry-After": "5"}))
+        raise
 
 
 # 页面不存在
@@ -856,6 +869,18 @@ def douban_tv():
                            Title="豆瓣电视剧",
                            Filter="douban_tv",
                            FilterConf=ModuleConf.DISCOVER_FILTER_CONF.get('douban_tv'))
+
+
+@App.route('/douban/subject/<int:subject_id>/preview')
+@login_required
+def douban_subject_preview(subject_id):
+    url = DoubanWeb().subject_preview(subject_id)
+    if not url:
+        return "", 404
+    response = redirect(url)
+    # 预览地址有时效，重新请求时需要取当时的签名。
+    response.cache_control.no_store = True
+    return response
 
 
 @App.route('/tmdb_movie', methods=['POST', 'GET'])
@@ -1524,6 +1549,34 @@ def library_items():
         return {"code": -1, "msg": str(e)}
 
 
+@App.route('/library/summary', methods=['POST'])
+@login_required
+def library_summary():
+    """
+    字幕状态标签计数，仅读取数据库中的同步记录与字幕状态快照
+    """
+    try:
+        data = request.get_json(silent=True) or request.form.to_dict() or {}
+        return MediaLibrary().summary_counts(data)
+    except Exception as e:
+        ExceptionUtils.exception_traceback(e)
+        return {"code": -1, "msg": str(e)}
+
+
+@App.route('/library/refresh', methods=['POST'])
+@login_required
+def library_refresh():
+    """
+    手动刷新当前页：逐项读取媒体服务器最新信息并更新本地记录，不做全量同步
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        return MediaLibrary().refresh_items(data)
+    except Exception as e:
+        ExceptionUtils.exception_traceback(e)
+        return {"code": -1, "msg": "刷新失败，请稍后重试"}
+
+
 @App.route('/library/episodes', methods=['POST'])
 @login_required
 def library_episodes():
@@ -1579,6 +1632,30 @@ def library_online_subtitle_search():
         return {"code": -1, "msg": str(error)}
     except Exception:
         return {"code": -1, "msg": "在线字幕检索失败，请稍后重试"}
+
+
+@App.route('/library/subtitle/preview', methods=['POST'])
+@login_required
+def library_subtitle_preview():
+    """
+    上传前预估语言与目标文件名；只接收文件名，不读取字幕内容，也不写入任何文件
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        path = _online_subtitle_media_path(data.get("media_path"))
+        filenames = data.get("filenames")
+        if not isinstance(filenames, list) or not filenames or len(filenames) > 40 \
+                or any(not isinstance(name, str) or not name or len(name) > 255 for name in filenames):
+            raise ValueError("字幕文件名无效")
+        server = str(data.get("server") or "").strip().lower()
+        if server not in ("emby", "jellyfin", "plex"):
+            server = str((Config().get_config("media") or {}).get("media_server") or "emby").lower()
+        return {"code": 0, "items": Subtitle().preview_upload_names(path, filenames, server)}
+    except ValueError as error:
+        return {"code": -1, "msg": str(error)}
+    except Exception as error:
+        ExceptionUtils.exception_traceback(error)
+        return {"code": -1, "msg": "无法预估字幕文件名"}
 
 
 @App.route('/library/subtitle/download', methods=['POST'])
@@ -1738,76 +1815,170 @@ def library_subtitle_audit_categories():
         return {"code": -1, "msg": str(e)}
 
 
+def _enqueue_library_subtitle_repair(data, owner):
+    """单片和批量入口共用同一套路径授权、任务去重和队列容量检查。"""
+    from app.helper.subtitle_tasks import SubtitleTaskError
+    media_file = os.path.normpath(str(data.get("media_path") or ""))
+    media_config = Config().get_config('media') or {}
+    server_type = str(data.get("server") or media_config.get('media_server') or "emby").lower()
+    payload = {
+        "media_path": media_file,
+        "server": server_type,
+        "server_item_id": data.get("server_item_id") or "",
+        "parent_server_item_id": data.get("parent_server_item_id") or "",
+        "library_id": data.get("library_id") or ""
+    }
+    request_id = str(data.get("request_id") or "").strip()
+    manager = _subtitle_tasks(start=False)
+    if request_id:
+        receipt = manager.get_repair_receipt(owner, request_id, payload)
+        if receipt is not None:
+            return receipt, True
+    if not media_file or not os.path.isfile(media_file):
+        raise SubtitleTaskError("媒体文件不存在")
+    if os.path.splitext(media_file)[-1].lower() not in RMT_MEDIAEXT:
+        raise SubtitleTaskError("请选择有效的媒体文件")
+    if not _is_within_media_library(media_file):
+        raise SubtitleTaskError("媒体文件不在媒体库目录范围内")
+    if server_type not in ["emby", "jellyfin", "plex"]:
+        raise SubtitleTaskError("影视服务器配置无效")
+    path_authorization = _path_authorization_snapshot(
+        media_file, _get_all_media_library_root_paths()
+    )
+    if not path_authorization:
+        raise SubtitleTaskError("媒体文件路径在入队前发生变化，请重试", status_code=409)
+    payload["path_authorization"] = {"repair": path_authorization}
+    dedupe_key = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return manager.submit_task(
+        "repair",
+        owner=owner,
+        payload=payload,
+        request_id=request_id,
+        server=server_type,
+        dedupe_key=dedupe_key
+    )
+
+
 @App.route('/library/subtitle/repair', methods=['POST'])
 @login_required
 def library_subtitle_repair():
     """创建单个媒体的外挂字幕二次处理任务。"""
+    from app.helper.subtitle_tasks import SubtitleTaskError
     try:
         data = request.get_json(silent=True) or request.form.to_dict() or {}
-        media_file = os.path.normpath(str(data.get("media_path") or ""))
-        media_config = Config().get_config('media') or {}
-        server_type = str(data.get("server") or media_config.get('media_server') or "emby").lower()
-        if not media_file or not os.path.isfile(media_file):
-            return {"code": -1, "msg": "媒体文件不存在"}, 400
-        if os.path.splitext(media_file)[-1].lower() not in RMT_MEDIAEXT:
-            return {"code": -1, "msg": "请选择有效的媒体文件"}, 400
-        if not _is_within_media_library(media_file):
-            return {"code": -1, "msg": "媒体文件不在媒体库目录范围内"}, 400
-        if server_type not in ["emby", "jellyfin", "plex"]:
-            return {"code": -1, "msg": "影视服务器配置无效"}, 400
-        path_authorization = _path_authorization_snapshot(
-            media_file, _get_all_media_library_root_paths()
-        )
-        if not path_authorization:
-            return {"code": -1, "msg": "媒体文件路径在入队前发生变化，请重试"}, 409
-        payload = {
-            "media_path": media_file,
-            "server": server_type,
-            "server_item_id": data.get("server_item_id") or "",
-            "parent_server_item_id": data.get("parent_server_item_id") or "",
-            "library_id": data.get("library_id") or "",
-            "path_authorization": {"repair": path_authorization}
-        }
-        dedupe_key = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-        task, reused = _subtitle_tasks().submit_task(
-            "repair",
-            owner=_subtitle_task_owner(),
-            payload=payload,
-            request_id=data.get("request_id"),
-            server=server_type,
-            dedupe_key=dedupe_key
-        )
+        task, reused = _enqueue_library_subtitle_repair(data, _subtitle_task_owner())
         return _subtitle_task_response(task, reused, "已加入字幕二次处理队列")
+    except SubtitleTaskError as error:
+        return _subtitle_task_error(error)
+    except OperationalError as error:
+        if is_database_contention(error):
+            return {"code": -1, "msg": "数据库繁忙，请稍后重试"}, 503
+        ExceptionUtils.exception_traceback(error)
+        return {"code": -1, "msg": "修复请求未能确认，请在任务中心核对"}, 500
     except Exception as e:
         ExceptionUtils.exception_traceback(e)
         return _subtitle_task_error(e)
 
 
-@App.route('/library/image/<itemid>', methods=['GET'])
+@App.route('/library/subtitle/repair/batch', methods=['POST'])
+@login_required
+def library_subtitle_repair_batch():
+    from app.helper.subtitle_tasks import SubtitleTaskError
+    from app.db.transactions import DatabaseBusy, DatabaseContention
+    data = request.get_json(silent=True)
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list) or not 1 <= len(items) <= 18 or not all(isinstance(item, dict) for item in items):
+        return {"code": -1, "msg": "请选择本页 1 至 18 部电影"}, 400
+
+    owner = _subtitle_task_owner()
+    results = []
+    # 每部电影独立入队；后续文件失效或队列满时，已受理的任务仍可在任务中心跟踪。
+    for index, item in enumerate(items):
+        try:
+            task, reused = _enqueue_library_subtitle_repair(item, owner)
+            results.append({"task_id": task["task_id"], "status": task["status"], "reused": reused})
+        except Exception as error:
+            if isinstance(error, DatabaseContention) or is_database_contention(error):
+                # 同一写库或回执查询被锁后，不对余下每部电影再等一次 SQLite 超时。
+                results.append({"error": "数据库繁忙，本次提交待重试", "retryable": True})
+                results.extend({"error": "数据库繁忙，本次未尝试提交", "retryable": True} for _ in items[index + 1:])
+                break
+            if isinstance(error, (SubtitleTaskError, DatabaseBusy)):
+                results.append({"error": str(error)})
+            else:
+                ExceptionUtils.exception_traceback(error)
+                results.append({"error": "提交结果未确认，请在任务中心核对", "unconfirmed": True})
+    return {"code": 0, "results": results}
+
+
+_LIBRARY_IMAGE_TYPES = ("Primary", "Backdrop", "Thumb", "Logo", "Banner", "Art")
+_LIBRARY_IMAGE_TAG = re.compile(r"[A-Za-z0-9._-]{1,128}")
+_LIBRARY_IMAGE_ID = re.compile(r"[A-Za-z0-9._:/-]{1,200}")
+_LIBRARY_THUMB_WIDTH = 320
+_LIBRARY_THUMB_QUALITY = 85
+
+
+def _library_image_item_id(itemid):
+    """
+    规范化海报路由中的项目ID。Emby/Jellyfin的ID只允许单段；Plex的ID是
+    /library/metadata/N 形式的路径，路由中省略了开头的斜杠。
+    """
+    itemid = str(itemid or "")
+    if not _LIBRARY_IMAGE_ID.fullmatch(itemid) or ".." in itemid.split("/"):
+        return ""
+    server_type = MediaServer().get_type()
+    if str(getattr(server_type, "value", "")).lower() == "plex":
+        return "/" + itemid.lstrip("/")
+    return "" if "/" in itemid else itemid
+
+
+@App.route('/library/image/<path:itemid>', methods=['GET'])
 @login_required
 def library_image(itemid):
     """
     代理媒体服务器封面，避免前端暴露媒体服务器API Key
     """
-    try:
-        image_type = request.args.get("type") or "Primary"
-        res = MediaServer().get_item_image(itemid, image_type)
-        if not res or res.status_code != 200:
-            poster_file = MediaLibrary().get_local_poster_file(itemid)
-            if poster_file:
-                return send_file(poster_file)
-            response = make_response("", 404)
-            response.headers["Cache-Control"] = "private, max-age=300"
-            return response
-        response = make_response(res.content)
-        response.headers["Content-Type"] = res.headers.get("Content-Type") or "image/jpeg"
-        response.headers["Cache-Control"] = "private, max-age=3600"
-        return response
-    except Exception as e:
-        ExceptionUtils.exception_traceback(e)
+    def not_found():
         response = make_response("", 404)
         response.headers["Cache-Control"] = "private, max-age=300"
         return response
+
+    try:
+        itemid = _library_image_item_id(itemid)
+        if not itemid:
+            return not_found()
+        image_type = request.args.get("type") or "Primary"
+        if image_type not in _LIBRARY_IMAGE_TYPES:
+            return not_found()
+        tag = request.args.get("tag") or ""
+        if not _LIBRARY_IMAGE_TAG.fullmatch(tag):
+            tag = ""
+        try:
+            res = MediaServer().get_item_image(
+                itemid, image_type, max_width=_LIBRARY_THUMB_WIDTH,
+                quality=_LIBRARY_THUMB_QUALITY, tag=tag or None)
+        except Exception as e:
+            ExceptionUtils.exception_traceback(e)
+            res = None
+        content_type = (res.headers.get("Content-Type") or "") if res else ""
+        if not res or res.status_code != 200 or not content_type.lower().startswith("image/"):
+            poster_file = MediaLibrary().get_local_poster_file(itemid)
+            if poster_file:
+                # Local fallback files can change without a version: revalidate.
+                response = send_file(poster_file)
+                response.headers["Cache-Control"] = "private, no-cache"
+                return response
+            return not_found()
+        response = make_response(res.content)
+        response.headers["Content-Type"] = content_type
+        # A versioned URL changes whenever the server's poster changes, so the
+        # browser may keep it; unversioned posters keep the short cache.
+        response.headers["Cache-Control"] = (
+            "private, max-age=31536000, immutable" if tag else "private, max-age=3600")
+        return response
+    except Exception as e:
+        ExceptionUtils.exception_traceback(e)
+        return not_found()
 
 
 # 媒体服务器页面
@@ -1837,8 +2008,15 @@ def notification():
 @App.route('/subtitle', methods=['POST', 'GET'])
 @login_required
 def subtitle():
+    try:
+        auto_download_usage = Subtitle().get_auto_download_usage()
+    except Exception as err:
+        # The usage line is informational; a database error must not hide the settings.
+        ExceptionUtils.exception_traceback(err)
+        auto_download_usage = None
     return render_template("setting/subtitle.html",
-                           Config=Config().get_config())
+                           Config=Config().get_config(),
+                           AutoDownloadUsage=auto_download_usage)
 
 
 # 字幕库的独立任务设置页；同时支持直接读取与 navmenu 的 POST 页面加载。
@@ -2141,30 +2319,49 @@ def telegram():
         log.error("收到来自 %s 的非法Telegram消息：%s" % (request.remote_addr, msg_json))
         return '不允许的IP地址请求'
     if msg_json:
-        message = msg_json.get("message", {})
-        text = message.get("text")
-        user_id = message.get("from", {}).get("id")
-        log.info("收到Telegram消息：from=%s, text=%s" % (user_id, text))
-        # 获取用户名
-        user_name = message.get("from", {}).get("username")
-        if text:
-            # 检查权限
-            if text.startswith("/"):
-                if str(user_id) not in interactive_client.get("client").get_admin():
-                    Message().send_channel_msg(channel=SearchType.TG,
-                                               title="只有管理员才有权限执行此命令",
-                                               user_id=user_id)
-                    return '只有管理员才有权限执行此命令'
-            else:
-                if not str(user_id) in interactive_client.get("client").get_users():
-                    message.send_channel_msg(channel=SearchType.TG,
-                                             title="你不在用户白名单中，无法使用此机器人",
-                                             user_id=user_id)
-                    return '你不在用户白名单中，无法使用此机器人'
-            WebAction().handle_message_job(msg=text,
-                                           in_from=SearchType.TG,
-                                           user_id=user_id,
-                                           user_name=user_name)
+        client = interactive_client['client']
+        callback = msg_json.get('callback_query')
+        message = msg_json.get('message', {})
+        actor = callback.get('from', {}) if callback else message.get('from', {})
+        user_id = actor.get('id')
+        text = message.get('text') or ''
+        allowed = client.get_admin() if text.startswith('/') else client.get_users()
+        if str(user_id) not in allowed:
+            if callback:
+                client.answer_search_callback(callback['id'], '你没有使用此机器人的权限')
+            return '不允许的用户'
+        from web.backend.telegram_search import TelegramSearch
+        try:
+            if callback:
+                TelegramSearch().callback(callback)
+            elif text:
+                # Preserve existing service commands, subscriptions and direct
+                # links. Movie searches use isolated message-bound sessions.
+                from web.backend.search_torrents import SEARCH_MEDIA_TYPE
+                numeric_choice = text.isdigit() and int(text) < 10
+                legacy = (text.startswith(('/', '订阅', 'http', 'magnet:')) or
+                          (numeric_choice and not message.get('reply_to_message') and
+                           SEARCH_MEDIA_TYPE.get(user_id) == 'SUBSCRIBE'))
+                if legacy:
+                    WebAction().handle_message_job(msg=text, in_from=SearchType.TG,
+                                                   user_id=user_id, user_name=actor.get('username'))
+                else:
+                    if not numeric_choice:
+                        # Numeric film titles also start a new search rather
+                        # than continuing a previous subscription selection.
+                        # A new session search supersedes legacy numeric-reply
+                        # mode, but never replaces another session's candidates.
+                        SEARCH_MEDIA_TYPE[user_id] = 'SESSION_SEARCH'
+                    TelegramSearch().receive(text, user_id, message.get('chat', {}).get('id', user_id),
+                                             actor.get('username'), msg_json.get('update_id'),
+                                             message.get('reply_to_message', {}).get('message_id'))
+        except TaskQueueFull:
+            if callback:
+                client.answer_search_callback(callback['id'], '任务队列繁忙，请稍后重试')
+            return 'Busy', 503
+        except RuntimeError:
+            # A transport failure must not consume a webhook update as success.
+            return 'Telegram unavailable', 503
     return 'Ok'
 
 
@@ -2584,13 +2781,14 @@ def _request_bool(value):
     return str(value or "").strip().lower() in ["1", "true", "yes", "on", "y"]
 
 
-def _subtitle_tasks():
+def _subtitle_tasks(start=True):
     """Lazily register task processors after the application DB is available."""
     from app.helper.subtitle_tasks import get_subtitle_task_manager
     from app.helper.subtitle_task_processors import register_subtitle_task_processors
     manager = get_subtitle_task_manager()
     register_subtitle_task_processors(manager)
-    manager.start()
+    if start:
+        manager.start()
     return manager
 
 
@@ -2903,14 +3101,16 @@ def subtitle_task_detail(task_id):
 @login_required
 def subtitle_task_cancel(task_id):
     try:
-        task = _subtitle_tasks().cancel_task(
-            task_id,
-            owner=_subtitle_task_owner(),
-            admin=False
-        )
+        # 冷启动和 SQLite 等待也放在后台，HTTP 回执不会被同一把数据库锁挡住。
+        task = _subtitle_tasks(start=False).request_cancel(task_id, owner=_subtitle_task_owner())
         if not task:
             return {"code": -1, "msg": "字幕任务不存在"}, 404
+        if task.get("cancel_pending"):
+            return {"code": 0, "cancel_pending": True,
+                    "msg": "已收到取消请求，正在等待后台确认"}, 202
         return {"code": 0, "msg": "已请求取消字幕任务", "data": task}
+    except TaskQueueFull as e:
+        return {"code": -1, "msg": str(e)}, 503, {"Retry-After": "5"}
     except Exception as e:
         ExceptionUtils.exception_traceback(e)
         return _subtitle_task_error(e)

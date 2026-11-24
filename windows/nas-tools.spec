@@ -29,7 +29,21 @@ def collect_pkg_data(package, include_py_files=False, subdir=None):
     return data_toc
 
 pkg_data1 = collect_pkg_data('web')
-pkg_data2 = collect_pkg_data('config')
+# Only bundle built-in resources, never local databases, caches or temporary files.
+pkg_data2 = TOC([
+    ('config/' + filename, './../config/' + filename, 'DATA')
+    for filename in (
+        'config.example.yaml',
+        'default-category.yaml',
+        'sites.dat',
+        'init_filter.sql',
+        'init_userrss_v3.sql',
+        'reset_db_version.sql',
+        'update_subscribe.sql',
+        'update_userpris.sql',
+        'update_userrss.sql',
+    )
+])
 pkg_data3 = collect_pkg_data('db_scripts', include_py_files=True) # <<< Put the name of your package here
 # <<< END ADDED PART
 

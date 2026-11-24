@@ -1,5 +1,5 @@
 """Real independent SQLite connections; no production config, NAS or network."""
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import hashlib
 import json
 import os
@@ -18,8 +18,8 @@ import tests.test_subtitle_tasks  # existing optional-dependency fixtures
 from sqlalchemy import create_engine, event, select
 from sqlalchemy.pool import QueuePool
 
-from app.db.models import (Base, SUBTITLETASK, SUBTITLEAUDITSTATE, SUBTITLEMEDIASTATUS,
-                           SUBTITLEPUBLICATION, SUBTITLESTATECLOCK)
+from app.db.models import (Base, CONFIGUSERS, SUBTITLETASK, SUBTITLEAUDITSTATE, SUBTITLEMEDIASTATUS,
+                           SUBTITLEPUBLICATION, SUBTITLESTATECLOCK, TRANSFERHISTORY)
 from app.db.publication import (seed_legacy, filter_visible, begin, stage, publish,
                                 publish_now, collect, sequence)
 from app.db.settings import DatabaseSettings, wal_runtime_supported
@@ -27,6 +27,7 @@ from app.db.transactions import (ManagedDatabase, WriteCoordinator, DatabaseBusy
                                  DatabaseWriteError)
 from app.db.backup import online_backup, create_backup, stage_restore, apply_pending_restore
 from app.db.runtime import validate_database
+from app.helper.db_helper import DbHelper
 from app.helper.subtitle_tasks import SubtitleTaskManager
 from app.helper.subtitle_media_status import SubtitleMediaStatusStore
 
@@ -105,6 +106,132 @@ class DatabaseCase(unittest.TestCase):
 
 
 class DatabaseGovernanceTest(DatabaseCase):
+    def test_cancel_http_retries_locked_user_lookup_before_accepting_request(self):
+        import web.main as web_main
+        with self.db.write_transaction() as session:
+            session.add(CONFIGUSERS(ID=7, NAME='test-user'))
+        with self.db.engine.connect() as reader:
+            # Pin the timeout to this read pool for deterministic lock detection.
+            reader.connection.cursor().execute('PRAGMA busy_timeout=50').close()
+        client = web_main.App.test_client()
+        with client.session_transaction() as session:
+            session['_user_id'] = 7
+        with patch.object(DbHelper, '_db', self.db), patch('web.backend.user.Config') as config, \
+                patch.object(web_main, '_subtitle_tasks') as tasks:
+            config.return_value.get_config.return_value = {'login_user': 'admin', 'login_password': 'dummy value'}
+            tasks.return_value.request_cancel.return_value = {'cancel_pending': True}
+            with closing(sqlite3.connect(self.db.path)) as other:
+                other.execute('BEGIN EXCLUSIVE')
+                response = client.post('/subtitle/tasks/test/cancel')
+                self.assertEqual(response.status_code, 503)
+                self.assertTrue(response.get_json()['cancel_retryable'])
+                for url in ('/library/subtitle/repair', '/library/subtitle/repair/batch'):
+                    with self.subTest(url=url):
+                        response = client.post(url, json={})
+                        self.assertEqual(response.status_code, 503)
+                        self.assertTrue(response.get_json()['retryable'])
+                        self.assertEqual(response.headers['Retry-After'], '5')
+                tasks.assert_not_called()
+            response = client.post('/subtitle/tasks/test/cancel')
+            self.assertEqual(response.status_code, 202)
+            tasks.return_value.request_cancel.assert_called_once_with('test', owner='7')
+
+    def test_cold_cancel_applies_only_to_owned_task_during_recovery(self):
+        self.task('owned')
+        self.task('other')
+        with self.db.write_transaction():
+            self.db.query(SUBTITLETASK).filter_by(ID='other').one().OWNER = 'someone-else'
+        manager = SubtitleTaskManager(db=self.db, staging_root=str(self.root / 'staging'))
+        self.addCleanup(manager.shutdown)
+        receipt = manager.request_cancel('owned', 'owner')
+        terminal = tests.test_subtitle_tasks.SubtitleTaskManagerTest.wait_terminal(manager, 'owned')
+        self.assertEqual(terminal['status'], 'canceled')
+        self.assertTrue(receipt.get('cancel_pending') or receipt.get('status') == 'canceled')
+        self.assertIsNone(manager.request_cancel('other', 'owner'))
+        self.assertFalse(self.db.query(SUBTITLETASK).filter_by(ID='other').one().CANCEL_REQUESTED)
+
+    def test_sql_error_mentioning_locked_column_is_not_retried_as_contention(self):
+        with self.assertRaises(DatabaseWriteError), self.db.write_transaction() as session:
+            session.execute('SELECT missing_locked_column FROM SUBTITLE_TASK')
+
+    def test_cancel_running_audit_during_exclusive_lock(self):
+        manager = SubtitleTaskManager(db=self.db, staging_root=str(self.root / 'staging'))
+        started, check_cancel = threading.Event(), threading.Event()
+        stopped, finish = threading.Event(), threading.Event()
+
+        def scan(manager, task_id):
+            started.set()
+            if check_cancel.wait(8) and manager.is_cancel_requested(task_id):
+                stopped.set()
+            finish.wait(8)
+            manager.commit_audit_result(task_id, 'scope', 'emby', {'movie': {'status': 'ok'}},
+                                        {}, 'succeeded', 'done')
+
+        manager.register_processor('audit', scan)
+        self.addCleanup(manager.shutdown)
+        self.addCleanup(finish.set)
+        self.addCleanup(check_cancel.set)
+        task, _ = manager.submit_task('audit', 'owner', {'category': 'movie'}, scope_key='scope')
+        task_id = task['task_id']
+        self.assertTrue(started.wait(3))
+        with self.db.managed.write_engine.connect() as writer:
+            writer.exec_driver_sql('PRAGMA busy_timeout=50')
+        with closing(sqlite3.connect(self.db.path)) as other:
+            other.execute('BEGIN EXCLUSIVE')
+            self.assertIsNone(manager.request_cancel(task_id, 'other-user'))
+            self.assertEqual(manager.request_cancel(task_id, 'owner'), {'cancel_pending': True})
+            self.assertEqual(manager.request_cancel(task_id, 'owner'), {'cancel_pending': True})
+            check_cancel.set()
+            self.assertTrue(stopped.wait(2), 'the owner can stop the scan even while reads are blocked')
+            self.assertFalse(other.execute('SELECT CANCEL_REQUESTED FROM SUBTITLE_TASK WHERE ID=?',
+                                           (task_id,)).fetchone()[0])
+            other.rollback()
+            # No further HTTP request or processor write: the server must deliver
+            # the cancellation itself once the independent writer releases the lock.
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                state = other.execute('SELECT STATUS, CANCEL_REQUESTED FROM SUBTITLE_TASK WHERE ID=?',
+                                      (task_id,)).fetchone()
+                if state == ('canceling', 1):
+                    break
+                time.sleep(0.02)
+            self.assertEqual(state, ('canceling', 1))
+        finish.set()
+        terminal = tests.test_subtitle_tasks.SubtitleTaskManagerTest.wait_terminal(manager, task_id)
+        self.assertEqual(terminal['status'], 'canceled')
+        self.assertEqual(self.db.query(SUBTITLEAUDITSTATE).count(), 0)
+
+    def test_linked_audit_can_commit_progress_while_iterating_transfer_history(self):
+        self.task()
+        manager = SubtitleTaskManager(db=self.db, staging_root=str(self.root / 'staging'))
+        helper = DbHelper()
+        helper._db = self.db
+        with self.db.write_transaction() as session:
+            session.add_all([
+                TRANSFERHISTORY(ID=i, DATE='2026-11-20' if i % 2 else None,
+                                DEST_PATH='/media', DEST_FILENAME=f'{i}.mkv')
+                for i in range(1, 121)
+            ])
+            session.add(TRANSFERHISTORY(ID=121, DATE='2026-11-21', DEST_PATH='', DEST_FILENAME='x'))
+        # Keep the real commit and separate reader/writer connections. A short
+        # timeout makes a reader held across the generator yield fail promptly.
+        with self.db.managed.write_engine.connect() as connection:
+            self.assertEqual(connection.exec_driver_sql('PRAGMA journal_mode').scalar(), 'delete')
+            connection.exec_driver_sql('PRAGMA busy_timeout=100')
+        histories = helper.iter_transfer_histories_with_dest(batch_size=50)
+        self.addCleanup(histories.close)
+        first = next(histories)
+        self.assertTrue(manager.update_progress('audit', phase='enumerating', current_item=first.DEST_FILENAME))
+        # A late backdated transfer must wait for the next scan. Deleting an
+        # already visited row must not shift the remaining page boundaries.
+        with self.db.write_transaction() as session:
+            session.add(TRANSFERHISTORY(DATE=None, DEST_PATH='/media', DEST_FILENAME='late.mkv'))
+            session.query(TRANSFERHISTORY).filter_by(ID=first.ID).delete()
+        self.assertEqual([first.ID] + [row.ID for row in histories],
+                         list(range(119, 0, -2)) + list(range(120, 0, -2)))
+        with self.db.read_snapshot():
+            self.assertEqual(self.db.query(SUBTITLETASK).one().CURRENT_ITEM, '119.mkv')
+
     def test_fixed_runtime_matrix_does_not_accept_intermediate_unpatched_versions(self):
         for version in ((3, 44, 6), (3, 50, 7), (3, 51, 3), (3, 53, 1)):
             self.assertTrue(wal_runtime_supported(version))

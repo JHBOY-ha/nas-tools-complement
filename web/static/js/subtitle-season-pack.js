@@ -21,7 +21,8 @@
   window.open_library_season_pack = function () {
     if (request || !isCurrent()) return;
     const season = $("#library_episode_season").val();
-    const item = library_items_cache[library_current_series_id];
+    const item = typeof library_lookup_item === "function"
+      ? library_lookup_item(library_current_series_id) : library_items_cache[library_current_series_id];
     if (!item || season === "" || season == null) {
       show_fail_modal("请先选择具体的一季，再上传整季字幕");
       return;
@@ -37,7 +38,8 @@
     $("#season_pack_rows").empty();
     message("选择字幕文件（可多选）或 ZIP 包后预览匹配，可取消勾选不需要的字幕。");
     busy(false);
-    $("#index-library-episodes-modal").modal("hide");
+    // The drawer and the dialog must not hold focus together; it returns when the dialog closes.
+    if (typeof library_drawer_hide_for_modal === "function") library_drawer_hide_for_modal();
     $("#season-pack-modal").modal("show");
   };
   window.reset_library_season_pack = function () {

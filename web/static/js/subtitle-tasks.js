@@ -6,7 +6,7 @@
   }
 
   const TERMINAL_STATUSES = new Set([
-    "succeeded", "partial", "failed", "canceled", "interrupted"
+    "succeeded", "partial", "failed", "canceled", "interrupted", "unavailable"
   ]);
   const ACTIVE_STATUSES = new Set([
     "queued", "recovering", "running", "canceling"
@@ -14,6 +14,7 @@
   const STORAGE_KEY = "nastool.subtitle.tasks.v1";
   const taskCache = new Map();
   const watchers = new Map();
+  const cancelRequests = new Map();
   const detailLoaded = new Set();
   const detailLoading = new Set();
   let initialized = false;
@@ -38,12 +39,18 @@
     partial: ["部分完成", "bg-yellow-lt text-yellow"],
     failed: ["失败", "bg-red-lt text-red"],
     canceled: ["已取消", "bg-secondary-lt text-secondary"],
-    interrupted: ["已中断", "bg-orange-lt text-orange"]
+    interrupted: ["已中断", "bg-orange-lt text-orange"],
+    unavailable: ["结果已不可查询", "bg-secondary-lt text-secondary"]
   };
   const TYPE_LABELS = {
     upload: "手动上传",
     repair: "二次处理",
     audit: "字幕检测"
+  };
+  const SERVER_LABELS = {
+    emby: "Emby",
+    jellyfin: "Jellyfin",
+    plex: "Plex"
   };
   const PHASE_LABELS = {
     queued: "等待资源",
@@ -162,6 +169,7 @@
           const response = (xhr && xhr.responseJSON) || parseJson(xhr && xhr.responseText);
           reject({
             status: xhr && xhr.status,
+            timedOut: textStatus === "timeout",
             response: response,
             message: responseMessage(response, textStatus === "timeout" ? "请求超时，请重试" : "连接中断，请稍后重试")
           });
@@ -251,6 +259,7 @@
   function pollWatcher(entry) {
     request("GET", "/subtitle/tasks/" + encodeURIComponent(entry.taskId))
         .then(function (response) {
+          if (watchers.get(entry.taskId) !== entry) return;
           const task = taskOf(response) || payloadOf(response);
           if (!task || !(task.task_id || task.id)) {
             throw {message: "任务状态响应不完整"};
@@ -274,6 +283,19 @@
           scheduleWatcher(entry, hiddenDelay);
         })
         .catch(function (error) {
+          if (watchers.get(entry.taskId) !== entry) return;
+          if (error.status === 404 && error.response && error.response.code === -1) {
+            // A task-detail 404 ends observation. Its actual outcome is unknown;
+            // never cache this local notification as a finished server task.
+            window.clearTimeout(entry.timer);
+            watchers.delete(entry.taskId);
+            taskCache.delete(entry.taskId);
+            detailLoaded.delete(entry.taskId);
+            renderCenter();
+            updateTaskButtons();
+            notifyWatcher(entry, "onDone", {task_id: entry.taskId, status: "unavailable", error: "任务结果已不可查询"});
+            return;
+          }
           entry.failures += 1;
           entry.connectionLost = true;
           entry.delay = Math.min(Math.round(entry.delay * 1.8), 30000);
@@ -411,15 +433,38 @@
     if (!taskId) {
       return Promise.reject({message: "缺少任务 ID"});
     }
-    return request("POST", "/subtitle/tasks/" + encodeURIComponent(taskId) + "/cancel", {})
-        .then(function (response) {
-          const task = taskOf(response) || payloadOf(response);
-          if (task && (task.task_id || task.id)) {
-            emitTask(task);
-          }
-          watch(taskId, {});
-          return task;
-        });
+    if (!cancelRequests.has(taskId)) {
+      cancelRequests.set(taskId, sendCancel(taskId).finally(() => cancelRequests.delete(taskId)));
+    }
+    return cancelRequests.get(taskId);
+  }
+
+  async function sendCancel(taskId) {
+    let delay = 5000;
+    while (true) {
+      let response;
+      try {
+        response = await request("POST", "/subtitle/tasks/" + encodeURIComponent(taskId) + "/cancel", {});
+      } catch (error) {
+        if (!error.timedOut && !(error.response && error.response.cancel_retryable)) throw error;
+        // 排他锁也可能挡住身份查询。服务端尚未确认接收时，由当前页面退避重试。
+        const message = "尚未收到取消回执，此页面将自动重试";
+        setConnectionState(message, true);
+        announce(message);
+        await new Promise(resolve => window.setTimeout(resolve, delay));
+        delay = Math.min(delay * 2, 30000);
+        continue;
+      }
+      if (!watchers.has(taskId)) watch(taskId, {});
+      if (response.cancel_pending) {
+        setConnectionState(response.msg, true);
+        announce(response.msg);
+        return response;
+      }
+      const task = taskOf(response) || payloadOf(response);
+      if (task && (task.task_id || task.id)) emitTask(task);
+      return task;
+    }
   }
 
   function confirmCancel(taskId) {
@@ -564,6 +609,32 @@
     return `${remaining}秒`;
   }
 
+  // 按浏览器本地时间显示“今天 10:57”“昨天 23:10”“11月18日 00:11”，跨年才带年份；
+  // 完整时间戳保留在 datetime/title 中。
+  function formatTaskTime(value, now) {
+    const date = new Date(value);
+    if (!value || Number.isNaN(date.getTime())) {
+      return String(value || "");
+    }
+    const pad = function (number) {
+      return String(number).padStart(2, "0");
+    };
+    const clock = `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+    const today = now ? new Date(now) : new Date();
+    const dayStart = function (day) {
+      return new Date(day.getFullYear(), day.getMonth(), day.getDate()).getTime();
+    };
+    const days = Math.round((dayStart(today) - dayStart(date)) / 86400000);
+    if (days === 0) {
+      return `今天 ${clock}`;
+    }
+    if (days === 1) {
+      return `昨天 ${clock}`;
+    }
+    const year = date.getFullYear() === today.getFullYear() ? "" : `${date.getFullYear()}年`;
+    return `${year}${date.getMonth() + 1}月${date.getDate()}日 ${clock}`;
+  }
+
   function metricsText(metrics) {
     metrics = metrics || {};
     const definitions = [
@@ -684,7 +755,8 @@
     const percent = state.percent === null || state.percent === undefined ? null : Math.max(0, Math.min(100, Math.round(state.percent)));
     if (bar) {
       bar.classList.toggle("progress-bar-indeterminate", percent === null);
-      bar.style.width = percent === null ? "100%" : percent + "%";
+      // 未知进度不设宽度：整条填满会盖住同色的 Tabler 滑块，看起来像已完成。
+      bar.style.width = percent === null ? "" : percent + "%";
       bar.textContent = percent === null ? "" : percent + "%";
     }
     if (progress) {
@@ -767,19 +839,34 @@
     return html;
   }
 
+  function serverLabel(task) {
+    return task.server ? (SERVER_LABELS[String(task.server).toLowerCase()] || String(task.server)) : "";
+  }
+
+  function timeTag(value, suffix) {
+    return value
+        ? `<time datetime="${escapeHtml(value)}" title="${escapeHtml(value)}">${escapeHtml(formatTaskTime(value))}${suffix || ""}</time>`
+        : "";
+  }
+
+  // 进行中的任务保留完整卡片：进度、当前项与取消入口都需要看得到。
   function renderTaskCard(task) {
     task = normalizeTask(task);
     const status = statusMeta(task.status);
     const data = progressData(task);
     const knownProgress = data.percent !== null;
     const title = TYPE_LABELS[task.type] || task.type || "字幕任务";
-    const server = task.server ? String(task.server).toUpperCase() : "";
+    const server = serverLabel(task);
     const scope = taskScopeText(task);
-    const time = task.created_at || task.started_at || "";
+    const active = isActive(task);
+    // 排队中的任务还没开始，显示提交时间。
+    const time = task.started_at || task.created_at || "";
+    const timeSuffix = active ? (task.started_at ? " 开始" : " 提交") : "";
     const elapsed = data.elapsedSeconds !== undefined && data.elapsedSeconds !== null
         ? formatElapsed(data.elapsedSeconds) : "";
     const metrics = metricsText(data.metrics);
-    const canCancel = task.cancellable !== false && isActive(task) && task.status !== "canceling";
+    const canCancel = task.cancellable !== false && isActive(task)
+        && (task.status !== "canceling" || (task.progress && task.progress.phase === "cancel_reconciling"));
     const queue = task.status === "queued" && task.queue_position
         ? `<span class="text-muted small">队列第 ${escapeHtml(task.queue_position)} 位</span>` : "";
     const progressLabel = data.total !== null && data.total !== undefined
@@ -793,22 +880,22 @@
               <div class="d-flex flex-wrap align-items-center gap-2">
                 <span class="fw-bold">${escapeHtml(title)}</span>
                 <span class="badge ${status[1]}">${escapeHtml(status[0])}</span>
-                ${server ? `<span class="badge bg-secondary-lt text-secondary">${escapeHtml(server)}</span>` : ""}
                 ${queue}
               </div>
-              <div class="d-flex flex-wrap gap-2 text-muted small mt-1">
+              <div class="subtitle-task-meta text-muted small mt-1">
+                ${server ? `<span>${escapeHtml(server)}</span>` : ""}
                 <span>${escapeHtml(data.phase)}</span>
                 ${progressLabel ? `<span>${escapeHtml(progressLabel)}</span>` : ""}
-                ${elapsed ? `<span>耗时 ${escapeHtml(elapsed)}</span>` : ""}
-                ${time ? `<span>${escapeHtml(time)}</span>` : ""}
+                ${timeTag(time, timeSuffix)}
+                ${elapsed ? `<span>${active ? "已运行" : "耗时"} ${escapeHtml(elapsed)}</span>` : ""}
               </div>
               ${scope ? `<div class="text-muted small text-break mt-1">${escapeHtml(scope)}</div>` : ""}
             </div>
-            ${canCancel ? `<button type="button" class="btn btn-sm btn-outline-danger subtitle-task-cancel" data-task-id="${escapeHtml(task.task_id)}" aria-label="取消${escapeHtml(title)}">取消</button>` : ""}
+            ${canCancel ? `<button type="button" class="btn btn-sm subtitle-task-cancel" data-task-id="${escapeHtml(task.task_id)}" aria-label="取消${escapeHtml(title)}">取消</button>` : ""}
           </div>
-          ${isActive(task) ? `
+          ${active ? `
           <div class="progress progress-sm mt-3" role="progressbar" aria-label="${escapeHtml(title)}进度" ${knownProgress ? `aria-valuenow="${data.percent}"` : ""} aria-valuemin="0" aria-valuemax="100">
-            <div class="progress-bar ${knownProgress ? "" : "progress-bar-indeterminate"}" style="width:${knownProgress ? data.percent + "%" : "100%"}"></div>
+            <div class="progress-bar ${knownProgress ? "" : "progress-bar-indeterminate"}"${knownProgress ? ` style="width:${data.percent}%"` : ""}></div>
           </div>` : ""}
           ${data.message ? `<div class="small mt-2">${escapeHtml(data.message)}</div>` : ""}
           ${data.currentItem ? `<div class="text-muted small text-break mt-1">当前：${escapeHtml(data.currentItem)}</div>` : ""}
@@ -817,6 +904,47 @@
           ${resultDetails(task)}
         </div>
       </article>`;
+  }
+
+  function fileNameOf(path) {
+    const parts = String(path || "").split(/[\\/]/).filter(Boolean);
+    return parts.length ? parts[parts.length - 1] : String(path || "");
+  }
+
+  // 已结束的任务压成紧凑行：媒体文件只显示文件名，完整路径放在悬停提示里；
+  // 时间在宽屏靠右，窄屏并入信息行；错误、指标和逐字幕结果仍然保留，避免压缩后丢信息。
+  function renderTaskRow(task) {
+    task = normalizeTask(task);
+    const status = statusMeta(task.status);
+    const data = progressData(task);
+    const title = TYPE_LABELS[task.type] || task.type || "字幕任务";
+    const server = serverLabel(task);
+    const scope = taskScopeText(task);
+    const subject = /[\\/]/.test(scope) ? fileNameOf(scope) : scope;
+    const time = task.finished_at || task.updated_at || task.created_at || "";
+    const elapsed = data.elapsedSeconds !== undefined && data.elapsedSeconds !== null
+        ? formatElapsed(data.elapsedSeconds) : "";
+    const metrics = metricsText(data.metrics);
+    const error = task.error || (task.result && task.result.error) || "";
+    return `
+      <div class="list-group-item subtitle-task-row" data-subtitle-task-id="${escapeHtml(task.task_id)}">
+        <div class="d-flex align-items-start gap-3">
+          <span class="badge ${status[1]} subtitle-task-row-status flex-shrink-0">${escapeHtml(status[0])}</span>
+          <div class="flex-fill min-w-0">
+            <div class="text-break"${scope ? ` title="${escapeHtml(scope)}"` : ""}><span class="fw-bold">${escapeHtml(title)}</span>${subject ? ` · ${escapeHtml(subject)}` : ""}</div>
+            <div class="subtitle-task-meta text-muted small">
+              ${server ? `<span>${escapeHtml(server)}</span>` : ""}
+              ${time ? `<span class="d-sm-none">${timeTag(time)}</span>` : ""}
+              ${data.message ? `<span>${escapeHtml(data.message)}</span>` : ""}
+              ${elapsed ? `<span>耗时 ${escapeHtml(elapsed)}</span>` : ""}
+            </div>
+            ${metrics ? `<div class="text-muted small">${escapeHtml(metrics)}</div>` : ""}
+            ${error ? `<div class="text-danger small mt-1">${escapeHtml(error)}</div>` : ""}
+            ${resultDetails(task)}
+          </div>
+          ${time ? `<span class="text-muted small text-nowrap d-none d-sm-inline">${timeTag(time)}</span>` : ""}
+        </div>
+      </div>`;
   }
 
   function sortedTasks() {
@@ -837,7 +965,24 @@
       list.innerHTML = '<div class="empty py-5"><p class="empty-title">暂无字幕任务</p><p class="empty-subtitle text-muted">上传、二次处理和检测任务会显示在这里。</p></div>';
       return;
     }
-    list.innerHTML = '<div class="d-grid gap-3">' + tasks.map(renderTaskCard).join("") + "</div>";
+    const running = tasks.filter(isActive);
+    const finished = tasks.filter(function (task) {
+      return !isActive(task);
+    });
+    let html = "";
+    if (running.length) {
+      html += `<section class="subtitle-task-group" aria-labelledby="subtitle-task-group-running">
+          <h6 class="subtitle-task-group-title" id="subtitle-task-group-running">进行中 · ${running.length}</h6>
+          <div class="d-grid gap-3">${running.map(renderTaskCard).join("")}</div>
+        </section>`;
+    }
+    if (finished.length) {
+      html += `<section class="subtitle-task-group" aria-labelledby="subtitle-task-group-finished">
+          <h6 class="subtitle-task-group-title" id="subtitle-task-group-finished">最近完成</h6>
+          <div class="card"><div class="list-group list-group-flush">${finished.map(renderTaskRow).join("")}</div></div>
+        </section>`;
+    }
+    list.innerHTML = html;
   }
 
   function updateTaskButtons() {
@@ -945,13 +1090,28 @@
     style.textContent = [
       ".subtitle-task-modal-list{min-height:12rem}",
       ".subtitle-upload-progress .progress-bar{min-width:0;transition:width .2s ease-out}",
-      "[data-subtitle-task-center],.subtitle-task-cancel,.subtitle-task-cancel-action{min-height:2.75rem}",
-      "@media (prefers-reduced-motion:reduce){.subtitle-upload-progress .progress-bar{transition:none!important}}"
+      // 卡片里的“取消”是中性小按钮，高度由 .lit-library-modal 的统一规则决定（桌面 28px、触屏 36px）。
+      "[data-subtitle-task-center],.subtitle-task-cancel-action{min-height:2.75rem}",
+      // 每项前都带“·”，整体左移一个分隔符宽度并裁掉溢出：每行第一项的分隔符落在框外，换行后行首不会挂着“·”。
+      ".subtitle-task-meta{display:flex;flex-wrap:wrap;column-gap:.75rem;overflow:hidden}",
+      ".subtitle-task-meta>*{margin-left:-.75rem}",
+      ".subtitle-task-meta>*::before{content:\"·\";display:inline-block;width:.75rem;text-align:center}",
+      ".subtitle-task-row-status{min-width:3.75rem;text-align:center}",
+      ".subtitle-task-modal-list .list-group{--tblr-list-group-item-padding-x:1rem;--tblr-list-group-item-padding-y:.875rem}",
+      ".subtitle-task-group+.subtitle-task-group{margin-top:1.5rem}",
+      ".subtitle-task-group-title{margin:0 0 .5rem;font-size:.75rem;font-weight:600;color:var(--tblr-muted)}",
+      ".subtitle-task-footer-note{display:flex;align-items:flex-start;gap:.5rem;flex:1 1 16rem;max-width:28rem;margin-right:auto}",
+      ".subtitle-task-footer-note .icon{flex-shrink:0;width:1.125rem;height:1.125rem;margin-top:.0625rem}",
+      // 窄屏说明独占一行，按钮另起一行靠右，避免三行说明和按钮挤在一起。
+      "@media (max-width:575.98px){.subtitle-task-footer-note{flex-basis:100%;max-width:none}}",
+      "@media (prefers-reduced-motion:reduce){.subtitle-upload-progress .progress-bar{transition:none!important}}",
+      // 进度未知时由 Tabler 的滑块表达“仍在进行”；减少动态效果时改为静止的浅色整条，避免误读为已完成。
+      "@media (prefers-reduced-motion:reduce){:is(.subtitle-upload-progress,.subtitle-task-modal-list) .progress-bar-indeterminate{width:100%!important;opacity:.35}:is(.subtitle-upload-progress,.subtitle-task-modal-list) .progress-bar-indeterminate:before{animation:none}}"
     ].join("");
     document.head.appendChild(style);
     const wrapper = document.createElement("div");
     wrapper.innerHTML = `
-      <div class="modal modal-blur fade" id="subtitle-task-center-modal" tabindex="-1" role="dialog" aria-hidden="true">
+      <div class="modal modal-blur fade lit-library-modal" id="subtitle-task-center-modal" tabindex="-1" role="dialog" aria-hidden="true">
         <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable" role="document">
           <div class="modal-content">
             <div class="modal-header">
@@ -962,11 +1122,14 @@
               <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
             </div>
             <div class="modal-body">
-              <div class="alert alert-info py-2">关闭窗口不会停止后台任务。只有点击任务右侧的“取消”才会请求停止；NAS 目录操作可能在安全点前保持“正在取消”。</div>
               <div id="subtitle-task-center-list" class="subtitle-task-modal-list" aria-live="polite"></div>
             </div>
             <div class="modal-footer">
-              <button type="button" class="btn me-auto" data-bs-dismiss="modal">关闭</button>
+              <div class="subtitle-task-footer-note text-muted small">
+                <svg xmlns="http://www.w3.org/2000/svg" class="icon" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><path d="M12 8h.01"></path><path d="M11 12h1v4h1"></path></svg>
+                <span>关闭窗口不会停止后台任务，点“取消”才会请求停止；NAS 目录操作可能在安全点前保持“正在取消”。</span>
+              </div>
+              <button type="button" class="btn" data-bs-dismiss="modal">关闭</button>
               <button type="button" class="btn btn-outline-primary" id="subtitle-task-center-refresh">刷新状态</button>
             </div>
           </div>

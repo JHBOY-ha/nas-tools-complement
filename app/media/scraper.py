@@ -1,5 +1,7 @@
+import errno
 import os.path
 import time
+import uuid
 from xml.dom import minidom
 
 import log
@@ -85,7 +87,8 @@ class Scraper:
                            doubaninfo: dict,
                            scraper_movie_nfo: dict,
                            out_path,
-                           file_name):
+                           file_name,
+                           exclusive=False):
         """
         生成电影的NFO描述文件
         :param tmdbinfo: TMDB元数据
@@ -93,6 +96,7 @@ class Scraper:
         :param scraper_movie_nfo: 刮削配置
         :param out_path: 电影根目录
         :param file_name: 电影文件名，不含后缀
+        :param exclusive: 原盘元数据须完整发布且不得覆盖已有 NFO（可能与下载目录硬链接）
         """
         # 开始生成XML
         log.info("【Scraper】正在生成电影NFO文件：%s" % file_name)
@@ -116,7 +120,23 @@ class Scraper:
             DomUtils.add_node(doc, root, "year",
                               tmdbinfo.get("release_date")[:4] if tmdbinfo.get("release_date") else "")
         # 保存
-        self.__save_nfo(doc, os.path.join(out_path, "%s.nfo" % file_name))
+        self.__save_nfo(doc, os.path.join(out_path, "%s.nfo" % file_name), exclusive=exclusive)
+
+    def ensure_disc_movie_nfo(self, media, options, dir_path):
+        """Directory discs use movie.nfo; errors must reach the transfer transaction."""
+        from app.media.meta.disc_metadata import validate_movie_nfo
+        path = os.path.join(dir_path, 'movie.nfo')
+        if validate_movie_nfo(path, media.tmdb_id):
+            return path
+        if not (options.get('basic') or options.get('credits')):
+            return None
+        # Even a credits-only disc NFO needs its movie identity for safe reuse.
+        options = dict(options, basic=True)
+        doubaninfo = self.douban.get_douban_info(media) if (
+            options.get('credits') and options.get('credits_chinese')) else None
+        self.gen_movie_nfo_file(media.tmdb_info, doubaninfo, options, dir_path, 'movie', exclusive=True)
+        validate_movie_nfo(path, media.tmdb_id)
+        return path
 
     def gen_tv_nfo_file(self,
                         tmdbinfo: dict,
@@ -283,8 +303,33 @@ class Scraper:
             ExceptionUtils.exception_traceback(err)
 
     @staticmethod
-    def __save_nfo(doc, out_file):
+    def __save_nfo(doc, out_file, exclusive=False):
         xml_str = doc.toprettyxml(indent="  ", encoding="utf-8")
+        if exclusive:
+            from app.utils.exclusive_publish import rename_exclusive
+            # Never truncate a shared inode or expose a partially written NFO.
+            temporary = os.path.join(os.path.dirname(out_file), '.movie-nfo-' + uuid.uuid4().hex + '.tmp')
+            # Match ordinary NFO creation permissions (0666 filtered by umask),
+            # instead of tempfile's private 0600 that can hide NFOs from Jellyfin.
+            descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+            try:
+                with os.fdopen(descriptor, 'wb') as stream:
+                    stream.write(xml_str)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                # Hardlink publication is exclusive and also works on older musl
+                # without renameat2. Only unsupported linking may fall back;
+                # existing targets and ordinary I/O errors must remain failures.
+                try:
+                    os.link(temporary, out_file)
+                except OSError as error:
+                    if error.errno not in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS, errno.EXDEV, errno.EINVAL):
+                        raise
+                    rename_exclusive(temporary, out_file)
+            finally:
+                if os.path.lexists(temporary):
+                    os.unlink(temporary)
+            return
         with open(out_file, "wb") as xml_file:
             xml_file.write(xml_str)
 

@@ -67,6 +67,9 @@ ACTION_PERMISSIONS = {command: permission for permission, commands in _COMMAND_G
 # These native routes render credentials/configuration or bypass the dispatcher.
 # Protect their views as well as /do, so a backup/page cannot leak the API key.
 PAGE_ACTIONS = {
+    "library_refresh": "start_mediasync",
+    # 单片和批量修复都会改写外挂字幕，沿用字幕文件操作的“媒体整理”权限。
+    "library_subtitle_repair": "download_subtitle", "library_subtitle_repair_batch": "download_subtitle",
     "resources": "list_site_resources",  # Reject denied pages before rendering empty results.
     "basic": "update_config", "douban": "update_config", "downloader": "update_config",
     "indexer": "update_config", "library": "update_config", "mediaserver": "update_config",

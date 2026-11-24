@@ -252,6 +252,9 @@ def execute(operation, arguments):
                 digest.update(chunk)
         return digest.hexdigest()
     if operation == 'compare':
+        # Persistent workers must not reuse a pre-interruption byte comparison
+        # merely because a restored/replaced file kept its size and timestamps.
+        filecmp.clear_cache()
         return filecmp.cmp(arguments['source'], arguments['target'], shallow=False)
     if operation == 'lock':
         handle = open(arguments['path'], 'a+b')

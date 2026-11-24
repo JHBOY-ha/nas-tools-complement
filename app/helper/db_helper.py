@@ -4,10 +4,11 @@ import time
 import json
 import re
 from enum import Enum
-from sqlalchemy import and_, cast, func, or_
+from sqlalchemy import and_, cast, func, or_, select, tuple_
 
 from app.db import MainDb, DbPersist
 from app.db.models import *
+from app.db.transactions import read_snapshot
 from app.utils import StringUtils
 from app.utils.types import MediaType, RmtMode
 
@@ -17,11 +18,19 @@ class DbHelper:
 
     @DbPersist(_db)
     def insert_search_results(self, media_items: list, title=None, ident_flag=True):
+        # Legacy channels retain their existing table; interactive sessions use
+        # the same presentation mapping without touching those global rows.
+        rows = self.make_search_results(media_items, title, ident_flag)
+        if rows:
+            self._db.insert(rows)
+
+    @staticmethod
+    def make_search_results(media_items: list, title=None, ident_flag=True):
         """
-        将返回信息插入数据库
+        构造页面结果行；会话结果可直接使用，不必写入全局结果表。
         """
         if not media_items:
-            return
+            return []
         data_list = []
         for media_item in media_items:
             if media_item.type == MediaType.TV:
@@ -63,7 +72,7 @@ class DbHelper:
                     UPLOAD_VOLUME_FACTOR=media_item.upload_volume_factor,
                     DOWNLOAD_VOLUME_FACTOR=media_item.download_volume_factor
                 ))
-        self._db.insert(data_list)
+        return data_list
 
     def get_search_result_by_id(self, dl_id):
         """
@@ -398,19 +407,36 @@ class DbHelper:
         ).all()
 
     def iter_transfer_histories_with_dest(self, batch_size=500):
-        """分批迭代已有目标文件的转移历史，避免大型媒体库一次载入内存。"""
+        """按日期和 ID 倒序分页，每页结束读事务后再交给字幕扫描器。"""
         try:
             batch_size = max(50, min(int(batch_size or 500), 5000))
         except (TypeError, ValueError):
             batch_size = 500
-        query = self._db.query(TRANSFERHISTORY).filter(
-            TRANSFERHISTORY.DEST_PATH.isnot(None),
-            TRANSFERHISTORY.DEST_FILENAME.isnot(None),
-            TRANSFERHISTORY.DEST_PATH != '',
-            TRANSFERHISTORY.DEST_FILENAME != ''
-        ).order_by(TRANSFERHISTORY.DATE.desc(), TRANSFERHISTORY.ID.desc())
-        for row in query.yield_per(batch_size):
-            yield row
+        history = TRANSFERHISTORY
+        with read_snapshot(self._db) as session:
+            max_id = session.query(func.max(history.ID)).scalar()
+        if max_id is None:
+            return
+        # 扫描期间新增的高 ID 记录留给下次。按键续页，删除已读记录不会跳过下一条。
+        base = select(history).where(
+            history.ID <= max_id, history.DEST_PATH != '', history.DEST_FILENAME != ''
+        ).order_by(history.DATE.desc(), history.ID.desc()).limit(batch_size)
+        # SQLite 倒序时空日期排最后。单独遍历旧的空日期记录，让两段都能用索引续页。
+        for dated in (True, False):
+            section = base.where(history.DATE.isnot(None) if dated else history.DATE.is_(None))
+            page = section
+            while True:
+                with read_snapshot(self._db) as session:
+                    rows = session.execute(page).scalars().all()
+                # 消费者会检查 NAS 文件并用独立连接保存进度，不能在 yield 时持有读游标。
+                yield from rows
+                if len(rows) < batch_size:
+                    break
+                last = rows[-1]
+                if dated:
+                    page = section.where(tuple_(history.DATE, history.ID) < (last.DATE, last.ID))
+                else:
+                    page = section.where(history.ID < last.ID)
 
     @DbPersist(_db)
     def delete_transfer_log_by_id(self, logid):
@@ -580,6 +606,7 @@ class DbHelper:
         """
         self._db.query(TRANSFERBLACKLIST).delete()
         self._db.query(SYNCHISTORY).delete()
+        self._db.query(SYSTEMDICT).filter(SYSTEMDICT.TYPE == 'verified_disc').delete()
 
     @DbPersist(_db)
     def truncate_rss_history(self, ):

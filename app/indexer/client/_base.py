@@ -9,6 +9,7 @@ from app.media import Media
 from app.media.meta import MetaInfo
 from app.media.meta.special_resolver import identity, tmdb_type
 from app.utils import DomUtils, RequestUtils, StringUtils, ExceptionUtils
+from app.utils.search_cancellation import search_is_canceled
 from app.utils.types import MediaType, SearchType
 
 
@@ -57,7 +58,7 @@ class _IIndexClient(metaclass=ABCMeta):
         """
         根据关键字多线程检索
         """
-        if not indexer or not key_word:
+        if search_is_canceled() or not indexer or not key_word:
             return None
         if filter_args is None:
             filter_args = {}
@@ -73,9 +74,13 @@ class _IIndexClient(metaclass=ABCMeta):
                                                         allow_space=True)
         api_url = f"{indexer.domain}?apikey={self.api_key}&t=search&q={search_word}"
         result_array = self.__parse_torznabxml(api_url)
+        if search_is_canceled():
+            return []
         if len(result_array) == 0:
             log.warn(f"【{self.index_type}】{indexer.name} 未检索到数据")
-            self.progress.update(ptype='search', text=f"{indexer.name} 未检索到数据")
+            # Session-owned status must not overwrite another web search bar.
+            if not filter_args.get("_session_search"):
+                self.progress.update(ptype='search', text=f"{indexer.name} 未检索到数据")
             return []
         else:
             log.warn(f"【{self.index_type}】{indexer.name} 返回数据：{len(result_array)}")
@@ -204,6 +209,10 @@ class _IIndexClient(metaclass=ABCMeta):
         index_match_fail = 0
         index_error = 0
         for item in result_array:
+            # A site can return hundreds of releases. Stop between releases and
+            # after parsing so cancellation cannot start a second recognition.
+            if search_is_canceled():
+                return []
             # 这此站标题和副标题相反
             if indexer.id in self._reverse_title_sites:
                 torrent_name = item.get('description')
@@ -231,6 +240,8 @@ class _IIndexClient(metaclass=ABCMeta):
                 continue
             # 识别种子名称
             meta_info = MetaInfo(title=torrent_name, subtitle=description)
+            if search_is_canceled():
+                return []
             if not meta_info.get_name():
                 log.info(f"【{self.index_type}】{torrent_name} 无法识别到名称")
                 index_match_fail += 1
@@ -291,21 +302,12 @@ class _IIndexClient(metaclass=ABCMeta):
                         index_match_fail += 1
                         continue
                     # IMDb is an independent work constraint, not a reason to skip
-                    # ordinal interpretation validation or leave a stale skip_reason.
-                    if bound_info and any(release_note.get(key) for key in ("ordinal_candidates", "ordinal_default")):
-                        prepared = self.media.resolve_ordinal_identity(
-                            meta_info, bound=bound_info, mtype_hint=filter_args.get("type"))
-                        if prepared and not meta_info.note.get("ordinal_resolution"):
-                            # The compatibility default still needs the original
-                            # identity/number-mapping checks; it is not a bypass.
-                            prepared = self.media._prepare_media_identity(meta_info, bound_info)
-                    else:
-                        prepared = bound_info and self.media._prepare_media_identity(meta_info, bound_info)
-                    if not prepared:
+                    # ordinal/numbering validation or the shared final admission.
+                    if not self.media.prepare_bound_release(meta_info, bound_info,
+                                                            mtype_hint=filter_args.get("type")):
                         log.info(f"【{self.index_type}】{torrent_name} 的 IMDb 作品已匹配，但季集未通过校验")
                         index_match_fail += 1
                         continue
-                    meta_info.set_tmdb_info(bound_info)
                     media_info = self.media.merge_media_info(meta_info, match_media)
                 else:
                     # 统一入口内部复用作品缓存，同时逐条验证发布编号与正式季集。
@@ -358,6 +360,8 @@ class _IIndexClient(metaclass=ABCMeta):
                             f"跳过低优先级或同优先级资源：{torrent_name}"
                         )
                         continue
+            if search_is_canceled():
+                return []
             # 检查标题是否匹配季、集、年
             if not self.filter.is_torrent_match_sey(media_info,
                                                     filter_args.get("season"),
@@ -393,6 +397,7 @@ class _IIndexClient(metaclass=ABCMeta):
         end_time = datetime.datetime.now()
         log.info(
             f"【{self.index_type}】{indexer.name} 共检索到 {len(result_array)} 条数据，过滤 {index_rule_fail}，不匹配 {index_match_fail}，错误 {index_error}，有效 {index_sucess}，耗时 {(end_time - start_time).seconds} 秒")
-        self.progress.update(ptype='search',
-                             text=f"{indexer.name} 共检索到 {len(result_array)} 条数据，过滤 {index_rule_fail}，不匹配 {index_match_fail}，错误 {index_error}，有效 {index_sucess}，耗时 {(end_time - start_time).seconds} 秒")
+        if not filter_args.get("_session_search"):
+            self.progress.update(ptype='search',
+                                 text=f"{indexer.name} 共检索到 {len(result_array)} 条数据，过滤 {index_rule_fail}，不匹配 {index_match_fail}，错误 {index_error}，有效 {index_sucess}，耗时 {(end_time - start_time).seconds} 秒")
         return ret_array

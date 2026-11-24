@@ -348,6 +348,24 @@ class UploadLeaseTest(TestCase):
             request.close(); stream.close(); builder.close()
 
 
+class OpenSubtitlesSettingsTest(TestCase):
+    def test_update_config_saves_a_valid_limit_and_rejects_invalid_input(self):
+        from web.action import WebAction
+        from app.subtitle import Subtitle
+
+        action = WebAction.__new__(WebAction)
+        update = action._WebAction__update_config
+        key = "subtitle.opensubtitles.auto_download_limit"
+        with patch("web.action.Config") as config, patch.object(Subtitle(), "init_config") as reload_config:
+            config.return_value.get_config.return_value = {"media": {}}
+            self.assertEqual(0, update({key: "5"})["code"])
+            saved = config.return_value.save_config.call_args.args[0]
+            self.assertEqual(5, saved["subtitle"]["opensubtitles"]["auto_download_limit"])
+            self.assertEqual(1, update({key: "-1"})["code"])
+            config.return_value.save_config.assert_called_once()
+            reload_config.assert_called_once()
+
+
 class ActionPermissionTest(TestCase):
     def test_status_requires_both_owner_and_original_permission(self):
         import web.action as action_module
@@ -402,6 +420,7 @@ class ActionPermissionTest(TestCase):
 class ScheduledAdmissionTest(TestCase):
     def test_schedulers_share_a_finite_queue_and_close_only_owned_work(self):
         from datetime import datetime, timezone
+        from app.llm_source import current_llm_source
         from apscheduler.schedulers.background import BackgroundScheduler
         import app.utils.scheduled_executor as module
         pool = BoundedExecutor(1, 2, 'scheduled-admission-test')
@@ -420,13 +439,13 @@ class ScheduledAdmissionTest(TestCase):
             try:
                 first.submit_job(job('one', hold), [datetime.now(timezone.utc)])
                 self.assertTrue(started.wait(1))
-                second.submit_job(job('two', lambda: events.append('two')), [datetime.now(timezone.utc)])
+                second.submit_job(job('two', lambda: events.append(current_llm_source())), [datetime.now(timezone.utc)])
                 first.shutdown(wait=False)
                 self.assertFalse(pool._shutdown, 'A scheduler must not close shared admission capacity')
-                second.submit_job(job('three', lambda: events.append('three')), [datetime.now(timezone.utc)])
+                second.submit_job(job('three', lambda: events.append(current_llm_source())), [datetime.now(timezone.utc)])
                 with self.assertRaises(TaskQueueFull):
                     second.submit_job(job('overflow', lambda: events.append('overflow')), [datetime.now(timezone.utc)])
                 release.set(); second.shutdown(wait=True)
-                self.assertEqual(events, ['two', 'three'])
+                self.assertEqual(events, ['two（定时）', 'three（定时）'])
             finally:
                 release.set(); pool.shutdown()

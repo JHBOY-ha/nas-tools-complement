@@ -10,6 +10,126 @@ body, .page {
     min-height: 100%;
 }
 
+/* --- 全站圆角刻度 ---
+   徽标 4、输入框 8、卡片与上传区 12、弹窗 16。按钮和开关使用 Tabler 胶囊圆角；
+   嵌套内容沿用容器圆角，抽屉贴边不加圆角。 */
+:root {
+    --nt-radius-xs: 4px;
+    --nt-radius-sm: 6px;
+    --nt-radius-md: 8px;
+    --nt-radius-lg: 12px;
+    --nt-radius-xl: 16px;
+    --tblr-border-radius-sm: var(--nt-radius-sm);
+    --tblr-border-radius: var(--nt-radius-md);
+    --tblr-border-radius-lg: var(--nt-radius-lg);
+    --tblr-border-radius-xl: var(--nt-radius-xl);
+}
+
+/* Tabler 在以下组件里写死了 2px/4px/8px 或沿用基础圆角，这里映射到对应档位。 */
+.card {
+    --tblr-card-border-radius: var(--nt-radius-lg);
+    --tblr-card-inner-border-radius: calc(var(--nt-radius-lg) - var(--tblr-border-width));
+}
+
+.modal {
+    --tblr-modal-border-radius: var(--nt-radius-xl);
+    --tblr-modal-inner-border-radius: calc(var(--nt-radius-xl) - var(--tblr-border-width));
+}
+
+.modal-status {
+    border-radius: var(--tblr-modal-inner-border-radius) var(--tblr-modal-inner-border-radius) 0 0;
+}
+
+.badge {
+    --tblr-badge-border-radius: var(--nt-radius-xs);
+}
+
+/* 通过按钮变量覆盖各尺寸，让 Tabler 继续处理组合按钮的直边接缝。 */
+.btn,
+.btn-group-sm > .btn,
+.btn-group-lg > .btn {
+    --tblr-btn-border-radius: var(--tblr-border-radius-pill);
+}
+
+/* 这些按钮未读取 --tblr-btn-border-radius，包含链接式操作和原生文件选择按钮。 */
+button,
+input:is([type="button"], [type="submit"], [type="reset"]),
+input[type="file"]::file-selector-button,
+.btn-close,
+.btn-icon,
+.btn-action,
+.navbar-toggler,
+.dropdown-item,
+.page-link,
+.form-selectgroup .form-selectgroup-input + .form-selectgroup-label,
+.fc .fc-button,
+.input-group-sm > .btn,
+.input-group-lg > .btn {
+    border-radius: var(--tblr-border-radius-pill);
+}
+
+.pagination {
+    --tblr-pagination-border-radius: var(--tblr-border-radius-pill);
+}
+
+/* Tabler 会在首尾折叠项上单独设置部分圆角，展开标题时同样沿用按钮轮廓。 */
+.accordion-header .accordion-button {
+    --tblr-accordion-inner-border-radius: var(--tblr-border-radius-pill);
+    border-radius: var(--tblr-border-radius-pill);
+}
+
+.alert {
+    --tblr-alert-border-radius: var(--nt-radius-md);
+}
+
+.dropdown-menu {
+    --tblr-dropdown-border-radius: var(--nt-radius-md);
+    --tblr-dropdown-inner-border-radius: calc(var(--nt-radius-md) - var(--tblr-border-width));
+}
+
+.toast {
+    --tblr-toast-border-radius: var(--nt-radius-md);
+}
+
+/* 模板里用到的 min-w-0 在 Tabler beta16 中不存在；补上后 flex 子项才能截断长文本。 */
+.min-w-0 {
+    min-width: 0;
+}
+
+/* 普通复选框保留小圆角，开关单独使用胶囊轨道。 */
+.form-check-input[type=checkbox] {
+    border-radius: var(--nt-radius-xs);
+}
+
+/* 滑块里的短横与勾号是镂空的，会透出轨道颜色；位置和滑动过渡沿用 Tabler。 */
+.form-switch .form-check-input[type=checkbox] {
+    border: 0;
+    border-radius: var(--tblr-border-radius-pill);
+    background-color: var(--tblr-secondary);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'%3E%3Cpath fill='white' fill-rule='evenodd' d='M10 2a8 8 0 1 0 0 16a8 8 0 1 0 0-16ZM7 9h6a1 1 0 0 1 0 2H7a1 1 0 0 1 0-2Z'/%3E%3C/svg%3E");
+    background-size: auto 100%;
+    cursor: pointer;
+}
+
+.form-switch .form-check-input[type=checkbox]:checked {
+    background-color: var(--tblr-primary);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'%3E%3Cpath fill='white' fill-rule='evenodd' d='M10 2a8 8 0 1 0 0 16a8 8 0 1 0 0-16ZM5.5 10l1.4-1.4L9 10.7l4.1-4.1L14.5 8 9 13.5Z'/%3E%3C/svg%3E");
+}
+
+.form-switch .form-check-input:focus-visible {
+    outline: 2px solid var(--tblr-primary);
+    outline-offset: 2px;
+}
+
+/* 强制配色交给系统绘制，确保滑块在自定义高对比配色下仍可辨认。 */
+@media (forced-colors: active) {
+    .form-switch .form-check-input[type=checkbox],
+    .form-switch .form-check-input[type=checkbox]:checked {
+        appearance: auto;
+        background: none;
+    }
+}
+
 .theme-light .page {
     background-image: linear-gradient(180deg, rgba(123, 178, 233, 0.4) 0%, rgba(231, 235, 239, 1) calc(50vh));
 }
@@ -195,11 +315,6 @@ body, .page {
     gap: 0.5rem;
 }
 
-/* 字幕库任务入口共用任务中心的触控高度，宽度继承同一 btn 内边距和图标规则。 */
-.lit-library-task-action {
-    min-height: 2.75rem;
-}
-
 /* 文件管理任务入口沿用默认 btn 尺寸，与转移目录一致；覆盖任务中心动态注入的最小高度。 */
 .btn.mediafile-task-action {
     min-height: 0;
@@ -256,9 +371,10 @@ body, .page {
 .lit-library-result-bar {
     min-height: 2rem;
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     flex: 1 1 auto;
-    gap: 1rem;
+    gap: 0.5rem 1rem;
 }
 
 .lit-library-toolbar {
@@ -267,41 +383,66 @@ body, .page {
     gap: 1rem;
 }
 
-.lit-library-filter-trigger {
-    min-height: 2.75rem;
-    display: inline-flex;
-    align-items: center;
-    gap: 0.45rem;
-    white-space: nowrap;
+/* --- 字幕库：按钮统一规则 --- */
+
+/* 操作按钮 36px、紧凑按钮 28px；粗指针设备放大到任务中心的 44px 触控高度，同组控件始终等高。 */
+.lit-library-panel,
+.lit-library-drawer,
+.lit-library-modal {
+    --lit-library-btn-height: 2.25rem;
+    --lit-library-btn-sm-height: 1.75rem;
 }
 
+@media (pointer: coarse) {
+    .lit-library-panel,
+    .lit-library-drawer,
+    .lit-library-modal {
+        --lit-library-btn-height: 2.75rem;
+        --lit-library-btn-sm-height: 2.25rem;
+    }
+}
+
+:is(.lit-library-panel, .lit-library-drawer, .lit-library-modal) .btn,
+:is(.lit-library-panel, .lit-library-drawer, .lit-library-modal) input.form-control,
+:is(.lit-library-panel, .lit-library-drawer, .lit-library-modal) .form-select {
+    min-height: var(--lit-library-btn-height);
+}
+
+:is(.lit-library-panel, .lit-library-drawer, .lit-library-modal) .btn-icon {
+    min-width: var(--lit-library-btn-height);
+}
+
+/* Tabler 的 btn-sm 内边距过窄，这里放宽到与 28px 高度相称。 */
+:is(.lit-library-panel, .lit-library-drawer, .lit-library-modal) .btn-sm {
+    --tblr-btn-padding-y: 0.25rem;
+    --tblr-btn-padding-x: 0.5rem;
+    min-height: var(--lit-library-btn-sm-height);
+}
+
+:is(.lit-library-panel, .lit-library-drawer, .lit-library-modal) .btn-sm.btn-icon {
+    min-width: var(--lit-library-btn-sm-height);
+}
+
+.lit-library-panel .btn .badge {
+    margin-left: 0.375rem;
+}
+
+/* 图标在文字右侧时镜像 Tabler 的默认外边距，与“上一页”对称。 */
+#library_next_btn .icon {
+    margin: 0 calc(var(--tblr-btn-padding-x) / -4) 0 calc(var(--tblr-btn-padding-x) / 2);
+}
+
+/* 类型、小分类、状态标签与已启用筛选的入口共用同一选中态。 */
+.lit-library-status-tab.active,
+.lit-library-category-chip.active,
 .lit-library-filter-trigger.active {
-    color: var(--tblr-primary-fg, #fff) !important;
-    background: var(--tblr-primary) !important;
-    border-color: var(--tblr-primary) !important;
-    font-weight: 600;
-    box-shadow: 0 0 0 1px rgba(var(--tblr-primary-rgb), 0.12), 0 0.125rem 0.35rem rgba(var(--tblr-primary-rgb), 0.18);
-}
-
-.lit-library-filter-trigger.active:hover,
-.lit-library-filter-trigger.active:focus,
-.lit-library-filter-trigger.active[aria-expanded="true"] {
-    color: var(--tblr-primary-fg, #fff) !important;
-    background: var(--tblr-primary) !important;
-    border-color: var(--tblr-primary) !important;
-}
-
-.lit-library-filter-trigger.active svg {
-    color: inherit;
-}
-
-.lit-library-filter-trigger.active .badge {
-    color: var(--tblr-primary) !important;
-    background: var(--tblr-primary-fg, #fff) !important;
+    --tblr-btn-active-color: var(--tblr-primary);
+    --tblr-btn-active-bg: rgba(var(--tblr-primary-rgb), 0.1);
+    --tblr-btn-active-border-color: var(--tblr-primary);
 }
 
 .lit-library-filter-menu {
-    width: min(46rem, calc(100vw - 2rem));
+    width: min(32rem, calc(100vw - 2rem));
     max-width: calc(100vw - 2rem);
     overflow: hidden;
 }
@@ -412,6 +553,8 @@ body, .page {
 
     .lit-library-panel > .card-header .card-actions {
         width: 100%;
+        margin-left: 0;
+        padding-left: 0;
         justify-content: flex-start;
     }
 
@@ -474,10 +617,16 @@ body, .page {
     height: 100%;
     border: none;
     background: var(--tblr-bg-surface);
-    border-radius: 12px;
-    overflow: hidden;
+    border-radius: var(--nt-radius-lg);
+    /* 卡片菜单需要溢出卡片边界；海报自带圆角与裁剪。 */
+    overflow: visible;
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
     transition: transform 0.18s ease, box-shadow 0.18s ease;
+}
+
+/* 打开菜单的卡片盖住相邻卡片，菜单才不会被后续卡片遮挡。 */
+.lit-library-card:has(.dropdown-menu.show) {
+    z-index: 6;
 }
 
 .lit-library-card:hover {
@@ -497,7 +646,7 @@ body, .page {
     flex: 0 0 auto;
     align-items: center;
     justify-content: center;
-    border-radius: 12px 12px 0 0;
+    border-radius: var(--nt-radius-lg) var(--nt-radius-lg) 0 0;
 }
 
 .lit-library-card-poster img {
@@ -517,6 +666,11 @@ body, .page {
         var(--tblr-bg-surface-secondary);
 }
 
+/* 没有海报时隐藏空白图片，占位字才能居中。 */
+.lit-library-card-poster.no-poster img {
+    display: none;
+}
+
 .lit-library-card-fallback {
     display: none;
     font-size: 2rem;
@@ -527,6 +681,21 @@ body, .page {
 
 .lit-library-card-poster.no-poster .lit-library-card-fallback {
     display: block;
+}
+
+/* 海报是打开详情的按钮：去掉原生按钮外观，保留键盘焦点。 */
+button.lit-library-card-poster {
+    width: 100%;
+    padding: 0;
+    border: 0;
+    color: inherit;
+    cursor: pointer;
+    appearance: none;
+}
+
+button.lit-library-card-poster:focus-visible {
+    outline: 2px solid var(--tblr-primary);
+    outline-offset: -2px;
 }
 
 /* --- Badges on poster --- */
@@ -576,6 +745,23 @@ body, .page {
 
 .lit-library-card-subtitle-indicator.unknown {
     background: #a0a0a0;
+}
+
+/* 剧集字幕覆盖进度：贴在海报底边，文字由 aria-label 与卡片正文提供。 */
+.lit-library-card-coverage {
+    position: absolute;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    height: 4px;
+    background: rgba(0, 0, 0, 0.35);
+    pointer-events: none;
+}
+
+.lit-library-card-coverage > span {
+    display: block;
+    height: 100%;
+    background: var(--tblr-green, #2fb344);
 }
 
 /* --- Body --- */
@@ -668,10 +854,19 @@ body, .page {
     padding: 0.375rem 0.625rem 0.625rem;
 }
 
-.lit-library-card-footer .btn {
-    font-size: 0.75rem;
-    padding: 0.25rem 0.5rem;
-    border-radius: 8px;
+.lit-library-card-actions {
+    display: flex;
+    align-items: stretch;
+    gap: 0.375rem;
+}
+
+.lit-library-card-actions .btn-icon {
+    flex: 0 0 auto;
+}
+
+.lit-library-card-menu .dropdown-menu {
+    min-width: 8.5rem;
+    font-size: 0.8125rem;
 }
 
 .lit-library-help-section + .lit-library-help-section {
@@ -718,4 +913,181 @@ body, .page {
 .subtitle-help:focus-visible {
     outline: 2px solid var(--tblr-primary);
     outline-offset: 2px;
+}
+
+
+/* --- 字幕库：类型与状态标签 --- */
+
+.lit-library-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.75rem 1rem;
+    margin-bottom: 1rem;
+}
+
+.lit-library-status-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.375rem;
+}
+
+.lit-library-status-tab .badge {
+    background: var(--tblr-bg-surface-secondary);
+    color: var(--tblr-body-color);
+}
+
+.lit-library-status-tab.active .badge {
+    background: var(--tblr-primary);
+    color: var(--tblr-primary-fg, #fff);
+}
+
+/* “有问题”与前面互斥的覆盖状态交叉，不是第五种状态，用分隔线区分。 */
+.lit-library-tab-divider {
+    align-self: stretch;
+    width: 1px;
+    margin: 0.375rem 0.25rem;
+    background: var(--tblr-border-color);
+}
+
+/* --- 字幕库：小分类标签行（紧凑按钮，位于类型标签下方） --- */
+
+.lit-library-category-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.75rem;
+    margin: -0.375rem 0 1rem;
+}
+
+.lit-library-category-row[hidden] {
+    display: none;
+}
+
+.lit-library-category-label {
+    flex: 0 0 auto;
+    font-size: 0.75rem;
+    font-weight: 600;
+    line-height: var(--lit-library-btn-sm-height);
+    color: var(--tblr-muted-color);
+}
+
+.lit-library-category-chips {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.375rem;
+    min-width: 0;
+}
+
+/* 全部类型时按电影、电视剧、动漫分组；组名只是引导文字，不可点击。 */
+.lit-library-category-group {
+    margin-left: 0.5rem;
+    font-size: 0.75rem;
+    color: var(--tblr-muted-color);
+}
+
+.lit-library-category-chips > .lit-library-category-group:first-child {
+    margin-left: 0;
+}
+
+.lit-library-category-chip .badge {
+    background: var(--tblr-bg-surface-secondary);
+    color: var(--tblr-body-color);
+}
+
+.lit-library-category-chip.active .badge {
+    background: var(--tblr-primary);
+    color: var(--tblr-primary-fg, #fff);
+}
+
+/* 当前状态下为 0 的分类保留原位、可点击，只降低文字强调。 */
+.lit-library-category-chip.is-empty:not(.active) {
+    color: var(--tblr-muted-color);
+}
+
+/* 新列表返回前保留旧卡片并调淡，避免整页闪白；不使用过渡动画。 */
+.lit-library-grid.is-loading {
+    opacity: 0.55;
+    pointer-events: none;
+}
+
+.lit-library-active-filters {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.375rem;
+}
+
+.lit-library-active-filters:empty {
+    display: none;
+}
+
+@media (max-width: 767.98px) {
+    /* 状态标签换行后分隔线会悬在行尾，窄屏只靠“有问题”另起一行区分。 */
+    .lit-library-tab-divider {
+        display: none;
+    }
+
+    /* 窄屏小分类横向滑动，保持一行，不把卡片挤到首屏之外。 */
+    .lit-library-category-row {
+        align-items: center;
+    }
+
+    .lit-library-category-chips {
+        flex: 1 1 auto;
+        flex-wrap: nowrap;
+        overflow-x: auto;
+        padding-bottom: 0.125rem;
+    }
+
+    .lit-library-category-chips > * {
+        flex: 0 0 auto;
+    }
+}
+
+/* --- 字幕库：详情抽屉与拖放上传 --- */
+
+.lit-library-drawer {
+    --tblr-offcanvas-width: min(34rem, 100vw);
+    width: min(34rem, 100vw);
+}
+
+.lit-library-drawer-section + .lit-library-drawer-section {
+    margin-top: 1.25rem;
+    padding-top: 1.25rem;
+    border-top: 1px solid var(--tblr-border-color);
+}
+
+.lit-library-drawer-heading {
+    margin-bottom: 0.75rem;
+    font-size: 1rem;
+    font-weight: 600;
+}
+
+.lit-library-dropzone {
+    display: grid;
+    gap: 0.5rem;
+    padding: 1rem;
+    border: 2px dashed var(--tblr-border-color);
+    border-radius: var(--nt-radius-lg);
+    text-align: center;
+}
+
+.lit-library-dropzone.is-dragover {
+    border-color: var(--tblr-primary);
+    background: rgba(var(--tblr-primary-rgb), 0.06);
+}
+
+.lit-library-dropzone.is-disabled {
+    opacity: 0.6;
+}
+
+.lit-library-dropzone-title {
+    color: var(--tblr-muted-color);
+    font-size: 0.875rem;
+}
+
+.lit-library-pending-row {
+    padding: 0.5rem 0;
+    border-bottom: 1px solid var(--tblr-border-color);
 }

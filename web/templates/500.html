@@ -13,7 +13,8 @@
   <link rel="icon" href="apple-touch-icon.png">
   <title>500 - NAStool</title>
   <!-- CSS files -->
-  <link href="../static/css/tabler.min.css" rel="stylesheet"/>
+  <link href="{{ url_for('static', filename='css/tabler.min.css') }}" rel="stylesheet"/>
+  <link href="{{ url_for('static', filename='css/style.css') }}" rel="stylesheet"/>
 </head>
 
 <body class=" border-top-wide border-primary d-flex flex-column">

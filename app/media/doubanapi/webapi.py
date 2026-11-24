@@ -1,3 +1,4 @@
+import re
 from functools import lru_cache
 
 import requests
@@ -206,6 +207,21 @@ class DoubanWeb(object):
         查询详情
         """
         return cls.__get_obj("detail", cls.__invoke_web("detail", cookie, doubanid))
+
+    @classmethod
+    def subject_preview(cls, subject_id):
+        # 电影与剧集共用此分享页。豆瓣有时在 302 的正文里给出预览图。
+        response = RequestUtils(timeout=cls._timout).get_res(
+            f"https://m.douban.com/movie/subject/{subject_id}/", allow_redirects=False)
+        if response is None or response.status_code not in (200, 302) or not response.content:
+            return None
+        page = etree.HTML(response.content)
+        if page is not None:
+            url = page.xpath('string(//meta[@property="og:image"]/@content)')
+            # 只向豆瓣图片域名跳转，完整保留来源页面给出的路径和签名。
+            if re.fullmatch(r"https://[a-z0-9-]+\.doubanio\.com/view/photo/[^\s\\#]+", url):
+                return url
+        return None
 
     @classmethod
     @lru_cache(maxsize=10)

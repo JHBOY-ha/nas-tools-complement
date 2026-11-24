@@ -20,22 +20,46 @@ RECOGNITION_MODULES = (
     "tests.test_metadata_binding_guards",
     "tests.test_meta_recognition_plan",
     "tests.test_fractional_versions",
+    # Include manual EP priority and its target/publication safeguards.
+    "tests.test_manual_episode_precedence",
+    # Numeric guards, scan rejection reasons and the current receipt lifecycle.
+    "tests.test_episode_transfer_guards",
+    # Disc retries must never authorize deletion before the whole tree is verified.
+    "tests.test_bluray_transfer",
+    "tests.test_disc_metadata",
+    # Preserve title roles through provider lookup and cache reuse.
+    "tests.test_series_name_integrity",
+    "tests.test_recognition_naming_gaps",
     "tests.test_special_episodes",
     "tests.test_special_confirmation",
     "tests.test_review_regressions",
     "tests.test_recognition_performance",
     "tests.test_llm_season_binding",
+    "tests.test_absolute_episode_numbering",
     "tests.test_media_cn_fallback",
+    # Keep crawler link normalization in the offline regression suite.
+    "tests.test_spider_response",
+    # Chinese interactive searches must include English-only torrent sites.
+    "tests.test_indexer_language",
+    # Session ownership and Telegram callbacks share the real search pipeline.
+    "tests.test_search_sessions",
     "tests.test_meta_llm_parser",
     "tests.test_sync_reliability",
     "tests.test_download_dedupe",
     "tests.test_rss_prefilter",
+    "tests.test_custom_rss_recognition",
     "tests.test_media_cache_numbering",
     "tests.test_media_recognition_integrity",
     "tests.test_meta_parser_boundaries",
     "tests.test_meta_multi_episode_guards",
     "tests.test_meta_recognition_matrix",
     "tests.test_media_identity_matrix",
+    # Constraint matrix for the series recognition invariants (C1-C6).
+    "tests.test_recognition_invariants",
+    # Cross-branch regressions: release evidence, identity sources and query reuse.
+    "tests.test_recognition_special_crossings",
+    "tests.test_recognition_llm_crossings",
+    "tests.test_recognition_query_crossings",
 )
 
 

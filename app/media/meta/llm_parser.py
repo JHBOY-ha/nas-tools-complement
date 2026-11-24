@@ -7,10 +7,13 @@ from threading import RLock
 from urllib.parse import quote
 
 import log
+from app.llm_source import llm_log_message
 from app.media.tmdbv3api import TMDb, Search, TV, TMDbException
 from app.media.meta.title_utils import promote_bracket_title
+from app.media.meta.recognition import cached_recognition_query, query_tmdb, RecognitionPending
 from app.utils import ExceptionUtils, RequestUtils, StringUtils
 from app.utils.llm_client import LLMClient
+from app.utils.search_cancellation import search_is_canceled
 from app.utils.commons import singleton
 from app.utils.types import MediaType
 from config import Config, DEFAULT_TMDB_PROXY
@@ -113,14 +116,14 @@ class LLMMetaParser(object):
             return client.get_status()
         except Exception as err:
             ExceptionUtils.exception_traceback(err)
-            log.error("【Meta】LLM 连接测试失败：%s" % str(err))
+            log.error(llm_log_message("Meta", "LLM 连接测试失败：%s" % str(err)))
             return False
 
     def parse(self, title, subtitle=None, mtype_hint=None):
         """
         调用 LLM 解析媒体名称并返回标准化字段
         """
-        if not title or not self.__is_client_ready(require_enable=True):
+        if search_is_canceled() or not title or not self.__is_client_ready(require_enable=True):
             return {}
         cache_key = self.__make_parse_cache_key(title=title, subtitle=subtitle, mtype_hint=mtype_hint)
         cached_result = self.__get_cached_parse_result(cache_key)
@@ -143,6 +146,8 @@ class LLMMetaParser(object):
                 subtitle=subtitle,
                 mtype_hint=mtype_hint
             )
+            if search_is_canceled():
+                return {}
             system_prompt = (
                 "你是媒体文件名解析助手。"
                 "请严格返回 JSON 对象，不要输出任何额外文本。"
@@ -194,17 +199,22 @@ class LLMMetaParser(object):
             if external_candidates:
                 user_prompt += f"external_candidates: {external_candidates}\n"
             user_prompt += "若字段无法判断请省略该字段。"
+            # Let the shared client use the configured output budget for this model.
             content = client.complete_text(
                 system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                max_tokens=512
+                user_prompt=user_prompt
             )
+            # A stopped request is not a negative recognition result. Do not
+            # poison the shared cache for another search of the same release.
+            if search_is_canceled():
+                return {}
             if content:
-                log.info("【Meta】LLM原始返回：%s" % self.__shorten_text(content, 2000))
-            else:
-                log.info("【Meta】LLM原始返回为空")
+                log.debug(llm_log_message("Meta", "LLM原始返回：%s" % self.__shorten_text(content, 2000)))
+
             parsed = self.__parse_json(content)
             if not parsed:
+                reason = "返回格式无法解析" if content else "未返回识别结果"
+                log.info(llm_log_message("Meta", f"《{self.__clean_text(title, 120)}》{reason}，继续按规则识别"))
                 self.__set_cached_parse_result(cache_key, {})
                 return {}
             result = self.__normalize_result(parsed)
@@ -213,11 +223,28 @@ class LLMMetaParser(object):
                                                           candidate_payload=candidate_payload,
                                                           title=title,
                                                           subtitle=subtitle))
+            # Keep release numbering separate from TMDB's numbering when a provider merges seasons.
+            name = result.get("cn_name") or result.get("en_name") or self.__clean_text(title, 120)
+            numbering = []
+            for field, marker in (("season", "S"), ("episode", "E")):
+                begin = result.get("begin_" + field)
+                if begin is not None:
+                    end = result.get("end_" + field)
+                    numbering.append(f"{marker}{begin:02d}" + (f"–{marker}{end:02d}" if end else ""))
+            summary = f"LLM 解析《{name}》" + "".join(numbering)
+            if result.get("candidate_verified"):
+                candidate = f"TMDB {result['tmdb_id']}"
+                if result.get("season_verified") and result["tmdb_season"] != result.get("begin_season"):
+                    candidate += f" 第{result['tmdb_season']}季"
+                summary += f"，匹配 {candidate}"
+            log.info(llm_log_message("Meta", summary))
             self.__set_cached_parse_result(cache_key, result)
             return result
         except Exception as err:
+            if search_is_canceled():
+                return {}
             ExceptionUtils.exception_traceback(err)
-            log.error("【Meta】LLM 识别失败：%s" % str(err))
+            log.error(llm_log_message("Meta", "LLM 识别失败：%s" % str(err)))
             self.__set_cached_parse_result(cache_key, {})
             return {}
 
@@ -240,14 +267,22 @@ class LLMMetaParser(object):
 
         if llm_result:
             original_year = meta_info.year
+            # A publisher's subtitle can supply the explicit year even though
+            # the rule parser reads only season/episode markers from subtitles.
+            source_year = original_year or self.__extract_year_hint(title, subtitle)
+            if source_year:
+                meta_info.year = source_year
             original_season = meta_info.begin_season
             rule_names = [name for name in (meta_info.cn_name, meta_info.en_name) if name]
-            # Explicit multi-episode numbering is release evidence. LLM hints
-            # may refine names, but range conversion requires full TMDB evidence.
+            # Ranges and an episode without a season are release evidence. An
+            # LLM-filled season must not silently turn a total into a local EP;
+            # verified TMDB season/episode hints are resolved together later.
             range_fields = ("begin_season", "end_season", "total_seasons",
                             "begin_episode", "end_episode", "total_episodes")
             release_range = ({key: getattr(meta_info, key) for key in range_fields}
-                             if len(meta_info.get_episode_list()) > 1 else None)
+                             if len(meta_info.get_episode_list()) > 1 or len(meta_info.get_season_list()) > 1
+                             or (original_season is None and meta_info.begin_episode is not None)
+                             else None)
             self.__apply_result(meta_info, llm_result)
             if release_range:
                 for key, value in release_range.items():
@@ -266,29 +301,32 @@ class LLMMetaParser(object):
                 note["llm"]["rule_names"] = rule_names
             if llm_names:
                 note["llm"]["llm_names"] = llm_names
-            note["llm"]["inferred_year"] = bool(
-                not original_year and meta_info.year
-                and not re.search(r"(?<!\d)(?:19|20)\d{2}(?!\d)", title or "")
-            )
+            note["llm"]["inferred_year"] = bool(not source_year and meta_info.year)
             if llm_result.get("tmdb_id"):
                 note["llm"].update({
                     "tmdb_id": llm_result.get("tmdb_id"),
                     "tmdb_type": llm_result.get("tmdb_type"),
                     "candidate_verified": llm_result.get("candidate_verified", False)
                 })
-                log.info(
-                    "【Meta】LLM直出TMDB候选：id=%s, type=%s"
-                    % (llm_result.get("tmdb_id"), llm_result.get("tmdb_type") or "")
+                log.debug(
+                    llm_log_message("Meta", "LLM直出TMDB候选：id=%s, type=%s"
+                    % (llm_result.get("tmdb_id"), llm_result.get("tmdb_type") or ""))
                 )
                 pick_reason = self.__clean_text(llm_result.get("tmdb_pick_reason"), max_len=120)
                 if pick_reason:
                     note["llm"]["pick_reason"] = pick_reason
-                    log.info("【Meta】LLM候选选择依据：%s" % pick_reason)
+                    log.debug(llm_log_message("Meta", "LLM候选选择依据：%s" % pick_reason))
             release_season = self.__parse_int(llm_result.get("release_season", original_season),
                                               min_val=0, max_val=999)
             if release_season is not None:
                 note["llm"]["release_season"] = release_season
-            if llm_result.get("season_verified"):
+            # The rule parser also understands Roman/ordinal/2x03 seasons that
+            # the lightweight LLM query parser may not extract. Its source
+            # season still requires independent evidence before a conversion.
+            season_verified = (llm_result.get("season_verified") and not (
+                original_season is not None and original_season != llm_result.get("tmdb_season")
+                and llm_result.get("season_evidence") == "llm_only"))
+            if season_verified:
                 note["llm"].update({
                     "tmdb_season": llm_result.get("tmdb_season"),
                     "tmdb_season_name": llm_result.get("tmdb_season_name"),
@@ -296,15 +334,15 @@ class LLMMetaParser(object):
                     "season_verified": True,
                     "season_evidence": llm_result.get("season_evidence")
                 })
-                log.info(
-                    "【Meta】LLM季号通过校验：TMDB季=%s(%s), 依据=%s, 标题季标记=%s"
+                log.debug(
+                    llm_log_message("Meta", "LLM季号通过校验：TMDB季=%s(%s), 依据=%s, 标题季标记=%s"
                     % (llm_result.get("tmdb_season"),
                        llm_result.get("tmdb_season_name") or "",
                        llm_result.get("season_evidence") or "",
-                       self.__clean_text(release_season, max_len=10) or "无")
+                       self.__clean_text(release_season, max_len=10) or "无"))
                 )
             elif llm_result.get("tmdb_season") is not None:
-                log.warn("【Meta】LLM季号未通过校验，忽略：%s" % llm_result.get("tmdb_season"))
+                log.warn(llm_log_message("Meta", "LLM季号未通过校验，忽略：%s" % llm_result.get("tmdb_season")))
 
         meta_info.note = note
 
@@ -356,6 +394,9 @@ class LLMMetaParser(object):
 
     def __apply_result(self, meta_info, llm_result):
         for field in self._llm_fields:
+            if field in ("begin_season", "end_season", "total_seasons",
+                         "begin_episode", "end_episode", "total_episodes"):
+                continue
             if field not in llm_result:
                 continue
             value = llm_result.get(field)
@@ -364,6 +405,16 @@ class LLMMetaParser(object):
             if not self.__should_apply(field, getattr(meta_info, field, None), llm_result):
                 continue
             setattr(meta_info, field, value)
+        # An absent end means a known single item, not a missing field. Fill
+        # numbering only as a complete group when the rule parser has no start.
+        for kind in ("season", "episode"):
+            begin = llm_result.get("begin_" + kind)
+            if getattr(meta_info, "begin_" + kind) is not None or begin is None:
+                continue
+            end = llm_result.get("end_" + kind)
+            setattr(meta_info, "begin_" + kind, begin)
+            setattr(meta_info, "end_" + kind, end if end != begin else None)
+            setattr(meta_info, "total_" + kind + "s", (end if end is not None else begin) - begin + 1)
 
     def __should_apply(self, field, current_value, llm_result):
         """
@@ -476,29 +527,33 @@ class LLMMetaParser(object):
             search_func=lambda q: self.__search_tmdb_candidates(query=q, mtype_hint=mtype_hint, year=year_hint),
             query_list=query_list
         )
-        bangumi_candidates = self.__search_candidates_by_queries(
-            search_func=self.__search_bangumi_candidates,
-            query_list=query_list
-        )
+        try:
+            bangumi_candidates = self.__search_candidates_by_queries(
+                search_func=self.__search_bangumi_candidates, query_list=query_list)
+        except RecognitionPending as error:
+            # Bangumi names enrich the prompt; only the separate alias lookup
+            # requires this provider to decide whether a work was found.
+            log.debug(llm_log_message("Meta", str(error)))
+            bangumi_candidates = []
 
         if tmdb_candidates:
             payload["tmdb"] = tmdb_candidates
         if bangumi_candidates:
             payload["bangumi"] = bangumi_candidates
 
-        log.info(
-            "【Meta】LLM检索增强候选：query=%s, 年份=%s, tmdb=%s, bangumi=%s"
+        log.debug(
+            llm_log_message("Meta", "LLM检索增强候选：query=%s, 年份=%s, tmdb=%s, bangumi=%s"
             % (
                 self.__shorten_text(query, 80),
                 year_hint or "无",
                 len(tmdb_candidates),
                 len(bangumi_candidates)
-            )
+            ))
         )
         if not payload:
             return "", {}
         season_total = sum(len(item.get("seasons") or []) for item in tmdb_candidates)
-        log.info("【Meta】LLM候选季列表：候选=%s, 季条目=%s" % (len(tmdb_candidates), season_total))
+        log.debug(llm_log_message("Meta", "LLM候选季列表：候选=%s, 季条目=%s" % (len(tmdb_candidates), season_total)))
         return self.__serialize_candidate_payload(payload), payload
 
     @classmethod
@@ -566,12 +621,12 @@ class LLMMetaParser(object):
         """
         取单个电视剧候选的季列表、别名与外部链接（一次 TMDB 请求，结果走请求缓存）。
         """
-        if not tmdb_id:
+        if search_is_canceled() or not tmdb_id:
             return {}
         try:
             detail = TV().details(tmdb_id, append_to_response="alternative_titles,external_ids")
         except Exception as err:
-            log.debug("【Meta】TMDB候选季信息获取失败：%s" % str(err))
+            log.debug(llm_log_message("Meta", "TMDB候选季信息获取失败：%s" % str(err)))
             return {}
         if not detail:
             return {}
@@ -655,30 +710,27 @@ class LLMMetaParser(object):
         if season is None:
             return verified
         if season not in seasons:
-            log.warn("【Meta】LLM季号不在候选季列表中，忽略：%s" % result.get("tmdb_season"))
+            log.warn(llm_log_message("Meta", "LLM季号不在候选季列表中，忽略：%s" % result.get("tmdb_season")))
             return verified
 
-        evidence_text = " ".join([
-            str(title or ""),
-            str(subtitle or ""),
-            str(result.get("cn_name") or ""),
-            str(result.get("en_name") or "")
-        ])
+        # Generated translations are search suggestions, never independent
+        # evidence for overriding an explicit release season.
+        evidence_text = " ".join([str(title or ""), str(subtitle or "")])
         name_matched = self.__match_seasons_by_name(evidence_text, seasons)
         evidence = "llm_only"
         if name_matched:
             if season in name_matched:
                 evidence = "season_name"
             elif len(name_matched) == 1:
-                log.warn("【Meta】LLM季号与TMDB季名证据不符，按季名修正：%s -> %s"
-                         % (result.get("tmdb_season"), name_matched[0]))
+                log.warn(llm_log_message("Meta", "LLM季号与TMDB季名证据不符，按季名修正：%s -> %s"
+                         % (result.get("tmdb_season"), name_matched[0])))
                 season = name_matched[0]
                 evidence = "season_name_override"
         if season not in seasons:
             return verified
         if release_season is not None and season != release_season and evidence == "llm_only":
-            log.warn("【Meta】LLM季号%s与标题季标记%s冲突且缺少季名证据，保留标题季标记"
-                     % (season, release_season))
+            log.warn(llm_log_message("Meta", "LLM季号%s与标题季标记%s冲突且缺少季名证据，保留标题季标记"
+                     % (season, release_season)))
             return verified
         verified["season_verified"] = True
         verified["tmdb_season"] = season
@@ -729,7 +781,7 @@ class LLMMetaParser(object):
         if not text.strip():
             return None
         patterns = [
-            r"(?<![A-Za-z0-9])S(\d{1,2})(?!\d)",
+            r"(?i)(?<![A-Za-z0-9])S(\d{1,2})(?!\d)",
             r"(?i)\bSeason[ ._-]*(\d{1,2})\b",
             r"第\s*(\d{1,2})\s*[季部]",
         ]
@@ -976,6 +1028,8 @@ class LLMMetaParser(object):
         candidates = []
         seen = set()
         for query in query_list:
+            if search_is_canceled():
+                return []
             if len(candidates) >= self._search_max_results:
                 break
             query_candidates = search_func(query) or []
@@ -1047,11 +1101,11 @@ class LLMMetaParser(object):
             search = Search()
             params = {"query": query, "page": 1}
             if mtype_hint == MediaType.MOVIE:
-                raw_results = search.movies(params)
+                raw_results = query_tmdb(search, "movies", params)
             elif mtype_hint in [MediaType.TV, MediaType.ANIME]:
-                raw_results = search.tv_shows(params)
+                raw_results = query_tmdb(search, "tv_shows", params)
             else:
-                raw_results = search.multi(params)
+                raw_results = query_tmdb(search, "multi", params)
 
             raw_items = []
             for item in (raw_results or []):
@@ -1086,13 +1140,15 @@ class LLMMetaParser(object):
             candidates = self.__filter_duplicate_candidates(candidates)
             return candidates[:self._search_max_results]
         except TMDbException as err:
-            log.debug("【Meta】TMDB候选检索失败：%s" % str(err))
+            log.debug(llm_log_message("Meta", "TMDB候选检索失败：%s" % str(err)))
             return []
         except Exception as err:
-            log.debug("【Meta】TMDB候选检索异常：%s" % str(err))
+            log.debug(llm_log_message("Meta", "TMDB候选检索异常：%s" % str(err)))
             return []
 
     def __build_tmdb_candidate(self, item, mtype_hint=None):
+        if search_is_canceled():
+            return {}
         genres = getattr(item, "genre_ids", None) or []
         if mtype_hint == MediaType.ANIME and 16 not in genres:
             return {}
@@ -1149,9 +1205,9 @@ class LLMMetaParser(object):
                 authoritative = [item for item in group if cls.__candidate_authority(item)]
                 if authoritative:
                     log.warn(
-                        "【Meta】同名候选存在带外链的正式条目，忽略疑似重复条目：id=%s(%s) -> 保留 id=%s(%s)"
+                        llm_log_message("Meta", "同名候选存在带外链的正式条目，忽略疑似重复条目：id=%s(%s) -> 保留 id=%s(%s)"
                         % (candidate.get("id"), candidate.get("name"),
-                           authoritative[0].get("id"), authoritative[0].get("name"))
+                           authoritative[0].get("id"), authoritative[0].get("name")))
                     )
                     continue
             kept.append(candidate)
@@ -1202,6 +1258,11 @@ class LLMMetaParser(object):
         return None
 
     def __search_bangumi_candidates(self, query):
+        return cached_recognition_query(
+            ("bangumi", query, self._search_max_results, str(Config().get_proxies())),
+            lambda: self.__fetch_bangumi_candidates(query))
+
+    def __fetch_bangumi_candidates(self, query):
         try:
             req_url = "https://api.bgm.tv/search/subject/%s" % quote(query)
             response = RequestUtils(
@@ -1216,7 +1277,7 @@ class LLMMetaParser(object):
                 }
             )
             if not response or not response.ok:
-                return []
+                raise RecognitionPending("Bangumi 候选检索不可用，保留待重试")
             data = response.json()
             items = data.get("list") or data.get("data") or []
             candidates = []
@@ -1238,9 +1299,11 @@ class LLMMetaParser(object):
                     candidate["year"] = year
                 candidates.append(candidate)
             return candidates
+        except RecognitionPending:
+            raise
         except Exception as err:
-            log.debug("【Meta】Bangumi候选检索异常：%s" % str(err))
-            return []
+            log.debug(llm_log_message("Meta", "Bangumi候选检索异常：%s" % str(err)))
+            raise RecognitionPending("Bangumi 候选检索不可用，保留待重试") from err
 
     def __extract_content(self, response):
         if not response or not getattr(response, "choices", None):

@@ -9,12 +9,13 @@ import re
 import shutil
 import signal
 import subprocess
+import time
 from copy import deepcopy
 from math import floor
 from urllib.parse import unquote, urlsplit
 
 import cn2an
-from flask import g, has_request_context, copy_current_request_context, request
+from flask import current_app, g, has_request_context, copy_current_request_context, request, session
 from flask_login import logout_user, current_user
 from werkzeug.security import generate_password_hash
 
@@ -31,6 +32,7 @@ from app.helper import DbHelper, ProgressHelper, ThreadHelper, \
 from app.indexer import Indexer
 from app.media import Category, Media, Bangumi, DouBan
 from app.media.meta import MetaInfo, MetaBase
+from app.media.meta.special import download_block_reason
 from app.media.tmdbv3api import TMDb, TMDbException
 from app.mediaserver import MediaServer
 from app.message import Message, MessageCenter
@@ -40,7 +42,7 @@ from app.scheduler import stop_scheduler
 from app.sites import Sites
 from app.sites.sitecookie import SiteCookie
 from app.subscribe import Subscribe
-from app.subtitle import Subtitle
+from app.subtitle import Subtitle, parse_auto_download_limit
 from app.sync import Sync, stop_monitor
 from app.torrentremover import TorrentRemover
 from app.speedlimiter import SpeedLimiter
@@ -50,6 +52,7 @@ from app.utils.types import RmtMode, OsType, SearchType, DownloaderType, SyncTyp
 from app.utils.security_utils import parse_episode_offset, parse_rule_dict, normalize_proxies, compile_ignore_pattern
 from web.backend.uploads import upload_directory, uploaded_path
 from app.utils.exclusive_publish import rename_exclusive
+from app.llm_source import current_llm_source, llm_source
 from app.utils.workload import TaskQueueFull
 from app.helper.action_tasks import ActionTasks, COMMAND_TITLES
 from config import RMT_MEDIAEXT, TMDB_IMAGE_W500_URL, RMT_SUBEXT, Config
@@ -264,7 +267,21 @@ class WebAction:
         func = self._actions.get(cmd)
         if not func:
             return {"code": -1, "msg": "非授权访问！"}
-        else:
+        action_name = COMMAND_TITLES.get(cmd, cmd)
+        parent = current_llm_source()
+        source = f"{parent} · {action_name}" if parent else action_name
+        if has_request_context() and request.endpoint == "do":
+            page = request.headers.get("X-NAStool-Page")
+            # Use only registered static routes. A client-supplied URL can contain secrets.
+            if page and any(rule.rule == page and not rule.arguments for rule in current_app.url_map.iter_rules()):
+                source = {
+                    "/douban_tv": "豆瓣电视剧", "/douban_movie": "豆瓣电影", "/ranking": "榜单推荐",
+                    "/tmdb_tv": "TMDB电视剧", "/tmdb_movie": "TMDB电影", "/recommend": "推荐列表",
+                    "/media_detail": "媒体详情", "/history": "整理历史", "/user_rss": "自定义订阅",
+                }.get(page, f"页面 {page}")
+                if cmd in COMMAND_TITLES:
+                    source = f"{source} · {action_name}"
+        with llm_source(source):
             try:
                 if has_request_context() and not getattr(g, '_action_task_worker', False) \
                         and cmd in COMMAND_TITLES \
@@ -302,7 +319,8 @@ class WebAction:
                 return {'code': -1, 'msg': '未知服务'}
             # Execute the service itself, not its former "thread started" ack.
             def function(_data):
-                result = service()
+                with llm_source(f"{current_llm_source()} → {data['item']}"):
+                    result = service()
                 # 目录同步的 False 包括锁繁忙和逐文件/记录失败，均须保留失败终态。
                 if result is False:
                     return {'code': -1, 'retmsg': '服务未执行或执行失败，请查看日志后重试'}
@@ -513,6 +531,9 @@ class WebAction:
             else:
                 cfg['app']['proxies'] = {"https": None, "http": None}
             return cfg
+        # OpenSubtitles 自动下载上限：保存为整数，非法值拒绝且不改动配置
+        if cfg_key == "subtitle.opensubtitles.auto_download_limit":
+            cfg_value = parse_auto_download_limit(cfg_value)
         # 豆瓣用户列表
         if cfg_key == "douban.users":
             vals = cfg_value.split(",")
@@ -626,6 +647,14 @@ class WebAction:
         return {"retmsg": "服务已启动", "item": sch_item}
 
     @staticmethod
+    def _search_owner():
+        # REST JWTs populate g.api_user; trusted API-key requests have their own
+        # namespace. Browser usernames remain compatible with saved sessions.
+        if getattr(g, 'api_key_authenticated', False):
+            return 'api-key'
+        return (getattr(g, 'api_user', None) or current_user).username
+
+    @staticmethod
     def __search(data):
         """
         WEB检索资源
@@ -641,13 +670,28 @@ class WebAction:
             else:
                 media_type = MediaType.TV
         if search_word:
-            ret, ret_msg = search_medias_for_web(content=search_word,
-                                                 ident_flag=ident_flag,
-                                                 filters=filters,
-                                                 tmdbid=tmdbid,
-                                                 media_type=media_type)
+            from app.helper.search_sessions import SearchSessions
+            searches = SearchSessions()
+            owner = WebAction._search_owner()
+            record, _ = searches.create(owner, owner, search_word, channel='web')
+            session['search_id'] = record['id']
+            try:
+                ret, ret_msg = search_medias_for_web(content=search_word,
+                                                     ident_flag=ident_flag,
+                                                     filters=filters,
+                                                     tmdbid=tmdbid,
+                                                     media_type=media_type, search_id=record["id"])
+            except Exception:
+                # Failed searches must be terminal so normal TTL eviction can
+                # reclaim their slots, including failures before publication.
+                with searches.edit(record['id']) as current:
+                    current.update(state='failed', message='搜索失败，请重试')
+                raise
             if ret != 0:
-                return {"code": ret, "msg": ret_msg}
+                with searches.edit(record['id']) as current:
+                    current.update(state='failed', message=ret_msg)
+                return {"code": ret, "msg": ret_msg, "search_id": record["id"]}
+            return {"code": 0, "search_id": record["id"]}
         return {"code": 0}
 
     def __download(self, data):
@@ -657,6 +701,67 @@ class WebAction:
         dl_id = data.get("id")
         dl_dir = data.get("dir")
         dl_setting = data.get("setting")
+        owner = self._search_owner()
+        if ':' in str(dl_id):
+            from app.helper.search_sessions import SearchSessions, unpack_media
+            sid, rid = str(dl_id).split(':', 1)
+            try:
+                record = SearchSessions().owned(sid, owner, owner)
+                if record['channel'] != 'web' or record['expires_at'] < time.time():
+                    raise ValueError('搜索已过期，请重新搜索')
+                media = unpack_media(record['results'][rid])
+            except (ValueError, KeyError) as error:
+                return {"retcode": -1, "retmsg": '搜索资源不存在或已过期'}
+            with SearchSessions().edit(sid) as current:
+                prior = current['downloads'].get(rid)
+                if prior and prior['state'] != 'not_submitted':
+                    return {"retcode": 0 if prior['state'] == 'accepted' else -1, "retmsg": prior['message']}
+                current['downloads'][rid] = {'state': 'submitting', 'message': '正在提交，请勿重复点击'}
+            # Retry failures before client submission, but retain uncertain
+            # requests after that boundary to prevent duplicate downloads.
+            attempted = False
+            def before_submit():
+                nonlocal attempted
+                attempted = True
+            try:
+                if not media.tmdb_info:
+                    # Quick searches (including recognition fallback) only parse
+                    # releases. Resolve numbering now, keeping the selected site
+                    # and torrent rather than replacing the resource snapshot.
+                    resource = media
+                    media = Media().get_media_info(title=resource.org_string, subtitle=resource.description)
+                    if media:
+                        media.set_torrent_info(site=resource.site,
+                                               site_order=resource.site_order,
+                                               enclosure=resource.enclosure,
+                                               res_order=resource.res_order,
+                                               filter_rule=resource.filter_rule,
+                                               size=resource.size,
+                                               seeders=resource.seeders,
+                                               peers=resource.peers,
+                                               description=resource.description,
+                                               page_url=resource.page_url,
+                                               upload_volume_factor=resource.upload_volume_factor,
+                                               download_volume_factor=resource.download_volume_factor)
+                if media:
+                    ret, message = Downloader().download(media, download_dir=dl_dir, download_setting=dl_setting,
+                                                         before_submit=before_submit)
+                else:
+                    ret, message = None, '识别媒体信息失败'
+            except Exception:
+                ret, message = None, '提交状态待确认，请检查下载器' if attempted else '下载前处理失败，请重试'
+            if ret:
+                state, receipt_message = 'accepted', '已提交下载'
+            elif attempted:
+                state, receipt_message = 'unknown', '提交状态待确认，请检查下载器'
+            else:
+                state, receipt_message = 'not_submitted', message or '尚未提交下载，请重试'
+            with SearchSessions().edit(sid) as current:
+                current['downloads'][rid] = {'state': state, 'message': receipt_message}
+            if ret:
+                media.user_name = owner
+                Message().send_download_message(SearchType.WEB, media)
+            return {"retcode": 0 if ret else -1, "retmsg": '' if ret else message or receipt_message}
         results = self.dbhelper.get_search_result_by_id(dl_id)
         for res in results:
             media = Media().get_media_info(title=res.TORRENT_NAME, subtitle=res.DESCRIPTION)
@@ -675,7 +780,7 @@ class WebAction:
                                                  download_setting=dl_setting)
             if ret:
                 # 发送消息
-                media.user_name = current_user.username
+                media.user_name = owner
                 Message().send_download_message(in_from=SearchType.WEB,
                                                 can_item=media)
             else:
@@ -1032,6 +1137,13 @@ class WebAction:
             outpath = os.path.normpath(outpath)
         if not os.path.exists(inpath):
             return False, "输入路径不存在"
+        try:
+            # Reject malformed controls before TMDB lookup; movie inputs do not
+            # consume hidden episode fields left over from the TV form.
+            episode = (EpisodeFormat(None) if media_type == MediaType.MOVIE else
+                       EpisodeFormat(episode_format, episode_details, episode_offset))
+        except ValueError as error:
+            return False, str(error)
         if tmdbid:
             # 有输入TMDBID
             tmdb_info = Media().get_tmdb_info(mtype=media_type, tmdbid=tmdbid)
@@ -1045,25 +1157,19 @@ class WebAction:
                                                                tmdb_info=tmdb_info,
                                                                media_type=media_type,
                                                                season=season,
-                                                               episode=(
-                                                                   EpisodeFormat(episode_format,
-                                                                                 episode_details,
-                                                                                 episode_offset),
-                                                                   need_fix_all),
+                                                               episode=(episode, need_fix_all),
                                                                min_filesize=min_filesize,
                                                                udf_flag=True)
         else:
             # 按识别的信息转移
+            # 按名称识别作品时，也必须保留用户明确选择的目标季号。
             succ_flag, ret_msg = FileTransfer().transfer_media(in_from=SyncType.MAN,
                                                                in_path=inpath,
                                                                rmt_mode=syncmod,
                                                                target_dir=outpath,
                                                                media_type=media_type,
-                                                               episode=(
-                                                                   EpisodeFormat(episode_format,
-                                                                                 episode_details,
-                                                                                 episode_offset),
-                                                                   need_fix_all),
+                                                               season=season,
+                                                               episode=(episode, need_fix_all),
                                                                min_filesize=min_filesize,
                                                                udf_flag=True)
         return succ_flag, ret_msg
@@ -1561,7 +1667,7 @@ class WebAction:
         tmdbid = data.get("tmdbid")
         if not str(tmdbid).isdigit():
             tmdbid = None
-        if name:
+        if name and not rssid:
             name = MetaInfo(title=name).get_name()
         if mtype:
             if mtype in MovieTypes:
@@ -1602,6 +1708,7 @@ class WebAction:
         if isinstance(season, list):
             code = 0
             msg = ""
+            added_media = None
             for sea in season:
                 code, msg, media_info = _subscribe.add_rss_subscribe(mtype=mtype,
                                                                      name=name,
@@ -1620,8 +1727,13 @@ class WebAction:
                                                                      save_path=save_path,
                                                                      download_setting=download_setting,
                                                                      rssid=rssid)
-                if code != 0:
+                if code == 0:
+                    added_media = media_info
+                elif code != 9 or rssid:
                     break
+            # 榜单不会预查订阅。某一季已存在时，继续添加用户确认的其余季。
+            if not rssid and added_media and code == 9:
+                code, msg, media_info = 0, "添加订阅成功", added_media
         else:
             code, msg, media_info = _subscribe.add_rss_subscribe(mtype=mtype,
                                                                  name=name,
@@ -1648,7 +1760,8 @@ class WebAction:
                     title=name, tmdbid=media_info.tmdb_id)
             else:
                 rssid = self.dbhelper.get_rss_tv_id(
-                    title=name, tmdbid=media_info.tmdb_id)
+                    title=name, tmdbid=media_info.tmdb_id,
+                    season=media_info.get_season_string() if media_info.begin_season is not None else None)
         return {"code": code, "msg": msg, "page": page, "name": name, "rssid": rssid}
 
     def special_confirmation(self, data):
@@ -2339,8 +2452,9 @@ class WebAction:
             return {}
         tmdb_id = media_info.tmdb_id
         tmdb_link = media_info.get_detail_url()
+        recognition_reason = download_block_reason(media_info) or ""
         tmdb_S_E_link = ""
-        if tmdb_id:
+        if tmdb_id and not recognition_reason:
             if media_info.get_season_string():
                 tmdb_S_E_link = "%s/season/%s" % (tmdb_link,
                                                   media_info.get_season_seq())
@@ -2353,6 +2467,7 @@ class WebAction:
             "title": media_info.title,
             "year": media_info.year,
             "season_episode": media_info.get_season_episode_string(),
+            "recognition_reason": recognition_reason,
             "part": media_info.part,
             "tmdbid": tmdb_id,
             "tmdblink": tmdb_link,
@@ -2365,9 +2480,9 @@ class WebAction:
             "video_codec": media_info.video_encode,
             "audio_codec": media_info.audio_encode,
             "org_string": media_info.org_string,
-            "ignored_words": media_info.ignored_words,
-            "replaced_words": media_info.replaced_words,
-            "offset_words": media_info.offset_words
+            "ignored_words": media_info.ignored_words or [],
+            "replaced_words": media_info.replaced_words or [],
+            "offset_words": media_info.offset_words or []
         }
 
     @staticmethod
@@ -2826,14 +2941,16 @@ class WebAction:
                                                    tags=tags,
                                                    page=CurrentPage)
 
-        # 补充存在与订阅状态
+        # 榜单和发现页只展示来源数据。null 表示未查询；不能把浏览整页变成逐片识别。
+        if Type not in ("SEARCH", "DOWNLOADED"):
+            return {"code": 0, "Items": [dict(item, fav=None, rssid=None) for item in res_list]}
+
+        # 主动搜索与下载历史继续显示本地状态，列表类型本身不是影片的媒体类型。
         filetransfer = FileTransfer()
         for res in res_list:
-            fav, rssid = filetransfer.get_media_exists_flag(mtype=Type,
-                                                            title=res.get(
-                                                                "title"),
-                                                            year=res.get(
-                                                                "year"),
+            fav, rssid = filetransfer.get_media_exists_flag(mtype=res.get("type") or Type,
+                                                            title=res.get("title"),
+                                                            year=res.get("year"),
                                                             mediaid=res.get("id"))
             res.update({
                 'fav': fav,
@@ -3058,12 +3175,15 @@ class WebAction:
         tmdbid = data.get("tmdbid")
         title = data.get("title")
         if title:
-            title_season = MetaInfo(title=title).begin_season
+            # 用户仍可取消选季；仅用规则解析原始季标，正式提交再识别。
+            title_season = MetaInfo(title=title, use_llm=False).begin_season
         else:
             title_season = None
         if not str(tmdbid).isdigit():
             media_info = WebUtils.get_mediainfo_from_id(mtype=MediaType.TV,
-                                                        mediaid=tmdbid)
+                                                        mediaid=tmdbid, use_llm=False)
+            if not media_info or not media_info.tmdb_info:
+                return {"code": 1, "msg": "未查询到TMDB媒体信息", "seasons": []}
             season_infos = Media().get_tmdb_tv_seasons(media_info.tmdb_info)
         else:
             season_infos = Media().get_tmdb_tv_seasons_byid(tmdbid=tmdbid)
@@ -3215,7 +3335,7 @@ class WebAction:
         if not title:
             return {"code": -1}
         media_info, match_flag, exist_flag = RssChecker(
-        ).test_rss_articles(taskid=taskid, title=title)
+        ).test_rss_articles(taskid=taskid, title=title, year=data.get("year"), mtype=data.get("type"))
         if not media_info:
             return {"code": 0, "data": {"name": "无法识别"}}
         media_dict = self.mediainfo_dict(media_info)
@@ -3252,13 +3372,13 @@ class WebAction:
     @staticmethod
     def __rss_articles_download(data):
         if not data.get("articles"):
-            return {"code": 2}
-        res = RssChecker().download_rss_articles(
+            return {"code": 2, "msg": "未选择需要下载的报文"}
+        res, message = RssChecker().download_rss_articles(
             taskid=data.get("taskid"), articles=data.get("articles"))
         if res:
             return {"code": 0}
         else:
-            return {"code": 1}
+            return {"code": 1, "msg": message}
 
     def __add_custom_word_group(self, data):
         try:
@@ -3872,7 +3992,35 @@ class WebAction:
         查询所有搜索结果
         """
         SearchResults = {}
-        res = self.dbhelper.get_search_results()
+        if has_request_context():
+            from app.helper.search_sessions import SearchSessions, unpack_media
+            sid = (data or {}).get('search_id') or request.args.get('search_id') or session.get('search_id')
+            res = []
+            # Older message channels still link to the legacy table explicitly;
+            # native web/Telegram sessions never write to that shared table.
+            legacy = request.args.get('legacy') == '1'
+            if not sid and not legacy and (getattr(g, 'api_user', None) or getattr(g, 'api_key_authenticated', False)):
+                # Stateless API clients used to ask for the latest result without
+                # a search_id or cookie. Keep that lookup within the caller's namespace.
+                sid = SearchSessions().latest_web_search(self._search_owner())
+            elif legacy or not sid:
+                res = self.dbhelper.get_search_results()
+                sid = None
+            if sid:
+                try:
+                    owner = self._search_owner()
+                    record = SearchSessions().owned(sid, owner, owner)
+                    if record['channel'] == 'web':
+                        ids = list(record['results'])
+                        res = self.dbhelper.make_search_results(
+                            [unpack_media(record['results'][rid]) for rid in ids],
+                            title=record['query'], ident_flag=record.get('ident_flag', True))
+                        for row, rid in zip(res, ids):
+                            row.ID = sid + ':' + rid
+                except ValueError:
+                    pass
+        else:
+            res = self.dbhelper.get_search_results()
         total = len(res)
         for item in res:
             # 质量(来源、效果)、分辨率
@@ -4005,7 +4153,8 @@ class WebAction:
                 else:
                     exist_flag = False
                 SearchResults[title_string] = {
-                    "key": item.ID,
+                    # DOM/CSS identifiers must not contain the download ID's colon.
+                    "key": str(item.ID).replace(':', '_'),
                     "title": item.TITLE,
                     "year": item.YEAR,
                     "type_key": mtype,
@@ -4494,10 +4643,11 @@ class WebAction:
                           "episode": media.begin_episode,
                           "bluray": False,
                           "imdbid": media.imdb_id}]
-        success, retmsg = Subtitle().download_subtitle(
-            items=subtitle_item,
-            selected_file_id=data.get("file_id")
-        )
+        # File-manager downloads retain the source subtitle, then resolve the
+        # trusted transfer history for library naming, publication and refresh.
+        from app.helper.mediafile_subtitles import MediaFileSubtitles
+        success, retmsg = MediaFileSubtitles().download(
+            subtitle_item[0], selected_file_id=data.get("file_id"))
         if success:
             return {"code": 0, "msg": retmsg}
         elif isinstance(retmsg, dict):
@@ -4985,18 +5135,18 @@ class WebAction:
         if not tmdbid:
             return {"code": 1, "msg": "未指定媒体ID"}
         media_info = WebUtils.get_mediainfo_from_id(
-            mtype=mtype, mediaid=tmdbid)
+            mtype=mtype, mediaid=tmdbid, use_llm=False)
         # 检查TMDB信息
         if not media_info or not media_info.tmdb_info:
             return {
                 "code": 1,
                 "msg": "无法查询到TMDB信息"
             }
-        # 查询存在及订阅状态
-        fav, rssid = FileTransfer().get_media_exists_flag(mtype=mtype,
-                                                          title=media_info.title,
-                                                          year=media_info.year,
-                                                          mediaid=media_info.tmdb_id)
+        # 网页详情只展示资料；已有详情 API 调用方仍可获取单项的本地状态。
+        fav, rssid = None, None
+        if data.get("include_status") is not False:
+            fav, rssid = FileTransfer().get_media_exists_flag(mtype=mtype, title=media_info.title,
+                                                              year=media_info.year, mediaid=media_info.tmdb_id)
         MediaHander = Media()
         return {
             "code": 0,

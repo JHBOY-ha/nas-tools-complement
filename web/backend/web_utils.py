@@ -60,7 +60,7 @@ class WebUtils:
         return None, None, False
 
     @staticmethod
-    def get_mediainfo_from_id(mtype, mediaid):
+    def get_mediainfo_from_id(mtype, mediaid, *, use_llm=True):
         """
         根据TMDB/豆瓣/BANGUMI获取媒体信息
         """
@@ -79,12 +79,15 @@ class WebUtils:
             if original_title:
                 media_info = Media().get_media_info(title=f"{original_title} {year}",
                                                     mtype=mtype,
+                                                    use_llm=use_llm,
                                                     append_to_response="all")
             if not media_info or not media_info.tmdb_info:
                 media_info = Media().get_media_info(title=f"{title} {year}",
                                                     mtype=mtype,
+                                                    use_llm=use_llm,
                                                     append_to_response="all")
-            media_info.douban_id = doubanid
+            if media_info:
+                media_info.douban_id = doubanid
         elif str(mediaid).startswith("BG:"):
             # BANGUMI
             bangumiid = str(mediaid)[3:]
@@ -96,10 +99,12 @@ class WebUtils:
             year = info.get("date")[:4] if info.get("date") else ""
             media_info = Media().get_media_info(title=f"{title} {year}",
                                                 mtype=MediaType.TV,
+                                                use_llm=use_llm,
                                                 append_to_response="all")
             if not media_info or not media_info.tmdb_info:
                 media_info = Media().get_media_info(title=f"{title_cn} {year}",
                                                     mtype=MediaType.TV,
+                                                    use_llm=use_llm,
                                                     append_to_response="all")
         else:
             # TMDB
@@ -108,7 +113,8 @@ class WebUtils:
                                          append_to_response="all")
             if not info:
                 return None
-            media_info = MetaInfo(title=info.get("title") if mtype == MediaType.MOVIE else info.get("name"))
+            media_info = MetaInfo(title=info.get("title") if mtype == MediaType.MOVIE else info.get("name"),
+                                  use_llm=use_llm)
             media_info.set_tmdb_info(info)
 
         return media_info

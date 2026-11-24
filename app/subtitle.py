@@ -30,6 +30,24 @@ from config import Config, RMT_MEDIAEXT, RMT_SUBEXT
 from version import APP_VERSION
 
 
+AUTO_DOWNLOAD_LIMIT_MAX = 1000
+
+
+def parse_auto_download_limit(value):
+    """Return the automatic OpenSubtitles download cap; 0 means unlimited."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return 0
+    text = "" if isinstance(value, bool) else str(value).strip()
+    if not re.fullmatch(r"\d{1,4}", text) or int(text) > AUTO_DOWNLOAD_LIMIT_MAX:
+        raise ValueError("OpenSubtitles 自动下载上限必须是 0–%s 的整数，0 表示不限制"
+                         % AUTO_DOWNLOAD_LIMIT_MAX)
+    return int(text)
+
+
+class _AutomaticDownloadSkipped(Exception):
+    """An automatic-only admission decision; manual waiters can take the claim."""
+
+
 @singleton
 class Subtitle:
     opensubtitles = None
@@ -45,6 +63,15 @@ class Subtitle:
     # runs outside this lock; the client separately guards token/quota state.
     _opensubtitles_lock = threading.RLock()
     _opensubtitles_publication_generation = 0
+    # Post-transfer downloads share the account's daily quota with manual
+    # ones. A persisted rolling 24-hour ledger caps only the automatic share,
+    # which stays within the quota whether the provider resets daily or 24
+    # hours after first use. A limit of 0 records usage without capping it.
+    _auto_download_limit = 0
+    _auto_download_window = 24 * 60 * 60
+    _auto_download_ledger_key = ("OpenSubtitles", "AutoDownloadLedger")
+    _auto_download_lock = threading.Lock()
+    _auto_download_store = None
     _opensubtitles_download_limit = 20 * 1024 * 1024
     _opensubtitles_download_chunk = 64 * 1024
     _jellyfin_iso639_2 = {
@@ -73,6 +100,7 @@ class Subtitle:
         if not os.path.exists(self._save_tmp_path):
             os.makedirs(self._save_tmp_path)
         subtitle = Config().get_config('subtitle')
+        self._auto_download_limit = 0
         if subtitle:
             self._server = subtitle.get("server")
             if self._server == "chinesesubfinder":
@@ -86,13 +114,25 @@ class Subtitle:
                 self._local_path = subtitle.get("chinesesubfinder", {}).get("local_path")
                 self._remote_path = subtitle.get("chinesesubfinder", {}).get("remote_path")
             else:
-                self._opensubtitles_enable = subtitle.get("opensubtitles", {}).get("enable")
+                opensubtitles_conf = subtitle.get("opensubtitles") or {}
+                self._opensubtitles_enable = opensubtitles_conf.get("enable")
+                try:
+                    self._auto_download_limit = parse_auto_download_limit(
+                        opensubtitles_conf.get("auto_download_limit"))
+                except ValueError as error:
+                    # A hand-edited invalid value keeps the previous unlimited behaviour.
+                    log.warn("【Subtitle】%s，已按不限制处理" % error)
 
-    def download_subtitle(self, items, server=None, selected_file_id=None):
+    def download_subtitle_automatically(self, items):
+        """Post-transfer entry: OpenSubtitles downloads count against the automatic cap."""
+        return self.download_subtitle(items, automatic=True)
+
+    def download_subtitle(self, items, server=None, selected_file_id=None, automatic=False):
         """
         字幕下载入口
         :param items: {"type":, "file", "file_ext":, "name":, "title", "year":, "season":, "episode":, "bluray":}
         :param server: 字幕下载服务器
+        :param automatic: 整理后自动下载；OpenSubtitles 下载次数受自动下载上限约束
         :return: 是否成功，消息内容
         """
         if not items:
@@ -102,10 +142,109 @@ class Subtitle:
             return False, "未配置字幕下载器"
         if _server == "opensubtitles":
             if server or self._opensubtitles_enable:
-                return self.__download_opensubtitles(items, selected_file_id=selected_file_id)
+                return self.__download_opensubtitles(items, selected_file_id=selected_file_id,
+                                                     automatic=automatic)
         elif _server == "chinesesubfinder":
             return self.__download_chinesesubfinder(items)
         return False, "未配置字幕下载器"
+
+    def is_chinesesubfinder(self):
+        """The file-manager action must wait for this provider's queued download."""
+        return self._server == "chinesesubfinder"
+
+    def find_downloaded_subtitle(self, item):
+        """Locate a matching configured-language subtitle without spending quota."""
+        # ChineseSubFinder's Chinese output is independent of language choices
+        # configured for the other provider (which may, for example, be English).
+        languages = OpenSubtitles.DEFAULT_LANGUAGES.split(",") if self.is_chinesesubfinder() else None
+        return self.__existing_opensubtitles_target(item, languages=languages)
+
+    def sync_downloaded_subtitle(self, source_subtitle, media_file, target_media_file,
+                                 rmt_mode=None, server_type=None, path_guard_check=None):
+        """Publish a downloaded subtitle using the recorded library video's name.
+
+        Reuse identical outputs on retry, retain different existing subtitles,
+        and use atomic no-replace publication when a hardlink is unavailable.
+        """
+        result = {"source_subtitle": source_subtitle, "target_subtitle": "", "synced": False}
+        try:
+            if path_guard_check:
+                path_guard_check()
+            source_stem, extension = os.path.splitext(source_subtitle)
+            extension = extension.lower()
+            components = {extension: source_subtitle}
+            index = source_stem + ".idx"
+            if extension == ".sub" and os.path.lexists(index):
+                components[".idx"] = index
+            for path in components.values():
+                if os.path.islink(path) or not os.path.isfile(path):
+                    raise ValueError("源字幕不是有效的普通文件，未同步")
+                if os.path.getsize(path) > self._opensubtitles_download_limit:
+                    raise ValueError("源字幕超过 20 MiB，未同步")
+            validation = SubtitleHealth.validate_subtitle(source_subtitle)
+            if not validation.get("valid"):
+                raise ValueError("源字幕无法解析，未同步：%s" % (validation.get("message") or "格式无效"))
+            if os.path.abspath(media_file) == os.path.abspath(target_media_file):
+                result.update(target_subtitle=source_subtitle, synced=True)
+                return True, "字幕已保存在媒体库：%s" % source_subtitle, result
+
+            # Only suffix tags describe the subtitle language; the original
+            # video title can itself contain words such as English or Chinese.
+            media_base = os.path.splitext(os.path.basename(media_file))[0]
+            suffix = os.path.basename(source_subtitle)[len(media_base):]
+            # A generic ISO 639-2 prefix must not override an explicit zh-tw tag.
+            suffix = re.sub(r"(?i)^\.(?:chi|zho)\.(?=zh-)", ".", suffix)
+            language = self.__infer_subtitle_language(source_subtitle) or "zh-CN"
+            profile = self.__guess_subtitle_profile(suffix, default_language=language)
+            hashes = {ext: self.__file_sha256(path) for ext, path in components.items()}
+            # Pair selection, publication and rollback share the subtitle repair
+            # lock. A concurrent request must not reuse an index we may roll back.
+            with self._repair_lock if extension == ".sub" else nullcontext():
+                for attempt in range(3):
+                    if path_guard_check:
+                        path_guard_check()
+                    target = self.__build_subtitle_path(
+                        target_media_file, profile, extension, server_type,
+                        companion_exts=[".idx"] if extension == ".sub" else None, reuse_hashes=hashes)
+                    try:
+                        self.__sync_downloaded_files(components, hashes, target, rmt_mode, path_guard_check)
+                        result.update(target_subtitle=target, synced=True)
+                        return True, "字幕已同步到媒体库：%s" % target, result
+                    except FileExistsError:
+                        if attempt == 2:
+                            raise
+        except (OSError, ValueError) as error:
+            return False, "字幕已保存在原目录，同步失败：%s" % error, result
+
+    def __sync_downloaded_files(self, components, hashes, target, rmt_mode, path_guard_check):
+        def publish(ext, destination):
+            if path_guard_check:
+                path_guard_check()
+            if os.path.islink(destination):
+                raise FileExistsError("目标字幕文件已存在：%s" % destination)
+            if rmt_mode == RmtMode.LINK:
+                try:
+                    os.link(components[ext], destination)
+                    return True
+                except OSError:
+                    # The no-replace publisher handles identical existing files
+                    # and volumes that cannot hardlink to the download directory.
+                    pass
+            return self.__publish_file_no_replace(components[ext], destination, expected_hash=hashes[ext])
+
+        stem, extension = os.path.splitext(target)
+        index = stem + ".idx"
+        owned_index = None
+        if extension == ".sub" and ".idx" in components and publish(".idx", index):
+            owned_index = {"identity": self.__file_identity(index), "hash": hashes[".idx"]}
+        try:
+            publish(extension, target)
+        except (OSError, ValueError):
+            if owned_index and self.__owned_file_matches(index, owned_index):
+                if path_guard_check:
+                    path_guard_check()
+                os.unlink(index)
+            raise
 
     def upload_subtitle(self, upload_file, media_file, target_media_file=None, rmt_mode=None, server_type=None,
                         align_mode=None):
@@ -1584,7 +1723,8 @@ class Subtitle:
         return ""
 
     @classmethod
-    def __build_subtitle_path(cls, media_file, subtitle_profile, sub_ext, server_type=None, companion_exts=None):
+    def __build_subtitle_path(cls, media_file, subtitle_profile, sub_ext, server_type=None,
+                              companion_exts=None, reuse_hashes=None):
         """
         生成不覆盖已有文件的外挂字幕路径。
         命名格式：
@@ -1593,6 +1733,7 @@ class Subtitle:
           - Plex:          Movie.zh-CN.srt → Movie(1).zh-CN.srt → ...
                            (forced/sdh/cc 标记拼接在语言标签后: Movie.en.forced.sdh.srt)
         重名时最多尝试 100 个编号，超过则抛出 FileExistsError。
+        下载同步只复用已有组件内容都匹配的文件名，缺少的配对组件可在重试时补齐。
         """
         media_base = os.path.splitext(media_file)[0]
         suffix_parts = [cls.__subtitle_language_tag(subtitle_profile.get("language"), server_type)]
@@ -1608,10 +1749,16 @@ class Subtitle:
         companion_exts = [str(ext).lower() for ext in (companion_exts or []) if ext]
 
         def available(path):
-            if os.path.exists(path):
-                return False
-            base = os.path.splitext(path)[0]
-            return not any(os.path.exists(base + ext) for ext in companion_exts)
+            stem = os.path.splitext(path)[0]
+            for ext in [sub_ext, *companion_exts]:
+                component = stem + ext
+                if os.path.lexists(component):
+                    expected = (reuse_hashes or {}).get(ext)
+                    if not expected or os.path.islink(component) or not os.path.isfile(component):
+                        return False
+                    if cls.__file_sha256(component) != expected:
+                        return False
+            return True
 
         if available(target):
             return target
@@ -1626,6 +1773,54 @@ class Subtitle:
             if available(target):
                 return target
         raise FileExistsError("字幕文件重名过多")
+
+    @classmethod
+    def preview_upload_names(cls, media_file, filenames, server_type=None):
+        """
+        依据文件名预估上传后的语言与目标文件名，供界面在上传前核对。
+        不读取字幕内容；没有语言标记时真实处理会按正文识别，这里只给出占位名并提示。
+        """
+        names = [os.path.basename(str(name or "")) for name in (filenames or [])]
+        stems = {".sub": set(), ".idx": set()}
+        for name in names:
+            stem, ext = os.path.splitext(name)
+            if ext.lower() in stems:
+                stems[ext.lower()].add(stem.lower())
+        used = set()
+        rows = []
+        for name in names:
+            stem, ext = os.path.splitext(name)
+            ext = ext.lower()
+            row = {"name": name, "language": "", "target": "", "note": ""}
+            rows.append(row)
+            if ext not in (".srt", ".ass", ".ssa", ".smi", ".vtt", ".sub", ".idx"):
+                row["note"] = "不支持的字幕格式"
+                continue
+            if ext == ".idx":
+                row["note"] = "与同名 .sub 成对上传" if stem.lower() in stems[".sub"] else "缺少同名 .sub 文件"
+                continue
+            profile = cls.__guess_subtitle_profile(name, default_language="")
+            inferred = not profile.get("language")
+            if inferred:
+                profile["language"] = "zh-CN"
+            profile["source"] = cls.__guess_subtitle_source(name, media_file)
+            companions = [".idx"] if ext == ".sub" and stem.lower() in stems[".idx"] else []
+            try:
+                target = cls.__build_subtitle_path(
+                    media_file, profile, ext, server_type, companion_exts=companions)
+            except FileExistsError:
+                row["note"] = "同名字幕过多，无法生成文件名"
+                continue
+            row["language"] = "" if inferred else profile["language"]
+            row["target"] = os.path.basename(target)
+            notes = []
+            if inferred:
+                notes.append("文件名无语言标记，将按正文识别语言")
+            if target in used:
+                notes.append("同批次同名将自动编号")
+            used.add(target)
+            row["note"] = "；".join(notes)
+        return rows
 
     @classmethod
     def __subtitle_language_tag(cls, language_tag, server_type=None):
@@ -2227,25 +2422,39 @@ class Subtitle:
     def __subtitle_target(self, item, language):
         return "%s.%s.srt" % (item.get("file"), self.__subtitle_language_suffix(language))
 
-    def __existing_opensubtitles_target(self, item, language_evidence=None):
+    def __existing_opensubtitles_target(self, item, language_evidence=None, languages=None):
         media_base = str(item.get("file") or "")
         media_dir = os.path.dirname(media_base) or "."
         media_name = os.path.basename(media_base)
-        wanted = set(self.opensubtitles.languages)
+        wanted = set(self.opensubtitles.languages if languages is None else languages)
+        # Jellyfin writes e.g. "fre" for an OpenSubtitles preference of "fr".
+        wanted.update({self._jellyfin_iso639_2[code] for code in wanted if code in self._jellyfin_iso639_2})
         if "ze" in wanted:
             wanted.add("zh-cn")
         try:
-            # Stream directory entries so a matching subtitle can stop the
-            # traversal immediately without materializing every media filename.
+            # Track only possible siblings and subtitles of this movie in a single scan.
             with os.scandir(media_dir) as entries:
                 return self.__find_opensubtitles_target(entries, media_name, wanted, language_evidence)
         except OSError:
             return None
 
     def __find_opensubtitles_target(self, entries, media_name, wanted, language_evidence):
+        candidates = []
+        sibling_stems = set()
+        media_prefix = media_name.casefold() + "."
+        aliases = {"eng": "en", "english": "en",
+                   "zh-hans": "zh-cn", "chs": "zh-cn", "cn": "zh-cn",
+                   "zh-hant": "zh-tw", "cht": "zh-tw", "tw": "zh-tw",
+                   "ze": "zh-cn"}
+        # Bilingual tracks may carry language tags outside the user's preference.
+        tags = (set(aliases) | set(aliases.values()) | wanted | set(self._jellyfin_iso639_2)
+                | set(self._jellyfin_iso639_2.values()) | {
+                    'zh', 'chi', 'zho', 'chinese', 'forced', 'default', 'sdh', 'cc', 'hi', 'full'})
         for entry in entries:
             file_name = entry.name
             stem, extension = os.path.splitext(file_name)
+            if extension.lower() in RMT_MEDIAEXT and stem.casefold().startswith(media_prefix) and entry.is_file():
+                sibling_stems.add(stem.casefold())
             if extension.lower() not in RMT_SUBEXT or not (
                     stem == media_name or stem.startswith("%s." % media_name)):
                 continue
@@ -2255,14 +2464,18 @@ class Subtitle:
             # Inspect language tags after the media name, never the title itself.
             suffix = stem[len(media_name):].lower().replace("_", "-")
             # Emby appends collision numbers to the language tag (zh-CN(1)).
-            tokens = {re.sub(r"\([0-9]+\)$", "", token)
-                      for token in suffix.strip(".").split(".")}
-            aliases = {"eng": "en", "english": "en",
-                       "zh-hans": "zh-cn", "chs": "zh-cn", "cn": "zh-cn",
-                       "zh-hant": "zh-tw", "cht": "zh-tw", "tw": "zh-tw",
-                       "ze": "zh-cn"}
+            tokens = [re.sub(r"\([0-9]+\)$", "", token) for token in suffix.strip(".").split(".")]
+            # Jellyfin permits one source label before the language. Editorial
+            # cuts remain distinct even if their video has since been moved.
+            if stem != media_name and tokens[0] not in tags:
+                from app.media.meta.release_version import clean_cut_tokens
+                source = tokens.pop(0)
+                if not re.fullmatch(r'[\w-]{1,32}(?:-\d{1,3})?', source) or clean_cut_tokens(source) != source:
+                    continue
+            if stem != media_name and any(token not in tags for token in tokens):
+                continue
             languages = {aliases.get(token, token) for token in tokens}
-            if not languages.intersection({"zh-cn", "zh-tw"}) and tokens.intersection(
+            if not languages.intersection({"zh-cn", "zh-tw"}) and languages.intersection(
                     {"zh", "chi", "zho", "chinese"}):
                 languages.update({"zh-cn", "zh-tw"})
             if stem == media_name:
@@ -2271,6 +2484,13 @@ class Subtitle:
                 inferred = self.__infer_subtitle_language(target).lower()
                 languages = {aliases.get(inferred, inferred)}
             if languages.intersection(wanted):
+                if stem == media_name:
+                    return target
+                candidates.append((stem.casefold(), target))
+        # A sibling's stem can end in a language (Movie.EN.mkv) or a group name.
+        # It takes precedence even when its directory entry comes after the subtitle.
+        for stem, target in candidates:
+            if not any(stem == video or stem.startswith(video + ".") for video in sibling_stems):
                 return target
         return None
 
@@ -2417,7 +2637,7 @@ class Subtitle:
                 except OSError:
                     pass
 
-    def __download_opensubtitles(self, items, selected_file_id=None):
+    def __download_opensubtitles(self, items, selected_file_id=None, automatic=False):
         """Search freely, then consume at most one /download quota per item."""
         if not self.opensubtitles:
             return False, "未配置OpenSubtitles"
@@ -2429,7 +2649,7 @@ class Subtitle:
             return False, "没有可处理的媒体文件"
         if selected_file_id is not None and len(items) != 1:
             return False, "手动选择字幕时只能处理一个媒体文件"
-        results = [self.__download_opensubtitles_item(item, selected_file_id) for item in items]
+        results = [self.__download_opensubtitles_item(item, selected_file_id, automatic) for item in items]
         if len(results) == 1:
             return results[0]
         messages = []
@@ -2448,23 +2668,32 @@ class Subtitle:
             return None
 
     @network_operation
-    def __download_opensubtitles_item(self, item, selected_file_id=None):
+    def __download_opensubtitles_item(self, item, selected_file_id=None, automatic=False):
         key = os.path.normcase(os.path.abspath(str(item.get('file') or '')))
-        with self._opensubtitles_lock:
-            inflight = getattr(self, '_opensubtitles_inflight', None)
-            if inflight is None:
-                inflight = self._opensubtitles_inflight = {}
-            prior = inflight.get(key)
-            owner = prior is None
-            if owner:
-                prior = inflight[key] = Future()
-        if not owner:
+        while True:
+            with self._opensubtitles_lock:
+                inflight = getattr(self, '_opensubtitles_inflight', None)
+                if inflight is None:
+                    inflight = self._opensubtitles_inflight = {}
+                prior = inflight.get(key)
+                if prior is None:
+                    prior = inflight[key] = Future()
+                    break
             try:
                 return prior.result(timeout=current_deadline().remaining())
+            except _AutomaticDownloadSkipped as error:
+                if automatic:
+                    return False, str(error)
+                # A manual waiter still needs its own link after an automatic-only skip.
             except FutureTimeoutError:
                 return False, '现有字幕下载尚未完成，请稍后查看任务结果'
         try:
-            result = self.__download_opensubtitles_claimed(item, selected_file_id)
+            result = self.__download_opensubtitles_claimed(item, selected_file_id, automatic)
+        except _AutomaticDownloadSkipped as error:
+            with self._opensubtitles_lock:
+                del inflight[key]
+            prior.set_exception(error)
+            return False, str(error)
         except BaseException as error:
             prior.set_exception(error)
             raise
@@ -2476,7 +2705,7 @@ class Subtitle:
                 if inflight.get(key) is prior:
                     inflight.pop(key, None)
 
-    def __download_opensubtitles_claimed(self, item, selected_file_id=None):
+    def __download_opensubtitles_claimed(self, item, selected_file_id=None, automatic=False):
         directory = os.path.dirname(str(item.get("file") or "")) or "."
         # Directory traversal/language detection can wait on NAS. Perform the
         # normal preflight before taking the shared API token/quota lock, then
@@ -2494,15 +2723,111 @@ class Subtitle:
             and all(before is not None and before == self.__opensubtitles_path_identity(path)
                     for path, before in evidence)
         return self.__download_opensubtitles_item_locked(
-            item, selected_file_id, prechecked=prechecked, existing=existing
+            item, selected_file_id, prechecked=prechecked, existing=existing, automatic=automatic
         )
 
+    def __auto_download_ledger(self):
+        # Imported lazily: this module is also loaded in isolation by tests,
+        # which inject an in-memory store instead of the system dictionary.
+        if self._auto_download_store is None:
+            from app.helper import DictHelper
+            return DictHelper()
+        return self._auto_download_store
+
+    def __auto_download_stamps(self, store, now):
+        """Recorded automatic downloads still inside the rolling window, oldest first."""
+        try:
+            values = json.loads(store.get(*self._auto_download_ledger_key) or "[]")
+        except (TypeError, ValueError):
+            values = []
+        if not isinstance(values, list):
+            values = []
+        horizon = now - self._auto_download_window
+        # Entries far in the future come from a corrupted ledger, not a clock step.
+        return sorted(float(value) for value in values
+                      if isinstance(value, (int, float)) and not isinstance(value, bool)
+                      and horizon < value < now + self._auto_download_window)
+
+    def __save_auto_download_stamps(self, store, stamps):
+        if store.set(*self._auto_download_ledger_key, json.dumps(stamps)) is False:
+            raise OSError("写入 OpenSubtitles 自动下载记录失败")
+
+    def get_auto_download_usage(self):
+        """Automatic OpenSubtitles downloads in the last 24 hours, for the settings page."""
+        now = time.time()
+        with self._auto_download_lock:
+            stamps = self.__auto_download_stamps(self.__auto_download_ledger(), now)
+        limit = self._auto_download_limit
+        resume_at = None
+        if limit and len(stamps) >= limit:
+            # The cap lifts when enough of the oldest recorded uses age out.
+            resume_at = datetime.datetime.fromtimestamp(
+                stamps[len(stamps) - limit] + self._auto_download_window).strftime("%m-%d %H:%M")
+        return {"used": len(stamps), "limit": limit, "resume_at": resume_at}
+
+    def __auto_download_capped(self):
+        """Cheap pre-search check; the reservation before downloading is authoritative."""
+        limit = self._auto_download_limit
+        if not limit:
+            return False
+        with self._auto_download_lock:
+            try:
+                stamps = self.__auto_download_stamps(self.__auto_download_ledger(), time.time())
+            except Exception as error:
+                log.error("【Subtitle】读取 OpenSubtitles 自动下载记录失败：%s" % error)
+                return False
+            return len(stamps) >= limit
+
+    def __reserve_auto_download(self):
+        """Record one automatic quota use before requesting a link.
+
+        Returns the recorded timestamp, None when capped, or False when a cap
+        is configured but the use cannot be recorded. Reserving under the lock
+        keeps concurrent automatic downloads within the cap. Without a limit,
+        a ledger failure must not block downloads.
+        """
+        limit = self._auto_download_limit
+        with self._auto_download_lock:
+            now = time.time()
+            try:
+                store = self.__auto_download_ledger()
+                stamps = self.__auto_download_stamps(store, now)
+                if limit and len(stamps) >= limit:
+                    return None
+                stamps.append(now)
+                self.__save_auto_download_stamps(store, stamps)
+            except Exception as error:
+                log.error("【Subtitle】记录 OpenSubtitles 自动下载次数失败：%s" % error)
+                return False if limit else now
+            return now
+
+    def __release_auto_download(self, stamp):
+        """Release a reservation only after the client confirms it was uncharged."""
+        with self._auto_download_lock:
+            try:
+                store = self.__auto_download_ledger()
+                stamps = self.__auto_download_stamps(store, time.time())
+                if stamp in stamps:
+                    stamps.remove(stamp)
+                    self.__save_auto_download_stamps(store, stamps)
+            except Exception as error:
+                log.error("【Subtitle】回退 OpenSubtitles 自动下载记录失败：%s" % error)
+
+    def __skip_capped_auto_download(self, item):
+        message = "OpenSubtitles 自动下载已达 24 小时上限（%s 次），已跳过：%s" % (
+            self._auto_download_limit, item.get("name"))
+        log.info("【Subtitle】%s" % message)
+        raise _AutomaticDownloadSkipped(message)
+
     def __download_opensubtitles_item_locked(self, item, selected_file_id=None,
-                                            prechecked=False, existing=None):
+                                            prechecked=False, existing=None, automatic=False):
         if not prechecked:
             existing = self.__existing_opensubtitles_target(item)
         if existing:
             return True, "字幕已存在：%s" % existing
+        # Skip the search too: a capped automatic run could not download anyway.
+        if automatic and self.__auto_download_capped():
+            self.__skip_capped_auto_download(item)
         log.info("【Subtitle】开始通过OpenSubtitles.com API检索字幕：%s" % item.get("name"))
         candidates, error = self.opensubtitles.search_subtitles(item)
         if error:
@@ -2529,9 +2854,20 @@ class Subtitle:
                     "candidates": self.__public_candidates(candidates)
                 }
 
+        stamp = None
+        if automatic:
+            stamp = self.__reserve_auto_download()
+            if stamp is None:
+                self.__skip_capped_auto_download(item)
+            if stamp is False:
+                raise _AutomaticDownloadSkipped("无法记录 OpenSubtitles 自动下载次数，为避免超出上限已跳过：%s" % item.get("name"))
         payload, error = self.opensubtitles.download(selected.get("file_id"))
         if error:
+            # A lost response or unusable link can follow a charged POST.
+            if stamp is not None and isinstance(error, OpenSubtitles.UnchargedRequest):
+                self.__release_auto_download(stamp)
             return False, error
+        # From here the provider has counted the download, even if fetching fails.
         text, error = self.__fetch_temporary_subtitle(payload.get("link"))
         if error:
             return False, error

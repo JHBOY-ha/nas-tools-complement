@@ -3,41 +3,65 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
-const root = path.resolve(__dirname, '..');
-const source = fs.readFileSync(path.join(root, 'web/static/components/utility/utility.js'), 'utf8');
-const context = vm.createContext({URL, LitElement: class {}});
-vm.runInContext(source.replace(/^import .*;$/m, '').replaceAll('export class ', 'class ')
-  + '\nthis.Golbal = Golbal;', context);
-const imageUrl = value => context.Golbal.poster_image_url(value);
-const posterPath = '/view/photo/m_ratio_poster/public/p2936069048.webp';
-const resize = 'imageView2/2/q/80/w/500/h/750/format/webp';
-const expected = 'https://qnmob3.doubanio.com' + posterPath + '?' + resize;
 
-for (const host of ['img1', 'img2', 'img3', 'img9', 'qnmob3']) {
-  for (const scheme of ['https', 'http']) {
-    assert.equal(imageUrl(`${scheme}://${host}.doubanio.com${posterPath}`), expected);
-  }
+const elements = new Map();
+const nothing = Symbol('nothing');
+const context = vm.createContext({
+  LitElement: class {}, nothing, observeState: base => base, cardState: {},
+  NormalCardPlaceholder: {render_placeholder() {}},
+  window: {customElements: {define: (name, element) => elements.set(name, element)}},
+  html: (strings, ...values) => ({strings, values}),
+});
+for (const file of ['utility/utility.js', 'card/normal/index.js', 'custom/img/index.js']) {
+  const code = fs.readFileSync(path.join(__dirname, '../web/static/components', file), 'utf8');
+  vm.runInContext(code.replace(/^import .*$/gm, '').replaceAll('export class ', 'class '), context);
 }
-assert.equal(imageUrl(expected), expected, 'normalization must be idempotent');
-assert.equal(imageUrl('https://img3.doubanio.com' + posterPath + '?version=1#poster'),
-  'https://qnmob3.doubanio.com' + posterPath + '?version=1&' + resize + '#poster');
-assert.equal(imageUrl('http://img3.doubanio.com:80' + posterPath), expected);
-assert.equal(imageUrl('https://img3.doubanio.com/view/photo/s_ratio_poster/public/p42.jpg'),
-  'https://qnmob3.doubanio.com/view/photo/s_ratio_poster/public/p42.jpg?' + resize);
-for (const value of [undefined, null, '', 'None', 'not a URL', '../static/img/no-image.png',
-  'https://image.tmdb.org/t/p/w500/a.jpg', 'http://lain.bgm.tv/pic/cover/l/a.jpg',
-  'https://img3.doubanio.com.evil.test' + posterPath,
-  'https://evil.test/?url=https://img3.doubanio.com' + posterPath,
-  'https://user:secret@img3.doubanio.com' + posterPath,
-  'https://img3.doubanio.com:8443' + posterPath,
-  'ftp://img3.doubanio.com' + posterPath,
-  'https://img3.doubanio.com/icon/u123.jpg']) {
-  assert.equal(imageUrl(value), value, 'unrelated or invalid source must be unchanged');
+
+// Exercise the bindings and handlers returned by the actual Lit components.
+function binding(component, attribute) {
+  const template = component.render();
+  const index = template.strings.findIndex(text => text.endsWith(' ' + attribute + '='));
+  assert.notEqual(index, -1, attribute);
+  return template.values[index];
 }
-for (const component of ['card/normal', 'custom/img']) {
-  const code = fs.readFileSync(path.join(root, `web/static/components/${component}/index.js`), 'utf8');
-  assert(code.includes('referrerpolicy="no-referrer"'));
-  assert(code.includes('Golbal.poster_image_url('));
-  assert(code.includes('this.lazy == "1" ? "" :'), 'keep deferred image loading');
+
+const Card = elements.get('normal-card');
+const card = new Card();
+const original = 'https://img9.doubanio.com/view/photo/s_ratio_poster/public/p42.jpg?size=1&sig=a%2Fb';
+card.image = original;
+card.tmdb_id = 'DB:42';
+card.lazy = '1';
+assert.equal(binding(card, 'src'), nothing);
+card.lazy = '0';
+assert.equal(binding(card, 'src'), original);
+binding(card, '@error')();
+assert.equal(binding(card, 'src'), '/douban/subject/42/preview');
+binding(card, '@load')();
+assert.equal(card._placeholder, false);
+binding(card, '@error')();
+const noImage = '../static/img/no-image.png';
+assert.equal(binding(card, 'src'), noImage);
+binding(card, '@error')();
+assert.equal(binding(card, 'src'), noImage);
+assert.equal(card.image, original);
+
+card.tmdb_id = 'DB:43';
+card.image = '';
+card.willUpdate(new Map([['tmdb_id', 'DB:42'], ['image', original]]));
+assert.equal(binding(card, 'src'), '/douban/subject/43/preview');
+for (const id of ['123', 'BG:42', 'DB:bad', 'DB:4/2']) {
+  card.tmdb_id = id;
+  card.image = 'https://image.tmdb.org/t/p/w500/poster.jpg';
+  card.willUpdate(new Map([['tmdb_id', undefined]]));
+  assert.equal(binding(card, 'src'), card.image);
+  binding(card, '@error')();
+  assert.equal(binding(card, 'src'), noImage);
 }
-console.log('PASS: Douban direct CDN URLs, processing, idempotence, URL boundaries, components and lazy loading');
+
+const CustomImg = elements.get('custom-img');
+const img = new CustomImg();
+img.img_src = original;
+assert.equal(binding(img, 'src'), original);
+img.lazy = '1';
+assert.equal(binding(img, 'src'), '');
+console.log('PASS: original URLs, lazy loading, Douban preview, terminal fallback and reused cards');

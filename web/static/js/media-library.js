@@ -1,9 +1,12 @@
 var library_page = 1;
+var library_total_pages = null;
 var library_page_size = 18;
 var library_items_cache = {};
 var library_current_series_id = "";
 var library_current_series_title = "";
 var library_episodes_cache = [];
+var library_episodes_state = "idle";
+var library_episodes_request = null;
 var library_online_media = {};
 var library_poster_observer = null;
 var library_eager_poster_count = 6;
@@ -11,12 +14,31 @@ var library_default_media_server = "emby";
 var library_subtitle_audit_categories = {};
 var library_subtitle_audit_roots = {};
 var library_items_loading = false;
+var library_refreshing = false;
+var library_refresh_notice = "";
+var library_summary_generation = 0;
+var library_summary_key = "";
+var library_drawer_item = null;
+var library_drawer_resume_id = "";
+var library_upload_preview_generation = 0;
+var library_online_serialized = false;
+var library_fill = null;
+var library_fill_loading = false;
 var library_pending_page = null;
 var library_view_instance = null;
 var library_categories_cache = {};
+// Per-category counts under the current filters (category itself excluded); null until loaded.
+var library_category_counts = null;
+// Library sub-category to preselect when choosing an audit type in this dialog.
+var library_audit_prefill_subcategory = null;
 var library_subtitle_audit_task_id = "";
 var library_subtitle_upload_task_id = "";
 var library_subtitle_upload_request = null;
+// The last view is remembered per browser; history state still wins on back/forward.
+var library_view_storage_key = "nastool.media-library.view";
+var library_type_labels = {all: "全部类型", movie: "电影", tv: "电视剧", anime: "动漫"};
+var library_subtitle_labels = {missing: "缺字幕", unknown: "未检测", problem: "有问题", ok: "已完成"};
+var library_sort_labels = {internal: "是否有内嵌字幕", external: "是否有外挂字幕", audit: "字幕检测问题程度"};
 
 // popstate changes the history entry before the SPA replaces its DOM. Invalidate
 // immediately so a late response cannot write into that 150 ms transition window.
@@ -47,7 +69,7 @@ function library_escape_js(value) {
   return library_escape_html(value).replace(/\\/g, "\\\\").replace(/"/g, "&quot;");
 }
 
-function library_post_json(url, data, handler) {
+function library_post_json(url, data, handler, on_error) {
   NProgress.start();
   $.ajax({
     type: "POST",
@@ -60,9 +82,10 @@ function library_post_json(url, data, handler) {
       NProgress.done();
       handler(ret || {});
     },
-    error: function () {
+    error: function (xhr) {
       NProgress.done();
-      show_fail_modal("网络错误");
+      if (on_error) { on_error(xhr); }
+      else { show_fail_modal("网络错误"); }
     }
   });
 }
@@ -75,27 +98,207 @@ function library_filter_data(page) {
     sort_by: $("#library_sort_by").val(),
     sort_order: $("#library_sort_order").val(),
     keyword: $("#library_filter_keyword").val(),
+    audio_language: $("#library_filter_audio").val() || "all",
     page: page,
     page_size: library_page_size
   };
 }
 
-function update_library_category_options(categories) {
+// Status counters ignore the subtitle filter, so each tab shows what it would list;
+// sub-category counters ignore the category but follow the subtitle state.
+function library_summary_data() {
+  return {
+    type: $("#library_filter_type").val() || "all",
+    category: $("#library_filter_category").val() || "",
+    subtitle: $("#library_filter_subtitle").val() || "all",
+    keyword: String($("#library_filter_keyword").val() || "").trim(),
+    audio_language: $("#library_filter_audio").val() || "all"
+  };
+}
+
+function library_render_summary(counts) {
+  ["all", "missing", "unknown", "problem", "ok"].forEach(function (key) {
+    const value = counts && counts[key] !== undefined ? Number(counts[key]).toLocaleString("zh-CN") : "–";
+    $(`[data-library-count="${key}"]`).text(value);
+  });
+}
+
+function load_library_summary() {
+  const view = library_view_instance;
+  const grid = document.getElementById("library_items_grid");
+  const generation = ++library_summary_generation;
+  const data = library_summary_data();
+  const key = JSON.stringify(data);
+  const is_current = () => generation === library_summary_generation && grid && view &&
+      view === library_view_instance && document.getElementById("library_items_grid") === grid;
+  $.ajax({
+    type: "POST",
+    url: "/library/summary?random=" + Math.random(),
+    dataType: "json",
+    contentType: "application/json",
+    data: JSON.stringify(data),
+    timeout: 0,
+    success: function (ret) {
+      if (!is_current()) { return; }
+      if (ret && ret.code === 0) {
+        library_summary_key = key;
+        library_render_summary(ret.counts || {});
+        library_category_counts = ret.category_counts || null;
+      } else {
+        library_summary_key = "";
+        library_render_summary(null);
+        library_category_counts = null;
+      }
+      render_library_category_chips();
+    },
+    error: function () {
+      if (!is_current()) { return; }
+      library_summary_key = "";
+      library_render_summary(null);
+      library_category_counts = null;
+      render_library_category_chips();
+    }
+  });
+}
+
+function sync_library_tabs() {
+  const type = $("#library_filter_type").val() || "all";
+  const subtitle = $("#library_filter_subtitle").val() || "all";
+  $("#library_type_tabs [data-library-type]").each(function () {
+    const active = $(this).attr("data-library-type") === type;
+    $(this).toggleClass("active", active).attr("aria-pressed", active ? "true" : "false");
+  });
+  $("#library_status_tabs [data-library-subtitle]").each(function () {
+    const active = $(this).attr("data-library-subtitle") === subtitle;
+    $(this).toggleClass("active", active).attr("aria-pressed", active ? "true" : "false");
+  });
+  update_library_fill_scope();
+}
+
+// Audio language comes from synced movie streams, so it only applies to movies.
+function update_library_audio_control() {
+  const type = $("#library_filter_type").val() || "all";
+  const unavailable = type === "tv" || type === "anime";
+  if (unavailable) {
+    $("#library_filter_audio").val("all");
+  }
+  $("#library_filter_audio").prop("disabled", unavailable);
+}
+
+function set_library_type(type) {
+  if (["all", "movie", "tv", "anime"].indexOf(type) === -1) { return; }
+  $("#library_filter_type").val(type);
+  // Keep a sub-category that still belongs to the new type; any other would list nothing.
+  const category = $("#library_filter_category").val() || "";
+  if (category && library_category_list(type).indexOf(category) === -1) {
+    $("#library_filter_category").val("");
+  }
+  update_library_audio_control();
+  sync_library_tabs();
+  render_library_category_chips();
+  update_library_filter_badge();
+  load_library_items(1);
+}
+
+function set_library_subtitle(subtitle) {
+  if (["all", "missing", "unknown", "problem", "ok"].indexOf(subtitle) === -1) { return; }
+  $("#library_filter_subtitle").val(subtitle);
+  sync_library_tabs();
+  load_library_items(1);
+}
+
+function set_library_category(category) {
+  category = String(category || "");
+  const current = $("#library_filter_category").val() || "";
+  // Clicking the selected chip again returns to every sub-category.
+  const next = category && category === current ? "" : category;
+  if (next === current) { return; }
+  $("#library_filter_category").val(next);
+  // A sub-category implies its type, so highlight that tab too; a name shared by
+  // TV and anime (such as 动漫) keeps "全部类型" so both stay listed.
+  const owners = next ? library_category_owners(next) : [];
+  if (($("#library_filter_type").val() || "all") === "all" && owners.length === 1) {
+    $("#library_filter_type").val(owners[0]);
+    update_library_audio_control();
+  }
+  sync_library_tabs();
+  render_library_category_chips();
+  update_library_filter_badge();
+  load_library_items(1);
+}
+
+function update_library_categories(categories) {
   if (categories) {
     library_categories_cache = categories;
   }
-  categories = library_categories_cache || {};
-  const type = $("#library_filter_type").val();
-  const selected = $("#library_filter_category").val();
-  const category_list = type === "all"
-      ? Array.from(new Set([].concat(categories.movie || [], categories.tv || [], categories.anime || []))).sort()
-      : (categories[type] || []);
-  let html = '<option value="">全部</option>';
-  category_list.forEach(function (category) {
-    const escaped = library_escape_html(category);
-    html += `<option value="${escaped}" ${category === selected ? "selected" : ""}>${escaped}</option>`;
+  render_library_category_chips();
+}
+
+// The server lists each type's sub-categories in the category YAML's order.
+// "全部类型" groups them by type and lists a name shared by two types once.
+function library_category_groups(type) {
+  const categories = library_categories_cache || {};
+  const types = type === "movie" || type === "tv" || type === "anime" ? [type] : ["movie", "tv", "anime"];
+  const seen = Object.create(null);
+  const groups = [];
+  types.forEach(function (media_type) {
+    const names = (categories[media_type] || []).filter(function (name) {
+      if (!name || seen[name]) { return false; }
+      seen[name] = true;
+      return true;
+    });
+    if (names.length) {
+      groups.push({type: media_type, names: names});
+    }
   });
-  $("#library_filter_category").html(html);
+  return groups;
+}
+
+function library_category_list(type) {
+  return library_category_groups(type).reduce(function (all, group) { return all.concat(group.names); }, []);
+}
+
+function library_category_owners(category) {
+  const categories = library_categories_cache || {};
+  return ["movie", "tv", "anime"].filter(function (type) {
+    return (categories[type] || []).indexOf(category) !== -1;
+  });
+}
+
+function render_library_category_chips() {
+  const type = $("#library_filter_type").val() || "all";
+  const selected = $("#library_filter_category").val() || "";
+  const groups = library_category_groups(type);
+  const counts = library_category_counts;
+  const container = document.getElementById("library_category_chips");
+  // Counts arrive after the list and re-render the row; keep keyboard focus on the same chip.
+  const focused = container && typeof container.contains === "function" && document.activeElement &&
+      container.contains(document.activeElement) ? $(document.activeElement).attr("data-library-category") : null;
+  const chip = function (value, count) {
+    const active = value === selected;
+    const known = count !== null && count !== undefined;
+    const badge = known ? ` <span class="badge">${Number(count).toLocaleString("zh-CN")}</span>` : "";
+    return `<button type="button" class="btn btn-sm lit-library-category-chip${active ? " active" : ""}` +
+        `${known && Number(count) === 0 ? " is-empty" : ""}" data-library-category="${library_escape_html(value)}"` +
+        ` aria-pressed="${active ? "true" : "false"}">${library_escape_html(value || "全部")}${badge}</button>`;
+  };
+  let html = chip("", null);
+  groups.forEach(function (group) {
+    if (groups.length > 1) {
+      html += `<span class="lit-library-category-group">${library_type_labels[group.type]}</span>`;
+    }
+    group.names.forEach(function (name) {
+      const count = counts ? (Object.prototype.hasOwnProperty.call(counts, name) ? counts[name] : 0) : null;
+      html += chip(name, count);
+    });
+  });
+  $("#library_category_chips").html(html);
+  $("#library_category_row").prop("hidden", !groups.length);
+  if (focused !== null && focused !== undefined) {
+    $("#library_category_chips [data-library-category]").filter(function () {
+      return ($(this).attr("data-library-category") || "") === focused;
+    }).first().trigger("focus");
+  }
 }
 
 function library_saved_view() {
@@ -103,22 +306,138 @@ function library_saved_view() {
   return (extra && extra.library_view) || null;
 }
 
-function library_save_history_state() {
-  // Record the current filter/sort/page onto the active history entry so
-  // SPA back/forward restores this view instead of the default one.
-  if (typeof window_history !== "function") {
-    return;
+function library_stored_view() {
+  try {
+    const view = JSON.parse(window.localStorage.getItem(library_view_storage_key) || "null");
+    return view && typeof view === "object" ? view : null;
+  } catch (error) {
+    return null;
   }
-  const extra = (window.history.state && window.history.state.extra) || {};
-  window_history(false, Object.assign({}, extra, {library_view: {
+}
+
+// Saved values come from history or browser storage; accept only known options.
+function library_normalize_view(view) {
+  view = view || {};
+  const pick = function (value, allowed, fallback) {
+    return allowed.indexOf(value) !== -1 ? value : fallback;
+  };
+  const text = function (value, limit) {
+    return typeof value === "string" ? value.trim().slice(0, limit) : "";
+  };
+  const audio_options = $("#library_filter_audio option").map(function () { return this.value; }).get();
+  return {
+    type: pick(view.type, ["all", "movie", "tv", "anime"], "all"),
+    category: text(view.category, 100),
+    subtitle: pick(view.subtitle, ["all", "missing", "unknown", "problem", "ok"], "all"),
+    sort_by: pick(view.sort_by, ["default", "internal", "external", "audit"], "default"),
+    sort_order: pick(view.sort_order, ["asc", "desc"], "desc"),
+    audio_language: pick(view.audio_language, audio_options, "all"),
+    keyword: text(view.keyword, 200),
+    page: Math.max(parseInt(view.page, 10) || 1, 1)
+  };
+}
+
+function library_current_view() {
+  return {
     type: $("#library_filter_type").val() || "all",
     category: $("#library_filter_category").val() || "",
     subtitle: $("#library_filter_subtitle").val() || "all",
     sort_by: $("#library_sort_by").val() || "default",
     sort_order: $("#library_sort_order").val() || "desc",
     keyword: String($("#library_filter_keyword").val() || "").trim(),
+    audio_language: $("#library_filter_audio").val() || "all",
     page: library_page || 1
-  }}));
+  };
+}
+
+function library_view_is_customized() {
+  const view = library_current_view();
+  return view.type !== "all" || !!view.category || view.subtitle !== "all" || !!view.keyword ||
+      view.audio_language !== "all" || view.sort_by !== "default";
+}
+
+function library_save_history_state() {
+  // Record the current filter/sort/page onto the active history entry so
+  // SPA back/forward restores this view instead of the default one.
+  const view = library_current_view();
+  // The next visit reopens the same filters; a search word and page are one-off.
+  try {
+    window.localStorage.setItem(library_view_storage_key, JSON.stringify({
+      type: view.type, category: view.category, subtitle: view.subtitle, sort_by: view.sort_by,
+      sort_order: view.sort_order, audio_language: view.audio_language
+    }));
+  } catch (error) {
+    // Private browsing or blocked storage: remembering the view is optional.
+  }
+  if (typeof window_history !== "function") {
+    return;
+  }
+  const extra = (window.history.state && window.history.state.extra) || {};
+  window_history(false, Object.assign({}, extra, {library_view: view}));
+}
+
+// The fill queue walks movies only; a TV or anime scope must not fall back to every movie.
+function library_fill_scope() {
+  const type = $("#library_filter_type").val() || "all";
+  const category = $("#library_filter_category").val() || "";
+  if (type === "tv" || type === "anime") {
+    return {ok: false, label: library_type_labels[type]};
+  }
+  const owners = category ? library_category_owners(category) : [];
+  if (owners.length && owners.indexOf("movie") === -1) {
+    return {ok: false, label: category};
+  }
+  return {ok: true, label: category ? `电影 · ${category}` : "电影"};
+}
+
+function library_fill_status_label() {
+  return {unknown: "未检测", problem: "有问题"}[$("#library_filter_subtitle").val()] || "缺中文字幕";
+}
+
+function update_library_fill_scope() {
+  const scope = library_fill_scope();
+  $("#library_fill_btn").attr("title", scope.ok
+      ? `按当前筛选逐部补齐：${scope.label} · ${library_fill_status_label()}`
+      : `连续补齐只支持电影，当前筛选为“${scope.label}”`);
+}
+
+// Filters kept in the "筛选与排序" menu are otherwise invisible, notably after a remembered view.
+function render_library_active_filters() {
+  const parts = [];
+  const audio = $("#library_filter_audio").val() || "all";
+  if (audio !== "all") {
+    parts.push({key: "audio", label: `音轨：${library_audio_language_label(audio) || audio}`});
+  }
+  const sort_by = $("#library_sort_by").val() || "default";
+  if (sort_by !== "default") {
+    const order = $("#library_sort_order").val() === "asc" ? "升序" : "降序";
+    parts.push({key: "sort", label: `排序：${library_sort_labels[sort_by] || sort_by} · ${order}`});
+  }
+  let html = parts.map(function (part) {
+    const label = library_escape_html(part.label);
+    return `<button type="button" class="btn btn-sm" data-library-clear-filter="${part.key}" aria-label="移除${label}">` +
+        `${label}<span class="ms-1" aria-hidden="true">×</span></button>`;
+  }).join("");
+  if (library_view_is_customized()) {
+    html += '<button type="button" class="btn btn-sm" data-library-clear-filter="all">清除全部筛选</button>';
+  }
+  $("#library_active_filters").html(html);
+}
+
+function clear_library_filter(key) {
+  if (key === "all") {
+    reset_library_filters();
+    return;
+  }
+  if (key === "audio") {
+    $("#library_filter_audio").val("all");
+  } else if (key === "sort") {
+    $("#library_sort_by").val("default");
+    $("#library_sort_order").val("desc");
+    update_library_sort_order_labels();
+  }
+  update_library_filter_badge();
+  load_library_items(1);
 }
 
 function load_library_items(page) {
@@ -141,8 +460,16 @@ function load_library_items(page) {
   }
   library_items_loading = true;
   library_pending_page = null;
+  // 仅成功返回的“有问题”页可以批量修复。切换筛选或加载失败时，旧卡片不能成为批量目标。
+  view.repairItems = [];
+  $("#library_repair_page_btn").addClass("d-none");
+  const filters = library_filter_data(page);
+  // A failed request must leave the pager on the page the user still sees.
+  const previous_page = library_page;
   library_page = page;
   $("#library_prev_btn,#library_next_btn,#library_filter_btn,#library_filter_trigger,#library_refresh_btn").prop("disabled", true);
+  // Keep the previous cards, dimmed, until the new page arrives instead of blanking the grid.
+  $("#library_items_grid").addClass("is-loading").attr("aria-busy", "true");
   $("#library_items_summary").html(
       '<span class="d-inline-flex align-items-center gap-2"><span class="spinner-border spinner-border-sm" aria-hidden="true"></span><span>正在加载字幕状态...</span></span>'
   );
@@ -152,29 +479,52 @@ function load_library_items(page) {
     url: "/library/items?random=" + Math.random(),
     dataType: "json",
     contentType: "application/json",
-    data: JSON.stringify(library_filter_data(page)),
+    data: JSON.stringify(filters),
     timeout: 0,
     success: function (ret) {
       if (!is_current_view()) { return; }
       ret = ret || {};
       if (ret.code !== 0) {
+        library_page = previous_page;
+        update_library_pager();
         $("#library_items_summary").text("字幕库加载失败");
         show_fail_modal(ret.msg || "字幕库列表加载失败");
         return;
       }
-      update_library_category_options(ret.categories || {});
+      update_library_categories(ret.categories || {});
+      // A remembered sub-category may have been renamed or emptied since; drop it
+      // and list everything instead of showing a puzzling empty result.
+      const stale_category = $("#library_filter_category").val() || "";
+      if (ret.categories && stale_category &&
+          library_category_list($("#library_filter_type").val() || "all").indexOf(stale_category) === -1) {
+        $("#library_filter_category").val("");
+        library_refresh_notice = `小分类“${stale_category}”已不存在，已显示全部`;
+        render_library_category_chips();
+        update_library_filter_badge();
+        library_pending_page = 1;
+        return;
+      }
+      render_library_active_filters();
       library_items_cache = {};
       const items = ret.items || [];
       const total = ret.total || 0;
       const total_pages = Math.max(Math.ceil(total / library_page_size), 1);
+      // The server clamps a page past the end; follow the page it returned.
+      library_page = ret.page || 1;
       $("#library_items_summary").text(
-          `找到 ${total} 个媒体项目 · 本页展示 ${items.length} 个 · 第 ${ret.page || 1} / ${total_pages} 页`
+          `找到 ${total} 个媒体项目 · 本页展示 ${items.length} 个 · 第 ${library_page} / ${total_pages} 页` +
+          (library_refresh_notice ? ` · ${library_refresh_notice}` : "")
       );
-      $("#library_page_text").text(`${ret.page || 1} / ${total_pages}`);
-      $("#library_prev_btn").prop("disabled", (ret.page || 1) <= 1);
-      $("#library_next_btn").prop("disabled", (ret.page || 1) >= total_pages);
+      library_refresh_notice = "";
+      $("#library_synced_at").text(ret.synced_at ? `上次同步：${ret.synced_at}` : "尚未同步");
+      // Pure paging keeps the counters; filter changes and data changes refetch them.
+      if (!(page !== previous_page && JSON.stringify(library_summary_data()) === library_summary_key)) {
+        load_library_summary();
+      }
+      $("#library_page_text").text(`${library_page} / ${total_pages}`);
+      update_library_pager(total_pages);
       if (!items.length) {
-        $("#library_items_grid").html('<div class="empty" style="grid-column:1/-1;margin:3rem 0"><p class="empty-title">暂无媒体</p><p class="empty-subtitle text-muted">请先点击“媒体库同步”，或调整筛选条件。</p></div>');
+        $("#library_items_grid").html(library_empty_state(ret.library_total || 0));
         return;
       }
       let html = "";
@@ -182,12 +532,22 @@ function load_library_items(page) {
         library_items_cache[item.id] = item;
         html += library_item_card(item, index);
       });
+      if (filters.subtitle === "problem" && library_pending_page === null) {
+        view.repairItems = items.filter(library_can_repair);
+        if (view.repairItems.length) {
+          $("#library_repair_page_count").text(view.repairItems.length);
+          $("#library_repair_page_btn").removeClass("d-none").prop("disabled", !!view.repairBusy);
+        }
+      }
+      // The drawer reads this cache, so publish all new records before updating it.
+      library_refresh_drawer_item();
       $("#library_items_grid").html(html);
       init_library_posters();
     },
     error: function () {
       if (!is_current_view()) { return; }
-      $("#library_prev_btn,#library_next_btn").prop("disabled", false);
+      library_page = previous_page;
+      update_library_pager();
       $("#library_items_summary").text("字幕库加载失败，请稍后重试");
       show_fail_modal("网络错误");
     },
@@ -195,6 +555,7 @@ function load_library_items(page) {
       if (!is_current_view()) { return; }
       NProgress.done();
       library_items_loading = false;
+      $("#library_items_grid").removeClass("is-loading").attr("aria-busy", "false");
       library_save_history_state();
       $("#library_filter_btn,#library_filter_trigger,#library_refresh_btn").prop("disabled", false);
       const pending_page = library_pending_page;
@@ -208,13 +569,108 @@ function load_library_items(page) {
   });
 }
 
+function update_library_pager(total_pages) {
+  if (total_pages) {
+    library_total_pages = total_pages;
+  }
+  $("#library_prev_btn").prop("disabled", library_page <= 1);
+  // An unknown total (first load failed) keeps next available for a retry.
+  $("#library_next_btn").prop(
+      "disabled", library_total_pages !== null && library_page >= library_total_pages
+  );
+}
+
+function library_empty_state(library_total) {
+  let body;
+  const subtitle = $("#library_filter_subtitle").val() || "all";
+  if (!library_total) {
+    body = '<p class="empty-title">字幕库还没有媒体</p><p class="empty-subtitle text-muted">请先在首页执行“媒体库同步”，再回到这里查看。</p>';
+  } else if (library_subtitle_labels[subtitle]) {
+    // Name the empty combination and offer the same scope without the status filter.
+    const narrowed = !!String($("#library_filter_keyword").val() || "").trim() ||
+        ($("#library_filter_audio").val() || "all") !== "all";
+    const type = $("#library_filter_type").val() || "all";
+    const scope = library_escape_html(narrowed ? "当前筛选" :
+        ($("#library_filter_category").val() || (type === "all" ? "字幕库" : library_type_labels[type])));
+    body = `<p class="empty-title">${scope}中没有“${library_subtitle_labels[subtitle]}”的媒体</p>` +
+        `<div class="empty-action"><button class="btn" type="button" onclick="set_library_subtitle('all')">查看${scope}的全部媒体</button></div>`;
+  } else {
+    body = '<p class="empty-title">没有符合条件的媒体</p><p class="empty-subtitle text-muted">请调整或重置筛选条件。</p>' +
+        '<div class="empty-action"><button class="btn" type="button" onclick="reset_library_filters()">重置筛选</button></div>';
+  }
+  return `<div class="empty" style="grid-column:1/-1;margin:3rem 0">${body}</div>`;
+}
+
+function refresh_library_items() {
+  // Manual refresh only asks the media server about the items on screen; it
+  // never starts a full library sync.
+  const view = library_view_instance;
+  const grid = document.getElementById("library_items_grid");
+  const is_current_view = () => grid && view && view === library_view_instance &&
+      document.getElementById("library_items_grid") === grid;
+  if (!is_current_view() || library_refreshing || library_items_loading) {
+    return;
+  }
+  const item_ids = Object.keys(library_items_cache);
+  if (!item_ids.length) {
+    load_library_items(library_page);
+    return;
+  }
+  library_refreshing = true;
+  const button = $("#library_refresh_btn");
+  const original_html = button.html();
+  button.prop("disabled", true).html(
+      '<span class="spinner-border spinner-border-sm me-1" aria-hidden="true"></span>正在刷新'
+  );
+  NProgress.start();
+  $.ajax({
+    type: "POST",
+    url: "/library/refresh?random=" + Math.random(),
+    dataType: "json",
+    contentType: "application/json",
+    data: JSON.stringify({item_ids: item_ids}),
+    timeout: 0,
+    success: function (ret) {
+      if (!is_current_view()) { return; }
+      ret = ret || {};
+      if (ret.code !== 0) {
+        library_refresh_notice = "服务器信息未更新，当前显示上次同步的数据";
+        show_fail_modal(ret.msg || "刷新失败，当前显示上次同步的数据");
+      } else if (ret.failed && ret.failed >= ret.requested) {
+        library_refresh_notice = "服务器信息未更新，当前显示上次同步的数据";
+        show_fail_modal("无法从媒体服务器读取最新信息，当前显示上次同步的数据");
+      } else {
+        library_refresh_notice = ret.failed
+            ? `已更新 ${ret.updated || 0} 项，${ret.failed} 项读取失败，仍显示原数据`
+            : `已更新 ${ret.updated || 0} 项，${ret.unchanged || 0} 项无变化`;
+      }
+    },
+    error: function (xhr) {
+      if (!is_current_view()) { return; }
+      library_refresh_notice = "服务器信息未更新，当前显示上次同步的数据";
+      show_fail_modal(xhr.status === 403 ? "需要媒体整理权限才能刷新服务器信息。" : "网络错误");
+    },
+    complete: function () {
+      library_refreshing = false;
+      if (!is_current_view()) { return; }
+      NProgress.done();
+      button.html(original_html);
+      load_library_items(library_page);
+    }
+  });
+}
+
 function reset_library_filters() {
   $("#library_filter_type").val("all");
-  $("#library_filter_category").html('<option value="">全部</option>').val("");
+  $("#library_filter_category").val("");
   $("#library_filter_subtitle").val("all");
+  $("#library_filter_audio").val("all");
   $("#library_sort_by").val("default");
   $("#library_sort_order").val("desc");
   $("#library_filter_keyword").val("");
+  update_library_audio_control();
+  sync_library_tabs();
+  render_library_category_chips();
   update_library_sort_order_labels();
   update_library_filter_badge();
   hide_library_filter_menu();
@@ -246,14 +702,9 @@ function hide_library_filter_menu() {
 }
 
 function update_library_filter_badge() {
+  // Type, sub-category and subtitle state are visible as tabs, so they do not count here.
   let active_count = 0;
-  if ($("#library_filter_type").val() !== "all") {
-    active_count += 1;
-  }
-  if ($("#library_filter_category").val()) {
-    active_count += 1;
-  }
-  if ($("#library_filter_subtitle").val() !== "all") {
+  if (($("#library_filter_audio").val() || "all") !== "all") {
     active_count += 1;
   }
   if ($("#library_sort_by").val() !== "default") {
@@ -292,7 +743,21 @@ function run_library_subtitle_audit(retry) {
     $("#index_library_subtitle_audit_server").val(library_default_media_server);
     $("#index_library_subtitle_audit_mode").val("linked");
     $("#index_library_subtitle_audit_deep_confirm").prop("checked", false);
-    update_library_subtitle_audit_mode();
+    // Start from the library's current scope; the sub-category list loads below.
+    const view_type = $("#library_filter_type").val() || "all";
+    const view_category = $("#library_filter_category").val() || "";
+    const owners = view_category ? library_category_owners(view_category) : [];
+    const shared = view_type === "all" && owners.length > 1;
+    const type_select = $("#index_library_subtitle_audit_category");
+    // A shared chip has no single audit type. Offer only its owners until the dialog closes.
+    type_select.find("option").each(function () {
+      this.hidden = this.value ? shared && !owners.includes(this.value) : !shared;
+      this.disabled = !this.value || this.hidden;
+    });
+    type_select.val(shared ? "" : (view_type === "all" ? owners[0] || "movie" : view_type));
+    library_audit_prefill_subcategory = view_category;
+    library_subtitle_audit_categories = null;
+    update_library_subtitle_audit_subcategories();
     load_library_subtitle_task_limits();
     load_library_subtitle_audit_categories();
     load_library_subtitle_audit_history();
@@ -300,6 +765,7 @@ function run_library_subtitle_audit(retry) {
   }
   const category = $("#index_library_subtitle_audit_category").val();
   const subcategory = $("#index_library_subtitle_audit_subcategory").val();
+  if (!category || subcategory === null) { return; }
   const mode = $("#index_library_subtitle_audit_mode").val() || "linked";
   const server = $("#index_library_subtitle_audit_server").val() || library_default_media_server;
   if (mode === "deep" && !$("#index_library_subtitle_audit_deep_confirm").prop("checked")) {
@@ -357,6 +823,7 @@ function update_library_subtitle_audit_mode() {
   const category = $("#index_library_subtitle_audit_category option:selected").text() || "所选媒体分类";
   const categoryKey = $("#index_library_subtitle_audit_category").val();
   const subcategory = $("#index_library_subtitle_audit_subcategory").val();
+  $("#library_audit_start_scope").prop("disabled", !categoryKey || subcategory === null);
   const roots = library_subtitle_audit_roots[categoryKey] || [];
   const targetRoots = roots.map(function (root) {
     return subcategory ? String(root).replace(/[\\\/]$/, "") + "/" + subcategory : String(root);
@@ -408,9 +875,7 @@ function finish_library_subtitle_audit_task(task) {
     } else {
       load_library_subtitle_audit_history();
     }
-    if (rendered_result.category === "movie") {
-      load_library_items(library_page);
-    }
+    load_library_items(library_page);
     return;
   }
   const label = task.status === "canceled" ? "检测已取消" :
@@ -611,15 +1076,24 @@ function load_library_subtitle_audit_categories() {
 function update_library_subtitle_audit_subcategories() {
   const category = $("#index_library_subtitle_audit_category").val();
   const category_name = $("#index_library_subtitle_audit_category option:selected").text();
-  const current = $("#index_library_subtitle_audit_subcategory").val();
+  const select = $("#index_library_subtitle_audit_subcategory");
+  if (!category || !library_subtitle_audit_categories) {
+    const message = category ? "正在读取小分类…" : "请先选择检测分类";
+    select.html(`<option disabled selected>${message}</option>`).prop("disabled", true);
+    update_library_subtitle_audit_mode();
+    return;
+  }
+  const current = library_audit_prefill_subcategory || "";
   const categories = library_subtitle_audit_categories[category] || [];
-  let html = `<option value="">全部${library_escape_html(category_name)}</option>`;
+  // A removed YAML entry or a failed lookup must never expand a preselected audit to all media.
+  const needs_choice = current && !categories.includes(current);
+  let html = needs_choice ? '<option disabled selected>原小分类不可用，请选择检测范围</option>' : "";
+  html += `<option value="">全部${library_escape_html(category_name)}</option>`;
   categories.forEach(function (name) {
     const escaped = library_escape_html(name);
     html += `<option value="${escaped}" ${name === current ? "selected" : ""}>${escaped}</option>`;
   });
-  $("#index_library_subtitle_audit_subcategory").html(html);
-  $("#index_library_subtitle_audit_subcategory").prop("disabled", categories.length === 0);
+  select.html(html).prop("disabled", !categories.length && !needs_choice);
   update_library_subtitle_audit_mode();
 }
 
@@ -661,6 +1135,94 @@ function render_library_subtitle_audit_history(history) {
   $("#index_library_subtitle_audit_history").html(html);
 }
 
+function library_upload_block_reason(item) {
+  if (!item || item.media_type !== "movie" || item.can_upload) {
+    return "";
+  }
+  if (!item.linked) {
+    return "没有整理记录，无法定位目标媒体文件";
+  }
+  if (!item.target_path) {
+    return "整理记录缺少目标媒体文件";
+  }
+  return "媒体文件不存在或已移动，请检查后重试";
+}
+
+function library_upload_block_label(item) {
+  if (!item || item.media_type !== "movie" || item.can_upload) {
+    return "";
+  }
+  if (!item.linked) {
+    return "没有整理记录";
+  }
+  return item.target_path ? "媒体文件不存在" : "缺少目标文件";
+}
+
+// Same glyph as the header's SVG.dots() macro, which is not available to rendered cards.
+var library_dots_icon = '<svg xmlns="http://www.w3.org/2000/svg" class="icon icon-tabler icon-tabler-dots" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path stroke="none" d="M0 0h24v24H0z" fill="none"></path><circle cx="5" cy="12" r="1"></circle><circle cx="12" cy="12" r="1"></circle><circle cx="19" cy="12" r="1"></circle></svg>';
+
+function library_can_repair(item) {
+  return item.media_type === "movie" && item.can_upload && !!item.target_path
+      && ["warning", "error"].indexOf(item.subtitle_audit_status) !== -1;
+}
+
+function library_card_primary(item) {
+  const status = item.subtitle_status || "unknown";
+  const is_movie = item.media_type === "movie";
+  if (library_can_repair(item)) {
+    return {key: "repair", label: "修复", cls: "btn-outline-warning"};
+  }
+  if (status === "missing_chinese" || status === "unknown") {
+    return {key: is_movie ? "online" : "episodes", label: "找字幕", cls: "btn-primary"};
+  }
+  return {key: "detail", label: "管理", cls: "btn-outline-primary"};
+}
+
+function library_card_actions(item, item_id, title) {
+  const is_movie = item.media_type === "movie";
+  const block_reason = library_upload_block_reason(item);
+  const primary = library_card_primary(item);
+  const call = function (name) { return `${name}(&quot;${item_id}&quot;)`; };
+  const handlers = {
+    detail: call("open_library_drawer"),
+    online: call("open_library_online_movie"),
+    upload: `open_library_drawer(&quot;${item_id}&quot;, &quot;upload&quot;)`,
+    episodes: `open_library_drawer(&quot;${item_id}&quot;, &quot;episodes&quot;)`,
+    repair: `repair_library_subtitles(&quot;${item_id}&quot;, this)`
+  };
+  const blocked = block_reason && (primary.key === "online");
+  const reason_attr = block_reason ? ` title="${library_escape_html(block_reason)}"` : "";
+  const primary_button = `<button type="button" class="btn btn-sm ${primary.cls} flex-fill" ${blocked ? "disabled" : ""}${blocked ? reason_attr : ""}
+      aria-label="${library_escape_html(primary.label)}：${title}" onclick="${handlers[primary.key]}">${primary.label}</button>`;
+  // Everything the primary button does not cover stays one click away.
+  const entries = [];
+  entries.push({key: "detail", label: "打开详情"});
+  if (is_movie) {
+    entries.push({key: "online", label: "在线字幕", reason: block_reason});
+    entries.push({key: "upload", label: "上传字幕", reason: block_reason});
+  } else {
+    entries.push({key: "episodes", label: "选择剧集"});
+  }
+  if (library_can_repair(item)) {
+    entries.push({key: "repair", label: "二次处理"});
+  }
+  const menu_items = entries.filter(function (entry) { return entry.key !== primary.key; })
+      .map(function (entry) {
+        if (entry.reason) {
+          return `<button type="button" class="dropdown-item disabled" disabled>${entry.label}<span class="d-block small text-muted">${library_escape_html(entry.reason)}</span></button>`;
+        }
+        return `<button type="button" class="dropdown-item" onclick="${handlers[entry.key]}">${entry.label}</button>`;
+      }).join("");
+  return `<div class="lit-library-card-actions">
+        ${primary_button}
+        <div class="dropdown lit-library-card-menu">
+          <button type="button" class="btn btn-sm btn-icon" data-bs-toggle="dropdown" aria-expanded="false"
+                  aria-label="更多操作：${title}" title="更多操作">${library_dots_icon}</button>
+          <div class="dropdown-menu dropdown-menu-end">${menu_items}</div>
+        </div>
+      </div>`;
+}
+
 function library_item_card(item, index) {
   const item_id = library_escape_js(item.id);
   const title = library_escape_html(item.title || item.original_title || "未命名媒体");
@@ -699,25 +1261,26 @@ function library_item_card(item, index) {
   }
 
   const is_movie = item.media_type === "movie";
-  const can_repair = is_movie && item.can_upload
-      && ["warning", "error"].indexOf(item.subtitle_audit_status) !== -1;
-  const movie_upload_disabled = is_movie && !item.can_upload;
-  const btn_attr = is_movie
-      ? `${movie_upload_disabled ? "disabled" : ""} onclick="open_library_movie_upload(&quot;${item_id}&quot;)"`
-      : `onclick="open_library_episodes(&quot;${item_id}&quot;)"`;
-  const btn_text = is_movie ? (movie_upload_disabled ? "不可上传" : "上传字幕") : "选择剧集";
+  const episode_total = Math.max(parseInt(item.episode_total || 0, 10), 0);
+  const episode_covered = Math.min(Math.max(parseInt(item.episode_covered || 0, 10), 0), episode_total);
+  const coverage_text = `字幕已覆盖 ${episode_covered}/${episode_total} 集`;
+  const coverage_bar = !is_movie && episode_total > 0
+      ? `<span class="lit-library-card-coverage" role="progressbar" aria-label="${coverage_text}" aria-valuemin="0" aria-valuemax="${episode_total}" aria-valuenow="${episode_covered}" title="${coverage_text}"><span style="width:${Math.round(episode_covered * 100 / episode_total)}%"></span></span>`
+      : "";
   const poster_attrs = poster
-      ? `${eager ? `src="${poster}"` : `data-src="${poster}"`} alt="${title}" loading="${eager ? "eager" : "lazy"}" fetchpriority="${eager ? "high" : "low"}" decoding="async"`
-      : `alt="${title}"`;
+      ? `${eager ? `src="${poster}"` : `data-src="${poster}"`} alt="" loading="${eager ? "eager" : "lazy"}" fetchpriority="${eager ? "high" : "low"}" decoding="async"`
+      : `alt=""`;
   return `
     <div class="lit-library-card">
-      <div class="lit-library-card-poster${poster ? "" : " no-poster"}" data-type="${library_escape_html(item.media_type || "")}">
+      <button type="button" class="lit-library-card-poster${poster ? "" : " no-poster"}" data-type="${library_escape_html(item.media_type || "")}"
+              aria-label="查看 ${title} 的字幕详情" onclick="open_library_drawer(&quot;${item_id}&quot;)">
         <img ${poster_attrs}
              onerror="this.style.display='none';this.parentNode.classList.add('no-poster')">
         <span class="lit-library-card-fallback">${type_initial}</span>
         <span class="lit-library-card-type-badge">${type_name}</span>
         <span class="lit-library-card-subtitle-indicator ${indicator_class}"></span>
-      </div>
+        ${coverage_bar}
+      </button>
       <div class="lit-library-card-body">
         <div class="lit-library-card-title" title="${title}">${title}</div>
         <div class="lit-library-card-meta-line">
@@ -727,24 +1290,147 @@ function library_item_card(item, index) {
           <span class="dot ${dot_class}"></span>
           <span class="lit-library-card-meta" title="${subtitle_state_title}">${subtitle_label}</span>
         </div>
+        ${coverage_bar && item.subtitle_status !== "unknown" ? `<div class="lit-library-card-meta">${coverage_text}</div>` : ""}
+        ${library_upload_block_label(item) ? `<div class="lit-library-card-meta text-warning">不可上传：${library_upload_block_label(item)}</div>` : ""}
         ${is_movie && subtitle_audit_label ? `
         <div class="lit-library-card-audit">
           <span class="badge ${subtitle_audit_badge} lit-library-card-audit-badge" title="最近检测：${subtitle_audit_checked_at}">${subtitle_audit_text}</span>
         </div>` : ""}
       </div>
       <div class="lit-library-card-footer">
-        ${is_movie ? `<button type="button" class="btn btn-sm btn-outline-primary w-100" ${movie_upload_disabled ? "disabled" : ""} onclick="open_library_online_movie(&quot;${item_id}&quot;)">在线字幕</button>` : ""}
-        ${can_repair ? `<button type="button" class="btn btn-sm btn-outline-warning w-100"
-          title="按全局影视服务器规则规范化现有外挂字幕"
-          aria-label="二次处理 ${title} 的外挂字幕"
-          onclick="repair_library_subtitles(&quot;${item_id}&quot;, this)">二次处理</button>` : ""}
-        <button type="button" class="btn btn-sm btn-primary w-100" ${btn_attr}>${btn_text}</button>
+        ${library_card_actions(item, item_id, title)}
       </div>
     </div>`;
 }
 
+function library_repair_payload(item) {
+  const context = {
+    server_item_id: item.server_item_id || "",
+    parent_server_item_id: item.parent_server_item_id || "",
+    library_id: item.library_id || ""
+  };
+  return {
+    ...context,
+    media_path: item.target_path,
+    server: item.server || library_default_media_server,
+    refresh_context: context
+  };
+}
+
+function repair_library_page() {
+  const view = library_view_instance;
+  const items = view && view.repairItems;
+  const grid = document.getElementById("library_items_grid");
+  const current = () => view === library_view_instance && grid === document.getElementById("library_items_grid");
+  if (!grid || !items || !items.length || view.repairBusy || library_items_loading) return;
+  show_confirm_modal(
+      `修复本页 ${items.length} 部电影的已有外挂字幕？将按影视服务器规则处理命名和编码，保留不同来源的字幕轨道。`,
+      function () {
+        if (!current()) return;
+        hide_confirm_modal();
+        if (view.repairItems !== items || view.repairBusy) return;
+        view.repairBusy = true;
+        const button = $("#library_repair_page_btn").prop("disabled", true);
+        const status = $("#library_repair_page_status").removeClass("d-none").text("正在提交本页字幕修复任务…");
+        // 连接中断后重试同一目标时复用请求 ID，即使之前的任务已完成也不会重复修复。
+        if (!view.repairRequestIds) view.repairRequestIds = new Map();
+        const payloads = items.map(function (item) {
+          const payload = library_repair_payload(item);
+          const key = JSON.stringify(payload);
+          if (!view.repairRequestIds.has(key)) view.repairRequestIds.set(key, SubtitleTasks.randomRequestId());
+          return Object.assign(payload, {request_id: view.repairRequestIds.get(key)});
+        });
+        function submissionUnknown(xhr) {
+          if (!current()) return;
+          view.repairBusy = false;
+          button.prop("disabled", false);
+          if (xhr && xhr.status === 503 && xhr.responseJSON && xhr.responseJSON.retryable) {
+            status.text(xhr.responseJSON.msg);
+          } else {
+            status.text(xhr && xhr.status === 403 ? "需要媒体整理权限才能修复字幕。" :
+                "未能确认提交结果，请查看任务中心。可在本页重试。");
+          }
+        }
+        library_post_json("/library/subtitle/repair/batch", {items: payloads}, function (response) {
+          if (!current()) return;
+          if (response.code !== 0 || !Array.isArray(response.results) || response.results.length !== items.length) {
+            submissionUnknown();
+            return;
+          }
+          track_library_page_repairs(view, items, response.results, current);
+        }, submissionUnknown);
+      });
+}
+
+function track_library_page_repairs(view, items, results, current) {
+  const status = $("#library_repair_page_status");
+  const accepted = results.filter(result => result.task_id);
+  const rejected = [];
+  const retryable = [];
+  const unknown = [];
+  results.forEach((result, index) => {
+    if (result.retryable) {
+      retryable.push(`${items[index].title}（${result.error}）`);
+      return;
+    }
+    if (result.unconfirmed) {
+      unknown.push(items[index].title);
+      return;
+    }
+    view.repairRequestIds.delete(JSON.stringify(library_repair_payload(items[index])));
+    if (!result.task_id) rejected.push(`${items[index].title}（${result.error}）`);
+  });
+  const reused = accepted.filter(result => result.reused).length;
+  const disconnected = new Set();
+  function update() {
+    if (!current()) return;
+    const completed = accepted.filter(SubtitleTasks.isTerminal);
+    const pending = accepted.length - completed.length;
+    const counts = [
+      ["succeeded", "已完成"], ["partial", "部分完成"], ["failed", "失败"],
+      ["canceled", "已取消"], ["interrupted", "已中断"], ["unavailable", "结果已不可查询"]
+    ].map(([key, label]) => {
+      const count = completed.filter(task => task.status === key).length;
+      return count ? `${label} ${count} 部` : "";
+    }).filter(Boolean);
+    const parts = [`本次修复已受理 ${accepted.length} 部${reused ? `（复用 ${reused} 个任务）` : ""}`];
+    if (pending) parts.push(`待完成 ${pending} 部`);
+    parts.push(...counts);
+    if (completed.some(task => ["partial", "failed"].includes(task.status))) parts.push("处理明细见任务中心");
+    if (rejected.length) parts.push(`未受理 ${rejected.length} 部：${rejected.join("、")}`);
+    if (retryable.length) parts.push(`可重试 ${retryable.length} 部：${retryable.join("、")}`);
+    if (unknown.length) parts.push(`提交待核对：${unknown.join("、")}，请查看任务中心`);
+    if (disconnected.size) parts.push("任务状态暂时无法读取，正在重连");
+    status.text(parts.join(" · "));
+    if (!pending) {
+      view.repairBusy = false;
+      $("#library_repair_page_btn").prop("disabled", false);
+      if (accepted.length) load_library_items(library_page);
+    }
+  }
+  update();
+  accepted.filter(task => !SubtitleTasks.isTerminal(task)).forEach(result => {
+    SubtitleTasks.watch(result.task_id, {
+      onConnectionError: function () {
+        if (!disconnected.has(result.task_id)) {
+          disconnected.add(result.task_id);
+          update();
+        }
+      },
+      onUpdate: function () {
+        if (disconnected.delete(result.task_id)) update();
+      },
+      onDone: function (task) {
+        disconnected.delete(result.task_id);
+        result.status = task.status;
+        update();
+      }
+    });
+  });
+}
+
 function repair_library_subtitles(item_id, button) {
-  const item = library_items_cache[item_id];
+  const item = library_lookup_item(item_id);
   if (!item || !item.target_path) {
     show_fail_modal("未找到可处理的媒体文件");
     return;
@@ -759,18 +1445,7 @@ function repair_library_subtitles(item_id, button) {
             '<span class="spinner-border spinner-border-sm me-1" aria-hidden="true"></span>正在创建任务'
         );
         NProgress.start();
-        SubtitleTasks.requestTask("/library/subtitle/repair", {
-          media_path: item.target_path,
-          server: item.server || library_default_media_server,
-          server_item_id: item.server_item_id || "",
-          parent_server_item_id: item.parent_server_item_id || "",
-          library_id: item.library_id || "",
-          refresh_context: {
-            server_item_id: item.server_item_id || "",
-            parent_server_item_id: item.parent_server_item_id || "",
-            library_id: item.library_id || ""
-          }
-        }, {
+        SubtitleTasks.requestTask("/library/subtitle/repair", library_repair_payload(item), {
           onUpdate: function (task) {
             const progress = task.progress || {};
             repair_button.html(
@@ -839,54 +1514,232 @@ function activate_library_poster(img) {
   img.removeAttribute("data-src");
 }
 
-function open_library_movie_upload(item_id) {
-  const item = library_items_cache[item_id];
-  if (!item || !item.target_path) {
-    show_fail_modal("未找到可上传字幕的电影文件");
-    return;
-  }
-  show_index_upload_subtitle_modal(item.title, item.target_path, {
-    server: item.server || library_default_media_server,
-    server_item_id: item.server_item_id || "",
-    parent_server_item_id: item.parent_server_item_id || "",
-    library_id: item.library_id || ""
-  });
+function library_lookup_item(item_id) {
+  // The drawer outlives list reloads: an item that left the filtered page must stay usable.
+  return library_items_cache[item_id] || (
+      library_drawer_item && String(library_drawer_item.id) === String(item_id) ? library_drawer_item : null);
 }
 
-function open_library_episodes(item_id) {
-  const item = library_items_cache[item_id];
+function library_drawer_element() {
+  return typeof document.getElementById === "function" ? document.getElementById("library-drawer") : null;
+}
+
+function library_drawer_instance() {
+  const element = library_drawer_element();
+  if (!element || !window.bootstrap || !window.bootstrap.Offcanvas) {
+    return null;
+  }
+  return window.bootstrap.Offcanvas.getOrCreateInstance(element);
+}
+
+function library_drawer_is_open() {
+  const element = library_drawer_element();
+  return !!(element && element.classList && element.classList.contains("show"));
+}
+
+function library_drawer_show() {
+  const drawer = library_drawer_instance();
+  if (drawer) { drawer.show(); }
+}
+
+function library_drawer_hide() {
+  const drawer = library_drawer_instance();
+  if (drawer) { drawer.hide(); }
+}
+
+// Modal dialogs and the offcanvas must not trap focus together: close the drawer while a
+// dialog is open and bring it back when that dialog closes.
+function library_drawer_hide_for_modal() {
+  if (library_drawer_is_open() && library_drawer_item) {
+    library_drawer_resume_id = String(library_drawer_item.id);
+    library_drawer_hide();
+  }
+}
+
+function library_drawer_resume() {
+  const item_id = library_drawer_resume_id;
+  library_drawer_resume_id = "";
+  if (item_id && library_drawer_item && String(library_drawer_item.id) === item_id) {
+    library_drawer_show();
+  }
+}
+
+function library_audio_language_label(code) {
+  return {zho: "中文", eng: "英语", fra: "法语", rus: "俄语", jpn: "日语", kor: "韩语", other: "其他语言", unknown: "未知"}[code] || "";
+}
+
+// 文字状态统一用浅底同色字：后端给出的实心色（如 bg-orange）在这里换成对应的 -lt 配色。
+function library_soft_badge(cls) {
+  const match = /^bg-([a-z]+)$/.exec(String(cls || "").trim());
+  return match ? `bg-${match[1]}-lt text-${match[1]}` : String(cls || "bg-secondary-lt text-secondary");
+}
+
+function render_library_drawer_overview(item) {
+  const is_movie = item.media_type === "movie";
+  const badge = function (cls, label) {
+    return `<span class="badge ${library_escape_html(cls)}">${library_escape_html(label)}</span>`;
+  };
+  const rows = [];
+  rows.push(`<div class="d-flex flex-wrap gap-2 align-items-center">${badge(library_soft_badge(item.subtitle_badge || "bg-secondary"), item.subtitle_label || "未检测")}${
+      item.subtitle_status_checked_at ? `<span class="text-muted small">检查于 ${library_escape_html(item.subtitle_status_checked_at)}</span>` : ""}</div>`);
+  if (is_movie && item.subtitle_audit_label) {
+    rows.push(`<div class="d-flex flex-wrap gap-2 align-items-center">${badge(item.subtitle_audit_badge || "bg-secondary-lt", item.subtitle_audit_label)}${
+        item.subtitle_audit_checked_at ? `<span class="text-muted small">最近检测 ${library_escape_html(item.subtitle_audit_checked_at)}</span>` : ""}</div>`);
+  }
+  const episode_total = Math.max(parseInt(item.episode_total || 0, 10), 0);
+  if (!is_movie && episode_total > 0) {
+    const covered = Math.min(Math.max(parseInt(item.episode_covered || 0, 10), 0), episode_total);
+    rows.push(`<div class="small">字幕已覆盖 ${covered}/${episode_total} 集${item.missing_count ? `，缺中文字幕 ${parseInt(item.missing_count, 10)} 集` : ""}</div>`);
+  }
+  const language = is_movie ? library_audio_language_label(item.audio_language) : "";
+  if (language) {
+    rows.push(`<div class="small text-muted">默认音轨语言：${language}</div>`);
+  }
+  const location = item.target_path || item.path || "";
+  if (location) {
+    rows.push(`<div class="small text-muted text-break">位置：${library_escape_html(location)}</div>`);
+  }
+  const reason = library_upload_block_reason(item);
+  const item_id = library_escape_js(item.id);
+  const buttons = [];
+  if (is_movie) {
+    buttons.push(`<button type="button" class="btn btn-sm btn-primary" ${reason ? `disabled title="${library_escape_html(reason)}"` : ""} onclick="open_library_online_movie(&quot;${item_id}&quot;)">在线字幕</button>`);
+    if (item.can_upload && ["warning", "error"].indexOf(item.subtitle_audit_status) !== -1) {
+      buttons.push(`<button type="button" class="btn btn-sm btn-outline-warning" onclick="repair_library_subtitles(&quot;${item_id}&quot;, this)">二次处理</button>`);
+    }
+  }
+  if (buttons.length) {
+    rows.push(`<div class="d-flex flex-wrap gap-2">${buttons.join("")}</div>`);
+  }
+  $("#library_drawer_overview").html(`<div class="d-grid gap-2">${rows.join("")}</div>`);
+}
+
+// A list reload may change the item's status; keep the open drawer in step.
+function library_refresh_drawer_item() {
+  if (!library_drawer_item) {
+    return;
+  }
+  const fresh = library_items_cache[library_drawer_item.id];
+  if (fresh) {
+    library_drawer_item = fresh;
+    render_library_drawer_overview(fresh);
+  }
+}
+
+function open_library_drawer(item_id, section) {
+  const item = library_lookup_item(item_id);
   if (!item) {
     show_fail_modal("未找到媒体项目");
     return;
   }
-  library_current_series_id = item_id;
-  library_current_series_title = item.title || "";
-  library_episodes_cache = [];
-  $("#library_episode_season,#library_episode_number").empty();
-  $("#index_library_episodes_title").text(`${item.title || "剧集"} - 选择剧集`);
+  const same = library_drawer_item && String(library_drawer_item.id) === String(item.id);
+  if (library_subtitle_upload_request && !same) {
+    show_fail_modal("字幕正在上传到暂存区，请等待上传完成后再打开其他媒体");
+    return;
+  }
+  library_drawer_item = item;
+  const is_movie = item.media_type === "movie";
+  const year = item.year ? ` · ${item.year}` : "";
+  $("#library_drawer_title").text(item.title || item.original_title || "未命名媒体");
+  $("#library_drawer_meta").text(`${item.media_type_name || ""} · ${item.category || "未分类"}${year}`);
+  render_library_drawer_overview(item);
+  $("#library_drawer_episodes").toggleClass("d-none", is_movie);
+  if (is_movie) {
+    if (!same) {
+      library_set_upload_target(item.title, item.target_path, {
+        server: item.server || library_default_media_server,
+        server_item_id: item.server_item_id || "",
+        parent_server_item_id: item.parent_server_item_id || "",
+        library_id: item.library_id || ""
+      }, library_upload_block_reason(item));
+    }
+  } else if (!same) {
+    library_current_series_id = item.id;
+    library_current_series_title = item.title || "";
+    library_episodes_cache = [];
+    $("#library_episode_season,#library_episode_number").empty();
+    library_set_upload_target("", "", {}, "请先在上方剧集列表中选择要上传字幕的一集");
+    load_library_episodes(item.id);
+  } else if (library_episodes_state === "error") {
+    // Reopening a failed series retries without clearing a selected upload or
+    // duplicating a request that is still loading. An empty success stays cached.
+    load_library_episodes(item.id);
+  }
+  library_drawer_show();
+  if (section === "upload" || section === "episodes") {
+    library_drawer_scroll_to(section === "upload" ? "library_drawer_upload" : "library_drawer_episodes");
+  }
+}
+
+function library_drawer_scroll_to(element_id) {
+  const element = typeof document.getElementById === "function" ? document.getElementById(element_id) : null;
+  if (element && typeof element.scrollIntoView === "function") {
+    element.scrollIntoView({block: "start"});
+  }
+}
+
+function open_library_movie_upload(item_id) {
+  open_library_drawer(item_id, "upload");
+}
+
+function open_library_episodes(item_id) {
+  open_library_drawer(item_id, "episodes");
+}
+
+function load_library_episodes(item_id) {
+  const item = library_lookup_item(item_id);
+  if (!item) {
+    return;
+  }
+  const previous_season = $("#library_episode_season").val() || "";
+  const previous_episode = $("#library_episode_number").val() || "";
+  const view = library_view_instance;
+  const body = document.getElementById("index_library_episodes_body");
+  const request = {};
+  library_episodes_request = request;
+  library_episodes_state = "loading";
+  const is_current = () => request === library_episodes_request && view === library_view_instance
+      && document.getElementById("index_library_episodes_body") === body
+      && library_drawer_item && library_drawer_item.id === item_id;
   $("#index_library_episodes_body").html('<div class="text-muted py-3">正在加载剧集...</div>');
-  $("#index-library-episodes-modal").modal("show");
   library_post_json("/library/episodes", {
     item_id: item_id,
     server: item.server || library_default_media_server,
     server_item_id: item.server_item_id || "",
     library_id: item.library_id || ""
   }, function (ret) {
+    if (!is_current()) { return; }
     if (ret.code !== 0) {
+      library_episodes_state = "error";
       $("#index_library_episodes_body").html(`<div class="text-danger py-3">${library_escape_html(ret.msg || "剧集加载失败")}</div>`);
       return;
     }
-    if (library_current_series_id !== item_id) { return; }
+    library_episodes_state = "loaded";
     library_episodes_cache = (ret.items || []).map(library_fill_episode_numbers);
     const seasons = Array.from(new Set(library_episodes_cache.map(function (episode) { return String(episode.season); })))
         .sort(function (a, b) { return Number(a) - Number(b); });
     const season_select = $("#library_episode_season").empty().append($("<option>").val("").text("全部季"));
+    // A single season is selected for the user, which is what season-pack upload needs.
     seasons.forEach(function (season) {
       if (season !== "" && season !== "undefined") {
         season_select.append($("<option>").val(season).text(`第 ${season} 季`));
       }
     });
+    const real_seasons = seasons.filter(function (season) { return season !== "" && season !== "undefined"; });
+    if (previous_season && real_seasons.indexOf(previous_season) !== -1) {
+      season_select.val(previous_season);
+    } else if (real_seasons.length === 1) {
+      season_select.val(real_seasons[0]);
+    }
     filter_library_episodes(true);
+    if (previous_episode && $("#library_episode_number option").filter(function () { return this.value === previous_episode; }).length) {
+      $("#library_episode_number").val(previous_episode);
+      filter_library_episodes(false);
+    }
+  }, function () {
+    if (!is_current()) { return; }
+    library_episodes_state = "error";
+    $("#index_library_episodes_body").text("剧集加载失败，请关闭并重新打开重试");
   });
 }
 
@@ -944,7 +1797,7 @@ function render_library_episodes(episodes) {
             <div class="text-muted small text-truncate" title="${path}">${path}</div>
           </div>
           <div class="col-auto">
-            <span class="badge ${library_escape_html(episode.subtitle_badge || "bg-secondary")}">${library_escape_html(episode.subtitle_label || "未检测")}</span>
+            <span class="badge ${library_escape_html(library_soft_badge(episode.subtitle_badge || "bg-secondary"))}">${library_escape_html(episode.subtitle_label || "未检测")}</span>
           </div>
           <div class="col-auto">${button}</div>
         </div>
@@ -962,36 +1815,201 @@ function open_library_episode_upload(index) {
     show_fail_modal("未找到可上传字幕的剧集文件");
     return;
   }
-  const series = library_items_cache[library_current_series_id] || {};
-  show_index_upload_subtitle_modal(title, path, {
+  const series = library_lookup_item(library_current_series_id) || {};
+  const label = [episode.season_episode, title].filter(Boolean).join(" ");
+  library_set_upload_target(label || title, path, {
     server: episode.server || series.server || library_default_media_server,
     server_item_id: episode.server_item_id || "",
     parent_server_item_id: episode.parent_server_item_id || series.server_item_id || "",
     library_id: episode.library_id || series.library_id || ""
   });
+  library_drawer_scroll_to("library_drawer_upload");
+  const input = document.getElementById("index_upload_subtitle_file");
+  if (input && typeof input.focus === "function") { input.focus(); }
 }
 
-function show_index_upload_subtitle_modal(name, media_path, metadata) {
+// Points the drawer's upload form at one media file; blocked_reason disables it with an explanation.
+function library_set_upload_target(name, media_path, metadata, blocked_reason) {
   metadata = metadata || {};
   if (library_subtitle_upload_request) {
-    $("#index-upload-subtitle-modal").modal("show");
+    library_drawer_show();
     return;
   }
-  $("#index_upload_subtitle_path").val(media_path);
-  $("#index_upload_subtitle_target_path").val(media_path);
+  $("#index_upload_subtitle_path").val(media_path || "");
+  $("#index_upload_subtitle_target_path").val(media_path || "");
   $("#index_upload_subtitle_request_id").val(SubtitleTasks.randomRequestId());
   $("#index_upload_subtitle_server_item_id").val(metadata.server_item_id || "");
   $("#index_upload_subtitle_parent_server_item_id").val(metadata.parent_server_item_id || "");
   $("#index_upload_subtitle_library_id").val(metadata.library_id || "");
-  $("#index_upload_subtitle_name").val(name || media_path);
+  $("#index_upload_subtitle_name").val(name || media_path || "");
   $("#index_upload_subtitle_file").val("");
   $("#index_upload_subtitle_align").val("none");
   $("#index_upload_subtitle_server").val(metadata.server || library_default_media_server);
   $("#index_upload_subtitle_progress").addClass("d-none");
   $("#index_upload_subtitle_cancel").addClass("d-none").removeData("task-id");
-  $("#index_upload_subtitle_btn").prop("disabled", false).text("上传");
   library_subtitle_upload_task_id = "";
-  $("#index-upload-subtitle-modal").modal("show");
+  const blocked = !media_path || !!blocked_reason;
+  $("#index_upload_subtitle_btn").prop("disabled", blocked).text("上传");
+  $("#index_upload_subtitle_file,#index_upload_subtitle_align,#index_upload_subtitle_server").prop("disabled", blocked);
+  $("#library_upload_dropzone").toggleClass("is-disabled", blocked).attr("aria-disabled", blocked ? "true" : "false");
+  $("#library_upload_blocked").text(blocked_reason || "").toggleClass("d-none", !blocked_reason);
+  render_library_pending_files();
+}
+
+function library_format_bytes(value) {
+  return typeof SubtitleTasks !== "undefined" && SubtitleTasks.formatBytes
+      ? SubtitleTasks.formatBytes(value) : `${value} B`;
+}
+
+function library_pending_files() {
+  const input = typeof document.getElementById === "function" ? document.getElementById("index_upload_subtitle_file") : null;
+  return input ? Array.from(input.files || []) : [];
+}
+
+// Replaces the file input's selection; returns false where DataTransfer cannot build a FileList.
+function library_set_pending_files(files) {
+  const input = document.getElementById("index_upload_subtitle_file");
+  try {
+    const transfer = new DataTransfer();
+    files.forEach(function (file) { transfer.items.add(file); });
+    input.files = transfer.files;
+  } catch (error) {
+    return false;
+  }
+  render_library_pending_files();
+  return true;
+}
+
+function remove_library_pending_file(index) {
+  if (library_subtitle_upload_request) { return; }
+  const files = library_pending_files();
+  files.splice(index, 1);
+  if (!library_set_pending_files(files)) {
+    $("#index_upload_subtitle_file").val("");
+    render_library_pending_files();
+  }
+}
+
+function render_library_pending_files(options) {
+  const files = library_pending_files();
+  const box = $("#library_upload_pending");
+  library_upload_preview_generation += 1;
+  if (!files.length) {
+    box.empty();
+    return;
+  }
+  const validation = SubtitleTasks.validateFiles(files, $("#index_upload_subtitle_align").val() || "none");
+  let html = validation.ok ? "" : `<div class="alert alert-warning py-2">${library_escape_html(validation.message)}</div>`;
+  html += '<ul class="list-unstyled mb-0 lit-library-pending">';
+  files.forEach(function (file, index) {
+    const name = library_escape_html(file.name);
+    html += `<li class="lit-library-pending-row"><div class="d-flex gap-2 align-items-start">
+      <div class="flex-fill min-w-0"><div class="fw-bold text-break">${name}</div>
+      <div class="small text-muted">${library_escape_html(library_format_bytes(file.size || 0))}<span data-library-preview="${index}"></span></div></div>
+      <button type="button" class="btn btn-sm" aria-label="移除 ${name}" onclick="remove_library_pending_file(${index})">移除</button>
+      </div></li>`;
+  });
+  html += '</ul><div class="small text-muted mt-2 d-none" id="library_upload_preview_note">预计语言与文件名仅依据文件名推断，实际以处理结果为准。</div>';
+  box.html(html);
+  if (!options || options.preview !== false) {
+    request_library_upload_preview(files);
+  }
+}
+
+function library_language_label(code) {
+  const labels = {"zh-CN": "简体中文", "zh-TW": "繁体中文", "eng": "英文"};
+  return labels[code] || code || "";
+}
+
+function request_library_upload_preview(files) {
+  const view = library_view_instance;
+  const pending = document.getElementById("library_upload_pending");
+  const media_path = $("#index_upload_subtitle_target_path").val();
+  if (!view || !pending || !media_path || !files.length) { return; }
+  const generation = library_upload_preview_generation;
+  $.ajax({
+    type: "POST", url: "/library/subtitle/preview", contentType: "application/json", dataType: "json", timeout: 15000,
+    data: JSON.stringify({
+      media_path: media_path,
+      filenames: files.map(function (file) { return file.name; }),
+      server: $("#index_upload_subtitle_server").val() || library_default_media_server
+    }),
+    success: function (ret) {
+      // Script reloads reset the counter; it only identifies a request within
+      // one page instance, never a preview belonging to a restored page.
+      if (view !== library_view_instance || document.getElementById("library_upload_pending") !== pending
+          || generation !== library_upload_preview_generation
+          || $("#index_upload_subtitle_target_path").val() !== media_path || !ret || ret.code !== 0) { return; }
+      (ret.items || []).forEach(function (row, index) {
+        const text = row.target
+            ? ` · 预计${library_language_label(row.language) ? ` ${library_language_label(row.language)}` : ""} → ${row.target}${row.note ? `（${row.note}）` : ""}`
+            : (row.note ? ` · ${row.note}` : "");
+        $(`[data-library-preview="${index}"]`).text(text);
+      });
+      $("#library_upload_preview_note").removeClass("d-none");
+    }
+  });
+}
+
+function library_clear_pending_files() {
+  $("#index_upload_subtitle_file").val("");
+  render_library_pending_files();
+}
+
+function library_drag_has_files(event) {
+  const types = event && event.dataTransfer && event.dataTransfer.types;
+  return !!types && Array.prototype.indexOf.call(types, "Files") !== -1;
+}
+
+// Dropping is accepted only inside the drawer's upload area; elsewhere the browser must not
+// navigate to the file. The window listeners are installed once and ignore other pages.
+function init_library_dropzone() {
+  const zone = typeof document.getElementById === "function" ? document.getElementById("library_upload_dropzone") : null;
+  if (!zone) {
+    return;
+  }
+  const disabled = () => zone.classList.contains("is-disabled") || !!library_subtitle_upload_request;
+  ["dragenter", "dragover"].forEach(function (type) {
+    zone.addEventListener(type, function (event) {
+      if (!library_drag_has_files(event)) { return; }
+      event.preventDefault();
+      event.dataTransfer.dropEffect = disabled() ? "none" : "copy";
+      zone.classList.toggle("is-dragover", !disabled());
+    });
+  });
+  zone.addEventListener("dragleave", function (event) {
+    if (!zone.contains(event.relatedTarget)) { zone.classList.remove("is-dragover"); }
+  });
+  zone.addEventListener("drop", function (event) {
+    if (!library_drag_has_files(event)) { return; }
+    event.preventDefault();
+    event.stopPropagation();
+    zone.classList.remove("is-dragover");
+    if (disabled()) { return; }
+    const dropped = Array.from(event.dataTransfer.files || []);
+    if (!dropped.length) { return; }
+    const merged = library_pending_files();
+    dropped.forEach(function (file) {
+      if (!merged.some(function (existing) { return existing.name === file.name; })) { merged.push(file); }
+    });
+    if (!library_set_pending_files(merged)) {
+      document.getElementById("index_upload_subtitle_file").files = event.dataTransfer.files;
+      render_library_pending_files();
+    }
+  });
+  if (!window.library_dnd_listener_installed && typeof window.addEventListener === "function") {
+    ["dragover", "drop"].forEach(function (type) {
+      window.addEventListener(type, function (event) {
+        const current = document.getElementById("library_upload_dropzone");
+        if (!current || !library_view_instance || !library_drag_has_files(event) || current.contains(event.target)) {
+          return;
+        }
+        event.preventDefault();
+        if (event.dataTransfer) { event.dataTransfer.dropEffect = "none"; }
+      });
+    });
+    window.library_dnd_listener_installed = true;
+  }
 }
 
 function render_library_upload_task(task) {
@@ -1011,9 +2029,11 @@ function finish_library_upload_task(task) {
   $("#index_upload_subtitle_cancel").addClass("d-none");
   $("#index_upload_subtitle_btn").prop("disabled", false).text("再次上传");
   if (["succeeded", "partial"].indexOf(task.status) !== -1) {
+    library_clear_pending_files();
     load_library_items(library_page);
-    if ($("#index-library-episodes-modal").hasClass("show") && library_current_series_id) {
-      open_library_episodes(library_current_series_id);
+    if (library_drawer_is_open() && library_current_series_id
+        && library_drawer_item && library_drawer_item.media_type !== "movie") {
+      load_library_episodes(library_current_series_id);
     }
   }
 }
@@ -1024,6 +2044,15 @@ function init_media_library_page(options) {
   library_view_instance = {};
   library_items_loading = false;
   library_pending_page = null;
+  // Session state belongs to the previous DOM; a re-initialised page starts clean.
+  library_fill = null;
+  library_fill_loading = false;
+  library_drawer_item = null;
+  library_episodes_state = "idle";
+  library_episodes_request = null;
+  library_drawer_resume_id = "";
+  library_online_serialized = false;
+  library_refreshing = false;
   options = options || {};
   SubtitleTasks.init();
   library_default_media_server = (options.default_server || window.CURRENT_MEDIA_SERVER_TYPE || library_default_media_server || "emby").toLowerCase();
@@ -1125,6 +2154,7 @@ function init_media_library_page(options) {
         upload_button.prop("disabled", false).text("再次上传");
         $("#index_upload_subtitle_cancel").addClass("d-none");
         $("#index_upload_subtitle_request_id").val(SubtitleTasks.randomRequestId());
+        library_clear_pending_files();
         load_library_items(library_page);
         return;
       }
@@ -1177,16 +2207,47 @@ function init_media_library_page(options) {
   });
   $("#index_library_subtitle_audit_server").unbind("change").change(load_library_subtitle_audit_history);
 
-  $("#library_filter_type").unbind("change").change(function () {
-    $("#library_filter_category").val("");
-    update_library_category_options();
-    update_library_filter_badge();
+  $("#index_upload_subtitle_file").unbind("change").on("change", function () {
+    render_library_pending_files();
+  });
+  $("#index_upload_subtitle_align").unbind("change").on("change", function () {
+    render_library_pending_files({preview: false});
+  });
+  $("#index_upload_subtitle_server").unbind("change").on("change", function () {
+    render_library_pending_files();
+  });
+  init_library_dropzone();
+  // Closing the online dialog ends a fill session, otherwise it hands focus back to the drawer.
+  $("#library-online-subtitle-modal").off("hidden.bs.modal.library").on("hidden.bs.modal.library", function () {
+    if (library_online_serialized) { return; }
+    if (library_fill) {
+      library_fill_exit();
+      return;
+    }
+    library_drawer_resume();
+  });
+  $("#season-pack-modal").off("hidden.bs.modal.library").on("hidden.bs.modal.library", library_drawer_resume);
+  $("#library_fill_exit").unbind("click").click(library_fill_exit);
+  $("#library_fill_skip").unbind("click").click(function () { library_fill_advance(false); });
+  $("#library_fill_next").unbind("click").click(function () { library_fill_advance(true); });
+
+  $("#library_type_tabs").unbind("click").on("click", "[data-library-type]", function () {
+    set_library_type($(this).attr("data-library-type"));
+  });
+  $("#library_status_tabs").unbind("click").on("click", "[data-library-subtitle]", function () {
+    set_library_subtitle($(this).attr("data-library-subtitle"));
+  });
+  $("#library_category_chips").unbind("click").on("click", "[data-library-category]", function () {
+    set_library_category($(this).attr("data-library-category") || "");
+  });
+  $("#library_active_filters").unbind("click").on("click", "[data-library-clear-filter]", function () {
+    clear_library_filter($(this).attr("data-library-clear-filter"));
   });
   $("#library_sort_by").unbind("change").change(function () {
     update_library_sort_order_labels();
     update_library_filter_badge();
   });
-  $("#library_filter_category,#library_filter_subtitle,#library_sort_order").unbind("change").change(function () {
+  $("#library_filter_audio,#library_sort_order").unbind("change").change(function () {
     update_library_filter_badge();
   });
   $("#library_filter_keyword").unbind("input").on("input", function () {
@@ -1202,25 +2263,32 @@ function init_media_library_page(options) {
     $("#library_filter_keyword").val("").trigger("input").trigger("focus");
   });
 
-  const saved_view = library_saved_view();
+  // Back/forward restores the exact entry (with search word and page); a fresh
+  // visit reopens the filters last used in this browser, starting from page 1.
+  const history_view = library_saved_view();
+  const stored_view = history_view ? null : library_stored_view();
+  const saved_view = history_view || stored_view;
+  const view = library_normalize_view(saved_view);
+  library_category_counts = null;
   if (saved_view) {
-    $("#library_filter_type").val(saved_view.type || "all");
-    $("#library_filter_subtitle").val(saved_view.subtitle || "all");
-    $("#library_sort_by").val(saved_view.sort_by || "default");
-    $("#library_sort_order").val(saved_view.sort_order || "desc");
-    $("#library_filter_keyword").val(saved_view.keyword || "");
-    // Category options only exist after the first server response, so seed
-    // the select with the saved value; update_library_category_options
-    // preserves it through the selected check and rebuilds the real list.
-    const saved_category = String(saved_view.category || "");
-    if (saved_category) {
-      $("#library_filter_category").html(
-          `<option value="${library_escape_html(saved_category)}" selected></option>`);
-    }
+    $("#library_filter_type").val(view.type);
+    $("#library_filter_subtitle").val(view.subtitle);
+    $("#library_filter_audio").val(view.audio_language);
+    $("#library_sort_by").val(view.sort_by);
+    $("#library_sort_order").val(view.sort_order);
+    $("#library_filter_keyword").val(history_view ? view.keyword : "");
+    // Chips need the first response's category list; an unknown name is dropped then.
+    $("#library_filter_category").val(view.category);
   }
+  update_library_audio_control();
+  sync_library_tabs();
+  render_library_category_chips();
   update_library_sort_order_labels();
   update_library_filter_badge();
-  load_library_items(saved_view ? Math.max(parseInt(saved_view.page, 10) || 1, 1) : 1);
+  if (stored_view && library_view_is_customized()) {
+    library_refresh_notice = "已恢复上次的筛选";
+  }
+  load_library_items(history_view ? view.page : 1);
 }
 
 var library_online_path = "";
@@ -1229,7 +2297,10 @@ var library_online_results = [];
 var library_online_default_keyword = "";
 
 function open_library_online_movie(item_id) {
-  const item = library_items_cache[item_id];
+  open_library_online_item(library_lookup_item(item_id));
+}
+
+function open_library_online_item(item) {
   if (item && item.target_path) {
     open_library_online_subtitles(item.title || item.original_title, item.target_path, {
       title: item.title, original_title: item.original_title, year: item.year, media_type: "movie",
@@ -1242,9 +2313,8 @@ function open_library_online_episode(index) {
   const cached_episode = library_episodes_cache[index];
   if (!cached_episode) { return; }
   const episode = library_fill_episode_numbers(cached_episode);
-  const series = library_items_cache[library_current_series_id] || {};
+  const series = library_lookup_item(library_current_series_id) || {};
   if (!episode || !episode.path) { return; }
-  $("#index-library-episodes-modal").modal("hide");
   open_library_online_subtitles(library_current_series_title, episode.path, {
     title: library_current_series_title, original_title: series.original_title, year: series.year,
     media_type: "episode", season: episode.season, episode: episode.episode, imdbid: series.imdbid
@@ -1272,6 +2342,8 @@ function reset_library_online_keyword() {
 }
 
 function open_library_online_subtitles(name, path, media) {
+  library_online_serialized = false;
+  library_drawer_hide_for_modal();
   library_online_path = path;
   library_online_media = media || {};
   const episode_label = library_online_media.media_type === "episode"
@@ -1336,16 +2408,20 @@ function download_library_online_subtitle(index, button, quota_confirmed) {
     // Serialize the existing Bootstrap dialogs so cancellation restores the
     // search and neither focus trap is active behind the other dialog.
     $(button).data("confirming", true).prop("disabled", true);
+    // The online dialog closes only to show the confirmation; that is not a user exit.
+    library_online_serialized = true;
     $("#library-online-subtitle-modal").one("hidden.bs.modal", function () {
       if (generation !== library_online_generation) {
+        library_online_serialized = false;
         $(button).data("confirming", false).prop("disabled", false);
         return;
       }
       let confirmed = false;
       $("#system-confirm-modal").one("hidden.bs.modal", function () {
         $(button).data("confirming", false).prop("disabled", false);
-        if (generation !== library_online_generation) { return; }
+        if (generation !== library_online_generation) { library_online_serialized = false; return; }
         $("#library-online-subtitle-modal").one("shown.bs.modal", function () {
+          library_online_serialized = false;
           if (generation !== library_online_generation) { return; }
           if (confirmed) { download_library_online_subtitle(index, button, true); }
           else { $(button).trigger("focus"); }
@@ -1359,6 +2435,10 @@ function download_library_online_subtitle(index, button, quota_confirmed) {
     return;
   }
   const payload = {ticket: item.ticket};
+  // Search results can change while this task runs. Keep the fill identity
+  // separate so completion still counts for this movie, never the next one.
+  const fill = library_fill;
+  const fill_item = fill && fill.queue[fill.index];
   if (item.provider === "opensubtitles") { payload.confirm_quota = true; }
   const member = $(`#library_online_member_${index}`);
   if (member.length) { payload.member = member.val(); }
@@ -1368,31 +2448,39 @@ function download_library_online_subtitle(index, button, quota_confirmed) {
     type: "POST", url: "/library/subtitle/download", contentType: "application/json", dataType: "json", timeout: 0,
     data: JSON.stringify(payload),
     success: function (ret) {
-      if (generation !== library_online_generation) { return; }
-      if (ret.code !== 0) { show_fail_modal(ret.msg || "下载失败"); return; }
+      const current_search = generation === library_online_generation;
+      if (!current_search && (!fill || fill !== library_fill)) { return; }
+      if (ret.code !== 0) {
+        if (current_search) { show_fail_modal(ret.msg || "下载失败"); }
+        return;
+      }
       if (ret.members) {
+        if (!current_search) { return; }
         const select = $('<select class="form-select mb-2" aria-label="选择压缩包中的字幕文件">').attr("id", `library_online_member_${index}`);
         ret.members.forEach(function (name) { select.append($("<option>").val(name).text(name)); });
         $(`#library_online_members_${index}`).empty().append(select);
         return;
       }
       if (ret.task_id) {
-        $(button).data("queued", true);
+        if (current_search) { $(button).data("queued", true); }
         SubtitleTasks.watch(ret.task_id, {
           onDone: function (task) {
             load_library_items(library_page);
-            if (generation !== library_online_generation) { return; }
             const saved = ["succeeded", "partial"].indexOf(task.status) !== -1;
+            if (saved) { library_fill_note_saved(fill, fill_item); }
+            if (generation !== library_online_generation) { return; }
             $(button).data("queued", false).data("saved", saved).prop("disabled", saved)
                 .text(saved ? "已保存" : "下载并保存");
             if (!saved) { show_fail_modal(task.error || "字幕处理未完成，请在任务中心查看详情"); }
           }
         });
         SubtitleTasks.refreshList(true).catch(function () {});
-        show_success_modal(ret.msg || "字幕已加入处理队列");
+        if (current_search) { show_success_modal(ret.msg || "字幕已加入处理队列"); }
       } else {
-        show_success_modal(ret.msg || "字幕已保存");
+        library_fill_note_saved(fill, fill_item);
         load_library_items(library_page);
+        if (!current_search) { return; }
+        show_success_modal(ret.msg || "字幕已保存");
         $(button).data("saved", true);
       }
     },
@@ -1406,4 +2494,137 @@ function download_library_online_subtitle(index, button, quota_confirmed) {
           .text($(button).data("queued") ? "后台处理中" : ($(button).data("saved") ? "已保存" : "下载并保存"));
     }
   });
+}
+
+// ---- Continuous fill -------------------------------------------------------------
+// Walks a fixed queue of movies through the existing online search. Nothing is
+// downloaded automatically; each save is still the user's explicit click.
+
+function start_library_fill() {
+  const view = library_view_instance;
+  const grid = document.getElementById("library_items_grid");
+  // Ordinary menu navigation replaces the DOM without clearing the view token.
+  const is_current_view = () => grid && view && view === library_view_instance &&
+      document.getElementById("library_items_grid") === grid;
+  if (!is_current_view() || library_fill || library_fill_loading || library_items_loading) {
+    return;
+  }
+  const scope = library_fill_scope();
+  if (!scope.ok) {
+    show_fail_modal(`连续补齐目前只支持电影。当前筛选是“${scope.label}”，请切换到“电影”或“全部类型”后再开始。`);
+    return;
+  }
+  const data = Object.assign(library_filter_data(1), {
+    type: "movie", page_size: 100, sort_by: "default", sort_order: "desc"
+  });
+  // Filling a finished library makes no sense; "all" and "completed" fall back to missing subtitles.
+  if (["all", "ok"].indexOf(data.subtitle) !== -1) {
+    data.subtitle = "missing";
+  }
+  const status_label = library_fill_status_label();
+  library_fill_loading = true;
+  $("#library_fill_btn").prop("disabled", true);
+  NProgress.start();
+  $.ajax({
+    type: "POST",
+    url: "/library/items?random=" + Math.random(),
+    dataType: "json",
+    contentType: "application/json",
+    data: JSON.stringify(data),
+    timeout: 0,
+    success: function (ret) {
+      if (!is_current_view()) { return; }
+      if (!ret || ret.code !== 0) {
+        show_fail_modal((ret && ret.msg) || "无法生成补齐队列");
+        return;
+      }
+      const items = ret.items || [];
+      const queue = items.filter(function (item) {
+        return item.media_type === "movie" && item.can_upload && item.target_path;
+      });
+      if (!queue.length) {
+        show_fail_modal("当前筛选下没有可补齐的电影。请调整筛选，或先执行外挂字幕检测。");
+        return;
+      }
+      const truncated = (ret.total || 0) > items.length ? `，仅取前 ${items.length} 部` : "";
+      const skipped = items.length - queue.length;
+      show_confirm_modal(
+          `将按当前筛选（${scope.label}、${status_label}）逐部检索字幕：共 ${queue.length} 部${truncated}` +
+          `${skipped ? `，另有 ${skipped} 部无法上传已排除` : ""}。不会自动下载，每部都由你确认。是否开始？`,
+          function () {
+            if (!is_current_view()) { return; }
+            library_fill = {queue: queue, index: 0, saved: 0, skipped: 0, current_saved: false};
+            $("#system-confirm-modal").one("hidden.bs.modal", function () {
+              if (is_current_view()) { library_fill_open(0); }
+            });
+            hide_confirm_modal();
+          });
+    },
+    error: function () {
+      if (!is_current_view()) { return; }
+      show_fail_modal("网络错误");
+    },
+    complete: function () {
+      if (!is_current_view()) { return; }
+      library_fill_loading = false;
+      NProgress.done();
+      $("#library_fill_btn").prop("disabled", false);
+    }
+  });
+}
+
+function library_fill_open(index) {
+  if (!library_fill) {
+    return;
+  }
+  const total = library_fill.queue.length;
+  if (index >= total) {
+    library_fill_exit(true);
+    return;
+  }
+  const item = library_fill.queue[index];
+  library_fill.index = index;
+  library_fill.current_saved = false;
+  const last = index + 1 >= total;
+  $("#library_fill_footer").removeClass("d-none");
+  $("#library_fill_progress").text(`第 ${index + 1} / ${total} 部 · 已保存 ${library_fill.saved} 部`);
+  $("#library_fill_skip").prop("disabled", false).text(last ? "跳过并结束" : "跳过");
+  $("#library_fill_next").prop("disabled", true).text(last ? "完成" : "下一部");
+  open_library_online_item(item);
+}
+
+function library_fill_advance(saved) {
+  if (!library_fill) {
+    return;
+  }
+  if (!saved && !library_fill.current_saved) {
+    library_fill.skipped += 1;
+  }
+  library_fill_open(library_fill.index + 1);
+}
+
+function library_fill_note_saved(fill, item) {
+  if (!fill || fill !== library_fill || fill.queue[fill.index] !== item || fill.current_saved) {
+    return;
+  }
+  library_fill.current_saved = true;
+  library_fill.saved += 1;
+  $("#library_fill_progress").text(
+      `第 ${library_fill.index + 1} / ${library_fill.queue.length} 部 · 已保存 ${library_fill.saved} 部`);
+  $("#library_fill_next").prop("disabled", false).trigger("focus");
+  $("#library_fill_skip").prop("disabled", true);
+}
+
+function library_fill_exit(completed) {
+  if (!library_fill) {
+    return;
+  }
+  const run = library_fill;
+  library_fill = null;
+  $("#library_fill_footer").addClass("d-none");
+  $("#library-online-subtitle-modal").modal("hide");
+  const untouched = run.queue.length - run.saved - run.skipped;
+  library_refresh_notice = `补齐${completed === true ? "完成" : "已结束"}：保存 ${run.saved} 部，跳过 ${run.skipped} 部` +
+      (untouched > 0 ? `，未处理 ${untouched} 部` : "");
+  load_library_items(library_page);
 }

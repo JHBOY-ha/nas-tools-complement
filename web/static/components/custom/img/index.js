@@ -78,7 +78,7 @@ export class CustomImg extends CustomElement {
           class=${this.img_class}
           style=${this.img_style}
           referrerpolicy="no-referrer"
-          src=${this.lazy == "1" ? "" : this.img_src ? Golbal.poster_image_url(this.img_src) : this.img_error == "1" ? this.img_noimage : ""}
+          src=${this.lazy == "1" ? "" : this.img_src || (this.img_error == "1" ? this.img_noimage : "")}
           @error=${() => { if (this.lazy != "1" && this.img_error == "1") { this.img_src = this.img_noimage } }}
           @load=${() => {
             this._placeholder = false;

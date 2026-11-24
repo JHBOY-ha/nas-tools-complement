@@ -212,7 +212,7 @@ class TMDb(object):
         return self.cached_request.cache_clear()
 
     def _call(
-            self, action, append_to_response, call_cached=True, method="GET", data=None
+            self, action, append_to_response, call_cached=True, method="GET", data=None, language=None
     ):
         if self.proxies == "INVALID_PROXY":
             raise TMDbException("代理配置无效，请修正后重试")
@@ -224,7 +224,8 @@ class TMDb(object):
             action,
             self.api_key,
             append_to_response,
-            self.language,
+            # Explicit request language must not write the process-wide default.
+            self.language if language is None else language,
         )
 
         if self.cache and self.obj_cached and call_cached and method != "POST":

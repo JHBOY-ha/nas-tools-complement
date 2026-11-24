@@ -45,11 +45,13 @@ class Movie(TMDb):
             self,
             movie_id,
             append_to_response="",
+            language=None,
     ):
         """
         Get the primary information about a movie.
         :param movie_id:
         :param append_to_response:
+        :param language: Request-only override; leaves the shared default unchanged.
         :return:
         """
         if append_to_response == "all":
@@ -60,6 +62,7 @@ class Movie(TMDb):
             **self._call(
                 self._urls["details"] % movie_id,
                 "append_to_response=" + append_to_response,
+                language=language,
             )
         )
 

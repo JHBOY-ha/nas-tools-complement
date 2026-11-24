@@ -1,5 +1,5 @@
 /* Real Bootstrap dialogs and source selection with offline subtitle API fixtures. */
-const {chromium} = require('playwright');
+const {firefox} = require('playwright');
 const {spawnSync} = require('child_process');
 const fs = require('fs'), path = require('path'), assert = require('node:assert/strict');
 const root = path.resolve(__dirname, '..');
@@ -9,7 +9,7 @@ from pathlib import Path
 from jinja2 import Environment, FileSystemLoader, ChainableUndefined
 env = Environment(loader=FileSystemLoader('web/templates'), undefined=ChainableUndefined, autoescape=True)
 library = env.get_template('rename/medialibrary.html').render(MediaServerType='emby')
-online = library[library.index('<div class="modal modal-blur fade" id="library-online-subtitle-modal"'):]
+online = library[library.index('<div class="modal modal-blur fade lit-library-modal" id="library-online-subtitle-modal"'):]
 shell = Path('web/templates/navigation.html').read_text()
 confirm = shell[shell.index('<!-- 危险确认提示框 -->'):shell.index('<!-- 成功带后续操作提示框 -->')]
 confirm = env.from_string("{% import 'macro/svg.html' as SVG %}" + confirm).render()
@@ -19,7 +19,7 @@ assert.equal(rendered.status, 0, rendered.stderr);
 const fixtures = JSON.parse(rendered.stdout);
 
 (async () => {
-  const browser = await chromium.launch({headless: true, ...(process.env.CHROME_PATH ? {executablePath: process.env.CHROME_PATH} : {})});
+  const browser = await firefox.launch({headless: true, ...(process.env.FIREFOX_PATH ? {executablePath: process.env.FIREFOX_PATH} : {})});
   try {
     const page = await browser.newPage({viewport: {width: 1100, height: 800}, reducedMotion: 'reduce'});
     const errors = [], downloads = [];
@@ -51,7 +51,9 @@ const fixtures = JSON.parse(rendered.stdout);
         await new Promise(resolve => setTimeout(resolve, 80));
         if (payload.keyword === 'empty') return route.fulfill({json: {code: 0, items: [], warnings: []}});
         if (payload.keyword === 'error') return route.fulfill({json: {code: -1, msg: 'OpenSubtitles请求失败：HTTP 403'}});
-        return route.fulfill({json: {code: 0, items: [{name: 'Movie.2024.1080p', provider: 'opensubtitles',
+        // Echo the requested source so a stale "all" result cannot pass as a filtered one.
+        const provider = payload.provider === 'all' ? 'thunder' : payload.provider;
+        return route.fulfill({json: {code: 0, items: [{name: 'Movie.2024.1080p', provider: provider,
           format: 'srt', language: '简体中文', match_label: '片名与年份匹配', ticket: 'signed-result'}], warnings: []}});
       }
       if (url.pathname === '/library/subtitle/download') {
@@ -71,27 +73,31 @@ const fixtures = JSON.parse(rendered.stdout);
     const online = page.locator('#library-online-subtitle-modal');
     const confirmation = page.locator('#system-confirm-modal');
     await page.getByRole('button', {name: '下载并保存', exact: true}).waitFor();
+    assert.match(await page.locator('#library_online_results').innerText(), /迅雷 ·/);
     // Popup rendering belongs to the OS; verify the native option and the
     // application's real keyboard focus order without automating OS menus.
+    // Changing the source must re-run the search without a second click.
     await page.getByRole('combobox', {name: '字幕来源'}).selectOption('opensubtitles');
+    assert.equal(await page.locator('#library_online_search').isDisabled(), true);
+    await page.locator('#library_online_results').getByText('OpenSubtitles ·').waitFor();
+    assert.doesNotMatch(await page.locator('#library_online_results').innerText(), /迅雷 ·/);
     await page.getByRole('combobox', {name: '字幕来源'}).focus();
     await page.keyboard.press('Tab');
     assert.equal(await page.evaluate(() => document.activeElement.innerText), '恢复默认词');
     assert.equal(await page.locator('#library_online_provider').inputValue(), 'opensubtitles');
-    await page.getByRole('button', {name: '检索字幕', exact: true}).click();
-    assert.equal(await page.locator('#library_online_search').isDisabled(), true);
-    await page.getByRole('button', {name: '下载并保存', exact: true}).waitFor();
-    assert.match(await page.locator('#library_online_results').innerText(), /OpenSubtitles/);
     await page.getByRole('button', {name: '下载并保存', exact: true}).click();
     await confirmation.waitFor({state: 'visible'});
     assert.equal(await online.isVisible(), false);
     assert.match(await confirmation.innerText(), /一次账户下载配额/);
+    // Bootstrap activates its focus trap after the visible fade transition.
+    await page.waitForFunction(() => document.querySelector('#system-confirm-modal').contains(document.activeElement));
     await page.keyboard.press('Escape');
     await online.waitFor({state: 'visible'});
     assert.equal(downloads.length, 0);
     await page.waitForFunction(() => document.activeElement.classList.contains('library-online-download'));
     await page.getByRole('button', {name: '下载并保存', exact: true}).click();
     await confirmation.waitFor({state: 'visible'});
+    await page.waitForFunction(() => document.querySelector('#system-confirm-modal').contains(document.activeElement));
     await page.locator('#system_confirm_btn').click();
     await page.getByRole('button', {name: '已保存', exact: true}).waitFor();
     assert.equal(downloads.length, 1);

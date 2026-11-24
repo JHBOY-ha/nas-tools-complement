@@ -21,7 +21,8 @@ finally:
 
 
 @contextmanager
-def api_server(cookie="QBT_SID_8080", status=204, value="token", expire=False):
+def api_server(cookie="QBT_SID_8080", status=204, value="token", expire=False,
+               add_response=None):
     state = types.SimpleNamespace(logins=0, cookies=[], expired=False)
 
     class Handler(BaseHTTPRequestHandler):
@@ -36,6 +37,10 @@ def api_server(cookie="QBT_SID_8080", status=204, value="token", expire=False):
             self.wfile.write(body.encode())
 
         def do_POST(self):
+            if self.path == "/api/v2/torrents/add" and add_response is not None:
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.reply(*add_response)
+                return
             if self.path != "/api/v2/auth/login":
                 self.reply(404)
                 return
@@ -56,7 +61,7 @@ def api_server(cookie="QBT_SID_8080", status=204, value="token", expire=False):
                 state.expired = True
                 self.reply(403)
             elif cookie and cookie + "=" + state.token in sent:
-                self.reply(200, "v5.2.3.10")
+                self.reply(200, "2.14.0" if self.path == "/api/v2/app/webapiVersion" else "v5.2.3.10")
             else:
                 self.reply(403)
 
@@ -143,6 +148,30 @@ def load_wrapper():
     return module
 
 
+class AddTorrentTests(unittest.TestCase):
+    def test_add_responses_through_bundled_client(self):
+        module = load_wrapper()
+        cases = (
+            (200, "Ok.", True),
+            (200, "Fails.", False),
+            (200, '{"success_count":1,"pending_count":0,"failure_count":0,"added_torrent_ids":["abc"]}', True),
+            (202, '{"success_count":0,"pending_count":1,"failure_count":0,"added_torrent_ids":[]}', True),
+            (409, '{"success_count":0,"pending_count":0,"failure_count":1}', False),
+            (200, '{"success_count":0,"pending_count":0,"failure_count":1}', False),
+            (415, "Invalid torrent", False),
+            (200, "", False),
+            (200, "not JSON", False),
+            (200, '"Ok."', False),
+            (200, '[]', False),
+            (200, '{"success_count":"1","pending_count":true}', False),
+        )
+        for status, body, expected in cases:
+            with self.subTest(status=status, body=body), api_server(add_response=(status, body)) as (client, _):
+                wrapper = module.Qbittorrent.__new__(module.Qbittorrent)
+                wrapper.qbc = client
+                self.assertEqual(wrapper.add_torrent("magnet:?xt=urn:btih:" + "a" * 40), expected)
+
+
 class ConnectionTests(unittest.TestCase):
     def setUp(self):
         self.module = load_wrapper()
@@ -158,6 +187,15 @@ class ConnectionTests(unittest.TestCase):
         wrapper = self.module.Qbittorrent(self.config)
         self.assertIs(wrapper.qbc, self.client)
         self.assertEqual(wrapper.ver, "v5.2.3.10")
+
+    def test_tag_lookup_reconnects_after_failed_initial_login(self):
+        self.client.auth_log_in.side_effect = [qbittorrentapi.LoginFailed(), None]
+        wrapper = self.module.Qbittorrent(self.config)
+        self.assertIsNone(wrapper.qbc)
+        self.client.torrents_info.return_value = [{'hash': 'existing'}]
+        self.assertEqual(wrapper.get_torrents(tag='nts-test'), ([{'hash': 'existing'}], False))
+        self.client.torrents_info.assert_called_once_with(torrent_hashes=None, status_filter=None, tag='nts-test')
+        self.client.torrents_add.assert_not_called()
 
     def test_login_failure(self):
         self.client.auth_log_in.side_effect = qbittorrentapi.LoginFailed()
